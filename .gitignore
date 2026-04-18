@@ -1,0 +1,18 @@
+# Rust
+target/
+Cargo.lock
+
+# Output directories (only root level)
+/cache/
+/output/
+/test_output/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
