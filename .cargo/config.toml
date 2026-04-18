@@ -1,0 +1,15 @@
+[build]
+# Use all available cores for building
+jobs = 16
+
+[target.x86_64-apple-darwin]
+# Use the native CPU features for better performance
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-apple-darwin]
+# Use the native CPU features for better performance
+rustflags = ["-C", "target-cpu=native"]
+
+# Enable parallel frontend compilation
+[unstable]
+parallel-compiler = true

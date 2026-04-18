@@ -1,0 +1,91 @@
+[package]
+name = "series-factory"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "series_factory"
+path = "src/lib.rs"
+
+[[bin]]
+name = "series-factory"
+path = "src/main.rs"
+
+[[bin]]
+name = "extract-vol"
+path = "src/bin/extract_vol.rs"
+
+[[bin]]
+name = "generate-renko-from-ticks"
+path = "src/bin/generate_renko_from_ticks.rs"
+
+[[bin]]
+name = "optimize-renko-stats"
+path = "src/bin/optimize_renko_stats.rs"
+
+[features]
+default = ["parquet-output"]
+parquet-output = ["arrow", "parquet"]
+
+[dependencies]
+# Core async runtime
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs", "sync"] }
+# Parallel processing
+rayon = "1.10"
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+# HTTP client - synchronous (TODO: replace with reqwest async)
+ureq = "2.10"
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+# CSV parsing
+csv = "1.3"
+# Parquet support (feature-gated, minimal features)
+arrow = { version = "54.0", default-features = false, features = ["ipc"], optional = true }
+parquet = { version = "54.0", default-features = false, features = ["arrow"], optional = true }
+# ZIP compression for Binance data
+zip = "2.2"
+# GZIP compression for Bybit data
+flate2 = "1.0"
+# Logging
+tracing = "0.1"
+# Random number generation for synthetic data
+rand = "0.8"
+rand_chacha = "0.3"
+rand_distr = "0.4"
+# Async traits (needed for dyn compatibility)
+async-trait = "0.1"
+# Error handling
+anyhow = "1.0"
+# Memory-mapped files
+memmap2 = "0.9"
+# POSIX resource limits (setrlimit for memory cap)
+libc = "0.2"
+# MITCH protocol types (shared with BTR/prime)
+mitch = { path = "../mitch/impl/rust", features = ["bytemuck"] }
+bytemuck = "1.0"
+# Shared SDK (aggregation primitives, Parkinson sigma, etc.)
+nxr-sdk = { path = "../sdk" }
+
+[profile.dev]
+opt-level = 0
+debug = true
+overflow-checks = true
+
+[profile.release]
+lto = "thin"  # Use thin LTO for faster builds
+codegen-units = 16  # Allow parallel compilation
+opt-level = 3
+debug = false
+incremental = true  # Enable incremental compilation
+
+# Fast release build for testing
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 2
