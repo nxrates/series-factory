@@ -27,11 +27,12 @@ use clap::Parser;
 use mitch::timestamp;
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::weights_schema::WeightsFile;
-use nxr_sdk::{parkinson_sigma, resolve_ticker_id};
+use nxr_sdk::resolve_ticker_id;
 use rayon::prelude::*;
 use serde::Deserialize;
 use series_factory::bar_construction::{
-    calibrate_mtf_with_target, CalibrationConfig, MtfParkinsonCalculator, RenkoConfig, VolConfig,
+    build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig, MtfParkinsonCalculator,
+    RenkoConfig, VolConfig,
 };
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
@@ -299,7 +300,10 @@ fn calibrate_one(
         Err(e) => return CalOutcome::Failed { ticker_id, reason: format!("open .idx: {}", e) },
     };
 
-    let mut hlc: HashMap<i64, (f64, f64, f64)> = HashMap::new();
+    // Stream the .idx once, populating both the 30-min HLC map (vol input)
+    // and the 1-min last-mid downsample (calibration input). Bucket H = ask,
+    // L = bid; matches `renko_from_idx.rs` semantics.
+    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
     let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
     loop {
         let rec = match stream.next_record() {
@@ -313,13 +317,10 @@ fn calibrate_one(
         let mid = (bid + ask) * 0.5;
         if !(mid.is_finite() && mid > 0.0) { continue; }
 
-        // 30-min HLC bucket: H = max(ask), L = min(bid). Match renko_from_idx.rs
-        // semantics (H/L from the consensus spread, C = last mid).
         let key = (ts / 1_800_000) * 1_800_000;
-        let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid), mid));
+        let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
         if ask > e.0 { e.0 = ask; }
         if bid < e.1 && bid > 0.0 { e.1 = bid; }
-        e.2 = mid;
 
         // 1-min last-mid bucket for in-memory calibration.
         let bucket = (ts / 60_000) * 60_000;
@@ -331,31 +332,17 @@ fn calibrate_one(
         return CalOutcome::Skipped { ticker_id, reason: "empty .idx".into() };
     }
 
-    // Build the .vol file (tmp, deleted at end of fn). Avoid disk churn? — Yes,
-    // VolMmap is the de-facto VolSource and reusing it keeps the calibration
-    // bit-for-bit identical to the existing prod pipeline.
+    // Build the .vol file (tmp, deleted at end of fn). VolMmap is the de-facto
+    // VolSource; reusing the canonical builder keeps calibration bit-for-bit
+    // identical to the prod pipeline and the other offline pipelines.
     let vol_path = std::env::temp_dir().join(format!("nxr-calibrate-{}-{}.vol", ticker_id, std::process::id()));
-    let mut hours: Vec<(i64, f64, f64)> = hlc.into_iter().map(|(ts, (h, l, _))| (ts, h, l)).collect();
-    hours.sort_unstable_by_key(|&(ts, _, _)| ts);
-    let alpha = 2.0 / (vol_cfg.ema_period as f64 + 1.0);
     {
         let mut writer = match VolWriter::new(&vol_path) {
             Ok(w) => w,
             Err(e) => return CalOutcome::Failed { ticker_id, reason: format!("vol writer: {}", e) },
         };
-        let mut prev_ema: Option<f64> = None;
-        for (i, &(ts, high, low)) in hours.iter().enumerate() {
-            let sigma = parkinson_sigma(high, low);
-            let ema = if i < vol_cfg.ema_period {
-                hours[..=i].iter().map(|&(_, h, l)| parkinson_sigma(h, l)).sum::<f64>()
-                    / (i + 1) as f64
-            } else {
-                alpha * sigma + (1.0 - alpha) * prev_ema.unwrap_or(sigma)
-            };
-            prev_ema = Some(ema);
-            if let Err(e) = writer.write_record(timestamp::from_epoch_ms(ts), ema) {
-                return CalOutcome::Failed { ticker_id, reason: format!("vol write: {}", e) };
-            }
+        if let Err(e) = build_vol_from_hlc(&hlc, vol_cfg, &mut writer) {
+            return CalOutcome::Failed { ticker_id, reason: format!("vol build: {}", e) };
         }
         if let Err(e) = writer.finish() {
             return CalOutcome::Failed { ticker_id, reason: format!("vol finish: {}", e) };

@@ -26,12 +26,10 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
-use bytemuck::bytes_of;
 use mitch::bar::{Bar, BarKind};
-use mitch::timestamp;
-use nxr_sdk::{parkinson_sigma, BarAccumulator};
+use nxr_sdk::BarAccumulator;
 use series_factory::{
-    bar_construction::{RenkoConfig, RenkoGenerator, VolConfig, VolSource},
+    bar_construction::{build_vol_from_hlc, RenkoConfig, RenkoGenerator, VolConfig, VolSource},
     vol_bin::{VolMmap, VolWriter},
     sampler::{SearchConfig, SearchState},
     read_tick_file,
@@ -40,8 +38,7 @@ use series_factory::{
 use std::{
     collections::BTreeMap,
     fs,
-    fs::File,
-    io::{BufWriter, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 use tracing::info;
@@ -137,8 +134,9 @@ fn main() -> Result<()> {
     info!("Found {} tick files", tick_files.len());
 
     // ── Phase 1: Build Parkinson vol (batched parallel) ────────────────────────────────
+    let vol_cfg = VolConfig::default();
     let vol_path = stats_dir.join(format!("_temp_vol_{}.vol", base));
-    build_vol_batched(&tick_files, &vol_path, max_concurrent_files)?;
+    build_vol_batched(&tick_files, &vol_path, max_concurrent_files, &vol_cfg)?;
     let vol_mmap = VolMmap::open(&vol_path)?;
     info!("Vol: {} records", vol_mmap.len());
 
@@ -411,17 +409,11 @@ fn main() -> Result<()> {
             }
         }
 
-        // Write 96-byte mitch::Bar file.
+        // Write 96-byte mitch::Bar file atomically (tmp + rename) so readers
+        // never observe a partial write.
         fs::create_dir_all(bars_dir)?;
         let bars_path = bars_dir.join(format!("{}.bars", pair_name.to_uppercase()));
-        let file = File::create(&bars_path)?;
-        let mut writer = BufWriter::with_capacity(256 * 1024, file);
-
-        for bar in &bars {
-            writer.write_all(bytes_of(bar))?;
-        }
-
-        writer.flush()?;
+        nxr_sdk::ipc::write_atomic::<Bar>(&bars_path, &bars)?;
         let file_size_mb = bars_path.metadata()?.len() as f64 / 1024.0 / 1024.0;
         info!(
             "Bars written: {} bars ({:.1} MB) -> {}",
@@ -492,6 +484,7 @@ fn build_vol_batched(
     tick_files: &[PathBuf],
     path: &Path,
     batch_size: usize,
+    vol_cfg: &VolConfig,
 ) -> Result<()> {
     info!(
         "Building Parkinson vol from {} files (batch_size={})...",
@@ -499,7 +492,11 @@ fn build_vol_batched(
         batch_size
     );
 
-    let mut hourly: BTreeMap<i64, (f64, f64, f64)> = BTreeMap::new();
+    // Canonical 30-min HLC buckets (matches VolMmap consumer + every other
+    // pipeline). Previous code used 1h buckets + hardcoded ema=14 here, which
+    // diverged silently from the rest of the stack.
+    const BUCKET_MS: i64 = 1_800_000;
+    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
 
     for (chunk_idx, chunk) in tick_files.chunks(batch_size).enumerate() {
         if chunk_idx % 5 == 0 {
@@ -510,56 +507,35 @@ fn build_vol_batched(
             );
         }
 
-        let partial_maps: Vec<BTreeMap<i64, (f64, f64, f64)>> = chunk
+        let partial_maps: Vec<BTreeMap<i64, (f64, f64)>> = chunk
             .par_iter()
             .filter_map(|tick_file| {
                 let ticks = read_tick_file(tick_file).ok()?;
-                let mut h: BTreeMap<i64, (f64, f64, f64)> = BTreeMap::new();
+                let mut h: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
                 for t in &ticks {
-                    let h_key = (t.timestamp_ms() / 3_600_000) * 3_600_000;
+                    let h_key = (t.timestamp_ms() / BUCKET_MS) * BUCKET_MS;
                     let mid = t.mid_price();
-                    let entry = h.entry(h_key).or_insert((mid, mid, mid));
+                    let entry = h.entry(h_key).or_insert((mid, mid));
                     entry.0 = entry.0.max(mid);
                     entry.1 = entry.1.min(mid);
-                    entry.2 = mid;
                 }
                 Some(h)
             })
             .collect();
 
         for partial in partial_maps {
-            for (ts, (h, l, c)) in partial {
-                let entry = hourly.entry(ts).or_insert((h, l, c));
+            for (ts, (h, l)) in partial {
+                let entry = hlc.entry(ts).or_insert((h, l));
                 entry.0 = entry.0.max(h);
                 entry.1 = entry.1.min(l);
-                entry.2 = c;
             }
         }
     }
 
-    let hours: Vec<(i64, f64, f64, f64)> =
-        hourly.into_iter().map(|(ts, (h, l, c))| (ts, h, l, c)).collect();
-
-    let parkinson = parkinson_sigma;
-
-    let ema_period = 14usize;
-    let alpha = 2.0 / (ema_period as f64 + 1.0);
     let mut writer = VolWriter::new(path)?;
-    let mut prev_ema: Option<f64> = None;
-
-    for (i, &(ts, high, low, _close)) in hours.iter().enumerate() {
-        let sigma = parkinson(high, low);
-        let ema = if i < ema_period {
-            hours[..=i].iter().map(|&(_, h, l, _)| parkinson(h, l)).sum::<f64>() / (i + 1) as f64
-        } else {
-            alpha * sigma + (1.0 - alpha) * prev_ema.unwrap_or(sigma)
-        };
-        prev_ema = Some(ema);
-        writer.write_record(timestamp::from_epoch_ms(ts), ema)?;
-    }
-
+    let n = build_vol_from_hlc(&hlc, vol_cfg, &mut writer)?;
     writer.finish()?;
-    info!("Vol built: {} hourly records", hours.len());
+    info!("Vol built: {} 30-min records", n);
     Ok(())
 }
 

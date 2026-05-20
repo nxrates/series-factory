@@ -44,7 +44,6 @@ Key production binaries:
 |--------|---------|
 | `generate-renko-from-ticks` | Offline: raw ticks → .bars files (backtesting) |
 | `optimize-renko-stats` | Bar optimizer: J_stats parameter search (runs as `bar-optimizer-{pair}` pod) |
-| `extract-vol` | Parkinson volatility extraction from tick files |
 | `series-factory` | Time/tick aggregation to MITCH `.bars` (96B mmap, non-renko) |
 
 **Architecture docs:** [NX Rates Architecture](../docs/architecture.md) | [Cluster Architecture](../docs/cluster-architecture.md)
