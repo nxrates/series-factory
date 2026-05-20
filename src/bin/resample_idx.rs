@@ -62,7 +62,7 @@ use nxr_sdk::{
     tdwap::{decode_ci_ubp, encode_ci_ubp},
 };
 use rayon::prelude::*;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
@@ -376,7 +376,7 @@ fn resample_one(path: &Path, args: &Args, factor: usize) -> Result<FileReport> {
     // --- Write .new file (unless dry-run) ---
     if !args.dry_run && invariants_passed {
         let new_path = path.with_extension("idx.new");
-        write_idx_atomic(&new_path, &merged)
+        nxr_sdk::ipc::write_atomic::<IndexRecord>(&new_path, &merged)
             .with_context(|| format!("write {}", new_path.display()))?;
 
         if args.commit {
@@ -562,23 +562,6 @@ fn build_header(msg_type: u8, provider_id: u16, bin_mts: u64, count: u8, seq: u1
                  // we'd call it here.
     h.set_timestamp(bin_mts);
     h
-}
-
-fn write_idx_atomic(path: &Path, records: &[IndexRecord]) -> Result<()> {
-    // Write to a same-dir tmp, fsync, then rename — same-fs atomic rename
-    // guarantees readers never see a partial file.
-    let tmp_path = path.with_extension("idx.new.tmp");
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-    let bytes: &[u8] = bytemuck::cast_slice(records);
-    f.write_all(bytes)?;
-    f.sync_data()?;
-    drop(f);
-    fs::rename(&tmp_path, path)?;
-    Ok(())
 }
 
 fn verify_invariants(

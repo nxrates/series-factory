@@ -12,19 +12,18 @@
 use anyhow::Result;
 use bytemuck::bytes_of;
 use mitch::bar::{Bar, BarKind};
-use mitch::timestamp;
-use nxr_sdk::{parkinson_sigma, BarAccumulator};
+use nxr_sdk::BarAccumulator;
 use serde::Deserialize;
 use series_factory::{
     bar_construction::{
-        calibrate_mtf, CalibrationConfig, MtfParkinsonCalculator, RenkoConfig, RenkoGenerator,
-        VolConfig,
+        build_vol_from_hlc, calibrate_mtf, CalibrationConfig, MtfParkinsonCalculator, RenkoConfig,
+        RenkoGenerator, VolConfig,
     },
     vol_bin::{VolMmap, VolWriter},
     TickFrame,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs::{self, File},
     io::{BufWriter, Write},
     path::PathBuf,
@@ -267,7 +266,7 @@ fn run_pipeline(
     // (needed for RenkoGenerator) and 1-min downsampled prices (used for
     // in-memory calibration, eliminating ~15 redundant tick file re-reads).
     let t0 = std::time::Instant::now();
-    let mut hlc: HashMap<i64, (f64, f64, f64)> = HashMap::new();
+    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
     let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
 
     for (fi, path) in tick_files.iter().enumerate() {
@@ -277,12 +276,11 @@ fn run_pipeline(
             let ts = frame.timestamp_ms();
             let mid = frame.mid_price();
 
-            // Vol: 30-min HLC buckets
+            // Vol: 30-min HLC buckets (H/L from mid since raw ticks lack a bid/ask split here).
             let key = (ts / 1_800_000) * 1_800_000;
-            let e = hlc.entry(key).or_insert((mid, mid, mid));
+            let e = hlc.entry(key).or_insert((mid, mid));
             if mid > e.0 { e.0 = mid; }
             if mid < e.1 { e.1 = mid; }
-            e.2 = mid;
 
             // Price: 1-min last-close for calibration (~25 MB for 3 years)
             let bucket = (ts / 60_000) * 60_000;
@@ -292,26 +290,9 @@ fn run_pipeline(
         release_mmap(&mmap);
     }
 
-    let parkinson = parkinson_sigma;
-
     let vol_path = output_path.with_extension("vol");
-    let mut hours: Vec<(i64, f64, f64)> = hlc.into_iter().map(|(ts, (h, l, _))| (ts, h, l)).collect();
-    hours.sort_unstable_by_key(|&(ts, _, _)| ts);
-    let ema_period = yml.vol.ema_period;
-    let alpha = 2.0 / (ema_period as f64 + 1.0);
     let mut vol_writer = VolWriter::new(&vol_path)?;
-    let mut prev_ema: Option<f64> = None;
-
-    for (i, &(ts, high, low)) in hours.iter().enumerate() {
-        let sigma = parkinson(high, low);
-        let ema = if i < ema_period {
-            hours[..=i].iter().map(|&(_, h, l)| parkinson(h, l)).sum::<f64>() / (i + 1) as f64
-        } else {
-            alpha * sigma + (1.0 - alpha) * prev_ema.unwrap_or(sigma)
-        };
-        prev_ema = Some(ema);
-        vol_writer.write_record(timestamp::from_epoch_ms(ts), ema)?;
-    }
+    let n_vol_records = build_vol_from_hlc(&hlc, &yml.vol, &mut vol_writer)?;
     vol_writer.finish()?;
     let vol_mmap = VolMmap::open(&vol_path)?;
 
@@ -322,7 +303,7 @@ fn run_pipeline(
     let pass1_ms = t0.elapsed().as_millis();
     let price_mb = (tick_prices.len() * 16) as f64 / (1024.0 * 1024.0);
     info!("Pass 1 done: {} vol records, {} prices ({:.1} MB) in {}ms",
-        hours.len(), tick_prices.len(), price_mb, pass1_ms);
+        n_vol_records, tick_prices.len(), price_mb, pass1_ms);
 
     // Diagnostic: dump first/last prices and check for zeros
     if let Some(first) = tick_prices.first() {

@@ -12,10 +12,6 @@ name = "series-factory"
 path = "src/main.rs"
 
 [[bin]]
-name = "extract-vol"
-path = "src/bin/extract_vol.rs"
-
-[[bin]]
 name = "generate-renko-from-ticks"
 path = "src/bin/generate_renko_from_ticks.rs"
 
