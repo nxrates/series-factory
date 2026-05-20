@@ -43,6 +43,10 @@ path = "src/bin/renko_from_idx.rs"
 name = "resample-idx"
 path = "src/bin/resample_idx.rs"
 
+[[bin]]
+name = "nxr-calibrate"
+path = "src/bin/nxr_calibrate.rs"
+
 [dependencies]
 # Core async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util"] }
