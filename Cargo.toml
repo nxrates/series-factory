@@ -43,6 +43,14 @@ path = "src/bin/resample_idx.rs"
 name = "nxr-calibrate"
 path = "src/bin/nxr_calibrate.rs"
 
+[[bin]]
+name = "integrity-check"
+path = "src/bin/integrity_check.rs"
+
+[[bin]]
+name = "glue-check"
+path = "src/bin/glue_check.rs"
+
 [dependencies]
 # Core async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util"] }
