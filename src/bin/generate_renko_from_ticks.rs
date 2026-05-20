@@ -16,7 +16,10 @@ use mitch::timestamp;
 use nxr_sdk::{parkinson_sigma, BarAccumulator};
 use serde::Deserialize;
 use series_factory::{
-    bar_construction::{MtfParkinsonCalculator, RenkoConfig, RenkoGenerator, VolConfig},
+    bar_construction::{
+        calibrate_mtf, CalibrationConfig, MtfParkinsonCalculator, RenkoConfig, RenkoGenerator,
+        VolConfig,
+    },
     vol_bin::{VolMmap, VolWriter},
     TickFrame,
 };
@@ -47,16 +50,6 @@ struct PipelineYml {
 struct RenkoYml {
     min_pct: f32,
     max_pct: f32,
-}
-
-#[derive(Debug, Deserialize)]
-struct CalibrationConfig {
-    target_bpd: f64,
-    windows_days: Vec<usize>,
-    min_window_days: usize,
-    max_rounds: usize,
-    tolerance: f64,
-    mult_bounds: [f64; 2],
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,86 +457,3 @@ fn run_pipeline(
     Ok(())
 }
 
-// ── Calibration (in-memory from downsampled prices) ─────────────────────────
-
-fn count_bars_from_prices(
-    prices: &[(i64, f64)], config: &RenkoConfig, vol_mmap: &VolMmap,
-    vol_config: &VolConfig, sigma_cache: &[f64], from_ts: i64, to_ts: i64,
-    diag: bool,
-) -> usize {
-    let mut gen = match RenkoGenerator::new(*config, vol_mmap, vol_config.clone()) {
-        Ok(g) => g,
-        Err(e) => {
-            if diag { eprintln!("  [diag] RenkoGenerator::new failed: {}", e); }
-            return 0;
-        }
-    };
-    gen.set_sigma_cache(sigma_cache);
-    let mut count = 0usize;
-    let mut n_in_range = 0usize;
-    let mut n_skipped_before = 0usize;
-
-    for &(ts, mid) in prices {
-        if ts < from_ts { n_skipped_before += 1; continue; }
-        if ts > to_ts { break; }
-        n_in_range += 1;
-        gen.feed_tick(ts, mid, &mut |_| { count += 1; Ok(()) }).ok();
-        if count > 1_000_000 { return count; }
-    }
-    if diag {
-        eprintln!("  [diag] count_bars: skipped_before={} in_range={} bars={} mult={:.6}",
-            n_skipped_before, n_in_range, count, config.multiplier);
-    }
-    count
-}
-
-fn calibrate_mtf(
-    prices: &[(i64, f64)], cal: &CalibrationConfig, base: &RenkoConfig,
-    vol_mmap: &VolMmap, vol_config: &VolConfig, sigma_cache: &[f64],
-) -> f32 {
-    let first = prices.first().map(|p| p.0).unwrap_or(0);
-    let last = prices.last().map(|p| p.0).unwrap_or(0);
-    if last <= first { return 0.0; }
-
-    let t0 = std::time::Instant::now();
-    let mut mults: Vec<f32> = Vec::new();
-
-    for &window_days in &cal.windows_days {
-        let from = (last - window_days as i64 * 86_400_000).max(first);
-        let days = (last - from) as f64 / 86_400_000.0;
-        if days < cal.min_window_days as f64 {
-            info!("  {}d window: insufficient data ({:.0}d available), skipping", window_days, days);
-            continue;
-        }
-
-        let (mut log_lo, mut log_hi) = (cal.mult_bounds[0].ln(), cal.mult_bounds[1].ln());
-        let mut best = (base.multiplier, f64::MAX);
-
-        for round in 0..cal.max_rounds {
-            let log_mid = (log_lo + log_hi) / 2.0;
-            let mult = log_mid.exp() as f32;
-            let trial = RenkoConfig { multiplier: mult, min_pct: base.min_pct, ..*base };
-            let t_round = std::time::Instant::now();
-            let diag = round == 0; // first round of each window gets diagnostics
-            let n = count_bars_from_prices(prices, &trial, vol_mmap, vol_config, sigma_cache, from, last, diag);
-            let bpd = n as f64 / days;
-            let err = (bpd / cal.target_bpd - 1.0).abs();
-            info!("    round {}/{}: mult={:.6} bars={} bpd={:.1} err={:.1}% ({:.1}ms)",
-                round + 1, cal.max_rounds, mult, n, bpd, err * 100.0, t_round.elapsed().as_millis());
-
-            if err < best.1 { best = (mult, err); }
-            if err < cal.tolerance { break; }
-            if bpd > cal.target_bpd { log_lo = log_mid; } else { log_hi = log_mid; }
-        }
-
-        info!("  {}d window: mult={:.6} (err={:.1}%)", window_days, best.0, best.1 * 100.0);
-        mults.push(best.0);
-    }
-
-    if mults.is_empty() { return 0.0; }
-    let geo_mean = (mults.iter().map(|m| (*m as f64).ln()).sum::<f64>() / mults.len() as f64).exp() as f32;
-
-    info!("MTF calibration done: geo_mean={:.6} from {:?} in {:.1}s",
-        geo_mean, mults, t0.elapsed().as_secs_f64());
-    geo_mean
-}
