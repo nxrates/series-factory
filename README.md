@@ -5,7 +5,7 @@
     <strong>Adaptive Renko bar generation and historical time series aggregator</strong>
   </p>
   <p>
-    <em>Primary role: live <code>processor</code> service in the NX Rates pipeline — converts time bars into adaptive Renko <code>mitch::Bar</code> files (128B, mmap) consumed by BTR optimizers.<br/>
+    <em>Primary role: live <code>processor</code> service in the NX Rates pipeline. Converts time bars into adaptive Renko <code>mitch::Bar</code> files (96B, mmap) consumed by BTR optimizers.<br/>
     Secondary role: offline historical data ingestion from CEX trade archives for backtesting.</em>
   </p>
   <p>
@@ -29,12 +29,12 @@ mmap time bars (sink output)
         │
         ▼
    series-factory (processor binary)
-        ├── adaptive_renko.rs — brick size = price * clamp(m * σ_blend, b_min, b_max)
-        ├── vol_bin.rs        — zero-copy VolMmap (Parkinson σ values)
-        └── stats.rs          — J_stats: stationarity + IID + homogeneity + normality + robustness
+        ├── adaptive_renko.rs : brick size = price * clamp(m * σ_blend, b_min, b_max)
+        ├── vol_bin.rs        : zero-copy VolMmap (Parkinson σ values)
+        └── stats.rs          : J_stats: stationarity + IID + homogeneity + normality + robustness
         │
         ▼
-   *.bars files (mitch::Bar, 128B mmap)
+   *.bars files (mitch::Bar, 96B mmap)
    → consumed by btr-ml and btr-runtime
 ```
 
@@ -45,7 +45,7 @@ Key production binaries:
 | `generate-renko-from-ticks` | Offline: raw ticks → .bars files (backtesting) |
 | `optimize-renko-stats` | Bar optimizer: J_stats parameter search (runs as `bar-optimizer-{pair}` pod) |
 | `extract-vol` | Parkinson volatility extraction from tick files |
-| `series-factory` | Legacy time/tick aggregation to Parquet (non-renko) |
+| `series-factory` | Time/tick aggregation to MITCH `.bars` (96B mmap, non-renko) |
 
 **Architecture docs:** [NX Rates Architecture](../docs/architecture.md) | [Cluster Architecture](../docs/cluster-architecture.md)
 
@@ -68,12 +68,12 @@ Key production binaries:
 
 - **Multiple Data Sources**: Support for 5+ CEX exchanges and synthetic generators.
 - **Aggregation Methods**: Time-based and tick-based aggregation with customizable parameters.
-- **Advanced Analytics**: Velocity, dispersion, and drift calculations per aggregate.
+- **Advanced Analytics**: Realized variance, bipower variance (jump-robust), drift, OFI, spread-bps, and max abs return per aggregate.
 - **Generative Models**: GBM, FBM, Heston, NJDM, and DEJDM for synthetic data generation.
 - **High Performance**: Multi-threaded processing with async I/O, targeting <60s for 1 month of data.
 - **Intelligent Caching**: Three-tier caching system for optimal performance.
 - **Data Quality**: Automatic filtering of stale and deviated ticks.
-- **Parquet Output**: Compressed columnar format optimized for time-series queries.
+- **MITCH Binary Output**: Zero-copy `.bars` files (96 B `mitch::Bar`, mmap-ready), consumed directly by btr-ml / btr-runtime.
 
 ## Data Sources
 
@@ -93,7 +93,7 @@ Key production binaries:
   <img src="assets/exchange_spreads_comparison.png" alt="Exchange Spread Comparison" width="100%">
 </div>
 
-The chart above shows price spread, dispersion spread, and drift spread across 5 major CEX exchanges for BTC-USDT with 10-second aggregation.
+The chart above shows price spread, realized-variance spread, and drift spread across 5 major CEX exchanges for BTC-USDT with 10-second aggregation.
 
 ## Installation
 
@@ -125,7 +125,6 @@ cargo build --release
 | `--weights` | Pipe-separated static weights (auto-normalized) | Equal weights |
 | `--tick-ttl` | Tick time-to-live in milliseconds for staleness check | 100 |
 | `--tick-max-deviation` | Maximum tick deviation ratio for outlier filtering. | 0.001 (0.1%) |
-| `--out-format` | Output file format. | "parquet" |
 | `--cache-dir` | Cache directory. | "./cache" |
 | `--output-dir` | Output directory. | "./output" |
 
@@ -188,18 +187,15 @@ The final step is to compute aggregates from the intermediate ticks. An aggregat
 
 ```rust
 Aggregate {
-    timestamp: i64,      // milliseconds since epoch (bucket close time)
-    open: f64,          // first tick mid price in bucket
-    high: f64,          // highest mid price in bucket  
-    low: f64,           // lowest mid price in bucket
-    close: f64,         // last tick mid price in bucket
-    mid: f64,           // time-decay weighted average price (TDWAP)
-    spread: f32,        // average spread as ratio
-    vbid: u32,          // cumulative bid volume
-    vask: u32,          // cumulative ask volume
-    velocity: f32,      // sqrt(tick_count) - activity measure
-    dispersion: f32,    // normalized price std dev - volatility measure
-    drift: f32,         // normalized regression slope - trend measure
+    open_ts / close_ts: u48 MITCH mts (16 us ticks since 2010)
+    open, high, low, close: f64  // OHLC mid prices
+    vbid, vask: u32              // cumulative bid / ask volume (same units as Index.vbid/vask)
+    tick_count: u32              // # ingested Index messages in bar
+    // microstructure section (32 B, f32 unless noted):
+    realized_var, bipower_var, drift, vol_imbalance,
+    avg_spread_bps, max_abs_return,
+    avg_ci_ubp: u16, reject_rate: u16,
+    kind: u8,  // 0=kline, 1=renko, 2=dib, 3=tib
 }
 ```
 
@@ -224,30 +220,55 @@ Aggregate {
 
 ### Step 4: Aggregate Analytics
 
-For each aggregate bucket, several analytical metrics are computed.
+For each bar, the following microstructure features are computed in a single
+streaming pass. All are canonical HF estimators; no derivable quantity is
+stored (e.g., `log_volume` is not stored since it is `ln(vbid + vask + 1)`).
 
-#### 4.1 Velocity Calculation
-Velocity represents the activity level within a bucket. It's a non-linear measure that compresses high-frequency periods, helping to normalize extreme activity spikes.
+#### 4.1 Realized Variance
 ```
-velocity = sqrt(tick_count)
+realized_var = Σ (log(mid_t / mid_{t-1}))²
+```
+Canonical high-frequency volatility estimator. Unlike CV / dispersion, it is
+defined directly on returns and is scale-invariant.
+
+#### 4.2 Drift
+Normalized OLS slope over the bar:
+```
+slope = cov(x, mid) / var(x)     # x = seconds since first tick
+drift = slope * duration_seconds / close
+```
+Dimensionless; positive = upward trend.
+
+#### 4.3 Average Spread (bps of mid)
+```
+avg_spread_bps = mean((ask - bid) / mid) * 1e4
 ```
 
-#### 4.2 Dispersion Calculation
-Dispersion measures price scatter around the trend line within the bucket, indicating volatility relative to the directional movement. It uses linear regression to establish the trend, then calculates deviations from that trend line. This ensures that aligned upward/downward movements result in low dispersion even with price changes.
+#### 4.4 Volume Imbalance (signed OFI)
 ```
-1. Calculate linear regression of mid_prices vs time
-2. dispersion = (stddev(deviations_from_regression_line) / mean(mid_prices)) * 100
+vol_imbalance = Σ sign(r_t) * (vbid_t + vask_t) / total_vol
 ```
-Expressed as percentage for comparability across different price levels and assets.
+Range `[-1, 1]`. VPIN primitive; positive = net buying pressure.
 
-#### 4.3 Drift Calculation  
-Drift captures the trend strength within the bucket as a percentage of the closing price. It uses the same linear regression as dispersion to calculate the slope, then expresses the total change over the time period as a percentage of the final price.
+#### 4.5 Bipower Variance
 ```
-1. Calculate linear regression slope (price_change_per_second)
-2. total_change = slope * time_duration_seconds
-3. drift = (total_change / close_price) * 100
+bipower_var = (π/2) · Σ |r_t|·|r_{t-1}|
 ```
-Expressed as percentage for comparability across different price levels and time periods.
+Jump-robust volatility estimator (Barndorff-Nielsen & Shephard 2004). Pair with
+`realized_var` to decompose: `jump_var ≈ max(realized_var - bipower_var, 0)`.
+
+#### 4.6 Max Absolute Return
+```
+max_abs_return = max_t |log(mid_t / mid_{t-1})|
+```
+Single-tick jump / tail indicator. Useful as a direct feature or for jump filtering.
+
+#### 4.7 Quality Features (inherited from Index)
+- `avg_ci_ubp`: mean `Index.ci_ubp`, sqrt-compressed u16.
+- `reject_rate`: `Σ rejected / Σ (accepted + rejected) × 65535`.
+
+Both default to zero when built from raw ticks without Index-level quality
+metadata.
 
 ## Generative Models
 
@@ -364,37 +385,26 @@ Example: `dejdm(0.05,0.2,10,0.02,-0.03,0.4,100.0)`
 
 ## Output Format
 
-### Parquet Schema
-Files are stored in Apache Parquet format with Snappy compression. Data is partitioned by date for efficient range queries.
+### `.bars` Binary Schema
 
-| Field | Type | Description |
-|-------|------|-------------|
-| timestamp | i64 | Aggregate close time (end of bucket) in milliseconds since epoch |
-| open | f64 | Opening price (first tick mid in bucket) |
-| high | f64 | Highest price reached in bucket |
-| low | f64 | Lowest price reached in bucket |
-| close | f64 | Closing price (last tick mid in bucket) |
-| mid | f64 | Time-decay weighted average price (TDWAP), legacy field same as close |
-| spread | f32 | Average spread as ratio of mid price |
-| vbid | u32 | Cumulative bid volume in USD* |
-| vask | u32 | Cumulative ask volume in USD* |
-| velocity | f32 | Activity measure: `sqrt(tick_count)` |
-| dispersion | f32 | Volatility measure: price scatter around trend (%) |
-| drift | f32 | Trend measure: directional movement strength (%) |
+Files are a packed stream of `mitch::Bar` records (96 B each, `#[repr(C, packed)]`, `Pod + Zeroable`). Layout is authoritative in [`../mitch/model/bar.md`](../mitch/model/bar.md) (64B OHLCV + 32B microstructure); the same format is what `btr/prime/crates/ml/src/barfile.rs` memory-maps, enabling zero-copy mmap reads downstream. Field-level offsets, types, and microstructure semantics live in the canonical spec - this README does not duplicate them.
+
+**Timestamps are MITCH `mts`:** 6-byte u48 LE, encoded as 16 µs ticks since 2010-01-01 UTC. Use `mitch::timestamp::{from_epoch_ms, to_epoch_ms}` (or `Bar::open_time_ms()` / `Bar::close_time_ms()`) to convert to/from Unix milliseconds. The on-disk bytes are never raw epoch seconds/ms.
+
+**File header:** none. Record count = `file_size / 96`. Append-only; readers use `mmap` + `bytemuck::cast_slice::<u8, Bar>` for zero-copy iteration.
 
 ### File Naming
-The output file name is structured to reflect its contents:
 ```
-{base}-{quote}_{sources}_{from}-{to}_{agg_mode}-{agg_step}.parquet
+{base}-{quote}_{sources}_{from}-{to}_{agg_mode}-{agg_step}.bars
 ```
-Example: `btc-usdt_binance_20250720-20250721_time-5000.parquet`
+Example: `btc-usdt_binance_20250720-20250721_time-5000.bars`
 
-Generation parameters, data sources, and other metadata are stored in the Parquet file properties for traceability.
+Generation parameters live in the filename; no in-file metadata header (the file is a raw `&[Bar]` slice, so `len / 96` == bar count).
 
 ### Data Preview
 The application automatically displays a formatted table showing the first and last 10 rows of generated data:
 - **Timestamp format**: YYYYMMDD HH:MM:SS.fff (e.g., 20250720 14:30:15.500)
-- **Percentage metrics**: Dispersion and drift displayed as percentages for immediate interpretation
+- **Microstructure metrics**: Realized variance, drift, OFI and spread-bps displayed per bar
 - **Summary statistics**: Average price, spread, and total volume
 - **Data quality**: First tick always has non-zero bid and ask values
 
@@ -410,9 +420,9 @@ A three-tier caching system is used to minimize redundant computations and data 
 - Default retention: 30 days.
 
 #### 2. Tick Cache (`./cache/ticks/`)
-- Stores raw data converted to a unified tick format (Parquet).
+- Stores raw data converted to a unified tick format (MITCH `.ticks` binary, 48 B per record).
 - Structure: `{exchange}/{symbol}/{year}/{month}/`
-- Schema: timestamp, bid, ask, vbid, vask.
+- Schema: MitchHeader (16 B) + Tick (32 B): timestamp, bid, ask, vbid, vask.
 
 #### 3. Aggregate Cache (`./cache/aggregates/`)
 - Stores pre-computed aggregates for common parameter sets.
@@ -430,8 +440,8 @@ A three-tier caching system is used to minimize redundant computations and data 
 - `sources/`: Data source implementations (Binance, synthetic models).
 - `aggregation/`: Core aggregation engine.
 - `cache/`: Three-tier caching system.
-- `output/`: Parquet file generation.
-- `types/`: Core data structures (e.g., Tick, Aggregate).
+- `output/`: MITCH `.bars` binary writer (zero-copy `bytemuck::cast_slice`).
+- `types/`: Core data structures (re-exports `mitch::TickFrame`, `mitch::bar::Bar`).
 - `cli/`: Command-line interface parsing and handling.
 
 ### Key Design Principles
@@ -513,7 +523,7 @@ This validates both synthetic data generation and exchange data fetching.
 
 - `tokio`: Async runtime for I/O operations
 - `rayon`: Data parallelism for CPU-intensive tasks
-- `arrow`/`parquet`: Columnar data format
+- `mitch` + `bytemuck`: Binary `.bars` layout and zero-copy casts
 - `reqwest`: HTTP client for data downloads
 - `chrono`: Date/time handling
 - `clap`: CLI argument parsing

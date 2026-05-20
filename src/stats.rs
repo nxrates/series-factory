@@ -12,7 +12,7 @@
 //!            Penalises both returns autocorrelation and volatility clustering.
 //!   HOMO   = 1 - CV(fold_variance)
 //!            Measures cross-fold variance stability.  MUST be computed at
-//!            aggregate level — CV of a single-fold variance is undefined.
+//!            aggregate level - CV of a single-fold variance is undefined.
 //!   NORM   = 1 - 0.1*|skew| - 0.05*|excess_kurtosis|
 //!            Light penalty only; fat tails are acceptable for gradient boosting.
 //!   ROBUST = 1 - CV(STAT) - 0.5*CV(IID)
@@ -25,13 +25,14 @@
 //!     time periods?" not "does the variance level vary?"
 //!   - All computation is strictly causal.
 
-use crate::adaptive_renko::RenkoBar;
+use mitch::bar::Bar;
+use nxr_sdk::stats::{acf, cv, median};
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Hard gate thresholds for filtering degenerate configurations.
 ///
-/// Only the reversal delay gate remains. The density (bars/day) gate was removed —
+/// Only the reversal delay gate remains. The density (bars/day) gate was removed -
 /// J_stats already captures everything that matters. If 3 bars/day or 1000 bars/day
 /// produces better statistical properties, the optimizer should be free to discover that.
 #[derive(Debug, Clone)]
@@ -52,7 +53,7 @@ impl Default for GateSpec {
 
 /// Statistical scores for a single temporal fold.
 ///
-/// Does NOT include HOMO — that is computed at aggregate level
+/// Does NOT include HOMO - that is computed at aggregate level
 /// from the collection of fold variances.
 #[derive(Debug, Clone, Default)]
 pub struct StatFoldScore {
@@ -128,7 +129,7 @@ pub fn aggregate_fold_scores(
     fold_scores: &[StatFoldScore],
     n_bars: usize,
     duration_ms: i64,
-    bars: &[RenkoBar],
+    bars: &[Bar],
     gate_spec: &GateSpec,
 ) -> StatAggregateScore {
     if fold_scores.is_empty() {
@@ -188,16 +189,15 @@ pub fn aggregate_fold_scores(
 ///
 /// Returns[i] = (close[i+horizon] - close[i]) / close[i].
 /// Causal: only uses information available at bar i.
-pub fn compute_returns(bars: &[RenkoBar], horizon: usize) -> Vec<f64> {
+pub fn compute_returns(bars: &[Bar], horizon: usize) -> Vec<f64> {
     if bars.len() <= horizon {
         return Vec::new();
     }
-    bars.iter()
-        .take(bars.len() - horizon)
-        .enumerate()
-        .map(|(i, bar)| {
+    (0..bars.len() - horizon)
+        .map(|i| {
+            let close = bars[i].close;
             let future = bars[i + horizon].close;
-            (future - bar.close) / bar.close.max(1e-10)
+            (future - close) / close.max(1e-10)
         })
         .collect()
 }
@@ -282,8 +282,8 @@ pub fn compute_iid(returns: &[f64]) -> f64 {
     let mut acf_sq_sum = 0.0;
 
     for lag in 1..=max_lag {
-        acf_sum += autocorrelation(returns, lag).abs();
-        acf_sq_sum += autocorrelation(&squared, lag).abs();
+        acf_sum += acf(returns, lag).abs();
+        acf_sq_sum += acf(&squared, lag).abs();
     }
 
     let mean_acf = acf_sum / max_lag as f64;
@@ -295,13 +295,13 @@ pub fn compute_iid(returns: &[f64]) -> f64 {
 /// HOMO = 1 − CV(fold_variances)
 ///
 /// Must be called with fold_variances from at least 2 folds.
-/// CV of a single-element slice is undefined — this is an aggregate metric.
+/// CV of a single-element slice is undefined - this is an aggregate metric.
 pub fn compute_homo(fold_variances: &[f64]) -> f64 {
     if fold_variances.len() < 2 {
         return 0.5;
     }
-    let cv = coefficient_of_variation(fold_variances);
-    (1.0 - cv.min(1.0)).max(0.0)
+    let c = cv(fold_variances);
+    (1.0 - c.min(1.0)).max(0.0)
 }
 
 /// NORM = 1 − 0.1·|skew| − 0.05·|excess_kurtosis| (capped)
@@ -326,8 +326,8 @@ pub fn compute_norm(returns: &[f64]) -> f64 {
 /// Measures whether the statistical properties themselves are stable across
 /// time periods.  Lower → regime-changing market → bad for ML generalisation.
 fn compute_robust(stats: &[f64], iids: &[f64]) -> f64 {
-    let cv_stat = coefficient_of_variation(stats);
-    let cv_iid = coefficient_of_variation(iids);
+    let cv_stat = cv(stats);
+    let cv_iid = cv(iids);
     (1.0 - cv_stat.min(1.0) - 0.5 * cv_iid.min(1.0)).max(0.0)
 }
 
@@ -347,17 +347,18 @@ pub fn compute_density_bars_per_day(n_bars: usize, duration_ms: i64) -> f64 {
 ///
 /// 0 = Renko reverses immediately at turning points.
 /// 1 = Renko takes 50+ bars to confirm a reversal.
-pub fn compute_reversal_delay_lag(bars: &[RenkoBar], window: usize) -> f64 {
+pub fn compute_reversal_delay_lag(bars: &[Bar], window: usize) -> f64 {
     if bars.len() < window * 2 {
         return 0.5;
     }
 
     let mut turning_points: Vec<(usize, i8)> = Vec::new();
     for i in window..bars.len().saturating_sub(window) {
-        let is_peak = (i - window..i).all(|j| bars[j].close <= bars[i].close)
-            && (i + 1..=i + window).all(|j| bars[j].close <= bars[i].close);
-        let is_trough = (i - window..i).all(|j| bars[j].close >= bars[i].close)
-            && (i + 1..=i + window).all(|j| bars[j].close >= bars[i].close);
+        let pivot_close = bars[i].close;
+        let is_peak = (i - window..i).all(|j| bars[j].close <= pivot_close)
+            && (i + 1..=i + window).all(|j| bars[j].close <= pivot_close);
+        let is_trough = (i - window..i).all(|j| bars[j].close >= pivot_close)
+            && (i + 1..=i + window).all(|j| bars[j].close >= pivot_close);
         if is_peak {
             turning_points.push((i, 1));
         } else if is_trough {
@@ -372,7 +373,8 @@ pub fn compute_reversal_delay_lag(bars: &[RenkoBar], window: usize) -> f64 {
     let mut delays: Vec<usize> = Vec::new();
     for &(tp_idx, tp_dir) in &turning_points {
         for j in tp_idx..bars.len().min(tp_idx + 100) {
-            if bars[j].direction == tp_dir {
+            let dir: i8 = if bars[j].is_bullish() { 1 } else { -1 };
+            if dir == tp_dir {
                 delays.push(j - tp_idx);
                 break;
             }
@@ -387,44 +389,3 @@ pub fn compute_reversal_delay_lag(bars: &[RenkoBar], window: usize) -> f64 {
     (mean_delay / 50.0).min(1.0)
 }
 
-// ── Private helpers ───────────────────────────────────────────────────────────
-
-fn autocorrelation(series: &[f64], lag: usize) -> f64 {
-    if lag >= series.len() || series.len() < 2 {
-        return 0.0;
-    }
-    let n = series.len() - lag;
-    let mean = series[..n].iter().sum::<f64>() / n as f64;
-    let mut num = 0.0;
-    let mut den = 0.0;
-    for i in 0..n {
-        let d = series[i] - mean;
-        num += d * (series[i + lag] - mean);
-        den += d * d;
-    }
-    if den > 1e-10 { num / den } else { 0.0 }
-}
-
-fn median(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let mut s = values.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = s.len();
-    if n % 2 == 0 { (s[n / 2 - 1] + s[n / 2]) / 2.0 } else { s[n / 2] }
-}
-
-fn coefficient_of_variation(values: &[f64]) -> f64 {
-    if values.len() < 2 {
-        return 0.0;
-    }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    if mean.abs() < 1e-10 {
-        return 1.0;
-    }
-    let std = (values.iter().map(|&v| (v - mean).powi(2)).sum::<f64>()
-        / values.len() as f64)
-        .sqrt();
-    std / mean.abs()
-}

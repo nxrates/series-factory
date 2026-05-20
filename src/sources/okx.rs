@@ -1,5 +1,5 @@
 use crate::sources::common::*;
-use crate::sources::TickSource;
+use crate::sources::{provider_id_for, TickSource};
 use crate::types::{Config, TickFrame};
 use anyhow::Result;
 use csv::ReaderBuilder;
@@ -14,16 +14,20 @@ impl OKXSource {
     pub fn new() -> Self { Self { agent: http_agent() } }
 
     fn parse_csv(csv_data: &[u8], ticker_id: u64) -> Result<Vec<TickFrame>> {
-        let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(Cursor::new(csv_data));
+        // Header-tolerant: `has_headers(false)` + parse-or-skip so streaming
+        // chunks work whether or not they start on the header row.
+        let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(Cursor::new(csv_data));
         let mut ticks = Vec::new();
+        let pid = provider_id_for("okx");
         for result in rdr.records() {
             let r = result?;
             // OKX: instrument_name, trade_id, side, price, size, created_time
-            let price: f64 = r[3].parse()?;
-            let size: f64 = r[4].parse()?;
+            let price: f64 = match r[3].parse() { Ok(v) => v, Err(_) => continue };
+            let size: f64 = match r[4].parse() { Ok(v) => v, Err(_) => continue };
+            let ts_raw: i64 = match r[5].parse() { Ok(v) => v, Err(_) => continue };
             let is_buyer = r[2].eq_ignore_ascii_case("buy");
-            let ts = normalize_timestamp_ms(r[5].parse()?);
-            ticks.push(TickFrame::new(0,
+            let ts = normalize_timestamp_ms(ts_raw);
+            ticks.push(TickFrame::new(pid,
                 mitch::timestamp::from_epoch_ms(ts),
                 infer_tick(ticker_id, price, (size * price) as u32, is_buyer),
             ));
@@ -53,7 +57,7 @@ impl TickSource for OKXSource {
             &parse,
         ).await?;
         info!("Processing {} tick files", files.len());
-        fetch_cached_ticks(&files, tx).await;
+        fetch_cached_ticks(&files, provider_id_for("okx"), tx).await;
         Ok(())
     }
 }

@@ -1,5 +1,5 @@
 use crate::sources::common::*;
-use crate::sources::TickSource;
+use crate::sources::{provider_id_for, TickSource};
 use crate::types::{Config, TickFrame};
 use anyhow::Result;
 use csv::ReaderBuilder;
@@ -14,19 +14,25 @@ impl BybitSource {
     pub fn new() -> Self { Self { agent: http_agent() } }
 
     fn parse_csv(csv_data: &[u8], ticker_id: u64) -> Result<Vec<TickFrame>> {
+        // Header-tolerant: `has_headers(false)` + parse-or-skip on the first
+        // numeric field, so streaming chunks work whether or not they start
+        // on the header row. (The monthly archive's first chunk has the
+        // header; every subsequent chunk is pure data.)
         let mut rdr = ReaderBuilder::new()
-            .has_headers(true)
+            .has_headers(false)
             .flexible(true) // Bybit added 'rpi' column mid-2025; rows mix 5 and 6 fields
             .from_reader(Cursor::new(csv_data));
         let mut ticks = Vec::new();
+        let pid = provider_id_for("bybit");
         for result in rdr.records() {
             let r = result?;
             // Bybit: id, timestamp, price, volume, side, [rpi]
-            let ts = normalize_timestamp_ms(r[1].parse()?);
-            let price: f64 = r[2].parse()?;
-            let qty: f64 = r[3].parse()?;
+            let ts_raw: i64 = match r[1].parse() { Ok(v) => v, Err(_) => continue };
+            let price: f64 = match r[2].parse() { Ok(v) => v, Err(_) => continue };
+            let qty: f64 = match r[3].parse() { Ok(v) => v, Err(_) => continue };
+            let ts = normalize_timestamp_ms(ts_raw);
             let is_buyer = r[4].eq_ignore_ascii_case("buy");
-            ticks.push(TickFrame::new(0,
+            ticks.push(TickFrame::new(pid,
                 mitch::timestamp::from_epoch_ms(ts),
                 infer_tick(ticker_id, price, (qty * price) as u32, is_buyer),
             ));
@@ -55,7 +61,7 @@ impl TickSource for BybitSource {
             &parse,
         ).await?;
         info!("Processing {} tick files", files.len());
-        fetch_cached_ticks(&files, tx).await;
+        fetch_cached_ticks(&files, provider_id_for("bybit"), tx).await;
         Ok(())
     }
 }

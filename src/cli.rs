@@ -36,17 +36,28 @@ pub struct Args {
     #[arg(long, default_value = "1000")]
     pub agg_step: f64,
 
-    /// Maximum price deviation for outlier filtering (ratio)
-    #[arg(long, default_value = "0.05")]
-    pub tick_max_deviation: f64,
+    /// Per-provider index cycle in ms. Default 50 (20 Hz) matches prod forwarders.
+    #[arg(long, default_value = "50")]
+    pub cycle_ms: u64,
 
-    /// Cache directory for downloaded data
-    #[arg(long, default_value = "./cache")]
-    pub cache_dir: PathBuf,
+    /// Stale-provider threshold in seconds (TDWAP half-life upper bound).
+    #[arg(long, default_value = "30")]
+    pub stale_secs: f64,
 
-    /// Output directory for generated files
-    #[arg(long, default_value = "./output")]
-    pub output_dir: PathBuf,
+    /// Z-score threshold for outlier rejection (prod crypto = 6.0, FX = 4.0).
+    #[arg(long, default_value = "6.0")]
+    pub z_threshold: f64,
+
+    /// Directory for raw ticks. Precedence: CLI flag > NXR_DATA_TICKS env >
+    /// NXR_DATA_ROOT/ticks > /data/ticks (matches fetch-crypto-history and
+    /// generate-renko-from-ticks, so the whole stack reads from one place).
+    #[arg(long)]
+    pub ticks_dir: Option<PathBuf>,
+
+    /// Directory for generated bar files. Same precedence as ticks_dir, via
+    /// NXR_DATA_BARS / NXR_DATA_ROOT.
+    #[arg(long)]
+    pub bars_dir: Option<PathBuf>,
 }
 
 impl Args {
@@ -60,6 +71,10 @@ impl Args {
             other => return Err(anyhow!("Invalid aggregation mode: '{}'. Use 'time' or 'tick'", other)),
         };
 
+        let nxr_cfg = nxr_sdk::NxrConfig::from_env();
+        let ticks_dir = self.ticks_dir.unwrap_or_else(|| PathBuf::from(&nxr_cfg.ticks_dir));
+        let bars_dir = self.bars_dir.unwrap_or_else(|| PathBuf::from(&nxr_cfg.bars_dir));
+
         Ok(Config {
             base: self.base,
             quote: self.quote,
@@ -68,9 +83,11 @@ impl Args {
             to,
             agg_mode,
             agg_step: self.agg_step,
-            tick_max_deviation: self.tick_max_deviation,
-            cache_dir: self.cache_dir,
-            output_dir: self.output_dir,
+            cycle_ms: self.cycle_ms,
+            stale_secs: self.stale_secs,
+            z_threshold: self.z_threshold,
+            ticks_dir,
+            bars_dir,
         })
     }
 }

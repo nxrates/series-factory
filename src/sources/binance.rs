@@ -1,5 +1,5 @@
 use crate::sources::common::*;
-use crate::sources::TickSource;
+use crate::sources::{provider_id_for, TickSource};
 use crate::types::{Config, TickFrame};
 use anyhow::Result;
 use csv::ReaderBuilder;
@@ -16,6 +16,7 @@ impl BinanceSource {
     fn parse_csv(csv_data: &[u8], ticker_id: u64) -> Result<Vec<TickFrame>> {
         let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(Cursor::new(csv_data));
         let mut ticks = Vec::new();
+        let pid = provider_id_for("binance");
         for result in rdr.records() {
             let r = result?;
             // Binance aggTrades: id, price, qty, first_id, last_id, timestamp, is_buyer_maker
@@ -23,7 +24,7 @@ impl BinanceSource {
             let qty: f64 = r[2].parse()?;
             let ts = normalize_timestamp_ms(r[5].parse()?);
             let is_buyer = r[6].to_lowercase() != "true"; // is_buyer_maker=true → seller initiated
-            ticks.push(TickFrame::new(0,
+            ticks.push(TickFrame::new(pid,
                 mitch::timestamp::from_epoch_ms(ts),
                 infer_tick(ticker_id, price, (price * qty) as u32, is_buyer),
             ));
@@ -52,7 +53,7 @@ impl TickSource for BinanceSource {
             &parse,
         ).await?;
         info!("Processing {} tick files", files.len());
-        fetch_cached_ticks(&files, tx).await;
+        fetch_cached_ticks(&files, provider_id_for("binance"), tx).await;
         Ok(())
     }
 }
