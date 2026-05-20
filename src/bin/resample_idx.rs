@@ -166,26 +166,60 @@ fn main() -> Result<()> {
     }
     info!(file_count = files.len(), "scanned input directory");
 
+    // Panic-safe: each file goes through catch_unwind so a single bad file
+    // does NOT abort the rayon collect (which would lose results for ALL
+    // already-completed files). Earlier production run lost ~290/351 results
+    // because of an unrecoverable panic inside resample_one for one file.
     let reports: Vec<FileReport> = files
         .par_iter()
-        .map(|path| match resample_one(path, &args, factor) {
-            Ok(r) => r,
-            Err(e) => {
-                error!(path = %path.display(), error = %e, "resample failed");
-                FileReport {
-                    id: filename_stem(path),
-                    bytes_old: 0,
-                    count_old: 0,
-                    count_new: 0,
-                    bytes_new: 0,
-                    ts_first_ms_old: 0,
-                    ts_last_ms_old: 0,
-                    ts_first_ms_new: 0,
-                    ts_last_ms_new: 0,
-                    partial_tail_dropped: 0,
-                    invariants_passed: false,
-                    invariants_failed: vec![format!("error: {}", e)],
-                    duration_ms: 0,
+        .map(|path| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resample_one(path, &args, factor)
+            }));
+            match result {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    error!(path = %path.display(), error = %e, "resample failed");
+                    FileReport {
+                        id: filename_stem(path),
+                        bytes_old: 0,
+                        count_old: 0,
+                        count_new: 0,
+                        bytes_new: 0,
+                        ts_first_ms_old: 0,
+                        ts_last_ms_old: 0,
+                        ts_first_ms_new: 0,
+                        ts_last_ms_new: 0,
+                        partial_tail_dropped: 0,
+                        invariants_passed: false,
+                        invariants_failed: vec![format!("error: {}", e)],
+                        duration_ms: 0,
+                    }
+                }
+                Err(panic_box) => {
+                    let msg = if let Some(s) = panic_box.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_box.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    error!(path = %path.display(), panic = %msg, "resample PANICKED");
+                    FileReport {
+                        id: filename_stem(path),
+                        bytes_old: 0,
+                        count_old: 0,
+                        count_new: 0,
+                        bytes_new: 0,
+                        ts_first_ms_old: 0,
+                        ts_last_ms_old: 0,
+                        ts_first_ms_new: 0,
+                        ts_last_ms_new: 0,
+                        partial_tail_dropped: 0,
+                        invariants_passed: false,
+                        invariants_failed: vec![format!("panic: {}", msg)],
+                        duration_ms: 0,
+                    }
                 }
             }
         })
@@ -234,6 +268,12 @@ fn filename_stem(path: &Path) -> String {
 fn resample_one(path: &Path, args: &Args, factor: usize) -> Result<FileReport> {
     let started = std::time::Instant::now();
     let id = filename_stem(path);
+    // Phase 53: filter records to the filename-ticker. Some prod .idx files
+    // contain mis-routed records (aggregator wrote some records under wrong
+    // filename — historical bug). Filtering to filename keeps the output
+    // semantically correct (this ticker's data only) while .bak retains
+    // ALL records for forensic recovery if needed.
+    let expected_ticker: Option<u64> = id.parse::<u64>().ok();
 
     // --- Read whole file into a byte buffer ---
     let bytes_old = fs::metadata(path)?.len();
@@ -257,6 +297,32 @@ fn resample_one(path: &Path, args: &Args, factor: usize) -> Result<FileReport> {
         dst_bytes.copy_from_slice(&bytes_buf[..count_old_raw * rec_size]);
     }
     drop(bytes_buf);
+    let raw_record_count = records.len();
+
+    // Phase 53: filter to filename-ticker. Aggregator mis-routed some records
+    // (historical bug — non-canonical ticker_ids in body for ~15-19% of records
+    // in some files). Keep only records whose body ticker matches the filename
+    // → output file is semantically clean for this ticker. .bak retains all
+    // raw records for forensic recovery.
+    let mut dropped_misrouted: usize = 0;
+    if let Some(expected) = expected_ticker {
+        let before = records.len();
+        records.retain(|r| {
+            let t = r.index.ticker;
+            t == expected
+        });
+        dropped_misrouted = before - records.len();
+        if dropped_misrouted > 0 {
+            warn!(
+                path = %path.display(),
+                dropped = dropped_misrouted,
+                kept = records.len(),
+                expected_ticker = expected,
+                "filtered misrouted records (aggregator bug)"
+            );
+        }
+    }
+    let count_old_raw = records.len();
 
     if count_old_raw == 0 {
         warn!(path = %path.display(), "empty file — skipped");
