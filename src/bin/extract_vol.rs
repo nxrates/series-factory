@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use tracing::info;
 
+use mitch::timestamp;
 use nxr_sdk::parkinson_sigma;
 use series_factory::{
     vol_bin::VolWriter,
@@ -25,9 +26,9 @@ pub struct VolExtractor {
 }
 
 impl VolExtractor {
-    pub fn new(cache_dir: &Path, base: &str, quote: &str) -> Result<Self> {
+    pub fn new(ticks_dir: &Path, base: &str, quote: &str) -> Result<Self> {
         let pair_name = format!("{}{}", base, quote);
-        let exchange_dir = cache_dir.join("binance").join(&pair_name);
+        let exchange_dir = ticks_dir.join("binance").join(&pair_name);
 
         info!("Looking for tick files in: {}", exchange_dir.display());
 
@@ -63,7 +64,7 @@ impl VolExtractor {
             fs::create_dir_all(parent)?;
         }
 
-        let mut writer = VolWriter::create(output_path, &self.pair_name)?;
+        let mut writer = VolWriter::new(output_path)?;
 
         // Aggregate ticks by hour
         let mut hourly_data: std::collections::HashMap<i64, HourlyData> = std::collections::HashMap::new();
@@ -116,8 +117,8 @@ impl VolExtractor {
             };
             ema_sigma = Some(smoothed);
 
-            // Write as percentage
-            writer.write_record(hour.timestamp, smoothed * 100.0)?;
+            // Write as percentage; on-disk timestamp uses u48 MITCH mts.
+            writer.write_record(timestamp::from_epoch_ms(hour.timestamp), smoothed * 100.0)?;
             record_count += 1;
         }
 
@@ -136,17 +137,18 @@ struct HourlyData {
 
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
+    nxr_sdk::memory::apply_safe_cap();
 
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 4 {
-        eprintln!("Usage: {} <BASE> <QUOTE> <OUTPUT.vol> [CACHE_DIR]", args[0]);
+        eprintln!("Usage: {} <BASE> <QUOTE> <OUTPUT.vol> [TICKS_DIR]", args[0]);
         eprintln!("");
         eprintln!("Arguments:");
         eprintln!("  BASE        - Base currency (e.g., BTC)");
         eprintln!("  QUOTE       - Quote currency (e.g., USDT)");
         eprintln!("  OUTPUT.vol  - Output Parkinson vol file path");
-        eprintln!("  CACHE_DIR   - Cache directory (default: ./cache)");
+        eprintln!("  TICKS_DIR   - Raw ticks directory (default: $NXR_DATA_TICKS or ./cache)");
         std::process::exit(1);
     }
 
@@ -154,13 +156,15 @@ fn main() -> Result<()> {
     let quote = &args[2];
     let output_path = PathBuf::from(&args[3]);
 
-    let cache_dir = if args.len() > 4 {
+    let ticks_dir = if args.len() > 4 {
         PathBuf::from(&args[4])
+    } else if let Ok(env_dir) = std::env::var("NXR_DATA_TICKS") {
+        PathBuf::from(env_dir)
     } else {
         PathBuf::from("./cache")
     };
 
-    let extractor = VolExtractor::new(&cache_dir, base, quote)?;
+    let extractor = VolExtractor::new(&ticks_dir, base, quote)?;
 
     let start = std::time::Instant::now();
     let record_count = extractor.extract_hourly_vol(&output_path)?;

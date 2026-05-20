@@ -1,4 +1,4 @@
-//! Shared exchange infrastructure — download, decompress, parse, tick I/O.
+//! Shared exchange infrastructure - download, decompress, parse, tick I/O.
 //!
 //! All exchange sources share: HTTP download, tick file I/O (native TickFrame),
 //! ZIP/GZIP decompression, bid/ask inference from trade data, batch sending,
@@ -71,45 +71,14 @@ pub fn read_tick_file(path: &Path) -> Result<Vec<TickFrame>> {
     Ok(frames.to_vec())
 }
 
-/// Write .ticks file from &[TickFrame] (zero-copy bytemuck).
-pub fn write_tick_file(path: &Path, frames: &[TickFrame]) -> Result<()> {
-    ensure_parent_dir(path)?;
-    let file = File::create(path)?;
-    let mut writer = BufWriter::with_capacity(256 * 1024, file);
-    let bytes: &[u8] = bytemuck::cast_slice(frames);
-    writer.write_all(bytes)?;
-    writer.flush()?;
-    Ok(())
-}
-
-// ─── Decompression ──────────────────────────────────��────────────────────────
-
-/// Extract all CSV files from a ZIP archive, return their raw bytes.
-pub fn extract_csvs_from_zip(zip_data: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let cursor = Cursor::new(zip_data);
-    let mut archive = ZipArchive::new(cursor)?;
-    let mut csvs = Vec::new();
-
-    for i in 0..archive.len() {
-        let mut file = match archive.by_index(i) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        if !file.name().ends_with(".csv") {
-            continue;
-        }
-        let mut data = Vec::new();
-        if file.read_to_end(&mut data).is_ok() {
-            csvs.push(data);
-        }
+/// Re-stamp every frame's header with `provider_id`. Used after reading
+/// cached .ticks files (older caches were written with provider_id=0 before
+/// sources plumbed their MITCH id through parse_csv).
+#[inline]
+pub fn stamp_provider_id(frames: &mut [TickFrame], provider_id: u16) {
+    for f in frames {
+        f.header.set_provider_id(provider_id);
     }
-    Ok(csvs)
-}
-
-/// Decompress gzip data.
-pub fn decompress_gzip(gz_data: &[u8]) -> Result<Vec<u8>> {
-    nxr_sdk::compress::decode_gzip_bytes(gz_data)
-        .ok_or_else(|| anyhow::anyhow!("gzip decompression failed"))
 }
 
 // ─── Bid/ask inference ───────────────────────────────────────────────────────
@@ -142,25 +111,6 @@ pub fn infer_tick(ticker_id: u64, price: f64, volume: u32, is_buyer: bool) -> Ti
 // ─── Batch sending ─────────────────────────────���─────────────────────────────
 
 const BATCH_SIZE: usize = 10_000;
-
-/// Send ticks through channel in owned batches (no .to_vec() copy).
-pub async fn send_tick_batches(
-    mut ticks: Vec<TickFrame>,
-    tx: &mpsc::Sender<Vec<TickFrame>>,
-) {
-    // Drain in BATCH_SIZE chunks, transferring ownership
-    while ticks.len() > BATCH_SIZE {
-        let rest = ticks.split_off(BATCH_SIZE);
-        let batch = ticks;
-        ticks = rest;
-        if tx.send(batch).await.is_err() {
-            return;
-        }
-    }
-    if !ticks.is_empty() {
-        let _ = tx.send(ticks).await;
-    }
-}
 
 // ─── Date helpers ────────────────────────────���───────────────────────────────
 
@@ -210,27 +160,93 @@ pub fn ensure_parent_dir(path: &Path) -> Result<()> {
 }
 
 /// Send ticks read from cached tick files through the channel.
-/// Shared implementation for all exchange fetch_ticks().
+///
+/// Streams files **sequentially** and emits `BATCH_SIZE`-tick batches sliced
+/// directly from each mmap, so peak RSS per source is one batch (~480 KiB)
+/// plus the kernel's working set for the current file (trimmed by
+/// `MADV_SEQUENTIAL`). The previous version used `par_iter().collect()`,
+/// which read every file for the source into an owned `Vec<TickFrame>`
+/// concurrently — for 30 days × 4 sources this pulled ≥10 GiB resident and
+/// OOM-killed the host on 2026-04-23.
+///
+/// Each emitted batch has its header provider_id re-stamped so the
+/// downstream aggregator can route per-provider regardless of whether the
+/// cache predates provider-aware parse_csv writes.
 pub async fn fetch_cached_ticks(
     files: &[std::path::PathBuf],
+    provider_id: u16,
     tx: mpsc::Sender<Vec<TickFrame>>,
 ) {
-    let results: Vec<Result<Vec<TickFrame>>> = files
-        .par_iter()
-        .map(|path| {
-            read_tick_file(path).map_err(|e| {
-                warn!("Error reading tick file {:?}: {}", path, e);
-                e
-            })
-        })
-        .collect();
-
-    for result in results {
-        if let Ok(ticks) = result {
-            send_tick_batches(ticks, &tx).await;
+    for path in files {
+        if let Err(e) = stream_tick_file_to_channel(path, provider_id, &tx).await {
+            warn!("Error streaming tick file {:?}: {}", path, e);
         }
     }
 }
+
+async fn stream_tick_file_to_channel(
+    path: &Path,
+    provider_id: u16,
+    tx: &mpsc::Sender<Vec<TickFrame>>,
+) -> Result<()> {
+    // Chunked `File::read` (NOT `Mmap::map`): on macOS, mmap'd pages that
+    // we touch are counted against our RSS and `MADV_SEQUENTIAL` is a weak
+    // hint; reading a 1.7 GiB bybit monthly via mmap once OOM-killed the
+    // host at a 2 GiB cap. Explicit read keeps resident use to ~1 batch.
+    let tick_frame_size = std::mem::size_of::<TickFrame>();
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    if len == 0 {
+        return Ok(());
+    }
+    if len % tick_frame_size != 0 {
+        anyhow::bail!(
+            "File size ({}) is not a multiple of TickFrame ({}): {}",
+            len,
+            tick_frame_size,
+            path.display(),
+        );
+    }
+    stream_as_tick_frames(&mut file, tick_frame_size, provider_id, tx).await
+}
+
+/// Stream a native `TickFrame` (48 B) file batch-by-batch through the channel.
+async fn stream_as_tick_frames(
+    file: &mut File,
+    frame_size: usize,
+    provider_id: u16,
+    tx: &mpsc::Sender<Vec<TickFrame>>,
+) -> Result<()> {
+    use std::io::Read;
+    let mut buf: Vec<u8> = vec![0u8; BATCH_SIZE * frame_size];
+    loop {
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        if filled % frame_size != 0 {
+            anyhow::bail!("short read {} bytes not aligned to TickFrame {}", filled, frame_size);
+        }
+        let frames: &[TickFrame] = bytemuck::cast_slice(&buf[..filled]);
+        let mut owned: Vec<TickFrame> = frames.to_vec();
+        stamp_provider_id(&mut owned, provider_id);
+        if tx.send(owned).await.is_err() {
+            return Ok(());
+        }
+        if filled < buf.len() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 
 // ─── Shared exchange download infrastructure ────────────────────────────────
 
@@ -245,7 +261,7 @@ pub async fn download_bytes_retry(agent: &Arc<ureq::Agent>, url: &str, max_attem
             Ok(data) => return Ok(data),
             Err(e) => {
                 if attempt + 1 < max_attempts {
-                    warn!("Attempt {}/{} failed: {} — retrying", attempt + 1, max_attempts, url);
+                    warn!("Attempt {}/{} failed: {} - retrying", attempt + 1, max_attempts, url);
                 }
                 last_err = Some(e);
             }
@@ -254,7 +270,21 @@ pub async fn download_bytes_retry(agent: &Arc<ureq::Agent>, url: &str, max_attem
     Err(last_err.unwrap())
 }
 
-/// Download archive, decompress, parse CSV, sort, write .ticks cache file.
+/// Download archive, stream-decompress + stream-parse CSV, stream-write the
+/// `.ticks` cache file. Peak resident memory is bounded to:
+///   * the downloaded archive bytes (compressed, ~50-300 MiB for monthly)
+///   * one `CSV_CHUNK_BYTES` line-aligned chunk (~1 MiB)
+///   * one `BATCH_SIZE`-tick parsed batch (~480 KiB)
+///
+/// The old path extracted all CSVs from the zip into memory (~1.5 GiB for
+/// binance monthly), then parsed to a second Vec<Vec<TickFrame>>, then
+/// flattened, then sorted. Peak ≥ 4.8 GiB. On 2026-04-23 this OOM-killed
+/// the host mid-download of the first monthly archive.
+///
+/// Exchange CSVs are time-ordered on disk (binance: by-id ≈ by-time; bybit,
+/// okx, bitget: by-timestamp). We preserve that order by streaming, so no
+/// in-memory sort is needed. Downstream `MergedTickStream` assumes each
+/// file is individually sorted and enforces it across sources.
 pub async fn download_and_convert<P>(
     agent: &Arc<ureq::Agent>, url: &str, cache_path: &Path, ticker_id: u64,
     compression: Compression, max_attempts: usize, parse_csv: &P,
@@ -262,24 +292,107 @@ pub async fn download_and_convert<P>(
 where
     P: Fn(&[u8], u64) -> Result<Vec<TickFrame>> + Sync,
 {
+    use std::io::{BufRead, BufReader};
+
+    const CSV_CHUNK_BYTES: usize = 1_000_000;
+
     let data = download_bytes_retry(agent, url, max_attempts).await?;
-    let mut ticks = match compression {
-        Compression::Zip => {
-            let csvs = extract_csvs_from_zip(&data)?;
-            let batches: Vec<Vec<TickFrame>> = csvs
-                .par_iter()
-                .filter_map(|csv| parse_csv(csv, ticker_id).ok())
-                .collect();
-            batches.into_iter().flatten().collect()
+    ensure_parent_dir(cache_path)?;
+    let tmp_path = cache_path.with_extension("ticks.partial");
+    let mut total_ticks: u64 = 0;
+
+    {
+        let out_file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::with_capacity(1 << 20, out_file);
+
+        // `feed` accepts one line-aligned CSV chunk and streams its parsed
+        // ticks directly to `writer`, so no large intermediate Vec survives
+        // between chunks.
+        let mut feed = |chunk: &[u8]| -> Result<()> {
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            match parse_csv(chunk, ticker_id) {
+                Ok(ticks) => {
+                    let bytes: &[u8] = bytemuck::cast_slice(&ticks);
+                    writer.write_all(bytes)?;
+                    total_ticks += ticks.len() as u64;
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!(ticker_id, err = %e, "csv chunk parse failed");
+                    Ok(())
+                }
+            }
+        };
+
+        match compression {
+            Compression::Zip => {
+                let mut archive = ZipArchive::new(Cursor::new(&data))?;
+                for i in 0..archive.len() {
+                    let file = match archive.by_index(i) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::warn!(ticker_id, idx = i, err = %e, "zip entry unreadable");
+                            continue;
+                        }
+                    };
+                    if !file.name().ends_with(".csv") {
+                        continue;
+                    }
+                    stream_csv_in_chunks(BufReader::with_capacity(64 * 1024, file), CSV_CHUNK_BYTES, &mut feed)?;
+                }
+            }
+            Compression::Gzip => {
+                let decoder = flate2::read::GzDecoder::new(Cursor::new(&data));
+                stream_csv_in_chunks(BufReader::with_capacity(64 * 1024, decoder), CSV_CHUNK_BYTES, &mut feed)?;
+            }
         }
-        Compression::Gzip => {
-            let csv_data = decompress_gzip(&data)?;
-            parse_csv(&csv_data, ticker_id)?
+
+        writer.flush()?;
+        // drop writer + out_file here so the rename below sees a closed fd.
+    }
+
+    // Atomic rename so a partial/interrupted download leaves the old cache
+    // file intact rather than a half-written target.
+    std::fs::rename(&tmp_path, cache_path)?;
+
+    info!("Converted {} ticks → {}", total_ticks, cache_path.display());
+    drop(data);
+    Ok(())
+}
+
+/// Read from `reader` in line-aligned chunks of ~`chunk_bytes` each and
+/// invoke `feed` on every complete chunk. A chunk always ends on a newline
+/// so `feed`'s callee can parse it as standalone CSV text without losing
+/// a split row at the boundary.
+fn stream_csv_in_chunks<R: std::io::BufRead>(
+    mut reader: R,
+    chunk_bytes: usize,
+    feed: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::with_capacity(chunk_bytes + 64 * 1024);
+    loop {
+        buf.clear();
+        let mut filled = 0usize;
+        while filled < chunk_bytes {
+            let before = buf.len();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    filled += buf.len() - before;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-    };
-    ticks.par_sort_unstable_by_key(|t| t.timestamp_ms());
-    write_tick_file(cache_path, &ticks)?;
-    info!("Converted {} ticks → {}", ticks.len(), cache_path.display());
+        if buf.is_empty() {
+            break;
+        }
+        feed(&buf)?;
+        if filled < chunk_bytes {
+            break; // hit EOF on the last read
+        }
+    }
     Ok(())
 }
 
@@ -305,7 +418,7 @@ where
     P: Fn(&[u8], u64) -> Result<Vec<TickFrame>> + Sync,
 {
     let today = chrono::Utc::now().date_naive();
-    let cache_dir = config.cache_dir.join(exchange).join(dir_name);
+    let ticks_dir = config.ticks_dir.join(exchange).join(dir_name);
     let mut files = Vec::new();
 
     for (month_start, month_end) in month_ranges(config.from.date_naive(), config.to.date_naive()) {
@@ -315,7 +428,7 @@ where
         // Try monthly archive for completed months
         if last_day_of_month(year, month) < today {
             let (url, filename) = monthly(symbol, year, month);
-            let cache_path = cache_dir.join(filename.replace(cache_ext, ".ticks"));
+            let cache_path = ticks_dir.join(filename.replace(cache_ext, ".ticks"));
 
             if cache_path.exists() {
                 debug!("Cached: {}", cache_path.display());
@@ -335,7 +448,7 @@ where
         let mut day = month_start;
         while day <= end {
             let (url, filename) = daily(symbol, day);
-            let cache_path = cache_dir.join(filename.replace(cache_ext, ".ticks"));
+            let cache_path = ticks_dir.join(filename.replace(cache_ext, ".ticks"));
 
             if !cache_path.exists() {
                 info!("Downloading daily: {}", filename);

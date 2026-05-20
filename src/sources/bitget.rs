@@ -1,5 +1,5 @@
 use crate::sources::common::*;
-use crate::sources::TickSource;
+use crate::sources::{provider_id_for, TickSource};
 use crate::types::{Config, TickFrame};
 use anyhow::Result;
 use csv::ReaderBuilder;
@@ -14,16 +14,20 @@ impl BitgetSource {
     pub fn new() -> Self { Self { agent: http_agent() } }
 
     fn parse_csv(csv_data: &[u8], ticker_id: u64) -> Result<Vec<TickFrame>> {
-        let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(Cursor::new(csv_data));
+        // Header-tolerant: `has_headers(false)` + parse-or-skip on the
+        // numeric columns, so streaming chunks work regardless of whether
+        // the chunk begins on the header row.
+        let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(Cursor::new(csv_data));
         let mut ticks = Vec::new();
+        let pid = provider_id_for("bitget");
         for result in rdr.records() {
             let r = result?;
             // Bitget: trade_id, timestamp, price, side, volume_quote, size_base
-            let ts: i64 = r[1].parse()?;
-            let price: f64 = r[2].parse()?;
+            let ts: i64 = match r[1].parse() { Ok(v) => v, Err(_) => continue };
+            let price: f64 = match r[2].parse() { Ok(v) => v, Err(_) => continue };
             let is_buyer = r[3].eq_ignore_ascii_case("buy");
             let volume: u32 = r[4].parse::<f64>().unwrap_or(0.0) as u32;
-            ticks.push(TickFrame::new(0,
+            ticks.push(TickFrame::new(pid,
                 mitch::timestamp::from_epoch_ms(ts),
                 infer_tick(ticker_id, price, volume, is_buyer),
             ));
@@ -39,7 +43,7 @@ impl TickSource for BitgetSource {
         let tid = nxr_sdk::resolve_ticker_id(&sym);
         info!("Fetching Bitget data for {}", sym);
 
-        let cache_dir = config.cache_dir.join("bitget").join(&sym);
+        let ticks_dir = config.ticks_dir.join("bitget").join(&sym);
         let mut files = Vec::new();
         let mut day = config.from.date_naive();
         let end = config.to.date_naive();
@@ -49,7 +53,7 @@ impl TickSource for BitgetSource {
             let mut seq = 1;
             loop {
                 let filename = format!("{}_{:03}.zip", ds, seq);
-                let cache_path = cache_dir.join(filename.replace(".zip", ".ticks"));
+                let cache_path = ticks_dir.join(filename.replace(".zip", ".ticks"));
                 if cache_path.exists() {
                     files.push(cache_path); seq += 1; continue;
                 }
@@ -63,7 +67,7 @@ impl TickSource for BitgetSource {
         }
 
         info!("Processing {} tick files", files.len());
-        fetch_cached_ticks(&files, tx).await;
+        fetch_cached_ticks(&files, provider_id_for("bitget"), tx).await;
         Ok(())
     }
 }

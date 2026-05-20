@@ -16,18 +16,18 @@ fn test_config() -> Config {
         to: Utc::now() - Duration::days(29),
         agg_mode: AggregationMode::Time,
         agg_step: TEST_STEP_MS as f64,
-        tick_max_deviation: 0.05,
-        cache_dir: "/tmp/test_cache".into(),
-        output_dir: "/tmp/test_output".into(),
+        cycle_ms: 50,
+        stale_secs: 30.0,
+        z_threshold: 6.0,
+        ticks_dir: "/tmp/test_cache".into(),
+        bars_dir: "/tmp/test_output".into(),
     }
 }
 
 fn aggregate(ticks: Vec<TickFrame>, config: &Config) -> Vec<Bar> {
     let mut agg = Aggregator::new(config.clone());
     let mut bars = agg.process_ticks(&ticks);
-    if let Some(final_bar) = agg.finalize() {
-        bars.push(final_bar);
-    }
+    bars.extend(agg.finalize());
     bars
 }
 

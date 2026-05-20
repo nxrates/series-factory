@@ -7,9 +7,6 @@ use std::path::PathBuf;
 pub use mitch::TickFrame;
 pub use mitch::bar::Bar;
 
-// Constants
-pub const STREAMING_BUFFER_SIZE: usize = 100_000;
-
 /// Round a float to 6 significant digits.
 #[inline]
 pub fn round_to_6_sig_digits(value: f64) -> f64 {
@@ -43,9 +40,14 @@ pub struct Config {
     pub to: DateTime<Utc>,
     pub agg_mode: AggregationMode,
     pub agg_step: f64,
-    pub tick_max_deviation: f64,
-    pub cache_dir: PathBuf,
-    pub output_dir: PathBuf,
+    /// Per-provider index cycle in ms (default 50 = 20 Hz, matching prod forwarders).
+    pub cycle_ms: u64,
+    /// Stale-provider threshold in seconds (TDWAP half-life clamp upper bound).
+    pub stale_secs: f64,
+    /// Z-score threshold for per-provider outlier rejection (matches prod forwarder z-gate).
+    pub z_threshold: f64,
+    pub ticks_dir: PathBuf,
+    pub bars_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]

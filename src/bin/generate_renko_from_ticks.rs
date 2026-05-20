@@ -5,16 +5,18 @@
 //! Pipeline (2 tick-file scans):
 //!   Scan 1: Stream ticks → 30-min Parkinson vol + 1-min downsampled prices
 //!   Calibration: Binary search on in-memory prices (no disk I/O)
-//!   Scan 2: Stream ticks → RenkoGenerator → enriched 128-byte Bar files
+//!   Scan 2: Stream ticks → RenkoGenerator → enriched 96-byte mitch::Bar files
 //!
-//! ALL parameters come from nxrates.yml `series` section — nothing hardcoded.
+//! ALL parameters come from nxrates.yml `series` section - nothing hardcoded.
 
 use anyhow::Result;
 use bytemuck::bytes_of;
-use nxr_sdk::parkinson_sigma;
+use mitch::bar::{Bar, BarKind};
+use mitch::timestamp;
+use nxr_sdk::{parkinson_sigma, BarAccumulator};
 use serde::Deserialize;
 use series_factory::{
-    adaptive_renko::{RenkoBar, RenkoConfig, RenkoGenerator, VolConfig},
+    bar_construction::{MtfParkinsonCalculator, RenkoConfig, RenkoGenerator, VolConfig},
     vol_bin::{VolMmap, VolWriter},
     TickFrame,
 };
@@ -35,17 +37,10 @@ struct NxratesYml {
 
 #[derive(Debug, Deserialize)]
 struct PipelineYml {
-    paths: PathsConfig,
     renko: RenkoYml,
     vol: VolConfig,
     calibration: CalibrationConfig,
     pipeline: PipelineParams,
-}
-
-#[derive(Debug, Deserialize)]
-struct PathsConfig {
-    cache_dir: String,
-    output_dir: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,113 +68,13 @@ struct PipelineParams {
     pairs: Vec<String>,
 }
 
-// ── Memory management ────────────────────────────────────────────────────────
-
-fn set_memory_limit(gb: usize) {
-    let bytes = gb * 1024 * 1024 * 1024;
-    #[cfg(unix)]
-    unsafe {
-        let mut rlim = std::mem::zeroed::<libc::rlimit>();
-        rlim.rlim_cur = bytes as libc::rlim_t;
-        rlim.rlim_max = bytes as libc::rlim_t;
-        libc::setrlimit(libc::RLIMIT_AS, &rlim);
-    }
-}
-
-// ── Microstructure stats (accumulated per bar) ───────────────────────────────
-
-#[derive(Clone, Default)]
-struct MicroStats {
-    ticks: u32, vbid: u32, vask: u32, max_trade: u32,
-    last_mid: f64, high_mid: f64, low_mid: f64,
-    welford_mean: f64, welford_m2: f64,
-    first_mid: f64,
-    sum_i: f64, sum_i_sq: f64, sum_i_y: f64, sum_y: f64,
-    sum_vol_price: f64, sum_vol: f64,
-}
-
-impl MicroStats {
-    #[inline]
-    fn update(&mut self, mid: f64, vbid: u32, vask: u32) {
-        self.ticks += 1;
-        self.vbid += vbid;
-        self.vask += vask;
-        if self.ticks == 1 { self.first_mid = mid; self.high_mid = mid; self.low_mid = mid; }
-        self.last_mid = mid;
-        if mid > self.high_mid { self.high_mid = mid; }
-        if mid < self.low_mid { self.low_mid = mid; }
-        let delta = mid - self.welford_mean;
-        self.welford_mean += delta / self.ticks as f64;
-        self.welford_m2 += delta * (mid - self.welford_mean);
-        let i = self.ticks as f64;
-        self.sum_i += i; self.sum_i_sq += i * i; self.sum_i_y += i * mid; self.sum_y += mid;
-        let vol = (vbid + vask) as f64;
-        self.sum_vol_price += vol * mid; self.sum_vol += vol;
-        self.max_trade = self.max_trade.max(vbid.max(vask));
-    }
-
-    fn dispersion(&self) -> f32 {
-        if self.ticks < 2 || self.welford_mean == 0.0 { return 0.0; }
-        let var = self.welford_m2 / (self.ticks - 1) as f64;
-        if var <= 0.0 { return 0.0; }
-        (var.sqrt() / self.welford_mean.abs()) as f32
-    }
-
-    fn drift(&self) -> f32 {
-        if self.ticks < 3 { return 0.0; }
-        let n = self.ticks as f64;
-        let denom = n * self.sum_i_sq - self.sum_i * self.sum_i;
-        if denom.abs() < 1e-12 { return 0.0; }
-        let slope = (n * self.sum_i_y - self.sum_i * self.sum_y) / denom;
-        let mean = self.sum_y / n;
-        if mean == 0.0 { return 0.0; }
-        (slope / mean * n) as f32
-    }
-
-    fn vwap_dev(&self) -> f32 {
-        if self.sum_vol == 0.0 || self.last_mid == 0.0 { return 0.0; }
-        let vwap = self.sum_vol_price / self.sum_vol;
-        ((self.last_mid - vwap) / self.last_mid) as f32
-    }
-
-    fn to_bar(&self, bar: &RenkoBar, bar_duration_ms: i32) -> mitch::Bar {
-        let total_vol = (self.vbid + self.vask) as f64;
-        let signed_of = self.vask as f64 - self.vbid as f64;
-        let signed_change = self.last_mid - self.first_mid;
-        let price_change = signed_change.abs();
-
-        let open_ts = mitch::timestamp::encode_u48(
-            mitch::timestamp::from_epoch_ms(bar.timestamp),
-        );
-        let close_ts = mitch::timestamp::encode_u48(
-            mitch::timestamp::from_epoch_ms(bar.timestamp + bar_duration_ms as i64),
-        );
-
-        mitch::Bar {
-            open_ts,
-            close_ts,
-            open: bar.open, high: bar.high, low: bar.low, close: bar.close,
-            vbid: self.vbid, vask: self.vask,
-            tick_count: self.ticks,
-            _pad: [0; 8],
-            dispersion: self.dispersion(), drift: self.drift(),
-            vwap_dev: self.vwap_dev(),
-            price_impact: if signed_of.abs() > 0.0 { (signed_change / signed_of * 1e6) as f32 } else { 0.0 },
-            vol_imbalance: if total_vol > 0.0 { (self.vask as f64 - self.vbid as f64) as f32 / total_vol as f32 } else { 0.0 },
-            tick_efficiency: if self.ticks > 1 && self.first_mid > 0.0 { (price_change / self.first_mid / self.ticks as f64) as f32 } else { 0.0 },
-            log_volume: if total_vol > 0.0 { (total_vol + 1.0).ln() as f32 } else { 0.0 },
-            _reserved: [0; 36],
-        }
-    }
-}
-
 // ── Tick file helpers ────────────────────────────────────────────────────────
 
-fn discover_tick_files(cache_dir: &PathBuf, pair: &str, exchanges: &[String]) -> Vec<PathBuf> {
+fn discover_tick_files(ticks_dir: &PathBuf, pair: &str, exchanges: &[String]) -> Vec<PathBuf> {
     let symbol = format!("{}USDT", pair);
     let mut tick_files: Vec<PathBuf> = Vec::new();
     for exchange in exchanges {
-        let dir = cache_dir.join(exchange).join(&symbol);
+        let dir = ticks_dir.join(exchange).join(&symbol);
         if !dir.exists() { continue; }
         let mut files: Vec<PathBuf> = fs::read_dir(&dir).into_iter().flatten()
             .filter_map(|e| e.ok()).map(|e| e.path())
@@ -238,7 +133,7 @@ fn maybe_convert_old_format(path: &PathBuf) -> bool {
 
     for i in 0..n_ticks {
         let off = i * OLD_TICK_SIZE;
-        let ts_ms = i64::from_le_bytes(m[off..off+8].try_into().unwrap());
+        let epoch_ms = i64::from_le_bytes(m[off..off+8].try_into().unwrap());
         let bid = f64::from_le_bytes(m[off+8..off+16].try_into().unwrap());
         let ask = f64::from_le_bytes(m[off+16..off+24].try_into().unwrap());
         let bvol = u32::from_le_bytes(m[off+24..off+28].try_into().unwrap());
@@ -251,7 +146,7 @@ fn maybe_convert_old_format(path: &PathBuf) -> bool {
             vbid: bvol,
             vask: avol,
         };
-        let frame = TickFrame::new(0, mitch::timestamp::from_epoch_ms(ts_ms), tick);
+        let frame = TickFrame::new(0, mitch::timestamp::from_epoch_ms(epoch_ms), tick);
         if writer.write_all(bytes_of(&frame)).is_err() {
             let _ = fs::remove_file(&tmp);
             return false;
@@ -313,6 +208,11 @@ fn frames_from_mmap(mmap: &memmap2::Mmap, n_frames: usize) -> &[TickFrame] {
 
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
+    // Shared RLIMIT_AS cap (60% physical or NXR_MAX_MEM_GB) — replaces the
+    // per-binary set_memory_limit helper that used to live here. The yml
+    // `pipeline.max_mem_gb` field is advisory (used for e.g. rayon sizing
+    // if wired later); the process-wide cap comes from apply_safe_cap.
+    nxr_sdk::memory::apply_safe_cap();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -322,21 +222,19 @@ fn main() -> Result<()> {
 
     let root: NxratesYml = serde_yaml::from_str(&fs::read_to_string(&args[1])?)?;
     let yml = root.series;
-    let yml_dir = PathBuf::from(&args[1]).parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-    let cache_dir = PathBuf::from(&yml.paths.cache_dir);
-    let output_base = if yml.paths.output_dir.starts_with('/') {
-        PathBuf::from(&yml.paths.output_dir)
-    } else {
-        yml_dir.join(&yml.paths.output_dir)
-    };
+
+    // Storage paths come from the unified NXR_DATA_* taxonomy:
+    //   NXR_DATA_TICKS  (raw tick archives, default <root>/ticks)
+    //   NXR_DATA_BARS   (generated .bars files, default <root>/bars)
+    let cfg = nxr_sdk::NxrConfig::from_env();
+    let ticks_dir = PathBuf::from(&cfg.ticks_dir);
+    let output_base = PathBuf::from(&cfg.bars_dir);
 
     let pairs: Vec<String> = if args.len() >= 3 {
         vec![args[2].to_uppercase()]
     } else {
         yml.pipeline.pairs.iter().map(|p| p.to_uppercase()).collect()
     };
-
-    set_memory_limit(yml.pipeline.max_mem_gb);
 
     for pair in &pairs {
         info!("═══ Processing {} ═══", pair);
@@ -352,7 +250,7 @@ fn main() -> Result<()> {
         config.max_pct = yml.renko.max_pct;
         config.validate()?;
 
-        let tick_files = discover_tick_files(&cache_dir, pair, &yml.pipeline.exchanges);
+        let tick_files = discover_tick_files(&ticks_dir, pair, &yml.pipeline.exchanges);
         info!("{} tick files across {} exchanges", tick_files.len(), yml.pipeline.exchanges.len());
 
         if tick_files.is_empty() {
@@ -360,14 +258,14 @@ fn main() -> Result<()> {
             continue;
         }
 
-        run_pipeline(pair, &tick_files, &mut config, &yml, &output_path, &config_path)?;
+        run_pipeline(&tick_files, &mut config, &yml, &output_path, &config_path)?;
     }
 
     Ok(())
 }
 
 fn run_pipeline(
-    pair: &str, tick_files: &[PathBuf], config: &mut RenkoConfig,
+    tick_files: &[PathBuf], config: &mut RenkoConfig,
     yml: &PipelineYml, output_path: &PathBuf, config_path: &PathBuf,
 ) -> Result<()> {
 
@@ -408,7 +306,7 @@ fn run_pipeline(
     hours.sort_unstable_by_key(|&(ts, _, _)| ts);
     let ema_period = yml.vol.ema_period;
     let alpha = 2.0 / (ema_period as f64 + 1.0);
-    let mut vol_writer = VolWriter::create(&vol_path, &format!("{}USDT", pair))?;
+    let mut vol_writer = VolWriter::new(&vol_path)?;
     let mut prev_ema: Option<f64> = None;
 
     for (i, &(ts, high, low)) in hours.iter().enumerate() {
@@ -419,7 +317,7 @@ fn run_pipeline(
             alpha * sigma + (1.0 - alpha) * prev_ema.unwrap_or(sigma)
         };
         prev_ema = Some(ema);
-        vol_writer.write_record(ts, ema)?;
+        vol_writer.write_record(timestamp::from_epoch_ms(ts), ema)?;
     }
     vol_writer.finish()?;
     let vol_mmap = VolMmap::open(&vol_path)?;
@@ -450,7 +348,7 @@ fn run_pipeline(
 
     // ═══ CALIBRATION (in-memory from downsampled prices) ═══
     let sigma_cache = {
-        let mut calc = series_factory::adaptive_renko::MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
+        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
         let t = std::time::Instant::now();
         let c = calc.precompute_sigma_cache();
         let min_s = c.iter().cloned().fold(f64::MAX, f64::min);
@@ -470,14 +368,16 @@ fn run_pipeline(
         info!("Updated config: {}", config_path.display());
     }
 
-    // ═══ PASS 2: Generate bars + inline enrichment ═══
+    // ═══ PASS 2: Generate bars + inline enrichment via BarAccumulator ═══
+    // BarAccumulator ingests every post-bootstrap tick, then we flush it at each
+    // emitted Renko bar to overlay the enrichment fields. Geometry (OHLC + ts)
+    // comes from RenkoGenerator; enrichment (dispersion, drift, ...) from accum.
     let first_price_ts = tick_prices.first().map(|p| p.0).unwrap_or(0);
     let bootstrap_end = first_price_ts + yml.pipeline.bootstrap_days * 86_400_000;
     let t1 = std::time::Instant::now();
-    let mut bars: Vec<RenkoBar> = Vec::new();
-    let mut bar_stats: Vec<MicroStats> = Vec::new();
-    let mut current_stats = MicroStats::default();
-    let mut pending: Vec<RenkoBar> = Vec::new();
+    let mut bars: Vec<Bar> = Vec::new();
+    let mut accum = BarAccumulator::new();
+    let mut pending: Vec<Bar> = Vec::new();
     let mut generator = RenkoGenerator::new(*config, &vol_mmap, yml.vol.clone())?;
     let mut pass2_tick_count = 0u64;
     let mut pass2_post_bootstrap = 0u64;
@@ -492,7 +392,6 @@ fn run_pipeline(
             let body = frame.body;
             pass2_tick_count += 1;
 
-            // Diagnostic: print first few ticks
             if pass2_tick_count <= 3 || (pass2_tick_count == 100_000) {
                 let spread = frame.spread();
                 eprintln!("  [diag] tick #{}: ts={} mid={:.2} spread={:.4}",
@@ -500,7 +399,7 @@ fn run_pipeline(
             }
 
             if ts < bootstrap_end {
-                generator.feed_tick(ts, mid, &mut |_: &RenkoBar| Ok(()))?;
+                generator.feed_tick(ts, mid, &mut |_: &Bar| Ok(()))?;
                 continue;
             }
 
@@ -511,17 +410,34 @@ fn run_pipeline(
                 eprintln!("  [diag] generator state after bootstrap: n_bars={}", nb);
             }
 
-            current_stats.update(mid, body.vbid, body.vask);
-            generator.feed_tick(ts, mid, &mut |bar: &RenkoBar| { pending.push(*bar); Ok(()) })?;
+            accum.ingest(body.bid, body.ask, body.vbid, body.vask, ts, 0.0, 1, 0);
+            generator.feed_tick(ts, mid, &mut |bar: &Bar| { pending.push(*bar); Ok(()) })?;
 
             if !pending.is_empty() {
-                let stats = std::mem::take(&mut current_stats);
-                let n = pending.len();
-                for j in 0..n {
-                    bars.push(pending[j]);
-                    bar_stats.push(if j == 0 { stats.clone() } else { MicroStats::default() });
+                // Flush accumulator once per burst of emissions (enrichment
+                // attributed to the first bar in the burst; subsequent bars in
+                // the same tick have zero enrichment since no additional ticks
+                // fell in their time window).
+                let enrich = accum.flush();
+                for (j, mut bar) in pending.drain(..).enumerate() {
+                    bar.kind = BarKind::Renko as u8;
+                    if j == 0 {
+                        if let Some(e) = enrich {
+                            bar.vbid = e.vbid;
+                            bar.vask = e.vask;
+                            bar.tick_count = e.tick_count;
+                            bar.realized_var = e.realized_var;
+                            bar.bipower_var = e.bipower_var;
+                            bar.drift = e.drift;
+                            bar.vol_imbalance = e.vol_imbalance;
+                            bar.avg_spread_bps = e.avg_spread_bps;
+                            bar.max_abs_return = e.max_abs_return;
+                            bar.avg_ci_ubp = e.avg_ci_ubp;
+                            bar.reject_rate = e.reject_rate;
+                        }
+                    }
+                    bars.push(bar);
                 }
-                pending.clear();
                 if bars.len() % 50_000 == 0 { eprintln!("    ... {} bars generated", bars.len()); }
                 if bars.len() > yml.pipeline.max_bars { anyhow::bail!("Bar count exceeds {} safety limit", yml.pipeline.max_bars); }
             }
@@ -533,17 +449,10 @@ fn run_pipeline(
         bars.len(), t1.elapsed().as_millis(), pass2_tick_count, pass2_post_bootstrap);
 
     // ═══ WRITE OUTPUT ═══
-    if let Some(parent) = output_path.parent() { fs::create_dir_all(parent)?; }
-    let mut writer = BufWriter::with_capacity(256 * 1024, File::create(&output_path)?);
-    let mut prev_ts: Option<i64> = None;
-
-    for (i, bar) in bars.iter().enumerate() {
-        let dur = prev_ts.map(|p| (bar.timestamp - p) as i32).unwrap_or(0);
-        prev_ts = Some(bar.timestamp);
-        let rec = bar_stats[i].to_bar(bar, dur);
-        writer.write_all(bytes_of(&rec))?;
-    }
-    writer.flush()?;
+    // Atomic tmp+rename: readers (btr/prime engine) holding an old FD continue
+    // reading the prior inode until they re-open, rather than seeing a
+    // truncated-mid-write buffer.
+    nxr_sdk::ipc::write_atomic::<Bar>(&output_path, &bars)?;
     let _ = fs::remove_file(&vol_path);
 
     let total_ms = t0.elapsed().as_millis();

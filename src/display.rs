@@ -12,7 +12,7 @@ pub fn display_data_table(bars: &[Bar]) {
     println!("{}", "=".repeat(110));
 
     println!("{:<20} {:>12} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}",
-        "Timestamp", "Close", "VBid", "VAsk", "Ticks", "Dispersion", "Drift", "VolImbal");
+        "Timestamp", "Close", "VBid", "VAsk", "Ticks", "RealVar", "Drift", "VolImbal");
     println!("{}", "-".repeat(110));
 
     let display_row = |bar: &Bar| {
@@ -21,7 +21,7 @@ pub fn display_data_table(bars: &[Bar]) {
         let vbid = bar.vbid;
         let vask = bar.vask;
         let tc = bar.tick_count;
-        let disp = bar.dispersion;
+        let rv = bar.realized_var;
         let drift = bar.drift;
         let vi = bar.vol_imbalance;
 
@@ -31,7 +31,7 @@ pub fn display_data_table(bars: &[Bar]) {
             else if close < 100.0 { format!("{:.6}", close) }
             else { format!("{:.4}", close) };
         println!("{:<20} {:>12} {:>8} {:>8} {:>8} {:>10.6} {:>10.6} {:>10.6}",
-            ts, price, vbid, vask, tc, disp, drift, vi);
+            ts, price, vbid, vask, tc, rv, drift, vi);
     };
 
     println!("=== FIRST 10 ROWS ===");
