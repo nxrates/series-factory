@@ -28,6 +28,10 @@ name = "ticks-to-idx"
 path = "src/bin/ticks_to_idx.rs"
 
 [[bin]]
+name = "backfill-all"
+path = "src/bin/backfill_all.rs"
+
+[[bin]]
 name = "merge-idx"
 path = "src/bin/merge_idx.rs"
 
