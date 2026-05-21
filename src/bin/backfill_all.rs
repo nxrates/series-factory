@@ -1,6 +1,6 @@
 //! Backfill orchestrator — drives `fetch-crypto-history` → `ticks-to-idx` →
-//! `merge-idx` → `renko-from-idx` → `integrity-check` for many tickers in
-//! parallel and emits a single JSON report.
+//! `merge-idx` → `s10-from-idx` → `renko-from-idx` → `integrity-check` for
+//! many tickers in parallel and emits a single JSON report.
 //!
 //! Bins are discovered via `$PATH` (k8s container installs them under
 //! `/usr/local/bin`). For each (ticker, step) we record start, duration,
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug, Clone)]
-#[command(about = "Backfill orchestrator: fetch → t2i → merge → renko → validate.")]
+#[command(about = "Backfill orchestrator: fetch → t2i → merge → s10 → renko → validate.")]
 struct Args {
     /// Path to nxrates.yml (forwarded to fetch-crypto-history).
     config: PathBuf,
@@ -45,7 +45,7 @@ struct Args {
     #[arg(long, default_value = "USDT")]
     quote: String,
     /// Comma-separated steps to run. Default: all.
-    #[arg(long, default_value = "fetch,t2i,merge,renko,validate")]
+    #[arg(long, default_value = "fetch,t2i,merge,s10,renko,validate")]
     steps: String,
     /// Parallel ticker workers.
     #[arg(long, default_value_t = 4)]
@@ -62,6 +62,11 @@ struct Args {
     /// Print plan and exit.
     #[arg(long)]
     dry_run: bool,
+    /// After successful validate, delete per-exchange `ticks/` and
+    /// `indexes/<exch>/` intermediates for the pair. Keeps composite
+    /// `.idx`, `.s10`, `.bars` (renko), `.vol`. Default: off (safe).
+    #[arg(long)]
+    cleanup: bool,
 }
 
 // ── Report types ─────────────────────────────────────────────────────────────
@@ -232,6 +237,10 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         .join("bars")
         .join(&base)
         .join(format!("{}{}.bars", base, quote));
+    let s10_path = out_dir
+        .join("bars")
+        .join(&base)
+        .join(format!("{}{}.s10", base, quote));
     let vol_path = out_dir.join("vol").join(format!("{}-{}.vol", base, quote));
 
     let want = |s: &str| ctx.steps.iter().any(|x| x == s);
@@ -325,7 +334,33 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         }
     }
 
-    // 4) renko
+    // 4) s10 (uniform 10s OHLC, microstructure-rich)
+    if want("s10") {
+        if ctx.args.resume && integrity_clean(&s10_path, "s10") {
+            steps_out.push(StepReport {
+                name: "s10-from-idx".to_string(),
+                duration_ms: 0,
+                exit_code: 0,
+                bytes: file_bytes(&s10_path),
+                skipped: true,
+                errors: Vec::new(),
+            });
+        } else {
+            let args = vec![cfg.clone(), format!("{}-{}", base, quote)];
+            let rep = run_step("s10-from-idx", &args, Some(&s10_path));
+            let failed = rep.exit_code != 0;
+            steps_out.push(rep);
+            if failed {
+                return TickerReport {
+                    ticker: ticker.to_string(),
+                    status: "failed".to_string(),
+                    steps: steps_out,
+                };
+            }
+        }
+    }
+
+    // 5) renko
     if want("renko") {
         if ctx.args.resume && integrity_clean(&bars_path, "bars") {
             steps_out.push(StepReport {
@@ -351,10 +386,11 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         }
     }
 
-    // 5) validate
+    // 6) validate (idx + s10 + bars/renko + vol)
     if want("validate") {
         for (kind, path) in [
             ("idx", composite_idx.clone()),
+            ("s10", s10_path.clone()),
             ("bars", bars_path.clone()),
             ("vol", vol_path.clone()),
         ] {
@@ -381,11 +417,69 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     } else {
         "ok"
     };
+
+    // 7) cleanup intermediates (opt-in). Runs only when the full pipeline
+    //    succeeded for this pair. Keeps composite .idx, .s10, .bars, .vol;
+    //    deletes per-exchange tick CSVs and per-exchange `.idx` files.
+    if ctx.args.cleanup && status == "ok" {
+        let cleanup_start = Instant::now();
+        let mut removed_bytes: u64 = 0;
+        let mut errors: Vec<String> = Vec::new();
+        for ex in &ctx.exchanges {
+            let ticks_dir = out_dir
+                .join("ticks")
+                .join(ex)
+                .join(format!("{}{}", base, quote));
+            if ticks_dir.exists() {
+                removed_bytes += dir_bytes(&ticks_dir);
+                if let Err(e) = fs::remove_dir_all(&ticks_dir) {
+                    errors.push(format!("rm -r {}: {}", ticks_dir.display(), e));
+                }
+            }
+            let per_idx = out_dir
+                .join("indexes")
+                .join(ex)
+                .join(format!("{}-{}.idx", base, quote));
+            if per_idx.exists() {
+                removed_bytes += file_bytes(&per_idx);
+                if let Err(e) = fs::remove_file(&per_idx) {
+                    errors.push(format!("rm {}: {}", per_idx.display(), e));
+                }
+            }
+        }
+        let exit_code = if errors.is_empty() { 0 } else { 1 };
+        steps_out.push(StepReport {
+            name: "cleanup".to_string(),
+            duration_ms: cleanup_start.elapsed().as_millis(),
+            exit_code,
+            bytes: removed_bytes,
+            skipped: false,
+            errors,
+        });
+    }
+
     TickerReport {
         ticker: ticker.to_string(),
         status: status.to_string(),
         steps: steps_out,
     }
+}
+
+fn dir_bytes(p: &Path) -> u64 {
+    let mut total = 0u64;
+    let read = match fs::read_dir(p) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += dir_bytes(&path);
+        } else if let Ok(m) = entry.metadata() {
+            total += m.len();
+        }
+    }
+    total
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
