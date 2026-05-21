@@ -8,6 +8,7 @@
 //!
 //! ```text
 //! integrity-check idx  <path.idx>  [--strict] [--json]
+//! integrity-check s10  <path.s10>  [--strict] [--json]
 //! integrity-check bars <path.bars> [--strict] [--json]
 //! integrity-check vol  <path.vol>  [--strict] [--json]
 //! integrity-check dir  <data_root> [--parallel 4] [--report path]
@@ -76,6 +77,17 @@ enum Cmd {
         strict: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Check a single `.s10` file (96B `mitch::Bar` rows, kind=Kline, 10s buckets).
+    S10 {
+        path: PathBuf,
+        #[arg(long)]
+        strict: bool,
+        #[arg(long)]
+        json: bool,
+        /// Bucket size in milliseconds (default 10_000 = 10 s).
+        #[arg(long, default_value_t = 10_000)]
+        bucket_ms: i64,
     },
     /// Check a single `.vol` file (14B `VolRecord` rows).
     Vol {
@@ -567,6 +579,242 @@ fn check_bars(path: &Path, strict: bool) -> Result<FileReport> {
     })
 }
 
+// ── .s10 check ──────────────────────────────────────────────────────────────
+
+/// Validate a `.s10` file: 96 B `mitch::Bar` rows, all `kind == Kline`,
+/// close_ts monotone with `close_ts[i] - close_ts[i-1] == bucket_ms`
+/// modulo gap (gap = no-data bucket; reported as WARN, never ERROR).
+fn check_s10(path: &Path, strict: bool, bucket_ms: i64) -> Result<FileReport> {
+    let mmap = open_mmap(path)?;
+    let bytes = mmap.len() as u64;
+    let rec_size = std::mem::size_of::<mitch::bar::Bar>();
+
+    let mut errors: Vec<Finding> = Vec::new();
+    let mut warnings: Vec<Finding> = Vec::new();
+    let mut stats = Stats::default();
+    let mut bars_stats = BarsStats::default();
+
+    if mmap.len() % rec_size != 0 {
+        errors.push(Finding {
+            record_ix: None,
+            msg: format!(
+                "truncated: file size {} not a multiple of {} (Bar)",
+                mmap.len(),
+                rec_size
+            ),
+        });
+        return Ok(FileReport {
+            path: path.display().to_string(),
+            kind: "s10",
+            bytes,
+            records: mmap.len() / rec_size,
+            errors,
+            warnings,
+            stats,
+        });
+    }
+
+    if mmap.is_empty() {
+        return Ok(FileReport {
+            path: path.display().to_string(),
+            kind: "s10",
+            bytes,
+            records: 0,
+            errors,
+            warnings,
+            stats,
+        });
+    }
+
+    let bars: &[mitch::bar::Bar] = cast_slice(&mmap[..]);
+    let n = bars.len();
+
+    let mut prev_close_ts_ms: Option<i64> = None;
+    let mut n_gaps: usize = 0;
+
+    for (i, bar) in bars.iter().enumerate() {
+        let open = bar.open;
+        let high = bar.high;
+        let low = bar.low;
+        let close = bar.close;
+        let kind = bar.kind;
+        let realized_var = bar.realized_var;
+        let bipower_var = bar.bipower_var;
+        let open_ts_ms = bar.open_time_ms();
+        let close_ts_ms = bar.close_time_ms();
+
+        if kind != mitch::bar::BarKind::Kline as u8 {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: format!(
+                    "s10: kind={} != Kline ({})",
+                    kind,
+                    mitch::bar::BarKind::Kline as u8
+                ),
+            });
+        } else {
+            bars_stats.n_kline += 1;
+        }
+
+        if stats.ts_first_ms.is_none() {
+            stats.ts_first_ms = Some(open_ts_ms);
+        }
+        stats.ts_last_ms = Some(close_ts_ms);
+
+        if open_ts_ms > close_ts_ms {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: format!("open_ts {} > close_ts {}", open_ts_ms, close_ts_ms),
+            });
+        }
+
+        if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: "non-finite OHLC".into(),
+            });
+            prev_close_ts_ms = Some(close_ts_ms);
+            continue;
+        }
+
+        let max_ocl = open.max(close).max(low);
+        let min_och = open.min(close).min(high);
+        if high < max_ocl {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: format!("high {} < max(o,c,l) {}", high, max_ocl),
+            });
+        }
+        if low > min_och {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: format!("low {} > min(o,c,h) {}", low, min_och),
+            });
+        }
+
+        if realized_var < 0.0 {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: format!("realized_var {} < 0", realized_var),
+            });
+        }
+        if bipower_var < 0.0 {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: format!("bipower_var {} < 0", bipower_var),
+            });
+        }
+
+        // Sanity bounds on microstructure (warn — not enough to fail).
+        let drift = bar.drift;
+        let vol_imb = bar.vol_imbalance;
+        let spread = bar.avg_spread_bps;
+        let max_ret = bar.max_abs_return;
+        if drift.is_finite() && drift.abs() > 1.0 {
+            warnings.push(Finding {
+                record_ix: Some(i),
+                msg: format!("drift {:.4} |x|>1 (suspicious)", drift),
+            });
+        }
+        if vol_imb.is_finite() && vol_imb.abs() > 1.0 + 1e-3 {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: format!("vol_imbalance {:.4} outside [-1,1]", vol_imb),
+            });
+        }
+        if spread.is_finite() && spread < 0.0 {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: format!("avg_spread_bps {} < 0", spread),
+            });
+        }
+        if max_ret.is_finite() && max_ret < 0.0 {
+            errors.push(Finding {
+                record_ix: Some(i),
+                msg: format!("max_abs_return {} < 0", max_ret),
+            });
+        }
+
+        if let Some(prev) = prev_close_ts_ms {
+            if close_ts_ms < prev {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("s10 ts non-monotone: {} < prev {}", close_ts_ms, prev),
+                });
+            } else {
+                let delta = close_ts_ms - prev;
+                if delta != bucket_ms {
+                    // Allow only integer-multiples of bucket_ms (= gap = no-data).
+                    if bucket_ms > 0 && delta > 0 && delta % bucket_ms == 0 {
+                        n_gaps += (delta / bucket_ms - 1) as usize;
+                        warnings.push(Finding {
+                            record_ix: Some(i),
+                            msg: format!(
+                                "s10 gap: {} ms between rows {}..{} ({} missing buckets)",
+                                delta,
+                                i - 1,
+                                i,
+                                delta / bucket_ms - 1,
+                            ),
+                        });
+                    } else {
+                        errors.push(Finding {
+                            record_ix: Some(i),
+                            msg: format!(
+                                "s10 spacing {} ms not a multiple of bucket {} ms",
+                                delta, bucket_ms
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        prev_close_ts_ms = Some(close_ts_ms);
+    }
+
+    if let (Some(a), Some(b)) = (stats.ts_first_ms, stats.ts_last_ms) {
+        let span_h = (b - a) as f64 / 3_600_000.0;
+        stats.span_hours = Some(span_h);
+        if span_h > 0.0 {
+            bars_stats.bars_per_day = n as f64 / (span_h / 24.0);
+        }
+    }
+
+    // Expected ≈ 8640 bars/day for 10s buckets when no gaps.
+    if strict && bars_stats.bars_per_day > 0.0 {
+        let expected = 86_400_000.0 / bucket_ms as f64;
+        let frac = bars_stats.bars_per_day / expected;
+        if !(0.5..=1.0 + 1e-6).contains(&frac) {
+            errors.push(Finding {
+                record_ix: None,
+                msg: format!(
+                    "strict: bars/day {:.1} = {:.1}% of expected {:.1} (gap fraction high)",
+                    bars_stats.bars_per_day,
+                    frac * 100.0,
+                    expected
+                ),
+            });
+        }
+    }
+    if n_gaps > 0 {
+        warnings.push(Finding {
+            record_ix: None,
+            msg: format!("total missing buckets: {}", n_gaps),
+        });
+    }
+
+    stats.bars_stats = Some(bars_stats);
+    Ok(FileReport {
+        path: path.display().to_string(),
+        kind: "s10",
+        bytes,
+        records: n,
+        errors,
+        warnings,
+        stats,
+    })
+}
+
 // ── .vol check ──────────────────────────────────────────────────────────────
 
 fn check_vol(path: &Path, _strict: bool) -> Result<FileReport> {
@@ -750,7 +998,7 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
             if p.is_dir() {
                 walk(&p, out);
             } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                if matches!(ext, "idx" | "bars" | "vol") {
+                if matches!(ext, "idx" | "bars" | "s10" | "vol") {
                     out.push(p);
                 }
             }
@@ -795,6 +1043,7 @@ fn check_dir(root: &Path, parallel: usize, strict: bool) -> Result<AggregateRepo
                 let res = match ext {
                     "idx" => check_idx(p, strict),
                     "bars" => check_bars(p, strict),
+                    "s10" => check_s10(p, strict, 10_000),
                     "vol" => check_vol(p, strict),
                     other => Err(anyhow::anyhow!("unhandled extension: {}", other)),
                 };
@@ -852,6 +1101,11 @@ fn main() -> Result<()> {
         }
         Cmd::Bars { path, strict, json } => {
             let r = check_bars(&path, strict)?;
+            emit_report(&r, json);
+            std::process::exit(exit_code(std::slice::from_ref(&r), strict));
+        }
+        Cmd::S10 { path, strict, json, bucket_ms } => {
+            let r = check_s10(&path, strict, bucket_ms)?;
             emit_report(&r, json);
             std::process::exit(exit_code(std::slice::from_ref(&r), strict));
         }

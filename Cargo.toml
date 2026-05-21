@@ -40,6 +40,10 @@ name = "renko-from-idx"
 path = "src/bin/renko_from_idx.rs"
 
 [[bin]]
+name = "s10-from-idx"
+path = "src/bin/s10_from_idx.rs"
+
+[[bin]]
 name = "resample-idx"
 path = "src/bin/resample_idx.rs"
 
