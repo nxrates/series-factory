@@ -67,6 +67,13 @@ struct Args {
     #[arg(long, default_value = "100")]
     sample_size: usize,
 
+    /// Max distance (ms) between a probe target_ts and the nearest record before
+    /// the sample is treated as landing in a data gap and skipped from drift
+    /// stats. Default = 10000 ms (10s @ 100ms cadence ≈ 100 cycles). Tune up for
+    /// laggier feeds, down for tighter outage detection.
+    #[arg(long, default_value = "10000")]
+    stale_threshold_ms: i64,
+
     /// Emit single-ticker output as JSON to stdout (default = human text).
     #[arg(long)]
     json: bool,
@@ -90,8 +97,20 @@ struct TickerReport {
     max_price_diff_bps: f64,
     max_ci_diff_pct: f64,
     monotone_violation_ix: Option<usize>,
-    status: String, // "ok" | "gap" | "overlap_drift" | "monotone_violation" | "missing_live" | "missing_backfill" | "empty" | "error"
+    status: String, // "ok" | "gap" | "overlap_drift" | "monotone_violation" | "missing_live" | "missing_backfill" | "empty" | "insufficient_samples" | "error"
     note: Option<String>,
+    /// Samples skipped because the nearest live record was further than
+    /// `stale_threshold_ms` from the probe target_ts (i.e. live aggregator
+    /// outage during the overlap window).
+    #[serde(default)]
+    live_outage_records: u32,
+    /// Samples skipped because the nearest backfill record was further than
+    /// `stale_threshold_ms` from the probe target_ts.
+    #[serde(default)]
+    backfill_outage_records: u32,
+    /// Samples that actually contributed to drift stats (both sides fresh).
+    #[serde(default)]
+    valid_sample_records: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,7 +199,7 @@ fn run_all(args: &Args) -> Result<AggregateReport> {
                 checked += 1;
                 passed += 1;
             }
-            "gap" => {
+            "gap" | "insufficient_samples" => {
                 checked += 1;
                 warned += 1;
             }
@@ -242,6 +261,9 @@ fn mk_err(ticker: &str, note: String) -> TickerReport {
         monotone_violation_ix: None,
         status: "error".to_string(),
         note: Some(note),
+        live_outage_records: 0,
+        backfill_outage_records: 0,
+        valid_sample_records: 0,
     }
 }
 
@@ -266,6 +288,9 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
             monotone_violation_ix: None,
             status: "missing_backfill".to_string(),
             note: Some(format!("no file at {}", backfill_path.display())),
+            live_outage_records: 0,
+            backfill_outage_records: 0,
+            valid_sample_records: 0,
         });
     }
 
@@ -283,6 +308,9 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
                 monotone_violation_ix: None,
                 status: "error".to_string(),
                 note: Some("could not resolve ticker_id from pair name".to_string()),
+                live_outage_records: 0,
+                backfill_outage_records: 0,
+                valid_sample_records: 0,
             });
         }
     };
@@ -298,6 +326,9 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
             monotone_violation_ix: None,
             status: "missing_live".to_string(),
             note: Some(format!("no file at {}", live_path.display())),
+            live_outage_records: 0,
+            backfill_outage_records: 0,
+            valid_sample_records: 0,
         });
     }
 
@@ -322,6 +353,9 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
                 bf.len(),
                 lv.len()
             )),
+            live_outage_records: 0,
+            backfill_outage_records: 0,
+            valid_sample_records: 0,
         });
     }
 
@@ -352,6 +386,9 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
             monotone_violation_ix: Some(ix),
             status: "monotone_violation".to_string(),
             note: Some(format!("backfill ts went backwards at record {}", ix)),
+            live_outage_records: 0,
+            backfill_outage_records: 0,
+            valid_sample_records: 0,
         });
     }
 
@@ -373,6 +410,9 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
                 t_live0,
                 t_cut + 2 * args.cycle_ms
             )),
+            live_outage_records: 0,
+            backfill_outage_records: 0,
+            valid_sample_records: 0,
         });
     }
 
@@ -389,6 +429,9 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
             monotone_violation_ix: None,
             status: "ok".to_string(),
             note: None,
+            live_outage_records: 0,
+            backfill_outage_records: 0,
+            valid_sample_records: 0,
         });
     }
 
@@ -405,6 +448,10 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
     let sample_n = args.sample_size.max(1).min(overlap_records.max(1));
     let mut max_price_diff_rel = 0.0_f64;
     let mut max_ci_diff_pct = 0.0_f64;
+    let stale_threshold_ms = args.stale_threshold_ms.max(0);
+    let mut live_outage_records: u32 = 0;
+    let mut backfill_outage_records: u32 = 0;
+    let mut valid_sample_records: u32 = 0;
 
     for s in 0..sample_n {
         // Uniformly-spaced timestamps in [t_overlap_start, t_cut].
@@ -420,6 +467,24 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
         let lv_ix = nearest_ix(lv, target_ts);
         let a = &bf[bf_ix];
         let b = &lv[lv_ix];
+
+        // Outage detection: if the nearest record is further away than the
+        // stale threshold, that side has a data gap at target_ts. Skip the
+        // sample from drift stats and tally it separately. ! comparing
+        // backfill vs (much-later) live record produces fake "drift".
+        let bf_dt = (ts_ms(a) - target_ts).abs();
+        let lv_dt = (ts_ms(b) - target_ts).abs();
+        let bf_stale = bf_dt > stale_threshold_ms;
+        let lv_stale = lv_dt > stale_threshold_ms;
+        if bf_stale {
+            backfill_outage_records += 1;
+        }
+        if lv_stale {
+            live_outage_records += 1;
+        }
+        if bf_stale || lv_stale {
+            continue;
+        }
 
         let bid_a = a.index.bid;
         let bid_b = b.index.bid;
@@ -442,17 +507,37 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
                 max_ci_diff_pct = d;
             }
         }
+
+        valid_sample_records += 1;
     }
 
     let max_price_diff_bps = max_price_diff_rel * 10_000.0;
     let mut status = "ok".to_string();
     let mut note = None;
-    if max_price_diff_rel > 0.01 || max_ci_diff_pct > 0.5 {
+    // Insufficient-sample guard fires BEFORE drift judgement: if a live outage
+    // ate most of the overlap window, max_price_diff_rel is meaningless even
+    // if the few surviving samples happen to disagree.
+    let min_valid = (sample_n / 4) as u32;
+    if valid_sample_records < min_valid {
+        status = "insufficient_samples".to_string();
+        note = Some(format!(
+            "valid={} < sample_size/4 = {} (live_outage={}, backfill_outage={}, stale_threshold_ms={})",
+            valid_sample_records,
+            min_valid,
+            live_outage_records,
+            backfill_outage_records,
+            stale_threshold_ms,
+        ));
+    } else if max_price_diff_rel > 0.01 || max_ci_diff_pct > 0.5 {
         status = "overlap_drift".to_string();
         note = Some(format!(
-            "max_price_diff_bps={:.2}, max_ci_diff_pct={:.2}",
+            "max_price_diff_bps={:.2}, max_ci_diff_pct={:.2} (valid_samples={}/{}, live_outage={}, backfill_outage={})",
             max_price_diff_bps,
-            max_ci_diff_pct * 100.0
+            max_ci_diff_pct * 100.0,
+            valid_sample_records,
+            sample_n,
+            live_outage_records,
+            backfill_outage_records,
         ));
     }
 
@@ -467,6 +552,9 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
         monotone_violation_ix: None,
         status,
         note,
+        live_outage_records,
+        backfill_outage_records,
+        valid_sample_records,
     })
 }
 
@@ -551,6 +639,9 @@ fn print_human(r: &TickerReport) {
     println!("t_cut:                 {}", r.t_cut);
     println!("gap_ms:                {}", r.gap_ms);
     println!("overlap_records:       {}", r.overlap_records);
+    println!("valid_sample_records:  {}", r.valid_sample_records);
+    println!("live_outage_records:   {}", r.live_outage_records);
+    println!("backfill_outage_records:{}", r.backfill_outage_records);
     println!("max_price_diff_bps:    {:.4}", r.max_price_diff_bps);
     println!("max_ci_diff_pct:       {:.4}", r.max_ci_diff_pct);
     if let Some(ix) = r.monotone_violation_ix {
