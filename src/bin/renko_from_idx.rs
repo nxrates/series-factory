@@ -1,37 +1,40 @@
-//! Generate renko bars from a single cross-provider composite `.idx` file.
+//! Generate renko bars from a sharded cross-provider composite `.idx`
+//! directory, emitting daily-sharded `.renko` files.
 //!
 //! Two-pass, streaming:
-//!   Pass 1 — sweep the composite `.idx` to build 30 min Parkinson HLC + an
-//!           EMA-smoothed sigma `.vol` file. Optionally use the same sweep
-//!           to calibrate the renko `multiplier` against `target_bpd`
-//!           (currently opt-in via `--calibrate`).
-//!   Pass 2 — sweep the composite `.idx` again, feed each record's mid
-//!           price to `RenkoGenerator`. The generator perpetually
-//!           re-calibrates its brick size every 30 min from the vol file
-//!           (`bar_construction/renko.rs:179-183`).
+//!   Pass 1 — sweep ∀ input shards (chronological) to build 30 min Parkinson
+//!           HLC + an EMA-smoothed sigma `.vol` file.
+//!   Pass 2 — sweep input shards again, feed each record's mid price to
+//!           `RenkoGenerator`. The generator perpetually re-calibrates its
+//!           brick size every 30 min from the vol file.
 //!
-//! Output: `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>.bars` (prod layout).
+//! Inputs:  `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>/<YYYY-MM-DD>.idx`
+//! Output:  `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>/<YYYY-MM-DD>.renko`
+//!         + merged into `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>/manifest.json`.
 
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use clap::Parser;
 use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
-use nxr_sdk::{
-    BarAccumulator, ipc::record::IndexRecord, parkinson_sigma,
-};
+use nxr_sdk::{BarAccumulator, ipc::record::IndexRecord, parkinson_sigma, resolve_ticker_id};
 use serde::Deserialize;
+use series_factory::sharding::{
+    bars_dir, composite_dir, list_shards, manifest_path, read_manifest, sha256_file,
+    shard_path, ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest, ShardEntry,
+};
 use series_factory::{
     bar_construction::{MtfParkinsonCalculator, RenkoConfig, RenkoGenerator, VolConfig},
     vol_bin::{VolMmap, VolWriter},
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(about = "Build renko .bars from a composite .idx.")]
+#[command(about = "Build renko shards from a sharded composite idx dir.")]
 struct Args {
     /// Path to nxrates.yml (reads `series.{renko,vol,calibration,pipeline}`).
     config: PathBuf,
@@ -39,14 +42,12 @@ struct Args {
     base: String,
     /// Quote asset symbol (e.g. USDT).
     quote: String,
-    /// Override the input composite `.idx` path.
-    /// Default: `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>.idx`.
-    #[arg(long)]
-    idx: Option<PathBuf>,
-    /// Override the output `.bars` path.
-    /// Default: `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>.bars`.
-    #[arg(long)]
-    out: Option<PathBuf>,
+    /// Override the input composite shard dir.
+    #[arg(long = "in-dir")]
+    input_dir: Option<PathBuf>,
+    /// Override the output shard dir.
+    #[arg(long = "out-dir")]
+    out_dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -79,48 +80,56 @@ fn main() -> Result<()> {
     let yml = root.series;
 
     let cfg = nxr_sdk::NxrConfig::from_env();
-    let idx_path = args.idx.unwrap_or_else(|| {
-        PathBuf::from(&cfg.indexes_dir)
-            .join("composite")
-            .join(format!(
-                "{}-{}.idx",
-                args.base.to_uppercase(),
-                args.quote.to_uppercase()
-            ))
-    });
-    let out_path = args.out.unwrap_or_else(|| {
-        PathBuf::from(&cfg.bars_dir)
-            .join(args.base.to_uppercase())
-            .join(format!(
-                "{}{}.bars",
-                args.base.to_uppercase(),
-                args.quote.to_uppercase()
-            ))
-    });
+    let base = args.base.to_uppercase();
+    let quote = args.quote.to_uppercase();
+    let data_root_idx = Path::new(&cfg.indexes_dir)
+        .parent()
+        .unwrap_or(Path::new("/data"))
+        .to_path_buf();
+    let data_root_bars = Path::new(&cfg.bars_dir)
+        .parent()
+        .unwrap_or(Path::new("/data"))
+        .to_path_buf();
+    let in_dir = args
+        .input_dir
+        .clone()
+        .unwrap_or_else(|| composite_dir(&data_root_idx, &base, &quote));
+    let out_dir = args
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| bars_dir(&data_root_bars, &base, &quote));
 
-    info!(idx = %idx_path.display(), out = %out_path.display(), "renko-from-idx starting");
+    info!(in_dir = %in_dir.display(), out_dir = %out_dir.display(), "renko-from-idx starting (sharded)");
+
+    let shards = list_shards(&in_dir, "idx")?;
+    if shards.is_empty() {
+        anyhow::bail!("no input shards in {}", in_dir.display());
+    }
+    info!(input_shards = shards.len(), "input shard scan done");
 
     // ═══ PASS 1: 30-min HLC from composite mid ═══
     let t0 = std::time::Instant::now();
     let mut hlc: HashMap<i64, (f64, f64, f64)> = HashMap::new();
-    let mut stream = IdxStream::open(&idx_path)?;
     let mut pass1_count: u64 = 0;
-    while let Some(rec) = stream.next_record()? {
-        let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
-        let mid = (rec.index.bid + rec.index.ask) * 0.5;
-        if !(mid.is_finite() && mid > 0.0) {
-            continue;
+    for (_, path) in &shards {
+        let mut stream = IdxStream::open(path)?;
+        while let Some(rec) = stream.next_record()? {
+            let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+            let mid = (rec.index.bid + rec.index.ask) * 0.5;
+            if !(mid.is_finite() && mid > 0.0) {
+                continue;
+            }
+            let key = (ts / 1_800_000) * 1_800_000;
+            let e = hlc.entry(key).or_insert((mid, mid, mid));
+            if mid > e.0 {
+                e.0 = mid;
+            }
+            if mid < e.1 {
+                e.1 = mid;
+            }
+            e.2 = mid;
+            pass1_count += 1;
         }
-        let key = (ts / 1_800_000) * 1_800_000;
-        let e = hlc.entry(key).or_insert((mid, mid, mid));
-        if mid > e.0 {
-            e.0 = mid;
-        }
-        if mid < e.1 {
-            e.1 = mid;
-        }
-        e.2 = mid;
-        pass1_count += 1;
     }
     info!(
         pass1_records = pass1_count,
@@ -130,10 +139,9 @@ fn main() -> Result<()> {
     );
 
     // ═══ Build vol (.vol) file ═══
-    let vol_path = out_path.with_extension("vol");
-    if let Some(parent) = vol_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    std::fs::create_dir_all(&out_dir)?;
+    // vol file lives alongside the shard dir; transient (deleted post-write).
+    let vol_path = out_dir.join("_renko.vol");
     let mut hours: Vec<(i64, f64, f64)> =
         hlc.into_iter().map(|(ts, (h, l, _))| (ts, h, l)).collect();
     hours.sort_unstable_by_key(|&(ts, _, _)| ts);
@@ -160,10 +168,6 @@ fn main() -> Result<()> {
     info!(vol_records = hours.len(), "vol file written");
 
     // ═══ PASS 2: feed composite mid → RenkoGenerator ═══
-    // RenkoGenerator already recomputes brick_size every 30 min from the
-    // VolMmap (renko.rs:179-183) — the prod "perpetual re-calibration".
-    // We also overlay micro-structure (realized_var, drift, ...) via
-    // BarAccumulator fed from the composite's bid/ask/vbid/vask.
     let first_ts = hours.first().map(|&(ts, _, _)| ts).unwrap_or(0);
     let bootstrap_end = first_ts + yml.pipeline.bootstrap_days * 86_400_000;
 
@@ -174,8 +178,6 @@ fn main() -> Result<()> {
     };
     renko_config.validate()?;
 
-    // Precompute sigma cache so the generator does not re-read the vol
-    // mmap on every tick (prod-identical: see `set_sigma_cache`).
     let sigma_cache = {
         let mut calc = MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
         calc.precompute_sigma_cache()
@@ -185,99 +187,148 @@ fn main() -> Result<()> {
     let mut generator = RenkoGenerator::new(renko_config, &vol_mmap, yml.vol.clone())?;
     generator.set_sigma_cache(&sigma_cache);
 
-    let mut bars: Vec<Bar> = Vec::new();
+    let mut bars_by_date: BTreeMap<NaiveDate, Vec<Bar>> = BTreeMap::new();
     let mut accum = BarAccumulator::new();
     let mut pending: Vec<Bar> = Vec::new();
-    let mut stream = IdxStream::open(&idx_path)?;
     let mut pass2_count: u64 = 0;
     let mut post_bootstrap: u64 = 0;
+    let mut total_bars: usize = 0;
 
-    while let Some(rec) = stream.next_record()? {
-        let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
-        let idx = rec.index;
-        let mid = (idx.bid + idx.ask) * 0.5;
-        if !(mid.is_finite() && mid > 0.0) {
-            continue;
-        }
-        pass2_count += 1;
-
-        if ts < bootstrap_end {
-            generator.feed_tick(ts, mid, &mut |_: &Bar| Ok(()))?;
-            continue;
-        }
-        post_bootstrap += 1;
-
-        // Composite Index already carries aggregated (bid, ask, vbid, vask,
-        // rejected, accepted). We feed those directly into BarAccumulator
-        // so enrichment reflects cross-provider consensus, not one tick's
-        // noise.
-        let ci_ubp = nxr_sdk::tdwap::decode_ci_ubp(idx.ci);
-        accum.ingest(
-            idx.bid,
-            idx.ask,
-            idx.vbid,
-            idx.vask,
-            ts,
-            ci_ubp,
-            idx.accepted as u32,
-            idx.rejected as u32,
-        );
-        generator.feed_tick(ts, mid, &mut |bar: &Bar| {
-            pending.push(*bar);
-            Ok(())
-        })?;
-
-        if !pending.is_empty() {
-            // Multi-brick batch fix: when one breakout tick produces N bricks,
-            // ALL N bricks share the same microstructure window
-            // [prev_emission_ts, current_ts]. Copy enrichment to every bar in
-            // the batch instead of zeroing bars 1..N (which would teach ML
-            // models a spurious inverse-velocity signal).
-            let enrich = accum.flush();
-            let n_pending = pending.len() as u32;
-            for mut bar in pending.drain(..) {
-                bar.kind = BarKind::Renko as u8;
-                if let Some(ref e) = enrich {
-                    bar.vbid = e.vbid;
-                    bar.vask = e.vask;
-                    // tick_count and additive volume fields are split evenly
-                    // so per-bar sums still aggregate to the true window total.
-                    bar.tick_count = if n_pending > 0 { e.tick_count / n_pending } else { 0 };
-                    // Variance/return/drift/spread/ci/reject are intensive
-                    // properties of the window, not extensive — copy as-is.
-                    bar.realized_var = e.realized_var;
-                    bar.bipower_var = e.bipower_var;
-                    bar.drift = e.drift;
-                    bar.vol_imbalance = e.vol_imbalance;
-                    bar.avg_spread_bps = e.avg_spread_bps;
-                    bar.max_abs_return = e.max_abs_return;
-                    bar.avg_ci_ubp = e.avg_ci_ubp;
-                    bar.reject_rate = e.reject_rate;
-                }
-                bars.push(bar);
+    for (_, path) in &shards {
+        let mut stream = IdxStream::open(path)?;
+        while let Some(rec) = stream.next_record()? {
+            let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+            let idx = rec.index;
+            let mid = (idx.bid + idx.ask) * 0.5;
+            if !(mid.is_finite() && mid > 0.0) {
+                continue;
             }
-            if bars.len() > yml.pipeline.max_bars {
-                anyhow::bail!("bar count exceeds {} safety limit", yml.pipeline.max_bars);
+            pass2_count += 1;
+
+            if ts < bootstrap_end {
+                generator.feed_tick(ts, mid, &mut |_: &Bar| Ok(()))?;
+                continue;
+            }
+            post_bootstrap += 1;
+
+            let ci_ubp = nxr_sdk::tdwap::decode_ci_ubp(idx.ci);
+            accum.ingest(
+                idx.bid,
+                idx.ask,
+                idx.vbid,
+                idx.vask,
+                ts,
+                ci_ubp,
+                idx.accepted as u32,
+                idx.rejected as u32,
+            );
+            generator.feed_tick(ts, mid, &mut |bar: &Bar| {
+                pending.push(*bar);
+                Ok(())
+            })?;
+
+            if !pending.is_empty() {
+                let enrich = accum.flush();
+                let n_pending = pending.len() as u32;
+                for mut bar in pending.drain(..) {
+                    bar.kind = BarKind::Renko as u8;
+                    if let Some(ref e) = enrich {
+                        bar.vbid = e.vbid;
+                        bar.vask = e.vask;
+                        bar.tick_count = if n_pending > 0 { e.tick_count / n_pending } else { 0 };
+                        bar.realized_var = e.realized_var;
+                        bar.bipower_var = e.bipower_var;
+                        bar.drift = e.drift;
+                        bar.vol_imbalance = e.vol_imbalance;
+                        bar.avg_spread_bps = e.avg_spread_bps;
+                        bar.max_abs_return = e.max_abs_return;
+                        bar.avg_ci_ubp = e.avg_ci_ubp;
+                        bar.reject_rate = e.reject_rate;
+                    }
+                    let date = ts_ms_to_utc_date(bar.open_time_ms());
+                    bars_by_date.entry(date).or_default().push(bar);
+                    total_bars += 1;
+                }
+                if total_bars > yml.pipeline.max_bars {
+                    anyhow::bail!("bar count exceeds {} safety limit", yml.pipeline.max_bars);
+                }
             }
         }
     }
 
     info!(
-        bars = bars.len(),
+        bars = total_bars,
         pass2_records = pass2_count,
         post_bootstrap,
+        out_shards = bars_by_date.len(),
         "pass 2 done in {}ms",
         t1.elapsed().as_millis()
     );
 
-    // ═══ WRITE OUTPUT ═══
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
+    // ═══ WRITE SHARDS ═══
+    for (date, bars) in &bars_by_date {
+        let path = shard_path(&out_dir, *date, "renko");
+        let bytes: &[u8] = bytemuck::cast_slice(bars);
+        write_shard_atomic(&path, bytes)?;
+        info!(date = %date, n = bars.len(), path = %path.display(), "wrote renko shard");
     }
-    nxr_sdk::ipc::write_atomic::<Bar>(&out_path, &bars)?;
+    // remove transient vol scratch file
     let _ = fs::remove_file(&vol_path);
-    info!(out = %out_path.display(), "wrote {} renko bars", bars.len());
+
+    // ═══ MANIFEST ═══
+    let ticker_str = format!("{}-{}", base, quote);
+    let ticker_id = resolve_ticker_id(&format!("{}/{}", base, quote));
+    let mpath = manifest_path(&out_dir);
+    let mut manifest = read_manifest(&mpath)?
+        .unwrap_or_else(|| Manifest::new(ticker_str.clone(), ticker_id, "renko"));
+    manifest.ticker = ticker_str;
+    manifest.ticker_id = ticker_id;
+    if manifest.kind.is_empty() {
+        manifest.kind = "renko".into();
+    } else if !manifest.kind.contains("renko") {
+        manifest.kind = format!("{},renko", manifest.kind);
+    }
+    let existing = list_shards(&out_dir, "renko")?;
+    manifest.shards.retain(|s| {
+        !existing.iter().any(|(d, _)| d.format("%Y-%m-%d").to_string() == s.date)
+    });
+    for (date, path) in existing {
+        manifest.upsert(build_shard_entry_bar(date, &path)?);
+    }
+    write_manifest(&mpath, &manifest)?;
+
+    info!(out_dir = %out_dir.display(), manifest = %mpath.display(), "manifest updated");
     Ok(())
+}
+
+/// Manifest entry for a 96B Bar shard.
+fn build_shard_entry_bar(date: NaiveDate, path: &Path) -> Result<ShardEntry> {
+    let rec_size = core::mem::size_of::<Bar>();
+    let size_bytes = std::fs::metadata(path)?.len();
+    let n_records = if rec_size == 0 { 0 } else { size_bytes / rec_size as u64 };
+    let mut first_ts: i64 = 0;
+    let mut last_ts: i64 = 0;
+    if n_records > 0 {
+        use std::io::Seek;
+        let mut f = std::fs::File::open(path)?;
+        let mut head = vec![0u8; rec_size];
+        f.read_exact(&mut head)?;
+        let bar0: Bar = *bytemuck::from_bytes(&head);
+        first_ts = bar0.open_time_ms();
+        f.seek(std::io::SeekFrom::End(-(rec_size as i64)))?;
+        let mut tail = vec![0u8; rec_size];
+        f.read_exact(&mut tail)?;
+        let bar_n: Bar = *bytemuck::from_bytes(&tail);
+        last_ts = bar_n.open_time_ms();
+    }
+    Ok(ShardEntry {
+        date: date.format("%Y-%m-%d").to_string(),
+        first_ts,
+        last_ts,
+        n_records,
+        size_bytes,
+        sha256: sha256_file(path)?,
+    })
 }
 
 /// Buffered streaming reader for an `AppendLog<IndexRecord>` file.
@@ -328,10 +379,6 @@ impl IdxStream {
 
     fn next_record(&mut self) -> Result<Option<IndexRecord>> {
         let rec_size = core::mem::size_of::<IndexRecord>();
-        // Refill on exhaustion. Re-check pos against filled afterwards so a
-        // refill that hits EOF (filled stays at the prior full buffer because
-        // `refill` short-circuits when `eof` is already set) still returns
-        // None instead of re-reading stale bytes past the file end.
         if self.pos >= self.filled {
             self.refill()?;
             if self.pos >= self.filled {

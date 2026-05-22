@@ -15,9 +15,9 @@
 //! bin before any binary that depends on pre-populated `.ticks` archives.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use series_factory::{
     sources::{create_source, TickSource},
     types::{AggregationMode, Config, DataSource, TickFrame},
@@ -52,6 +52,153 @@ struct Args {
     /// Max concurrent (pair x exchange) fetchers.
     #[arg(long, default_value = "4")]
     parallelism: usize,
+
+    /// Probe-only mode: HEAD-check archive coverage per (pair, exchange) and
+    /// emit JSON `[{ticker, exchange, has_data, first_date, last_date}]` on
+    /// stdout. Skips actual downloads. Used by `backfill-all` to drop
+    /// uncovered exchanges before paying download cost.
+    #[arg(long)]
+    probe: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeResult {
+    ticker: String,
+    exchange: String,
+    has_data: bool,
+    first_date: Option<String>,
+    last_date: Option<String>,
+}
+
+/// HEAD-check archive availability for one (pair, exchange) over the window.
+/// Returns earliest + latest month w/ a 200 OK monthly archive. Bounded:
+/// scans at most `MAX_PROBE_MONTHS` chronological months in each direction.
+async fn probe_one(
+    pair: &str,
+    quote: &str,
+    exchange: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> ProbeResult {
+    use chrono::Datelike;
+    const MAX_PROBE_MONTHS: i32 = 72; // 6y cap
+
+    let sym = format!("{}{}", pair.to_uppercase(), quote.to_uppercase());
+    let agent = std::sync::Arc::new(
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(15))
+            .build(),
+    );
+
+    let url_for = |y: i32, m: u32| -> Option<String> {
+        match exchange {
+            "binance" => Some(format!(
+                "https://data.binance.vision/data/spot/monthly/aggTrades/{s}/{s}-aggTrades-{y:04}-{m:02}.zip",
+                s = sym
+            )),
+            "bybit" => Some(format!(
+                "https://public.bybit.com/trading/{s}/{s}{y:04}-{m:02}.csv.gz",
+                s = sym
+            )),
+            // bitget/okx have no easily-HEADable monthly archive convention
+            // (per-day only) — return None to skip probing; fetcher itself
+            // will discover coverage on attempt.
+            _ => None,
+        }
+    };
+
+    // walk forward to find first available month
+    let mut first: Option<NaiveDate> = None;
+    let mut last: Option<NaiveDate> = None;
+    let mut cursor = NaiveDate::from_ymd_opt(from.year(), from.month(), 1).unwrap();
+    let stop = NaiveDate::from_ymd_opt(to.year(), to.month(), 1).unwrap();
+    let mut scanned = 0;
+    while cursor <= stop && scanned < MAX_PROBE_MONTHS {
+        scanned += 1;
+        let url = match url_for(cursor.year(), cursor.month()) {
+            Some(u) => u,
+            None => {
+                // unknown probe mapping → bail w/ has_data=true (don't block)
+                return ProbeResult {
+                    ticker: pair.to_string(),
+                    exchange: exchange.to_string(),
+                    has_data: true,
+                    first_date: None,
+                    last_date: None,
+                };
+            }
+        };
+        let ok = head_ok(&agent, &url).await;
+        if ok {
+            first = Some(cursor);
+            break;
+        }
+        cursor = next_month(cursor);
+    }
+    if first.is_none() {
+        return ProbeResult {
+            ticker: pair.to_string(),
+            exchange: exchange.to_string(),
+            has_data: false,
+            first_date: None,
+            last_date: None,
+        };
+    }
+    // walk backward from `to` to find last available
+    let mut cursor = stop;
+    let mut scanned = 0;
+    while scanned < MAX_PROBE_MONTHS {
+        scanned += 1;
+        let url = match url_for(cursor.year(), cursor.month()) {
+            Some(u) => u,
+            None => break,
+        };
+        if head_ok(&agent, &url).await {
+            last = Some(cursor);
+            break;
+        }
+        cursor = prev_month(cursor);
+        if cursor < first.unwrap() {
+            break;
+        }
+    }
+    ProbeResult {
+        ticker: pair.to_string(),
+        exchange: exchange.to_string(),
+        has_data: true,
+        first_date: first.map(|d| d.format("%Y-%m-%d").to_string()),
+        last_date: last.map(|d| d.format("%Y-%m-%d").to_string()),
+    }
+}
+
+fn next_month(d: NaiveDate) -> NaiveDate {
+    if d.month() == 12 {
+        NaiveDate::from_ymd_opt(d.year() + 1, 1, 1).unwrap()
+    } else {
+        NaiveDate::from_ymd_opt(d.year(), d.month() + 1, 1).unwrap()
+    }
+}
+
+fn prev_month(d: NaiveDate) -> NaiveDate {
+    if d.month() == 1 {
+        NaiveDate::from_ymd_opt(d.year() - 1, 12, 1).unwrap()
+    } else {
+        NaiveDate::from_ymd_opt(d.year(), d.month() - 1, 1).unwrap()
+    }
+}
+
+async fn head_ok(agent: &std::sync::Arc<ureq::Agent>, url: &str) -> bool {
+    let agent = agent.clone();
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || {
+        let resp = agent.head(&url).call();
+        match resp {
+            Ok(r) => r.status() >= 200 && r.status() < 300,
+            Err(_) => false,
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +268,27 @@ async fn main() -> Result<()> {
 
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();
     let ticks_dir = PathBuf::from(&nxr_cfg.ticks_dir);
+
+    // probe-only mode: HEAD-check every (pair, exchange) → JSON stdout
+    if args.probe {
+        let mut results: Vec<ProbeResult> = Vec::new();
+        for pair in &pairs {
+            for exchange in &exchanges {
+                let r = probe_one(pair, &args.quote, exchange, from, to).await;
+                info!(
+                    ticker = %r.ticker,
+                    exchange = %r.exchange,
+                    has_data = r.has_data,
+                    first_date = ?r.first_date,
+                    last_date = ?r.last_date,
+                    "probe"
+                );
+                results.push(r);
+            }
+        }
+        println!("{}", serde_json::to_string(&results)?);
+        return Ok(());
+    }
 
     info!(
         "fetching {} pairs x {} exchanges, window={} days [{} -> {}), ticks_dir={}",
