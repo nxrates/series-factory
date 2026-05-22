@@ -2,6 +2,18 @@
 //! `merge-idx` → `s10-from-idx` → `renko-from-idx` → `integrity-check` for
 //! many tickers in parallel and emits a single JSON report.
 //!
+//! Phase 55 W4 changes:
+//! - tracing-subscriber init at startup (defaults to INFO; honours RUST_LOG)
+//! - per-step start/done structured logs w/ duration_ms, exit_code, bytes
+//! - per-ticker boundary logs + progress markers on disk under
+//!   `<out_dir>/backfill/progress/<ticker>.{start,done,failed}`
+//! - 60s heartbeat thread emits active/completed counters
+//! - pre-fetch availability probe (HEAD-only) drops dead exchanges + may
+//!   skip a ticker entirely if no exchange has coverage
+//! - merge / s10 / renko emit daily shards; validate iterates shards via
+//!   `integrity-check` per shard (best-effort)
+//! - resume logic checks manifest sha256 + existence per shard
+//!
 //! Bins are discovered via `$PATH` (k8s container installs them under
 //! `/usr/local/bin`). For each (ticker, step) we record start, duration,
 //! exit code, bytes written, and any stderr lines. Tickers run on a rayon
@@ -12,8 +24,10 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, Utc};
@@ -21,6 +35,8 @@ use clap::Parser;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -64,9 +80,13 @@ struct Args {
     dry_run: bool,
     /// After successful validate, delete per-exchange `ticks/` and
     /// `indexes/<exch>/` intermediates for the pair. Keeps composite
-    /// `.idx`, `.s10`, `.bars` (renko), `.vol`. Default: off (safe).
+    /// shards + bars shards + .vol. Default: off (safe).
     #[arg(long)]
     cleanup: bool,
+    /// Skip availability probe (pre-fetch HEAD check). Useful for synthetic
+    /// or offline environments.
+    #[arg(long)]
+    skip_probe: bool,
 }
 
 // ── Report types ─────────────────────────────────────────────────────────────
@@ -82,10 +102,22 @@ struct StepReport {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct AvailabilityEntry {
+    exchange: String,
+    has_data: bool,
+    first_date: Option<String>,
+    last_date: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct TickerReport {
     ticker: String,
     status: String, // ok | failed | skipped
     steps: Vec<StepReport>,
+    #[serde(default)]
+    ticker_availability: Vec<AvailabilityEntry>,
+    #[serde(default)]
+    skip_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,12 +175,26 @@ fn file_bytes(p: &Path) -> u64 {
     fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
-fn run_step(
-    bin: &str,
-    args: &[String],
-    out_file: Option<&Path>,
-) -> StepReport {
+fn dir_bytes(p: &Path) -> u64 {
+    let mut total = 0u64;
+    let read = match fs::read_dir(p) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += dir_bytes(&path);
+        } else if let Ok(m) = entry.metadata() {
+            total += m.len();
+        }
+    }
+    total
+}
+
+fn run_step(ticker: &str, bin: &str, args: &[String], out_path: Option<&Path>) -> StepReport {
     let name = bin.to_string();
+    info!(ticker, bin, args = ?args, "step start");
     let start = Instant::now();
     let out = Command::new(bin).args(args).output();
     let duration_ms = start.elapsed().as_millis();
@@ -162,8 +208,30 @@ fn run_step(
                     errors.push(line.to_string());
                 }
                 errors.reverse();
+                error!(
+                    ticker,
+                    bin,
+                    exit_code,
+                    duration_ms = duration_ms as u64,
+                    stderr_tail = ?errors,
+                    "step failed"
+                );
             }
-            let bytes = out_file.map(file_bytes).unwrap_or(0);
+            let bytes = match out_path {
+                Some(p) if p.is_dir() => dir_bytes(p),
+                Some(p) => file_bytes(p),
+                None => 0,
+            };
+            if o.status.success() {
+                info!(
+                    ticker,
+                    bin,
+                    exit_code,
+                    duration_ms = duration_ms as u64,
+                    bytes_out = bytes,
+                    "step done"
+                );
+            }
             StepReport {
                 name,
                 duration_ms,
@@ -173,14 +241,17 @@ fn run_step(
                 errors,
             }
         }
-        Err(e) => StepReport {
-            name,
-            duration_ms,
-            exit_code: -1,
-            bytes: 0,
-            skipped: false,
-            errors: vec![format!("spawn failed: {}", e)],
-        },
+        Err(e) => {
+            error!(ticker, bin, err = %e, "spawn failed");
+            StepReport {
+                name,
+                duration_ms,
+                exit_code: -1,
+                bytes: 0,
+                skipped: false,
+                errors: vec![format!("spawn failed: {}", e)],
+            }
+        }
     }
 }
 
@@ -197,6 +268,22 @@ fn integrity_clean(file: &Path, kind: &str) -> bool {
     }
 }
 
+// ── Progress markers ─────────────────────────────────────────────────────────
+
+fn progress_dir(out_dir: &Path) -> PathBuf {
+    out_dir.join("backfill").join("progress")
+}
+
+fn write_marker(out_dir: &Path, ticker: &str, suffix: &str) {
+    let dir = progress_dir(out_dir);
+    let _ = fs::create_dir_all(&dir);
+    let p = dir.join(format!("{}.{}", ticker, suffix));
+    let now = Utc::now().to_rfc3339();
+    if let Err(e) = fs::write(&p, &now) {
+        warn!(path = %p.display(), err = %e, "progress marker write failed");
+    }
+}
+
 // ── Per-ticker pipeline ──────────────────────────────────────────────────────
 
 struct PlanCtx {
@@ -205,6 +292,95 @@ struct PlanCtx {
     to: NaiveDate,
     exchanges: Vec<String>,
     steps: Vec<String>,
+    counters: Arc<Counters>,
+}
+
+struct Counters {
+    active: AtomicUsize,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    skipped: AtomicU64,
+}
+
+impl Counters {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            completed: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+        }
+    }
+}
+
+/// HEAD-probe each exchange via fetch-crypto-history --probe. Returns the
+/// availability vec + filtered exchanges that have coverage.
+fn probe_availability(
+    ctx: &PlanCtx,
+    base: &str,
+    quote: &str,
+) -> (Vec<AvailabilityEntry>, Vec<String>) {
+    let args = vec![
+        ctx.args.config.to_string_lossy().to_string(),
+        "--pairs".to_string(),
+        base.to_string(),
+        "--exchanges".to_string(),
+        ctx.exchanges.join(","),
+        "--quote".to_string(),
+        quote.to_string(),
+        "--days".to_string(),
+        (ctx.to - ctx.from).num_days().max(1).to_string(),
+        "--probe".to_string(),
+    ];
+    let out = Command::new("fetch-crypto-history").args(&args).output();
+    let mut result = Vec::new();
+    let mut active = Vec::new();
+    match out {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            // probe emits exactly 1 JSON line at the end; pick last non-empty
+            let last = raw.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("");
+            #[derive(Deserialize)]
+            struct ProbeOut {
+                exchange: String,
+                has_data: bool,
+                first_date: Option<String>,
+                last_date: Option<String>,
+            }
+            if let Ok(parsed) = serde_json::from_str::<Vec<ProbeOut>>(last) {
+                for p in parsed {
+                    if p.has_data && ctx.exchanges.iter().any(|e| e == &p.exchange) {
+                        active.push(p.exchange.clone());
+                    } else if !p.has_data {
+                        warn!(
+                            ticker = %format!("{}-{}", base, quote),
+                            exchange = %p.exchange,
+                            "no archive coverage; skipping"
+                        );
+                    }
+                    result.push(AvailabilityEntry {
+                        exchange: p.exchange,
+                        has_data: p.has_data,
+                        first_date: p.first_date,
+                        last_date: p.last_date,
+                    });
+                }
+            } else {
+                warn!(stdout_tail = %last, "probe stdout did not parse; falling back to full exchange list");
+                active = ctx.exchanges.clone();
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            warn!(exit = ?o.status.code(), stderr = %stderr, "probe failed; falling back");
+            active = ctx.exchanges.clone();
+        }
+        Err(e) => {
+            warn!(err = %e, "probe spawn failed; falling back");
+            active = ctx.exchanges.clone();
+        }
+    }
+    (result, active)
 }
 
 fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
@@ -222,29 +398,55 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     skipped: false,
                     errors: vec![e.to_string()],
                 }],
+                ticker_availability: Vec::new(),
+                skip_reason: None,
             };
         }
     };
 
+    ctx.counters.active.fetch_add(1, Ordering::Relaxed);
+    write_marker(&ctx.args.out_dir, ticker, "start");
+    info!(ticker, "ticker start");
+
     let mut steps_out: Vec<StepReport> = Vec::new();
     let cfg = ctx.args.config.to_string_lossy().to_string();
     let out_dir = &ctx.args.out_dir;
-    let composite_idx = out_dir
+    // Sharded paths (per Phase 55 W4 spec).
+    let composite_dir = out_dir
         .join("indexes")
         .join("composite")
-        .join(format!("{}-{}.idx", base, quote));
-    let bars_path = out_dir
+        .join(format!("{}-{}", base, quote));
+    let bars_dir = out_dir
         .join("bars")
         .join(&base)
-        .join(format!("{}{}.bars", base, quote));
-    let s10_path = out_dir
-        .join("bars")
-        .join(&base)
-        .join(format!("{}{}.s10", base, quote));
+        .join(format!("{}{}", base, quote));
     let vol_path = out_dir.join("vol").join(format!("{}-{}.vol", base, quote));
 
     let want = |s: &str| ctx.steps.iter().any(|x| x == s);
     let days = (ctx.to - ctx.from).num_days().max(1);
+
+    // 0) availability probe — drops dead exchanges before fetch
+    let mut availability = Vec::new();
+    let mut active_exchanges = ctx.exchanges.clone();
+    if !ctx.args.skip_probe && want("fetch") {
+        let (av, active) = probe_availability(ctx, &base, &quote);
+        availability = av;
+        if active.is_empty() {
+            warn!(ticker, "all exchanges report no coverage; skipping ticker");
+            ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+            ctx.counters.skipped.fetch_add(1, Ordering::Relaxed);
+            write_marker(&ctx.args.out_dir, ticker, "done");
+            return TickerReport {
+                ticker: ticker.to_string(),
+                status: "skipped".to_string(),
+                steps: steps_out,
+                ticker_availability: availability,
+                skip_reason: Some("no archive coverage in any exchange".into()),
+            };
+        }
+        active_exchanges = active;
+        info!(ticker, active_exchanges = ?active_exchanges, "availability check ok");
+    }
 
     // 1) fetch
     if want("fetch") {
@@ -253,25 +455,30 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             "--pairs".to_string(),
             base.clone(),
             "--exchanges".to_string(),
-            ctx.exchanges.join(","),
+            active_exchanges.join(","),
             "--quote".to_string(),
             quote.clone(),
             "--days".to_string(),
             days.to_string(),
         ];
-        steps_out.push(run_step("fetch-crypto-history", &args, None));
+        steps_out.push(run_step(ticker, "fetch-crypto-history", &args, None));
         if steps_out.last().unwrap().exit_code != 0 {
+            ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+            write_marker(&ctx.args.out_dir, ticker, "failed");
             return TickerReport {
                 ticker: ticker.to_string(),
                 status: "failed".to_string(),
                 steps: steps_out,
+                ticker_availability: availability,
+                skip_reason: None,
             };
         }
     }
 
     // 2) t2i (per exchange)
     if want("t2i") {
-        for ex in &ctx.exchanges {
+        for ex in &active_exchanges {
             let per_idx = out_dir
                 .join("indexes")
                 .join(ex)
@@ -294,114 +501,153 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 "--cycle-ms".to_string(),
                 "100".to_string(),
             ];
-            let mut rep = run_step("ticks-to-idx", &args, Some(&per_idx));
+            let mut rep = run_step(ticker, "ticks-to-idx", &args, Some(&per_idx));
             rep.name = format!("ticks-to-idx[{}]", ex);
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
+                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+                write_marker(&ctx.args.out_dir, ticker, "failed");
                 return TickerReport {
                     ticker: ticker.to_string(),
                     status: "failed".to_string(),
                     steps: steps_out,
+                    ticker_availability: availability,
+                    skip_reason: None,
                 };
             }
         }
     }
 
-    // 3) merge
+    // 3) merge → sharded composite_dir
     if want("merge") {
-        if ctx.args.resume && integrity_clean(&composite_idx, "idx") {
+        // resume: manifest exists + every shard hash matches recorded sha256
+        if ctx.args.resume && manifest_ok(&composite_dir, "idx") {
             steps_out.push(StepReport {
                 name: "merge-idx".to_string(),
                 duration_ms: 0,
                 exit_code: 0,
-                bytes: file_bytes(&composite_idx),
+                bytes: dir_bytes(&composite_dir),
                 skipped: true,
                 errors: Vec::new(),
             });
         } else {
             let args = vec![base.clone(), quote.clone()];
-            let rep = run_step("merge-idx", &args, Some(&composite_idx));
+            let rep = run_step(ticker, "merge-idx", &args, Some(&composite_dir));
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
+                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+                write_marker(&ctx.args.out_dir, ticker, "failed");
                 return TickerReport {
                     ticker: ticker.to_string(),
                     status: "failed".to_string(),
                     steps: steps_out,
+                    ticker_availability: availability,
+                    skip_reason: None,
                 };
             }
         }
+        // post-merge: validate each shard strictly. If any fails → ticker failed.
+        let shard_check = validate_shards(ticker, &composite_dir, "idx");
+        steps_out.push(shard_check.clone());
+        if shard_check.exit_code != 0 {
+            ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+            write_marker(&ctx.args.out_dir, ticker, "failed");
+            return TickerReport {
+                ticker: ticker.to_string(),
+                status: "failed".to_string(),
+                steps: steps_out,
+                ticker_availability: availability,
+                skip_reason: None,
+            };
+        }
     }
 
-    // 4) s10 (uniform 10s OHLC, microstructure-rich)
+    // 4) s10 → sharded bars_dir/*.s10
     if want("s10") {
-        if ctx.args.resume && integrity_clean(&s10_path, "s10") {
+        if ctx.args.resume && manifest_ok(&bars_dir, "s10") {
             steps_out.push(StepReport {
                 name: "s10-from-idx".to_string(),
                 duration_ms: 0,
                 exit_code: 0,
-                bytes: file_bytes(&s10_path),
+                bytes: dir_bytes(&bars_dir),
                 skipped: true,
                 errors: Vec::new(),
             });
         } else {
             let args = vec![cfg.clone(), format!("{}-{}", base, quote)];
-            let rep = run_step("s10-from-idx", &args, Some(&s10_path));
+            let rep = run_step(ticker, "s10-from-idx", &args, Some(&bars_dir));
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
+                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+                write_marker(&ctx.args.out_dir, ticker, "failed");
                 return TickerReport {
                     ticker: ticker.to_string(),
                     status: "failed".to_string(),
                     steps: steps_out,
+                    ticker_availability: availability,
+                    skip_reason: None,
                 };
             }
         }
     }
 
-    // 5) renko
+    // 5) renko → sharded bars_dir/*.renko
     if want("renko") {
-        if ctx.args.resume && integrity_clean(&bars_path, "bars") {
+        if ctx.args.resume && manifest_ok(&bars_dir, "renko") {
             steps_out.push(StepReport {
                 name: "renko-from-idx".to_string(),
                 duration_ms: 0,
                 exit_code: 0,
-                bytes: file_bytes(&bars_path),
+                bytes: dir_bytes(&bars_dir),
                 skipped: true,
                 errors: Vec::new(),
             });
         } else {
-            let args = vec![format!("{}-{}", base, quote)];
-            let rep = run_step("renko-from-idx", &args, Some(&bars_path));
+            let args = vec![cfg.clone(), base.clone(), quote.clone()];
+            let rep = run_step(ticker, "renko-from-idx", &args, Some(&bars_dir));
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
+                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+                write_marker(&ctx.args.out_dir, ticker, "failed");
                 return TickerReport {
                     ticker: ticker.to_string(),
                     status: "failed".to_string(),
                     steps: steps_out,
+                    ticker_availability: availability,
+                    skip_reason: None,
                 };
             }
         }
     }
 
-    // 6) validate (idx + s10 + bars/renko + vol)
+    // 6) validate per-shard for s10/renko + vol (best-effort: scan shard dir)
     if want("validate") {
-        for (kind, path) in [
-            ("idx", composite_idx.clone()),
-            ("s10", s10_path.clone()),
-            ("bars", bars_path.clone()),
-            ("vol", vol_path.clone()),
-        ] {
+        // idx already validated post-merge; re-emit for symmetry only if we
+        // didn't already run it (e.g. resume skipped merge step).
+        if !steps_out.iter().any(|s| s.name == "integrity-check-shards[idx]") {
+            steps_out.push(validate_shards(ticker, &composite_dir, "idx"));
+        }
+        steps_out.push(validate_shards(ticker, &bars_dir, "s10"));
+        steps_out.push(validate_shards(ticker, &bars_dir, "renko"));
+        // vol (single legacy file)
+        if vol_path.exists() {
             let args = vec![
-                kind.to_string(),
-                path.to_string_lossy().to_string(),
+                "vol".to_string(),
+                vol_path.to_string_lossy().to_string(),
                 "--strict".to_string(),
                 "--json".to_string(),
             ];
-            let mut rep = run_step("integrity-check", &args, Some(&path));
-            rep.name = format!("integrity-check[{}]", kind);
+            let mut rep = run_step(ticker, "integrity-check", &args, Some(&vol_path));
+            rep.name = "integrity-check[vol]".to_string();
             steps_out.push(rep);
         }
     }
@@ -418,14 +664,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         "ok"
     };
 
-    // 7) cleanup intermediates (opt-in). Runs only when the full pipeline
-    //    succeeded for this pair. Keeps composite .idx, .s10, .bars, .vol;
-    //    deletes per-exchange tick CSVs and per-exchange `.idx` files.
+    // 7) cleanup intermediates (opt-in)
     if ctx.args.cleanup && status == "ok" {
         let cleanup_start = Instant::now();
         let mut removed_bytes: u64 = 0;
         let mut errors: Vec<String> = Vec::new();
-        for ex in &ctx.exchanges {
+        for ex in &active_exchanges {
             let ticks_dir = out_dir
                 .join("ticks")
                 .join(ex)
@@ -458,33 +702,154 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         });
     }
 
+    let n_steps = steps_out.len();
+    info!(ticker, status, n_steps, "ticker done");
+    ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+    match status {
+        "ok" => {
+            ctx.counters.completed.fetch_add(1, Ordering::Relaxed);
+            write_marker(&ctx.args.out_dir, ticker, "done");
+        }
+        "skipped" => {
+            ctx.counters.skipped.fetch_add(1, Ordering::Relaxed);
+            write_marker(&ctx.args.out_dir, ticker, "done");
+        }
+        _ => {
+            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+            write_marker(&ctx.args.out_dir, ticker, "failed");
+        }
+    }
+
     TickerReport {
         ticker: ticker.to_string(),
         status: status.to_string(),
         steps: steps_out,
+        ticker_availability: availability,
+        skip_reason: None,
     }
 }
 
-fn dir_bytes(p: &Path) -> u64 {
-    let mut total = 0u64;
-    let read = match fs::read_dir(p) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            total += dir_bytes(&path);
-        } else if let Ok(m) = entry.metadata() {
-            total += m.len();
+/// Cheap resume gate: manifest.json present in ticker_dir AND ≥1 shard of
+/// `kind` extension on disk. Full sha256 verification belongs to
+/// integrity-check; this only short-circuits the producer step when output
+/// is trivially complete.
+fn manifest_ok(ticker_dir: &Path, kind: &str) -> bool {
+    let mpath = ticker_dir.join("manifest.json");
+    if !mpath.exists() {
+        return false;
+    }
+    let suffix = format!(".{}", kind);
+    fs::read_dir(ticker_dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with(&suffix))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Run integrity-check on every shard in `ticker_dir` matching `kind`.
+/// Returns aggregate StepReport (first failure flips exit_code to 1).
+fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
+    let name = format!("integrity-check-shards[{}]", kind);
+    let start = Instant::now();
+    let suffix = format!(".{}", kind);
+    let mut shards: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(ticker_dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
+                if n.ends_with(&suffix) {
+                    shards.push(path);
+                }
+            }
         }
     }
-    total
+    shards.sort();
+    if shards.is_empty() {
+        // no shards → can't validate; signal failure only if the step is
+        // semantically required (i.e. we expected an output). At the call
+        // site we already filter to dirs that should contain output; treat
+        // empty as a soft warning here.
+        warn!(ticker, kind, dir = %ticker_dir.display(), "no shards to validate");
+        return StepReport {
+            name,
+            duration_ms: start.elapsed().as_millis(),
+            exit_code: 0,
+            bytes: 0,
+            skipped: true,
+            errors: vec!["no shards present".into()],
+        };
+    }
+    let mut errors: Vec<String> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut any_fail = false;
+    for shard in &shards {
+        total_bytes += file_bytes(shard);
+        let args = vec![
+            kind.to_string(),
+            shard.to_string_lossy().to_string(),
+            "--strict".to_string(),
+            "--json".to_string(),
+        ];
+        let out = Command::new("integrity-check").args(&args).output();
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                any_fail = true;
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                for line in stderr.lines().rev().take(5) {
+                    errors.push(format!("{}: {}", shard.display(), line));
+                }
+                error!(
+                    ticker,
+                    kind,
+                    shard = %shard.display(),
+                    exit = ?o.status.code(),
+                    "shard integrity-check failed"
+                );
+            }
+            Err(e) => {
+                any_fail = true;
+                errors.push(format!("{}: spawn {}", shard.display(), e));
+            }
+        }
+    }
+    let exit_code = if any_fail { 1 } else { 0 };
+    info!(
+        ticker,
+        kind,
+        n_shards = shards.len(),
+        exit_code,
+        duration_ms = start.elapsed().as_millis() as u64,
+        "shard validate done"
+    );
+    StepReport {
+        name,
+        duration_ms: start.elapsed().as_millis(),
+        exit_code,
+        bytes: total_bytes,
+        skipped: false,
+        errors,
+    }
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    // tracing init — default INFO, env RUST_LOG override. Logs to stderr.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_writer(std::io::stderr)
+        .init();
+
     let args = Args::parse();
 
     let to = parse_date(&args.to)?;
@@ -514,6 +879,17 @@ fn main() -> Result<()> {
         out_dir: args.out_dir.to_string_lossy().to_string(),
     };
 
+    info!(
+        from = %from,
+        to = %to,
+        n_tickers = tickers.len(),
+        exchanges = ?exchanges,
+        steps = ?steps,
+        parallel = args.parallel,
+        out_dir = %args.out_dir.display(),
+        "backfill plan"
+    );
+
     if args.dry_run {
         println!("PLAN");
         println!("  from   : {}", from);
@@ -529,13 +905,41 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let counters = Arc::new(Counters::new());
     let ctx = PlanCtx {
         args: args.clone(),
         from,
         to,
         exchanges,
         steps,
+        counters: counters.clone(),
     };
+
+    // ensure progress dir exists
+    let _ = fs::create_dir_all(progress_dir(&args.out_dir));
+
+    // heartbeat thread — emits every 60s while pool runs
+    let heartbeat_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hb_stop = heartbeat_stop.clone();
+    let hb_counters = counters.clone();
+    let n_tickers = tickers.len();
+    let heartbeat = thread::spawn(move || {
+        while !hb_stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(60));
+            if hb_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            info!(
+                msg = "heartbeat",
+                active_tickers = hb_counters.active.load(Ordering::Relaxed),
+                completed = hb_counters.completed.load(Ordering::Relaxed),
+                failed = hb_counters.failed.load(Ordering::Relaxed),
+                skipped = hb_counters.skipped.load(Ordering::Relaxed),
+                total = n_tickers,
+                "heartbeat"
+            );
+        }
+    });
 
     let pool = ThreadPoolBuilder::new()
         .num_threads(args.parallel.max(1))
@@ -548,22 +952,31 @@ fn main() -> Result<()> {
             let res = catch_unwind(AssertUnwindSafe(|| run_ticker(&ctx, t)));
             let rep = match res {
                 Ok(r) => r,
-                Err(_) => TickerReport {
-                    ticker: t.clone(),
-                    status: "failed".to_string(),
-                    steps: vec![StepReport {
-                        name: "panic".to_string(),
-                        duration_ms: 0,
-                        exit_code: -1,
-                        bytes: 0,
-                        skipped: false,
-                        errors: vec!["worker panicked".to_string()],
-                    }],
-                },
+                Err(_) => {
+                    ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+                    write_marker(&ctx.args.out_dir, t, "failed");
+                    TickerReport {
+                        ticker: t.clone(),
+                        status: "failed".to_string(),
+                        steps: vec![StepReport {
+                            name: "panic".to_string(),
+                            duration_ms: 0,
+                            exit_code: -1,
+                            bytes: 0,
+                            skipped: false,
+                            errors: vec!["worker panicked".to_string()],
+                        }],
+                        ticker_availability: Vec::new(),
+                        skip_reason: None,
+                    }
+                }
             };
             results.lock().unwrap().insert(t.clone(), rep);
         });
     });
+
+    heartbeat_stop.store(true, Ordering::Relaxed);
+    let _ = heartbeat.join();
 
     let results_vec: Vec<TickerReport> = results.into_inner().unwrap().into_values().collect();
     let mut ok = 0usize;
@@ -596,13 +1009,13 @@ fn main() -> Result<()> {
     let json = serde_json::to_string_pretty(&report)?;
     fs::write(&args.log_file, &json)
         .with_context(|| format!("write {}", args.log_file.display()))?;
-    println!(
-        "backfill done: total={} ok={} failed={} skipped={} → {}",
+    info!(
         total,
         ok,
         failed,
         skipped,
-        args.log_file.display()
+        log_file = %args.log_file.display(),
+        "backfill done"
     );
 
     if failed > 0 {

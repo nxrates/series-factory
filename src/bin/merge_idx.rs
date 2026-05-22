@@ -1,10 +1,12 @@
 //! Fan four per-provider `.idx` AppendLogs into a single cross-provider
-//! `<BASE>-<QUOTE>.idx` via TDWAP.
+//! `<BASE>-<QUOTE>/<YYYY-MM-DD>.idx` set of daily shards via TDWAP.
 //!
 //! Mirrors the prod aggregator's inner cycle: at every composite cycle we
 //! have one `ProviderEntry` per active provider (built from the last Index
 //! each file delivered), feed that slice to `compute_vwap_at`, and emit the
-//! resulting composite Index to a new AppendLog on disk.
+//! resulting composite Index to the daily shard keyed by
+//! `boundary_ts.utc_date()`. Per spec (`docs/sharding-spec.md`) all
+//! artifacts are sharded by `open_ts.date_utc()` — daily granularity.
 //!
 //! Default weights (locked in for the BTC/USDT offline replay):
 //!   binance=40, okx=20, bybit=30, bitget=10
@@ -18,9 +20,11 @@
 //!     [--weight binance=40 --weight okx=20 --weight bybit=30 --weight bitget=10]
 //!
 //! Inputs:  `$NXR_DATA_INDEXES/<exchange>/<BASE>-<QUOTE>.idx` for each exchange
-//! Output:  `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>.idx`
+//! Output:  `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>/<YYYY-MM-DD>.idx`
+//!         + `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>/manifest.json`
 
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use clap::Parser;
 use mitch::common::message_type;
 use mitch::header::MitchHeader;
@@ -31,8 +35,12 @@ use nxr_sdk::{
     resolve_ticker_id,
     tdwap::ProviderEntry,
 };
+use series_factory::sharding::{
+    list_shards, manifest_path, sha256_file, shard_path, ts_ms_to_utc_date, Manifest, ShardEntry,
+    write_manifest,
+};
 use std::collections::BinaryHeap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -47,7 +55,7 @@ const DEFAULT_OFFLINE_WEIGHTS: &[(&str, f64)] = &[
 ];
 
 #[derive(Parser, Debug)]
-#[command(about = "TDWAP-merge per-provider .idx into a composite .idx.")]
+#[command(about = "TDWAP-merge per-provider .idx into a per-day-sharded composite idx dir.")]
 struct Args {
     base: String,
     quote: String,
@@ -64,9 +72,9 @@ struct Args {
     ///   --weight binance=40 --weight okx=20
     #[arg(long = "weight")]
     weight_overrides: Vec<String>,
-    /// Override the output path.
+    /// Override the output directory (per-ticker shard root).
     #[arg(long)]
-    out: Option<PathBuf>,
+    out_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -76,7 +84,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = nxr_sdk::NxrConfig::from_env();
 
-    // --- Resolve providers + weights ---
+    // resolve providers + weights
     let weight_map = resolve_weights(&args)?;
     let exchanges: Vec<String> = if args.exchanges.is_empty() {
         DEFAULT_OFFLINE_WEIGHTS.iter().map(|(n, _)| n.to_string()).collect()
@@ -84,22 +92,26 @@ fn main() -> Result<()> {
         args.exchanges.clone()
     };
 
-    let ticker_id = resolve_ticker_id(&format!("{}/{}", args.base, args.quote));
+    let base_uc = args.base.to_uppercase();
+    let quote_uc = args.quote.to_uppercase();
+    let ticker_str = format!("{}-{}", base_uc, quote_uc);
+    let ticker_id = resolve_ticker_id(&format!("{}/{}", base_uc, quote_uc));
     let indexes_dir = PathBuf::from(&cfg.indexes_dir);
-    let out_path = args.out.unwrap_or_else(|| {
+    // shard root = <indexes_dir>/composite/<BASE>-<QUOTE>/
+    let out_dir = args.out_dir.clone().unwrap_or_else(|| {
         indexes_dir
             .join("composite")
-            .join(format!("{}-{}.idx", args.base.to_uppercase(), args.quote.to_uppercase()))
+            .join(format!("{}-{}", base_uc, quote_uc))
     });
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("create_dir_all {}", out_dir.display()))?;
 
-    // --- Open each provider's .idx and load it into RAM as a time-sorted Vec ---
-    // The raw .idx files are small (a few GiB total for 4x2yr at 50ms with
-    // sparse windows), so full load is fine and simplifies the k-way merge.
+    // open per-provider .idx as time-sorted streams
     let mut sources = Vec::<SourceStream>::with_capacity(exchanges.len());
     for exch in &exchanges {
         let path = indexes_dir
             .join(exch)
-            .join(format!("{}-{}.idx", args.base.to_uppercase(), args.quote.to_uppercase()));
+            .join(format!("{}-{}.idx", base_uc, quote_uc));
         let provider_id = nxr_sdk::providers::get_market_provider_id_by_name(exch)
             .with_context(|| format!("unknown exchange {}", exch))?;
         let base_weight = *weight_map
@@ -125,7 +137,7 @@ fn main() -> Result<()> {
         anyhow::bail!("no per-provider .idx files loaded; nothing to merge");
     }
 
-    // --- k-way merge heap keyed on head record timestamp ---
+    // k-way merge heap keyed on head record timestamp
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(sources.len());
     for i in 0..sources.len() {
         if let Some(ts) = sources[i].peek_ts() {
@@ -133,22 +145,18 @@ fn main() -> Result<()> {
         }
     }
 
-    // Per-provider "last known state" slots. Each slot carries a
-    // `ProviderEntry` that updates on every new Index from that source.
+    // per-provider "last known state" slots
     let mut slots: Vec<Option<ProviderEntry>> = vec![None; sources.len()];
 
-    // Simulated clock: anchor at the earliest record's epoch, then advance
-    // by (tick_ms - anchor_ms) so `compute_vwap_at`'s time-decay sees data
-    // time rather than wall-clock.
+    // simulated clock anchored at earliest record
     let anchor_instant = Instant::now();
     let anchor_ms = heap.peek().map(|e| e.ts_ms).unwrap_or(0);
     let sim_now = |ms: i64| -> Instant {
         anchor_instant + Duration::from_millis((ms - anchor_ms).max(0) as u64)
     };
 
-    // --- Output log ---
-    let mut out: AppendLog<IndexRecord> = AppendLog::open(&out_path)
-        .with_context(|| format!("open composite AppendLog {}", out_path.display()))?;
+    // sharded writer: rotates AppendLog on UTC date boundary
+    let mut writer = ShardedWriter::new(out_dir.clone());
 
     let cycle_ms = args.cycle_ms as i64;
     let mut next_cycle_ms: Option<i64> = None;
@@ -161,8 +169,7 @@ fn main() -> Result<()> {
         updates += 1;
         let now = sim_now(ts_ms);
 
-        // Emit composites for every cycle boundary strictly before or equal
-        // to this record's timestamp.
+        // emit composites for every cycle boundary <= record ts
         if next_cycle_ms.is_none() {
             next_cycle_ms = Some(ts_ms + cycle_ms);
         }
@@ -177,11 +184,10 @@ fn main() -> Result<()> {
                     boundary_now,
                 ) {
                     let mts = mitch::timestamp::from_epoch_ms(boundary);
-                    // provider_id=0 for the composite: it isn't a provider,
-                    // downstream readers treat it as "aggregate".
+                    // provider_id=0 ∵ composite ! single provider
                     let header = MitchHeader::new(message_type::INDEX, 0, mts, 1);
-                    out.append(&IndexRecord { header, index: composite })
-                        .context("composite AppendLog append failed")?;
+                    let rec_out = IndexRecord { header, index: composite };
+                    writer.append(boundary, &rec_out)?;
                     composites_written += 1;
                 }
                 dirty = false;
@@ -189,7 +195,7 @@ fn main() -> Result<()> {
             next_cycle_ms = Some(next_cycle_ms.unwrap() + cycle_ms);
         }
 
-        // Merge the new per-provider Index into the slot.
+        // merge new per-provider Index into slot
         let base_weight = sources[source_idx].base_weight;
         match &mut slots[source_idx] {
             Some(entry) => entry.update_at(rec.index, now),
@@ -202,8 +208,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Final flush at the last observed cycle boundary if there is pending
-    // dirty state (e.g. the last record arrived just before a boundary).
+    // final flush at last observed cycle boundary
     if dirty {
         let boundary = next_cycle_ms.unwrap();
         let boundary_now = sim_now(boundary);
@@ -215,19 +220,123 @@ fn main() -> Result<()> {
         ) {
             let mts = mitch::timestamp::from_epoch_ms(boundary);
             let header = MitchHeader::new(message_type::INDEX, 0, mts, 1);
-            out.append(&IndexRecord { header, index: composite })?;
+            let rec_out = IndexRecord { header, index: composite };
+            writer.append(boundary, &rec_out)?;
             composites_written += 1;
         }
     }
-    out.flush().context("composite AppendLog final flush")?;
+    writer.close()?;
+
+    // build manifest by scanning shards
+    let mut manifest = Manifest::new(ticker_str.clone(), ticker_id, "idx");
+    for (date, path) in list_shards(&out_dir, "idx")? {
+        let entry = shard_entry_for_idx(date, &path)?;
+        manifest.upsert(entry);
+    }
+    let mpath = manifest_path(&out_dir);
+    write_manifest(&mpath, &manifest)?;
 
     info!(
         composites_written,
         provider_updates = updates,
-        out = %out_path.display(),
+        shards = manifest.shards.len(),
+        out_dir = %out_dir.display(),
+        manifest = %mpath.display(),
         "merge-idx complete"
     );
     Ok(())
+}
+
+/// Per-day AppendLog rotator. Rolls on UTC date boundary.
+struct ShardedWriter {
+    out_dir: PathBuf,
+    current: Option<(NaiveDate, AppendLog<IndexRecord>)>,
+}
+
+impl ShardedWriter {
+    fn new(out_dir: PathBuf) -> Self {
+        Self { out_dir, current: None }
+    }
+
+    fn append(&mut self, ts_ms: i64, rec: &IndexRecord) -> Result<()> {
+        let date = ts_ms_to_utc_date(ts_ms);
+        let need_rotate = match &self.current {
+            Some((d, _)) => *d != date,
+            None => true,
+        };
+        if need_rotate {
+            // close prior shard ∵ AppendLog has Drop fsync
+            self.current = None;
+            let path = shard_path(&self.out_dir, date, "idx");
+            let log = AppendLog::<IndexRecord>::open(&path)
+                .with_context(|| format!("open shard {}", path.display()))?;
+            self.current = Some((date, log));
+        }
+        self.current.as_mut().unwrap().1.append(rec)?;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if let Some((_, mut log)) = self.current.take() {
+            log.flush()?;
+        }
+        Ok(())
+    }
+}
+
+/// Build a manifest entry for a `.idx` shard by streaming the file once.
+fn shard_entry_for_idx(date: NaiveDate, path: &Path) -> Result<ShardEntry> {
+    use std::io::Read;
+    let rec_size = core::mem::size_of::<IndexRecord>();
+    let size_bytes = std::fs::metadata(path)?.len();
+    let n_records = if rec_size == 0 { 0 } else { size_bytes / rec_size as u64 };
+    let mut f = std::fs::File::open(path)?;
+    let mut first_ts: i64 = i64::MAX;
+    let mut last_ts: i64 = i64::MIN;
+    let mut buf = vec![0u8; 4096 * rec_size];
+    loop {
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match f.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        if filled % rec_size != 0 {
+            anyhow::bail!("shard {} not aligned to IndexRecord", path.display());
+        }
+        let recs: &[IndexRecord] = bytemuck::cast_slice(&buf[..filled]);
+        if let Some(r) = recs.first() {
+            let ts = mitch::timestamp::to_epoch_ms(r.header.get_timestamp());
+            if ts < first_ts {
+                first_ts = ts;
+            }
+        }
+        if let Some(r) = recs.last() {
+            let ts = mitch::timestamp::to_epoch_ms(r.header.get_timestamp());
+            if ts > last_ts {
+                last_ts = ts;
+            }
+        }
+        if filled < buf.len() {
+            break;
+        }
+    }
+    if n_records == 0 {
+        first_ts = 0;
+        last_ts = 0;
+    }
+    Ok(ShardEntry {
+        date: date.format("%Y-%m-%d").to_string(),
+        first_ts,
+        last_ts,
+        n_records,
+        size_bytes,
+        sha256: sha256_file(path)?,
+    })
 }
 
 fn resolve_weights(args: &Args) -> Result<std::collections::BTreeMap<String, f64>> {
@@ -353,7 +462,7 @@ impl SourceStream {
 /// deterministic ordering.
 #[derive(PartialEq, Eq)]
 struct HeapEntry {
-    // Inverted so `BinaryHeap` (max-heap) gives us smallest-first.
+    // inverted so BinaryHeap (max-heap) gives smallest-first
     neg_ts_ms: i64,
     neg_idx: usize,
     ts_ms: i64,

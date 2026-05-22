@@ -3,6 +3,7 @@ pub mod bar_construction;
 pub mod display;
 pub mod merge;
 pub mod sampler;
+pub mod sharding;
 pub mod sources;
 pub mod stats;
 pub mod types;
