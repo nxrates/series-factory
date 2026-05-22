@@ -383,6 +383,55 @@ fn probe_availability(
     (result, active)
 }
 
+/// Delete a ticker's raw exchange staging once its composite `.idx` is built
+/// and validated. `ticks/<exch>/<BASE><QUOTE>/` and the per-provider
+/// `indexes/<exch>/<BASE>-<QUOTE>.idx` are fully consumed by `merge-idx` — the
+/// downstream s10 / renko / integrity steps all read the composite `.idx`,
+/// never the raw staging. Purging per-ticker here (rather than once at the end
+/// of the whole batch) keeps the data volume bounded: a 13-ticker x 2y backfill
+/// otherwise accumulates every ticker's raw ticks until the batch finishes,
+/// which overran the 500Gi volume.
+fn cleanup_ticker_staging(
+    out_dir: &std::path::Path,
+    exchanges: &[String],
+    base: &str,
+    quote: &str,
+) -> StepReport {
+    let start = Instant::now();
+    let mut removed_bytes: u64 = 0;
+    let mut errors: Vec<String> = Vec::new();
+    for ex in exchanges {
+        let ticks_dir = out_dir
+            .join("ticks")
+            .join(ex)
+            .join(format!("{}{}", base, quote));
+        if ticks_dir.exists() {
+            removed_bytes += dir_bytes(&ticks_dir);
+            if let Err(e) = fs::remove_dir_all(&ticks_dir) {
+                errors.push(format!("rm -r {}: {}", ticks_dir.display(), e));
+            }
+        }
+        let per_idx = out_dir
+            .join("indexes")
+            .join(ex)
+            .join(format!("{}-{}.idx", base, quote));
+        if per_idx.exists() {
+            removed_bytes += file_bytes(&per_idx);
+            if let Err(e) = fs::remove_file(&per_idx) {
+                errors.push(format!("rm {}: {}", per_idx.display(), e));
+            }
+        }
+    }
+    StepReport {
+        name: "cleanup-staging".to_string(),
+        duration_ms: start.elapsed().as_millis(),
+        exit_code: if errors.is_empty() { 0 } else { 1 },
+        bytes: removed_bytes,
+        skipped: false,
+        errors,
+    }
+}
+
 fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     let (base, quote) = match split_pair(ticker) {
         Ok(x) => x,
@@ -565,6 +614,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 skip_reason: None,
             };
         }
+
+        // Composite .idx built + validated — the raw ticks/<exch> staging and
+        // per-provider .idx are now fully consumed. Purge them immediately,
+        // per-ticker, so a long multi-ticker backfill keeps the data volume
+        // bounded instead of hoarding every ticker's raw ticks until the end.
+        steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
     }
 
     // 4) s10 → sharded bars_dir/*.s10
@@ -664,43 +719,9 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         "ok"
     };
 
-    // 7) cleanup intermediates (opt-in)
-    if ctx.args.cleanup && status == "ok" {
-        let cleanup_start = Instant::now();
-        let mut removed_bytes: u64 = 0;
-        let mut errors: Vec<String> = Vec::new();
-        for ex in &active_exchanges {
-            let ticks_dir = out_dir
-                .join("ticks")
-                .join(ex)
-                .join(format!("{}{}", base, quote));
-            if ticks_dir.exists() {
-                removed_bytes += dir_bytes(&ticks_dir);
-                if let Err(e) = fs::remove_dir_all(&ticks_dir) {
-                    errors.push(format!("rm -r {}: {}", ticks_dir.display(), e));
-                }
-            }
-            let per_idx = out_dir
-                .join("indexes")
-                .join(ex)
-                .join(format!("{}-{}.idx", base, quote));
-            if per_idx.exists() {
-                removed_bytes += file_bytes(&per_idx);
-                if let Err(e) = fs::remove_file(&per_idx) {
-                    errors.push(format!("rm {}: {}", per_idx.display(), e));
-                }
-            }
-        }
-        let exit_code = if errors.is_empty() { 0 } else { 1 };
-        steps_out.push(StepReport {
-            name: "cleanup".to_string(),
-            duration_ms: cleanup_start.elapsed().as_millis(),
-            exit_code,
-            bytes: removed_bytes,
-            skipped: false,
-            errors,
-        });
-    }
+    // Raw staging cleanup is no longer end-of-run: it now happens per-ticker
+    // immediately after the composite `.idx` is built + validated (see step 3),
+    // so the data volume stays bounded across a long multi-ticker backfill.
 
     let n_steps = steps_out.len();
     info!(ticker, status, n_steps, "ticker done");
