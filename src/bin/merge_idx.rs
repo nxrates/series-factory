@@ -369,17 +369,31 @@ const WINDOW: usize = 4096;
 
 impl SourceStream {
     fn load(path: &std::path::Path, _provider_id: u16, base_weight: f64) -> Result<Self> {
-        let file = std::fs::File::open(path)
+        // Open RW so we can self-heal a torn trailing record below.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
             .with_context(|| format!("open {}", path.display()))?;
         let len = file.metadata()?.len() as usize;
         let rec_size = core::mem::size_of::<IndexRecord>();
+        // Tolerate a trailing partial record. ticks-to-idx writes via mmap +
+        // AppendLog; if it is interrupted mid-write (OOM kill, pod restart,
+        // SIGKILL), the final 1..rec_size bytes are a torn write. Discarding
+        // those bytes is safe and idempotent — IndexRecord is fixed-stride,
+        // and at most one record is lost.
         if len > 0 && len % rec_size != 0 {
-            anyhow::bail!(
-                "{} size {} is not a multiple of IndexRecord ({})",
-                path.display(),
-                len,
-                rec_size
+            let aligned = (len / rec_size) * rec_size;
+            let trailing = len - aligned;
+            warn!(
+                path = %path.display(),
+                size = len,
+                trailing,
+                aligned,
+                "trailing partial IndexRecord detected; auto-healing via set_len"
             );
+            file.set_len(aligned as u64)
+                .with_context(|| format!("truncate {} to {}", path.display(), aligned))?;
         }
         let mut s = Self {
             file,
