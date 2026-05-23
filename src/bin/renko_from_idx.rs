@@ -20,7 +20,7 @@ use mitch::timestamp;
 use nxr_sdk::{BarAccumulator, ipc::record::IndexRecord, parkinson_sigma, resolve_ticker_id};
 use serde::Deserialize;
 use series_factory::sharding::{
-    bars_dir, composite_dir, list_shards, manifest_path, read_manifest, sha256_file,
+    bars_dir_pair, composite_dir, list_shards, manifest_path, read_manifest, sha256_file,
     shard_path, ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest, ShardEntry,
 };
 use series_factory::{
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
     let out_dir = args
         .out_dir
         .clone()
-        .unwrap_or_else(|| bars_dir(&data_root_bars, &base, &quote));
+        .unwrap_or_else(|| bars_dir_pair(&data_root_bars, &base, &quote));
 
     info!(in_dir = %in_dir.display(), out_dir = %out_dir.display(), "renko-from-idx starting (sharded)");
 
