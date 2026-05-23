@@ -137,9 +137,12 @@ fn migrate_idx(
     force: bool,
 ) -> Result<()> {
     let indexes = root.join("indexes");
-    let mut per_id: BTreeMap<u64, Vec<IndexRecord>> = BTreeMap::new();
 
-    // 1. Live flat files: indexes/<id>.idx (skip .bak and the <id>/ subdirs).
+    // Discover the ticker set + each ticker's source paths WITHOUT loading any
+    // record bodies. Flat live file: indexes/<id>.idx. Backfill: composite/
+    // <BASE-QUOTE>/ — self-identifying (read 1 record of its newest shard to
+    // get the ticker_id).
+    let mut flat: BTreeMap<u64, PathBuf> = BTreeMap::new();
     if indexes.is_dir() {
         for e in fs::read_dir(&indexes).with_context(|| format!("read_dir {}", indexes.display()))? {
             let p = e?.path();
@@ -148,80 +151,130 @@ fn migrate_idx(
             }
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.ends_with(".idx") {
-                continue; // skips .idx.bak (ends_with .bak)
+                continue; // skips .idx.bak
             }
-            let stem = &name[..name.len() - 4];
-            if let Ok(id) = stem.parse::<u64>() {
-                if !allowed(id) {
-                    continue;
-                }
-                let recs = shard::read_shard_aligned::<IndexRecord>(&p)?;
-                per_id.entry(id).or_default().extend(recs);
+            if let Ok(id) = name[..name.len() - 4].parse::<u64>() {
+                flat.insert(id, p);
             }
         }
     }
-
-    // 2. Backfill composite shards: records self-identify via index.ticker.
-    let composite = indexes.join("composite");
-    if composite.is_dir() {
-        for e in fs::read_dir(&composite)? {
+    let mut composite: BTreeMap<u64, PathBuf> = BTreeMap::new();
+    let comp_root = indexes.join("composite");
+    if comp_root.is_dir() {
+        for e in fs::read_dir(&comp_root)? {
             let dir = e?.path();
             if !dir.is_dir() {
                 continue;
             }
-            for (_d, path) in shard::list_shards(&dir, "idx")? {
-                for r in shard::read_shard_aligned::<IndexRecord>(&path)? {
-                    let id = r.index.ticker;
-                    if allowed(id) {
-                        per_id.entry(id).or_default().push(r);
-                    }
+            // Read the id from the first record of the newest shard (cheap).
+            if let Some((_d, path)) = shard::list_shards(&dir, "idx")?.last() {
+                if let Some(r) = shard::read_shard_aligned::<IndexRecord>(path)?.first() {
+                    composite.insert(r.index.ticker, dir);
                 }
             }
         }
     }
 
-    let mut total_in = 0usize;
+    let mut ids: Vec<u64> = flat.keys().chain(composite.keys()).copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+
     let mut total_written = 0usize;
-    for (id, mut recs) in per_id {
+    let mut total_seen = 0usize;
+    for id in ids {
+        if !allowed(id) {
+            continue;
+        }
         let idx_dir = shard::idx_dir(root, id);
         if force && idx_dir.exists() {
             fs::remove_dir_all(&idx_dir).ok();
         }
         let wm = idx_watermark(&idx_dir);
-        recs.retain(|r| {
-            let ts = r.shard_ts_ms();
-            ts >= cutoff_ms && ts > wm
-        });
-        recs.sort_by_key(|r| r.shard_ts_ms());
-        total_in += recs.len();
-        if recs.is_empty() {
-            continue;
-        }
-        if report_only {
-            println!(
-                "  [idx] {id}: {} new records (>{wm}), would write to {}",
-                recs.len(),
-                idx_dir.display()
-            );
-            continue;
-        }
-        let mut writer = IdxShardWriter::open(root, id, true)
-            .with_context(|| format!("open writer for {id}"))?;
+
+        // Live flat file (small, ts-ascending). Load it to learn live_start so
+        // backfill that overlaps the live window is dropped (live is canonical).
+        let flat_recs: Vec<IndexRecord> = match flat.get(&id) {
+            Some(p) => shard::read_shard_aligned::<IndexRecord>(p)?,
+            None => Vec::new(),
+        };
+        let live_start = flat_recs.first().map(|r| r.shard_ts_ms()).unwrap_or(i64::MAX);
+
+        // Open writer once per ticker (report_only: simulate the gate inline so
+        // we never write). The writer seeds last_bid/ask from the tail (idempotent).
+        let mut writer = if report_only {
+            None
+        } else {
+            Some(IdxShardWriter::open(root, id, true).with_context(|| format!("open writer {id}"))?)
+        };
+        // Inline gate-simulation state for report mode.
+        let mut sim_last: Option<(f64, f64)> = None;
+        let mut sim_date: Option<chrono::NaiveDate> = None;
+        let mut sim_sentinel = i64::MIN;
         let mut written = 0usize;
-        for r in &recs {
-            if writer.append(r)? {
-                written += 1;
+        let mut seen = 0usize;
+
+        let mut feed = |rec: &IndexRecord,
+                        writer: &mut Option<IdxShardWriter>,
+                        written: &mut usize,
+                        seen: &mut usize|
+         -> Result<()> {
+            let ts = rec.shard_ts_ms();
+            if ts < cutoff_ms || ts <= wm {
+                return Ok(());
+            }
+            *seen += 1;
+            if let Some(w) = writer.as_mut() {
+                if w.append(rec)? {
+                    *written += 1;
+                }
+            } else {
+                // Replicate IdxShardWriter gate for the dry-run count.
+                let date = shard::ts_ms_to_utc_date(ts);
+                let body = rec.index;
+                let (bid, ask) = (body.bid, body.ask);
+                let new_day = sim_date != Some(date);
+                let changed = sim_last.map(|(b, a)| bid != b || ask != a).unwrap_or(true);
+                if changed || new_day {
+                    *written += 1;
+                    sim_last = Some((bid, ask));
+                    sim_sentinel = ts;
+                } else if ts - sim_sentinel >= shard::SENTINEL_INTERVAL_MS {
+                    *written += 1; // liveness sentinel
+                    sim_sentinel = ts;
+                }
+                sim_date = Some(date);
+            }
+            Ok(())
+        };
+
+        // 1. Backfill (older), date-ordered shards, capped below live_start.
+        if let Some(dir) = composite.get(&id) {
+            for (_d, path) in shard::list_shards(dir, "idx")? {
+                for rec in shard::read_shard_aligned::<IndexRecord>(&path)? {
+                    if rec.shard_ts_ms() < live_start {
+                        feed(&rec, &mut writer, &mut written, &mut seen)?;
+                    }
+                }
             }
         }
-        writer.flush()?;
+        // 2. Live flat (newer), canonical for its window.
+        for rec in &flat_recs {
+            feed(rec, &mut writer, &mut written, &mut seen)?;
+        }
+
+        if let Some(mut w) = writer {
+            w.flush()?;
+        }
         total_written += written;
-        println!(
-            "  [idx] {id}: ingested {} records → {written} written (delta-gated) in {}",
-            recs.len(),
-            idx_dir.display()
-        );
+        total_seen += seen;
+        if seen > 0 {
+            let verb = if report_only { "would write" } else { "wrote" };
+            println!("  [idx] {id}: {seen} in-window → {verb} {written} (delta-gated)");
+        }
     }
-    println!("[idx] total: {total_in} ingested, {total_written} written (delta-gated)");
+    let verb = if report_only { "would write" } else { "wrote" };
+    println!("[idx] total: {total_seen} in-window, {verb} {total_written} (delta-gated, ~{:.1} MiB)",
+        (total_written * 56) as f64 / 1_048_576.0);
     Ok(())
 }
 
