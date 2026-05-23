@@ -52,6 +52,10 @@ name = "nxr-calibrate"
 path = "src/bin/nxr_calibrate.rs"
 
 [[bin]]
+name = "migrate-to-sharded"
+path = "src/bin/migrate_to_sharded.rs"
+
+[[bin]]
 name = "integrity-check"
 path = "src/bin/integrity_check.rs"
 
