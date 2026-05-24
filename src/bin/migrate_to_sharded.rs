@@ -204,7 +204,13 @@ fn migrate_idx(
         let mut writer = if report_only {
             None
         } else {
-            Some(IdxShardWriter::open(root, id, true).with_context(|| format!("open writer {id}"))?)
+            // manifest=false: skip per-rotation manifest rebuild/sha256/fsync.
+            // Feeding 2y of data is ~730 daily rotations/ticker; refreshing a
+            // growing manifest.json with an fsync each time is O(n^2) churn on
+            // DRBD. The API reads via list_shards (manifest-free); a manifest can
+            // be rebuilt cheaply afterward if needed.
+            Some(IdxShardWriter::open_with(root, id, true, false)
+                .with_context(|| format!("open writer {id}"))?)
         };
         // Inline gate-simulation state for report mode.
         let mut sim_last: Option<(f64, f64)> = None;
