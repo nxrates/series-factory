@@ -131,10 +131,12 @@ struct SeriesYml {
     calibration: CalibrationYml,
 }
 
+// max_pct dropped 2026-05-24 (operator: markets be markets).
+// Debate (Aoife ↔ Tomás): same as bar_construction/renko.rs — explicit
+// struct, serde tolerates stray legacy keys in yaml.
 #[derive(Deserialize)]
 struct RenkoYml {
     min_pct: f32,
-    max_pct: f32,
 }
 
 /// Mirrors `nxr_calibrate.rs::CalibrationConfigExt` minus the per-class table
@@ -412,14 +414,39 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         info!(pair = pair_str, n = removed, "removed future-dated renko shards");
     }
 
-    // ── Pass 1: stream every idx shard once, building both the 30-min HLC
-    //    (for the .vol blender) and the 1-min last-mid downsample (for the
-    //    calibrator). One linear scan, two outputs.
+    // ── Pass 1: stream every idx shard once, building (a) the 30-min HLC
+    //    for the .vol blender and (b) the FULL-tick (ts, mid) stream that
+    //    the calibrator replays. The previous 1-min last-mid downsample was
+    //    the root cause of the 3-5× bpd overshoot: calibration saw 1440
+    //    samples/day while the applier saw ~864k samples/day, so its `k`
+    //    came out 3-5× too small and bricks fired 3-5× too often.
+    //
+    //    Debate (Aoife HFT-quant ↔ Tomás storage):
+    //      - Aoife: "Cal granularity must match apply granularity, full
+    //        stop. Downsample = bias. Full ticks are non-negotiable."
+    //      - Tomás: "180d × 10 Hz × 16 B = 155 MB / ticker. RAM check?"
+    //      - Consensus: trim to longest calibration window only (i.e.
+    //        max(windows_days) days back from `to`). 120-180d × 10 Hz ≈
+    //        130-200 MB, acceptable on 8 GiB pods. Symbols above 10 Hz are
+    //        ignored — aggregator caps records at delta-gate cadence.
     let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
-    let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
-    // tick_stream is the full 56B record stream replayed in pass 3 for brick
-    // formation; we keep it lazily (re-open the streams) so RAM stays bounded.
+    let mut tick_stream: Vec<(i64, f64)> = Vec::new();
     let mut total_records: u64 = 0;
+
+    // Sliding window for tick retention: only keep `max(windows_days)` days
+    // back from the last calibration point we care about (= last day to be
+    // emitted). For trailing backfill this is `to`'s d_end; for fresh runs
+    // we don't know it yet, so we collect everything and prune in pass-1's
+    // tail. Simpler: retain ticks newer than `to_d_end - max_window_ms`.
+    let max_window_days = yml
+        .calibration
+        .windows_days
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(120);
+    let to_d_end = day_start_ms(to) + MS_PER_DAY;
+    let tick_retain_from = to_d_end - (max_window_days as i64) * MS_PER_DAY;
 
     for (_d, path) in &shards {
         let mut stream = ShardStream::<IndexRecord>::open(path)
@@ -434,6 +461,8 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
             }
             total_records += 1;
 
+            // (a) 30-min HLC for vol blender (full history — vol bins are
+            // tiny and the blender is causal on its own).
             let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
             let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
             if ask > e.0 {
@@ -443,10 +472,10 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
                 e.1 = bid;
             }
 
-            let bucket = (ts / 60_000) * 60_000;
-            let pe = price_buckets.entry(bucket).or_insert((ts, mid));
-            if ts >= pe.0 {
-                *pe = (ts, mid);
+            // (b) Full-tick stream, sliding window. Skip records older than
+            // the longest calibration window — they wouldn't be used anyway.
+            if ts >= tick_retain_from {
+                tick_stream.push((ts, mid));
             }
         }
     }
@@ -455,11 +484,12 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         pair = pair_str,
         idx_records = total_records,
         hlc_buckets = hlc.len(),
-        mid_buckets = price_buckets.len(),
-        "pass 1 (vol HLC + price downsample) done"
+        tick_stream_len = tick_stream.len(),
+        tick_retain_window_days = max_window_days,
+        "pass 1 (vol HLC + full-tick stream) done"
     );
 
-    if hlc.is_empty() || price_buckets.is_empty() {
+    if hlc.is_empty() || tick_stream.is_empty() {
         warn!(pair = pair_str, "no usable mid quotes after scan");
         return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
     }
@@ -491,12 +521,12 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         "vol + sigma_cache built"
     );
 
-    // 1-min mid prices as the calibrator input (ts-ordered by virtue of the
-    // BTreeMap key being the time bucket).
-    let prices: Vec<(i64, f64)> = price_buckets
-        .values()
-        .map(|(ts, mid)| (*ts, *mid))
-        .collect();
+    // Full-tick (ts, mid) stream feeds the calibrator. Ordered by virtue
+    // of pass-1 scanning shards in date order. Day shards are individually
+    // monotonic; cross-shard order is shard-date-monotonic ⇒ stream is
+    // globally monotonic. We rely on that for the leak gate's
+    // `partition_point` below.
+    let prices: Vec<(i64, f64)> = tick_stream;
 
     // ── Per-day walk-forward calibration + brick emission ───────────────
     let day_list = day_range(from, to);
@@ -569,7 +599,6 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         let base_cfg = RenkoConfig {
             multiplier: last_good_k as f32,
             min_pct: yml.renko.min_pct,
-            max_pct: yml.renko.max_pct,
         };
         let calibrated_k: f64 = if trailing.len() < 2 {
             // Too little history: keep prior k, mark this day as failed-cal.
@@ -599,7 +628,6 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         let renko_cfg = RenkoConfig {
             multiplier: calibrated_k as f32,
             min_pct: yml.renko.min_pct,
-            max_pct: yml.renko.max_pct,
         };
         renko_cfg
             .validate()
@@ -701,9 +729,9 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         let hour_idx = vol_mmap.find_index_for_mts(mid_ts_mts);
         let sigma_mid = sigma_cache.get(hour_idx).copied().unwrap_or(0.0);
         let min_pct = yml.renko.min_pct as f64;
-        let max_pct = yml.renko.max_pct as f64;
         let raw_pct = calibrated_k * sigma_mid;
-        let clamped_pct = raw_pct.clamp(min_pct, max_pct);
+        // Post 2026-05-24: floor-only, no ceiling.
+        let clamped_pct = raw_pct.max(min_pct);
 
         // Drop the per-day generator (its state is encoded in the prior
         // day's last close, which we re-seed next iteration).
@@ -711,7 +739,7 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
 
         summary.bpd_samples.push(bpd_actual);
         eprintln!(
-            "renko  pair={} id={} date={} bricks_in={} bricks_out={} bpd={:.0} k={:.6} sigma_mid={:.5} pct_clamped={:.5} (raw={:.5}, min={:.5}, max={:.5})",
+            "renko  pair={} id={} date={} bricks_in={} bricks_out={} bpd={:.0} k={:.6} sigma_mid={:.5} pct_clamped={:.5} (raw={:.5}, min={:.5})",
             pair_str,
             ticker_id,
             d,
@@ -722,8 +750,7 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
             sigma_mid,
             clamped_pct,
             raw_pct,
-            min_pct,
-            max_pct
+            min_pct
         );
     }
 
