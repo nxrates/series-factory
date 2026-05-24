@@ -61,7 +61,13 @@ impl RenkoConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !(0.001..=1.0).contains(&self.multiplier) {
+        // Upper bound mirrors `CalibrationConfig.mult_bounds[1]` (default 4.0):
+        // binary search may legitimately converge above 1.0 on high-vol regimes
+        // (e.g. SOL/USDT 2026-05-20: geo_mean=1.18 → emitted bricks=298 bpd,
+        // err=0.4%). Capping at 1.0 here aborted the run entirely. Operator
+        // policy: "markets be markets" — let k float to whatever the data
+        // requires. The floor stays at 0.001 (guards against k=0 degenerate).
+        if !(0.001..=4.0).contains(&self.multiplier) {
             anyhow::bail!("multiplier out of range: {}", self.multiplier);
         }
         // Debate (Aoife ↔ Tomás): allow min_pct == 0 (no floor) vs require > 0
