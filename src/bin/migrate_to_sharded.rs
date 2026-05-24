@@ -41,10 +41,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use nxr_sdk::shard::{self, IdxShardWriter, ShardRecord};
+use nxr_sdk::shard::{self, IdxShardWriter, ShardRecord, MS_PER_DAY};
 use nxr_sdk::{resolve_ticker_id, Bar, IndexRecord};
-
-const MS_PER_DAY: i64 = 86_400_000;
 
 #[derive(Parser, Debug)]
 #[command(about = "Unify market data into MITCH-ID daily-sharded layout")]
@@ -76,10 +74,6 @@ struct Args {
     purge_legacy: bool,
 }
 
-fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
-
 /// Max observation ts already migrated into `indexes/<id>/` (for idempotent
 /// incremental runs). `i64::MIN` when the ticker has no shards yet.
 fn idx_watermark(idx_dir: &Path) -> i64 {
@@ -103,7 +97,7 @@ fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
     let args = Args::parse();
     let root = &args.data_root;
-    let cutoff_ms = now_ms() - args.cutoff_days * MS_PER_DAY;
+    let cutoff_ms = nxr_sdk::now_ms() as i64 - args.cutoff_days * MS_PER_DAY;
     let allow = parse_ticker_filter(&args.tickers);
     let allowed = |id: u64| allow.as_ref().map(|v| v.contains(&id)).unwrap_or(true);
 

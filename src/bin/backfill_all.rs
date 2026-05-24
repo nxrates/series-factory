@@ -165,10 +165,9 @@ fn split_csv(s: &str) -> Vec<String> {
 }
 
 fn split_pair(t: &str) -> Result<(String, String)> {
-    let mut it = t.splitn(2, '-');
-    let base = it.next().ok_or_else(|| anyhow!("bad ticker {}", t))?;
-    let quote = it.next().ok_or_else(|| anyhow!("ticker missing quote: {}", t))?;
-    Ok((base.to_string(), quote.to_string()))
+    series_factory::split_pair(t)
+        .map(|(b, q)| (b.to_string(), q.to_string()))
+        .ok_or_else(|| anyhow!("bad ticker {}: expected BASE-QUOTE", t))
 }
 
 fn file_bytes(p: &Path) -> u64 {

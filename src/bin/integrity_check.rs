@@ -313,11 +313,9 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
             });
             continue;
         }
-        let bid = idx_body.bid;
-        let ask = idx_body.ask;
-        let mid = (bid + ask) * 0.5;
-        let spread_bps = if mid > 0.0 { (ask - bid) / mid * 1e4 } else { 0.0 };
+        let mid = idx_body.mid();
         if mid > 0.0 && mid.is_finite() {
+            let spread_bps = idx_body.spread_bps();
             let ci_price = idx_body.ci_price();
             let ratio = ci_price / mid;
             if ratio.is_finite() {

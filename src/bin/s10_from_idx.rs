@@ -14,19 +14,18 @@
 //! Higher-TF series (1m, 5m, 1h, ...) are produced on the fly by API
 //! readers via the OHLC monoid rollup (`nxr_sdk::ohlc::rollup`).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::NaiveDate;
 use clap::Parser;
 use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
-use nxr_sdk::{BarAccumulator, ipc::record::IndexRecord, resolve_ticker_id};
+use nxr_sdk::shard::ShardStream;
+use nxr_sdk::{BarAccumulator, resolve_ticker_id};
 use series_factory::sharding::{
-    bars_dir_pair, composite_dir, list_shards, manifest_path, read_manifest, sha256_file,
-    shard_path, ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest, ShardEntry,
+    bars_dir_pair, composite_dir, list_shards, manifest_path, read_manifest, shard_path,
+    ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
 };
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -50,28 +49,14 @@ struct Args {
     out_dir: Option<PathBuf>,
 }
 
-fn split_pair(s: &str) -> Result<(String, String)> {
-    let mut it = s.splitn(2, '-');
-    let base = it
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("bad pair {}: missing base", s))?
-        .to_uppercase();
-    let quote = it
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("bad pair {}: missing quote", s))?
-        .to_uppercase();
-    if base.is_empty() || quote.is_empty() {
-        anyhow::bail!("bad pair {}: empty base or quote", s);
-    }
-    Ok((base, quote))
-}
-
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
     nxr_sdk::memory::apply_safe_cap();
 
     let args = Args::parse();
-    let (base, quote) = split_pair(&args.pair)?;
+    let (base, quote) = series_factory::split_pair(&args.pair)
+        .map(|(b, q)| (b.to_uppercase(), q.to_uppercase()))
+        .ok_or_else(|| anyhow::anyhow!("bad pair {}: expected BASE-QUOTE", args.pair))?;
     if !args.config.exists() {
         anyhow::bail!("config not found: {}", args.config.display());
     }
@@ -127,8 +112,8 @@ fn main() -> Result<()> {
 
     for (date, path) in &shards {
         info!(date = %date, path = %path.display(), "reading input shard");
-        let mut stream = IdxStream::open(path)?;
-        while let Some(rec) = stream.next_record()? {
+        let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
+        while let Some(rec) = stream.next()? {
             let ts_ms = timestamp::to_epoch_ms(rec.header.get_timestamp());
             let idx = rec.index;
             let bid = idx.bid;
@@ -206,123 +191,11 @@ fn main() -> Result<()> {
     // ticker fields = canonical re-stamp
     manifest.ticker = ticker_str;
     manifest.ticker_id = ticker_id;
-    // ! overwrite kind: bars dir hosts multiple kinds (s10 + renko/bars). We
-    // track per-shard kind via extension on disk; manifest.kind = mixed
-    // marker.
-    if manifest.kind.is_empty() {
-        manifest.kind = "s10".into();
-    } else if !manifest.kind.contains("s10") {
-        manifest.kind = format!("{},s10", manifest.kind);
-    }
-    // re-scan ALL s10 shards (dir may contain shards from previous runs)
-    let existing = list_shards(&out_dir, "s10")?;
-    // drop stale s10 entries from manifest; rebuild from disk
-    manifest.shards.retain(|s| {
-        // keep non-s10 marker shards? manifest stores all in one Vec; we tag
-        // by date string only. Until split is needed, rebuild s10 entries
-        // and merge w/ existing-date entries from other kinds.
-        // Simplest: keep all that ! match existing s10 dates; we'll re-add.
-        !existing.iter().any(|(d, _)| d.format("%Y-%m-%d").to_string() == s.date)
-    });
-    for (date, path) in existing {
-        let entry = build_shard_entry_bar(date, &path)?;
-        manifest.upsert(entry);
-    }
+    // re-scan ALL s10 shards (dir may contain shards from previous runs); merge
+    // `s10` into the comma-joined `kind` field.
+    manifest.refresh_kind::<Bar>(&out_dir, "s10")?;
     write_manifest(&mpath, &manifest)?;
 
     info!(out_dir = %out_dir.display(), manifest = %mpath.display(), "manifest updated");
     Ok(())
-}
-
-/// Build a manifest entry for a Bar-shard (.s10/.renko/.bars). Reads bar
-/// records to extract first/last open_ts + count.
-fn build_shard_entry_bar(date: NaiveDate, path: &Path) -> Result<ShardEntry> {
-    let rec_size = core::mem::size_of::<Bar>();
-    let size_bytes = std::fs::metadata(path)?.len();
-    let n_records = if rec_size == 0 { 0 } else { size_bytes / rec_size as u64 };
-    let mut first_ts: i64 = 0;
-    let mut last_ts: i64 = 0;
-    if n_records > 0 {
-        use std::io::Seek;
-        let mut f = std::fs::File::open(path)?;
-        let mut head = vec![0u8; rec_size];
-        f.read_exact(&mut head)?;
-        let bar0: Bar = *bytemuck::from_bytes(&head);
-        first_ts = bar0.open_time_ms();
-        // seek to last record
-        f.seek(std::io::SeekFrom::End(-(rec_size as i64)))?;
-        let mut tail = vec![0u8; rec_size];
-        f.read_exact(&mut tail)?;
-        let bar_n: Bar = *bytemuck::from_bytes(&tail);
-        last_ts = bar_n.open_time_ms();
-    }
-    Ok(ShardEntry {
-        date: date.format("%Y-%m-%d").to_string(),
-        first_ts,
-        last_ts,
-        n_records,
-        size_bytes,
-        sha256: sha256_file(path)?,
-    })
-}
-
-/// Buffered streaming reader for an `AppendLog<IndexRecord>` file.
-struct IdxStream {
-    file: File,
-    buf: Vec<u8>,
-    pos: usize,
-    filled: usize,
-    eof: bool,
-}
-
-impl IdxStream {
-    fn open(path: &std::path::Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        Ok(Self {
-            file,
-            buf: vec![0u8; 4096 * core::mem::size_of::<IndexRecord>()],
-            pos: 0,
-            filled: 0,
-            eof: false,
-        })
-    }
-
-    fn refill(&mut self) -> Result<()> {
-        if self.eof {
-            return Ok(());
-        }
-        self.filled = 0;
-        self.pos = 0;
-        while self.filled < self.buf.len() {
-            match self.file.read(&mut self.buf[self.filled..])? {
-                0 => {
-                    self.eof = true;
-                    break;
-                }
-                n => self.filled += n,
-            }
-        }
-        if self.filled % core::mem::size_of::<IndexRecord>() != 0 {
-            anyhow::bail!(
-                "idx stream short read {} not aligned to IndexRecord {}",
-                self.filled,
-                core::mem::size_of::<IndexRecord>()
-            );
-        }
-        Ok(())
-    }
-
-    fn next_record(&mut self) -> Result<Option<IndexRecord>> {
-        let rec_size = core::mem::size_of::<IndexRecord>();
-        if self.pos >= self.filled {
-            self.refill()?;
-            if self.pos >= self.filled {
-                return Ok(None);
-            }
-        }
-        let slice = &self.buf[self.pos..self.pos + rec_size];
-        let rec: IndexRecord = *bytemuck::from_bytes(slice);
-        self.pos += rec_size;
-        Ok(Some(rec))
-    }
 }

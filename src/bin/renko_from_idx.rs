@@ -12,24 +12,24 @@
 //! Output:  `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>/<YYYY-MM-DD>.renko`
 //!         + merged into `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>/manifest.json`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::NaiveDate;
 use clap::Parser;
 use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
-use nxr_sdk::{BarAccumulator, ipc::record::IndexRecord, parkinson_sigma, resolve_ticker_id};
+use nxr_sdk::shard::{ShardStream, MS_PER_30MIN, MS_PER_DAY};
+use nxr_sdk::{BarAccumulator, resolve_ticker_id};
 use serde::Deserialize;
 use series_factory::sharding::{
-    bars_dir_pair, composite_dir, list_shards, manifest_path, read_manifest, sha256_file,
-    shard_path, ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest, ShardEntry,
+    bars_dir_pair, composite_dir, list_shards, manifest_path, read_manifest, shard_path,
+    ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
 };
 use series_factory::{
-    bar_construction::{MtfParkinsonCalculator, RenkoConfig, RenkoGenerator, VolConfig},
+    bar_construction::{build_vol_from_hlc, MtfParkinsonCalculator, RenkoConfig, RenkoGenerator, VolConfig},
     vol_bin::{VolMmap, VolWriter},
 };
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -112,14 +112,14 @@ fn main() -> Result<()> {
     let mut hlc: HashMap<i64, (f64, f64, f64)> = HashMap::new();
     let mut pass1_count: u64 = 0;
     for (_, path) in &shards {
-        let mut stream = IdxStream::open(path)?;
-        while let Some(rec) = stream.next_record()? {
+        let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
+        while let Some(rec) = stream.next()? {
             let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
             let mid = (rec.index.bid + rec.index.ask) * 0.5;
             if !(mid.is_finite() && mid > 0.0) {
                 continue;
             }
-            let key = (ts / 1_800_000) * 1_800_000;
+            let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
             let e = hlc.entry(key).or_insert((mid, mid, mid));
             if mid > e.0 {
                 e.0 = mid;
@@ -142,34 +142,20 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&out_dir)?;
     // vol file lives alongside the shard dir; transient (deleted post-write).
     let vol_path = out_dir.join("_renko.vol");
-    let mut hours: Vec<(i64, f64, f64)> =
-        hlc.into_iter().map(|(ts, (h, l, _))| (ts, h, l)).collect();
-    hours.sort_unstable_by_key(|&(ts, _, _)| ts);
-    let ema_period = yml.vol.ema_period;
-    let alpha = 2.0 / (ema_period as f64 + 1.0);
+    // Drop the close component → canonical (ts, H, L) BTreeMap for the shared
+    // EMA-Parkinson builder. BTreeMap sorts by ts so output is monotone.
+    let hlc_sorted: BTreeMap<i64, (f64, f64)> =
+        hlc.iter().map(|(&ts, &(h, l, _))| (ts, (h, l))).collect();
+    let first_ts = hlc_sorted.keys().next().copied().unwrap_or(0);
+    let n_vol = hlc_sorted.len();
     let mut vol_writer = VolWriter::new(&vol_path)?;
-    let mut prev_ema: Option<f64> = None;
-    for (i, &(ts, high, low)) in hours.iter().enumerate() {
-        let sigma = parkinson_sigma(high, low);
-        let ema = if i < ema_period {
-            hours[..=i]
-                .iter()
-                .map(|&(_, h, l)| parkinson_sigma(h, l))
-                .sum::<f64>()
-                / (i + 1) as f64
-        } else {
-            alpha * sigma + (1.0 - alpha) * prev_ema.unwrap_or(sigma)
-        };
-        prev_ema = Some(ema);
-        vol_writer.write_record(timestamp::from_epoch_ms(ts), ema)?;
-    }
+    build_vol_from_hlc(&hlc_sorted, &yml.vol, &mut vol_writer)?;
     vol_writer.finish()?;
     let vol_mmap = VolMmap::open(&vol_path)?;
-    info!(vol_records = hours.len(), "vol file written");
+    info!(vol_records = n_vol, "vol file written");
 
     // ═══ PASS 2: feed composite mid → RenkoGenerator ═══
-    let first_ts = hours.first().map(|&(ts, _, _)| ts).unwrap_or(0);
-    let bootstrap_end = first_ts + yml.pipeline.bootstrap_days * 86_400_000;
+    let bootstrap_end = first_ts + yml.pipeline.bootstrap_days * MS_PER_DAY;
 
     let renko_config = RenkoConfig {
         multiplier: 0.075,
@@ -195,8 +181,8 @@ fn main() -> Result<()> {
     let mut total_bars: usize = 0;
 
     for (_, path) in &shards {
-        let mut stream = IdxStream::open(path)?;
-        while let Some(rec) = stream.next_record()? {
+        let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
+        while let Some(rec) = stream.next()? {
             let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
             let idx = rec.index;
             let mid = (idx.bid + idx.ask) * 0.5;
@@ -283,111 +269,9 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| Manifest::new(ticker_str.clone(), ticker_id, "renko"));
     manifest.ticker = ticker_str;
     manifest.ticker_id = ticker_id;
-    if manifest.kind.is_empty() {
-        manifest.kind = "renko".into();
-    } else if !manifest.kind.contains("renko") {
-        manifest.kind = format!("{},renko", manifest.kind);
-    }
-    let existing = list_shards(&out_dir, "renko")?;
-    manifest.shards.retain(|s| {
-        !existing.iter().any(|(d, _)| d.format("%Y-%m-%d").to_string() == s.date)
-    });
-    for (date, path) in existing {
-        manifest.upsert(build_shard_entry_bar(date, &path)?);
-    }
+    manifest.refresh_kind::<Bar>(&out_dir, "renko")?;
     write_manifest(&mpath, &manifest)?;
 
     info!(out_dir = %out_dir.display(), manifest = %mpath.display(), "manifest updated");
     Ok(())
-}
-
-/// Manifest entry for a 96B Bar shard.
-fn build_shard_entry_bar(date: NaiveDate, path: &Path) -> Result<ShardEntry> {
-    let rec_size = core::mem::size_of::<Bar>();
-    let size_bytes = std::fs::metadata(path)?.len();
-    let n_records = if rec_size == 0 { 0 } else { size_bytes / rec_size as u64 };
-    let mut first_ts: i64 = 0;
-    let mut last_ts: i64 = 0;
-    if n_records > 0 {
-        use std::io::Seek;
-        let mut f = std::fs::File::open(path)?;
-        let mut head = vec![0u8; rec_size];
-        f.read_exact(&mut head)?;
-        let bar0: Bar = *bytemuck::from_bytes(&head);
-        first_ts = bar0.open_time_ms();
-        f.seek(std::io::SeekFrom::End(-(rec_size as i64)))?;
-        let mut tail = vec![0u8; rec_size];
-        f.read_exact(&mut tail)?;
-        let bar_n: Bar = *bytemuck::from_bytes(&tail);
-        last_ts = bar_n.open_time_ms();
-    }
-    Ok(ShardEntry {
-        date: date.format("%Y-%m-%d").to_string(),
-        first_ts,
-        last_ts,
-        n_records,
-        size_bytes,
-        sha256: sha256_file(path)?,
-    })
-}
-
-/// Buffered streaming reader for an `AppendLog<IndexRecord>` file.
-struct IdxStream {
-    file: File,
-    buf: Vec<u8>,
-    pos: usize,
-    filled: usize,
-    eof: bool,
-}
-
-impl IdxStream {
-    fn open(path: &std::path::Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        Ok(Self {
-            file,
-            buf: vec![0u8; 4096 * core::mem::size_of::<IndexRecord>()],
-            pos: 0,
-            filled: 0,
-            eof: false,
-        })
-    }
-
-    fn refill(&mut self) -> Result<()> {
-        if self.eof {
-            return Ok(());
-        }
-        self.filled = 0;
-        self.pos = 0;
-        while self.filled < self.buf.len() {
-            match self.file.read(&mut self.buf[self.filled..])? {
-                0 => {
-                    self.eof = true;
-                    break;
-                }
-                n => self.filled += n,
-            }
-        }
-        if self.filled % core::mem::size_of::<IndexRecord>() != 0 {
-            anyhow::bail!(
-                "idx stream short read {} not aligned to IndexRecord {}",
-                self.filled,
-                core::mem::size_of::<IndexRecord>()
-            );
-        }
-        Ok(())
-    }
-
-    fn next_record(&mut self) -> Result<Option<IndexRecord>> {
-        let rec_size = core::mem::size_of::<IndexRecord>();
-        if self.pos >= self.filled {
-            self.refill()?;
-            if self.pos >= self.filled {
-                return Ok(None);
-            }
-        }
-        let slice = &self.buf[self.pos..self.pos + rec_size];
-        let rec: IndexRecord = *bytemuck::from_bytes(slice);
-        self.pos += rec_size;
-        Ok(Some(rec))
-    }
 }

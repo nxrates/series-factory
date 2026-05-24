@@ -26,6 +26,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use mitch::timestamp;
 use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::shard::{ShardStream, MS_PER_30MIN};
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::resolve_ticker_id;
 use rayon::prelude::*;
@@ -215,58 +216,6 @@ fn classify_pair(pair: &str, ticker_id: u64, stables: &[String]) -> AssetClassBu
     }
 }
 
-// ── .idx streaming reader (mirrors renko_from_idx.rs::IdxStream) ────────────
-
-struct IdxStream {
-    file: std::fs::File,
-    buf: Vec<u8>,
-    pos: usize,
-    filled: usize,
-    eof: bool,
-}
-
-impl IdxStream {
-    fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        Ok(Self {
-            file,
-            buf: vec![0u8; 4096 * core::mem::size_of::<IndexRecord>()],
-            pos: 0,
-            filled: 0,
-            eof: false,
-        })
-    }
-
-    fn refill(&mut self) -> Result<()> {
-        use std::io::Read;
-        if self.eof { return Ok(()); }
-        self.filled = 0;
-        self.pos = 0;
-        while self.filled < self.buf.len() {
-            match self.file.read(&mut self.buf[self.filled..])? {
-                0 => { self.eof = true; break; }
-                n => self.filled += n,
-            }
-        }
-        if self.filled % core::mem::size_of::<IndexRecord>() != 0 {
-            anyhow::bail!("idx short read {} != mult of {}", self.filled, core::mem::size_of::<IndexRecord>());
-        }
-        Ok(())
-    }
-
-    fn next_record(&mut self) -> Result<Option<IndexRecord>> {
-        let rec_size = core::mem::size_of::<IndexRecord>();
-        if self.pos >= self.filled {
-            self.refill()?;
-            if self.pos >= self.filled { return Ok(None); }
-        }
-        let slice = &self.buf[self.pos..self.pos + rec_size];
-        let rec: IndexRecord = *bytemuck::from_bytes(slice);
-        self.pos += rec_size;
-        Ok(Some(rec))
-    }
-}
-
 // ── Per-ticker calibration ───────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -295,7 +244,7 @@ fn calibrate_one(
     }
 
     // Pass 1: stream .idx → 30-min HLC + 1-min mid downsample for calibration.
-    let mut stream = match IdxStream::open(&idx_path) {
+    let mut stream = match ShardStream::<IndexRecord>::open(&idx_path) {
         Ok(s) => s,
         Err(e) => return CalOutcome::Failed { ticker_id, reason: format!("open .idx: {}", e) },
     };
@@ -306,7 +255,7 @@ fn calibrate_one(
     let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
     let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
     loop {
-        let rec = match stream.next_record() {
+        let rec = match stream.next() {
             Ok(Some(r)) => r,
             Ok(None) => break,
             Err(e) => return CalOutcome::Failed { ticker_id, reason: format!("read .idx: {}", e) },
@@ -317,7 +266,7 @@ fn calibrate_one(
         let mid = (bid + ask) * 0.5;
         if !(mid.is_finite() && mid > 0.0) { continue; }
 
-        let key = (ts / 1_800_000) * 1_800_000;
+        let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
         let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
         if ask > e.0 { e.0 = ask; }
         if bid < e.1 && bid > 0.0 { e.1 = bid; }
