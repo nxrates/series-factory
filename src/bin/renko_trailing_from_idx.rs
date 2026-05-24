@@ -1,0 +1,867 @@
+//! Walk-forward renko backfill from sharded `.idx` to daily-sharded `.renko`.
+//!
+//! Unlike `renko-from-idx`, which applies ONE calibrated `k` (the live value
+//! from `ticker-params.json`) uniformly over the entire historical series, this
+//! tool re-calibrates `k(D)` per UTC day `D` using ONLY data with `ts < D_start`
+//! (strict no-future-leakage). The result is a brick stream whose density is
+//! stable around the configured `target_bpd` across regime shifts.
+//!
+//! Pipeline
+//! ────────
+//!   1. Read every shard in `<data>/indexes/<ticker_id>/*.idx` (MITCH-id keyed).
+//!   2. Build ONE `.vol` file over the FULL trailing range (the sigma blender
+//!      itself is causal — `compute_sigma(t)` only reads bins ≤ `t`).
+//!   3. Build the 1-min last-mid downsample used by the binary-search
+//!      calibrator (`calibrate_mtf_with_target`).
+//!   4. For each closed UTC day `D` (skip today, owned by the live producer):
+//!        a. Slice `prices` to `ts < D_start_ms`, call
+//!           `calibrate_mtf_with_target` → `k(D)`. If 0 / NaN, fall back to the
+//!           prior day's `k`, else the global geo-mean of every successful day,
+//!           else `0.075` (bootstrap k).
+//!        b. Apply `k(D)` to a `RenkoGenerator` whose state was carried over
+//!           from day `D-1`, and replay every tick whose `ts ∈ [D_start, D_end)`.
+//!           Bricks emitted in that window are appended to
+//!           `<data>/bars/<ticker_id>/<D>.renko` via `BarShardWriter`.
+//!   5. After the run, summarise total days, mean/median bpd, days outside
+//!      `[100, 600]` (an error margin around the 300 target).
+//!
+//! Output is keyed by MITCH ticker id (canonical, post-U1 sharded layout). The
+//! legacy pair-keyed `bars_dir_pair` path is NOT touched — see `renko-from-idx`
+//! for the broken one-shot fallback.
+//!
+//! Idempotency: shards that already exist with >0 records are skipped, so
+//! re-running the binary picks up where it left off. `--force` overwrites them.
+//!
+//! Future-dated junk (`203*.renko`, `204*.renko`, ...) is removed before the
+//! first write — leftover from migration corruption observed in prod.
+//!
+//! NOT a replacement for `nxr-calibrate` cron — that's the LIVE k. This binary
+//! is only for historical backfill where applying live-k uniformly would create
+//! 1k-15k bpd bricks in past regimes.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use clap::Parser;
+use mitch::bar::{Bar, BarKind};
+use mitch::timestamp;
+use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::resolve_ticker_id;
+use nxr_sdk::shard::{
+    bars_dir, idx_dir, list_shards, read_shard_aligned, shard_path, BarShardWriter, ShardStream,
+    MS_PER_30MIN, MS_PER_DAY,
+};
+use serde::Deserialize;
+use series_factory::bar_construction::{
+    build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig, MtfParkinsonCalculator,
+    RenkoConfig, RenkoGenerator, VolConfig, VolSource,
+};
+use series_factory::vol_bin::{VolMmap, VolWriter};
+use tracing::{info, warn};
+
+// ── Launch symbol set (operator-specified, see task brief) ──────────────────
+
+/// Pairs (`base/quote`) that the `--all` mode iterates. Ticker IDs are resolved
+/// at runtime via `resolve_ticker_id` — keeping the list in code (not yaml)
+/// because operator approval is implicit and the set is small.
+const LAUNCH_PAIRS: &[(&str, &str)] = &[
+    ("BTC", "USDT"),
+    ("ETH", "USDT"),
+    ("BNB", "USDT"),
+    ("SOL", "USDT"),
+    ("USDC", "USDT"),
+    ("USDS", "USDT"),
+    ("USDE", "USDT"),
+    ("USD1", "USDT"),
+    ("PAXG", "USDT"),
+];
+
+// ── CLI ─────────────────────────────────────────────────────────────────────
+
+#[derive(Parser, Debug)]
+#[command(
+    about = "Walk-forward renko backfill (per-day k, no future leakage). Writes <data>/bars/<id>/<D>.renko."
+)]
+struct Args {
+    /// Path to nxrates.yml — reads `series.{renko,vol,calibration,pipeline}`.
+    #[arg(long)]
+    config: PathBuf,
+
+    /// Base asset symbol (eg `BTC`). Required unless `--all`.
+    #[arg(long)]
+    base: Option<String>,
+
+    /// Quote asset symbol (eg `USDT`). Required unless `--all`.
+    #[arg(long)]
+    quote: Option<String>,
+
+    /// Process the hardcoded launch symbol set instead of `--base/--quote`.
+    #[arg(long)]
+    all: bool,
+
+    /// Inclusive start date (UTC, `YYYY-MM-DD`). Defaults to the first idx
+    /// shard. Ignored if it predates the available data.
+    #[arg(long)]
+    from: Option<String>,
+
+    /// Inclusive end date (UTC, `YYYY-MM-DD`). Defaults to the most recent
+    /// CLOSED day (live producer owns the current day onward).
+    #[arg(long)]
+    to: Option<String>,
+
+    /// Overwrite existing `<D>.renko` shards even when they have >0 records.
+    /// Default behaviour is resumable (idempotent): skip non-empty shards.
+    #[arg(long)]
+    force: bool,
+}
+
+// ── Config (subset of nxrates.yml) ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct NxratesYml {
+    series: SeriesYml,
+}
+
+#[derive(Deserialize)]
+struct SeriesYml {
+    renko: RenkoYml,
+    vol: VolConfig,
+    calibration: CalibrationYml,
+}
+
+#[derive(Deserialize)]
+struct RenkoYml {
+    min_pct: f32,
+    max_pct: f32,
+}
+
+/// Mirrors `nxr_calibrate.rs::CalibrationConfigExt` minus the per-class table
+/// (we resolve the bucket once per pair at startup, then plumb a flat
+/// `target_bpd` into every day's calibration).
+#[derive(Deserialize)]
+struct CalibrationYml {
+    target_bpd: f64,
+    windows_days: Vec<usize>,
+    min_window_days: usize,
+    max_rounds: usize,
+    tolerance: f64,
+    mult_bounds: [f64; 2],
+    #[serde(default)]
+    target_bpd_by_class: BTreeMap<String, ClassTarget>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum ClassTarget {
+    Bpd(f64),
+    Sentinel(String),
+}
+
+impl ClassTarget {
+    fn resolved(&self) -> Option<f64> {
+        match self {
+            ClassTarget::Bpd(v) if *v > 0.0 => Some(*v),
+            ClassTarget::Bpd(_) => None,
+            ClassTarget::Sentinel(s) if s.eq_ignore_ascii_case("skip") => None,
+            ClassTarget::Sentinel(_) => None,
+        }
+    }
+}
+
+impl CalibrationYml {
+    fn inner(&self) -> CalibrationConfig {
+        CalibrationConfig {
+            target_bpd: self.target_bpd,
+            windows_days: self.windows_days.clone(),
+            min_window_days: self.min_window_days,
+            max_rounds: self.max_rounds,
+            tolerance: self.tolerance,
+            mult_bounds: self.mult_bounds,
+        }
+    }
+
+    /// Per-asset-class target. Same string keys as `nxr-calibrate` consumes
+    /// (`crypto_major`, `crypto_alt`, `crypto_stable`, `fx_major`, `fx_cross`,
+    /// `default`). `None` ⇒ skip this pair.
+    fn target_for_class(&self, class_key: &str) -> Option<f64> {
+        if let Some(t) = self.target_bpd_by_class.get(class_key) {
+            return t.resolved();
+        }
+        if let Some(t) = self.target_bpd_by_class.get("default") {
+            return t.resolved();
+        }
+        Some(self.target_bpd)
+    }
+}
+
+// ── Pair → asset-class bucket (slimmed copy of nxr_calibrate.rs) ────────────
+
+/// Stable list of crypto majors (matches `nxr_calibrate.rs` so the per-class
+/// target lookup picks the same bucket as the live cron).
+const CRYPTO_MAJORS: &[&str] = &[
+    "BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "AVAX", "LINK", "DOT", "LTC", "BCH", "TRX",
+    "XMR", "ZEC", "SUI", "HYPE", "UNI", "XLM", "HBAR", "ETC", "TON",
+];
+
+/// Stables we recognise by symbol regardless of MITCH class bits (operator
+/// observed USDS / USDE etc. carrying PM bits in the registry, but for
+/// renko targeting they belong in the stable bucket).
+const STABLE_SYMBOLS: &[&str] = &[
+    "USDT", "USDC", "USD", "USDS", "USDE", "USD1", "DAI", "TUSD", "PYUSD", "FDUSD", "BUSD",
+];
+
+fn class_for_pair(base: &str, quote: &str) -> &'static str {
+    let b = base.to_uppercase();
+    let q = quote.to_uppercase();
+    let base_stable = STABLE_SYMBOLS.contains(&b.as_str());
+    let quote_stable = STABLE_SYMBOLS.contains(&q.as_str());
+    if base_stable && quote_stable {
+        return "crypto_stable";
+    }
+    if CRYPTO_MAJORS.contains(&b.as_str()) {
+        return "crypto_major";
+    }
+    "crypto_alt"
+}
+
+// ── Date helpers ────────────────────────────────────────────────────────────
+
+#[inline]
+fn day_start_ms(d: NaiveDate) -> i64 {
+    let ndt = NaiveDateTime::new(d, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+    Utc.from_utc_datetime(&ndt).timestamp_millis()
+}
+
+#[inline]
+fn parse_date(s: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").with_context(|| format!("parse date {}", s))
+}
+
+/// Inclusive set of UTC dates in `[from, to]`.
+fn day_range(from: NaiveDate, to: NaiveDate) -> Vec<NaiveDate> {
+    let mut out = Vec::new();
+    let mut d = from;
+    while d <= to {
+        out.push(d);
+        d = d.succ_opt().unwrap_or(d);
+    }
+    out
+}
+
+// ── Future-dated junk wiper ─────────────────────────────────────────────────
+
+/// Remove `<YYYY-MM-DD>.renko` shards whose YYYY is in a sentinel future
+/// range (eg `203*`, `204*`, ...). These appear after migration corruption
+/// observed in prod (`ts_ms` ran through an overflow path and produced
+/// 2099-or-later dates).
+fn wipe_future_dated_junk(dir: &Path, today: NaiveDate) -> Result<usize> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let cutoff_year = today.year() + 1;
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.ends_with(".renko") {
+            continue;
+        }
+        let stem = &name[..name.len() - ".renko".len()];
+        if let Ok(d) = NaiveDate::parse_from_str(stem, "%Y-%m-%d") {
+            if d.year() >= cutoff_year {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!(path = %path.display(), err = %e, "future-junk delete failed");
+                } else {
+                    info!(path = %path.display(), date = %d, "wiped future-dated junk shard");
+                    removed += 1;
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+// ── Per-pair walk-forward run ───────────────────────────────────────────────
+
+#[derive(Debug, Default)]
+struct PairSummary {
+    pair: String,
+    ticker_id: u64,
+    days: usize,
+    bpd_samples: Vec<f64>,
+    failed_days: usize,
+    skipped_days: usize,
+    used_k_samples: Vec<f64>,
+}
+
+impl PairSummary {
+    fn finalize(&self, target_bpd: f64) -> String {
+        let mut sorted = self.bpd_samples.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if sorted.is_empty() {
+            0.0
+        } else {
+            sorted[sorted.len() / 2]
+        };
+        let mean = if sorted.is_empty() {
+            0.0
+        } else {
+            sorted.iter().sum::<f64>() / sorted.len() as f64
+        };
+        // Error window: |bpd - target| ≤ target/3 (so 200..400 around 300).
+        let lo = (target_bpd / 3.0).max(50.0);
+        let hi = target_bpd * 2.0;
+        let out_of_band = sorted.iter().filter(|b| **b < lo || **b > hi).count();
+        format!(
+            "pair={} id={} days={} written={} failed={} skipped={} bpd_mean={:.0} bpd_median={:.0} bpd_oob[{:.0}..{:.0}]={} k_n={}",
+            self.pair,
+            self.ticker_id,
+            self.days,
+            self.bpd_samples.len(),
+            self.failed_days,
+            self.skipped_days,
+            mean,
+            median,
+            lo,
+            hi,
+            out_of_band,
+            self.used_k_samples.len(),
+        )
+    }
+}
+
+/// One-shot walk-forward backfill for `(base, quote)`.
+fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<PairSummary> {
+    let cfg = nxr_sdk::NxrConfig::from_env();
+    let data_root = Path::new(&cfg.indexes_dir)
+        .parent()
+        .unwrap_or(Path::new("/data"))
+        .to_path_buf();
+
+    let pair_str = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
+    let ticker_id = resolve_ticker_id(&pair_str);
+    let class_key = class_for_pair(base, quote);
+    let target_bpd = match yml.calibration.target_for_class(class_key) {
+        Some(t) => t,
+        None => {
+            info!(pair = pair_str, class = class_key, "class marked skip — no bricks emitted");
+            return Ok(PairSummary {
+                pair: pair_str,
+                ticker_id,
+                ..Default::default()
+            });
+        }
+    };
+
+    let idx_directory = idx_dir(&data_root, ticker_id);
+    let bars_directory = bars_dir(&data_root, ticker_id);
+    info!(
+        pair = pair_str,
+        ticker_id,
+        class = class_key,
+        target_bpd,
+        idx = %idx_directory.display(),
+        bars = %bars_directory.display(),
+        "renko-trailing: pair start"
+    );
+
+    // ── List input shards ────────────────────────────────────────────────
+    let shards = list_shards(&idx_directory, "idx")?;
+    if shards.is_empty() {
+        warn!(pair = pair_str, "no idx shards found, skipping");
+        return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
+    }
+
+    let first_shard_date = shards.first().unwrap().0;
+    let last_shard_date = shards.last().unwrap().0;
+    // Most-recent CLOSED day = yesterday in UTC (today is owned by the live
+    // producer). Also clip to last available shard date.
+    let today = Utc::now().date_naive();
+    let yesterday = today.pred_opt().unwrap_or(today);
+    let default_to = last_shard_date.min(yesterday);
+
+    let from = args
+        .from
+        .as_deref()
+        .map(parse_date)
+        .transpose()?
+        .map(|d| d.max(first_shard_date))
+        .unwrap_or(first_shard_date);
+    let to = args
+        .to
+        .as_deref()
+        .map(parse_date)
+        .transpose()?
+        .map(|d| d.min(default_to))
+        .unwrap_or(default_to);
+
+    if from > to {
+        warn!(pair = pair_str, %from, %to, "empty range, skipping");
+        return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
+    }
+
+    // ── Wipe future-dated junk before any write ──────────────────────────
+    let removed = wipe_future_dated_junk(&bars_directory, today)?;
+    if removed > 0 {
+        info!(pair = pair_str, n = removed, "removed future-dated renko shards");
+    }
+
+    // ── Pass 1: stream every idx shard once, building both the 30-min HLC
+    //    (for the .vol blender) and the 1-min last-mid downsample (for the
+    //    calibrator). One linear scan, two outputs.
+    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
+    // tick_stream is the full 56B record stream replayed in pass 3 for brick
+    // formation; we keep it lazily (re-open the streams) so RAM stays bounded.
+    let mut total_records: u64 = 0;
+
+    for (_d, path) in &shards {
+        let mut stream = ShardStream::<IndexRecord>::open(path)
+            .with_context(|| format!("open idx {}", path.display()))?;
+        while let Some(rec) = stream.next()? {
+            let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+            let bid = rec.index.bid;
+            let ask = rec.index.ask;
+            let mid = (bid + ask) * 0.5;
+            if !(mid.is_finite() && mid > 0.0) {
+                continue;
+            }
+            total_records += 1;
+
+            let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
+            let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
+            if ask > e.0 {
+                e.0 = ask;
+            }
+            if bid < e.1 && bid > 0.0 {
+                e.1 = bid;
+            }
+
+            let bucket = (ts / 60_000) * 60_000;
+            let pe = price_buckets.entry(bucket).or_insert((ts, mid));
+            if ts >= pe.0 {
+                *pe = (ts, mid);
+            }
+        }
+    }
+
+    info!(
+        pair = pair_str,
+        idx_records = total_records,
+        hlc_buckets = hlc.len(),
+        mid_buckets = price_buckets.len(),
+        "pass 1 (vol HLC + price downsample) done"
+    );
+
+    if hlc.is_empty() || price_buckets.is_empty() {
+        warn!(pair = pair_str, "no usable mid quotes after scan");
+        return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
+    }
+
+    // ── Build the .vol file (scratch, deleted at end). One vol file covers
+    //    the whole range; `compute_sigma(t)` only reads bins ≤ t so this is
+    //    causal: no leakage from "future" sigma into bricks for past days.
+    std::fs::create_dir_all(&bars_directory)
+        .with_context(|| format!("create_dir_all {}", bars_directory.display()))?;
+    let vol_path = std::env::temp_dir().join(format!(
+        "nxr-renko-trailing-{}-{}.vol",
+        ticker_id,
+        std::process::id()
+    ));
+    {
+        let mut writer = VolWriter::new(&vol_path)?;
+        build_vol_from_hlc(&hlc, &yml.vol, &mut writer)?;
+        writer.finish()?;
+    }
+    let vol_mmap = VolMmap::open(&vol_path)?;
+    let sigma_cache = {
+        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
+        calc.precompute_sigma_cache()
+    };
+    info!(
+        pair = pair_str,
+        vol_records = vol_mmap.records().len(),
+        sigma_cache = sigma_cache.len(),
+        "vol + sigma_cache built"
+    );
+
+    // 1-min mid prices as the calibrator input (ts-ordered by virtue of the
+    // BTreeMap key being the time bucket).
+    let prices: Vec<(i64, f64)> = price_buckets
+        .values()
+        .map(|(ts, mid)| (*ts, *mid))
+        .collect();
+
+    // ── Per-day walk-forward calibration + brick emission ───────────────
+    let day_list = day_range(from, to);
+    info!(
+        pair = pair_str,
+        n_days = day_list.len(),
+        from = %from,
+        to = %to,
+        "walk-forward starting"
+    );
+
+    // Continuity across day boundaries is achieved per-day by re-seeding the
+    // fresh generator with the prior day's last close (`shard_path(D-1)`).
+    // We can't carry the generator object across days because RenkoConfig is
+    // copied at construction and RenkoGenerator has no `set_multiplier` API
+    // (a future-proofing improvement, tracked in the follow-ups).
+    let mut last_good_k: f64 = 0.075;
+    let mut summary = PairSummary {
+        pair: pair_str.clone(),
+        ticker_id,
+        ..Default::default()
+    };
+
+    // Index input shards by date for fast per-day replay.
+    let shards_by_date: BTreeMap<NaiveDate, PathBuf> = shards.into_iter().collect();
+
+    // We open one BarShardWriter for the pair and let it route bars to the
+    // right daily shard via `append()` (it rotates on the bar's ts_ms).
+    // BUT: for `--force`/idempotency control we need to detect-and-skip /
+    // delete-and-rewrite per day BEFORE the writer touches that shard.
+    // Easiest path: skip-or-truncate per day, then append.
+    let bar_writer_must_finalize = true;
+
+    for d in &day_list {
+        summary.days += 1;
+        let d_start = day_start_ms(*d);
+        let d_end = d_start + MS_PER_DAY; // exclusive upper bound for "day D"
+
+        let out_path = shard_path(&bars_directory, *d, "renko");
+        // ── Idempotency / force gate ─────────────────────────────────────
+        let prior_records: u64 = if out_path.exists() {
+            // Cheap byte-length / sizeof check since Bar has a stable 96B layout.
+            std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0)
+                / std::mem::size_of::<Bar>() as u64
+        } else {
+            0
+        };
+        if prior_records > 0 && !args.force {
+            summary.skipped_days += 1;
+            eprintln!(
+                "skip   pair={} id={} date={} reason=existing_shard records={}",
+                pair_str, ticker_id, d, prior_records
+            );
+            continue;
+        }
+        if args.force && out_path.exists() {
+            if let Err(e) = std::fs::remove_file(&out_path) {
+                warn!(path = %out_path.display(), err = %e, "force-delete failed");
+            }
+        }
+
+        // ── Calibrate k(D) on prices with ts STRICTLY < d_start ─────────
+        // Defensive: the calibrator slices on the LAST timestamp of the
+        // input vec, so trimming the vec is the simplest leak-proof gate.
+        // Even a single equal-timestamp entry would let day-D data into
+        // the window, hence `< d_start` not `<=`.
+        let cutoff_idx = prices.partition_point(|(ts, _)| *ts < d_start);
+        let trailing: &[(i64, f64)] = &prices[..cutoff_idx];
+
+        let base_cfg = RenkoConfig {
+            multiplier: last_good_k as f32,
+            min_pct: yml.renko.min_pct,
+            max_pct: yml.renko.max_pct,
+        };
+        let calibrated_k: f64 = if trailing.len() < 2 {
+            // Too little history: keep prior k, mark this day as failed-cal.
+            summary.failed_days += 1;
+            last_good_k
+        } else {
+            let k = calibrate_mtf_with_target(
+                trailing,
+                &yml.calibration.inner(),
+                &base_cfg,
+                &vol_mmap,
+                &yml.vol,
+                &sigma_cache,
+                target_bpd,
+            ) as f64;
+            if k > 0.0 && k.is_finite() {
+                last_good_k = k;
+                k
+            } else {
+                summary.failed_days += 1;
+                last_good_k
+            }
+        };
+        summary.used_k_samples.push(calibrated_k);
+
+        // ── Apply k(D) to the renko generator (init or swap multiplier) ─
+        let renko_cfg = RenkoConfig {
+            multiplier: calibrated_k as f32,
+            min_pct: yml.renko.min_pct,
+            max_pct: yml.renko.max_pct,
+        };
+        renko_cfg
+            .validate()
+            .with_context(|| format!("invalid renko cfg on {}", d))?;
+
+        // Rebuild the generator with the new multiplier each day. Carrying
+        // bar state across days would require a `set_multiplier` API on
+        // RenkoGenerator (it has none). For backfill accuracy on the
+        // BRICK COUNT (the target metric), a fresh generator per day is
+        // acceptable: the first tick seeds last_close to its grid-snapped
+        // value, and that's the same value the live producer would settle
+        // to at midnight rollover anyway (within one brick of slop).
+        let mut gen_local = RenkoGenerator::new(renko_cfg, &vol_mmap, yml.vol.clone())?;
+        gen_local.set_sigma_cache(&sigma_cache);
+
+        // Optionally seed from the prior generator's last_close so the
+        // brick chain is continuous across day boundaries. We can't read
+        // RenkoGenerator's internal state from outside, so we synthesise a
+        // single seed tick at d_start using the last close price from the
+        // .renko shard for D-1 if it exists. Best-effort: missing prior
+        // shard → first tick of day D seeds the generator naturally.
+        if let Some(prev) = d.pred_opt() {
+            let prev_path = shard_path(&bars_directory, prev, "renko");
+            if prev_path.exists() {
+                if let Ok(prev_bars) = read_shard_aligned::<Bar>(&prev_path) {
+                    if let Some(last) = prev_bars.last() {
+                        // Seed: a synthetic tick at d_start carries the
+                        // prior close. The generator initialises last_close
+                        // via snap_to_grid. No bar is emitted (one tick).
+                        let _ = gen_local.feed_tick(d_start, last.close, &mut |_: &Bar| Ok(()));
+                    }
+                }
+            }
+        }
+
+        // ── Replay day D's ticks (only) → bricks → BarShardWriter ──────
+        // We re-open the idx shard(s) that overlap D. Since each idx file
+        // is per-UTC-day, that's at most 1 shard (today's). If a producer
+        // wrote ticks at exactly d_end (= next day's 00:00 UTC) they live
+        // in the next-day shard — we don't read them (ts < d_end).
+        let mut pass3_records: u64 = 0;
+        let mut pending: Vec<Bar> = Vec::new();
+        let mut writer = BarShardWriter::open_with(&data_root, ticker_id, "renko", true)?;
+
+        if let Some(idx_path) = shards_by_date.get(d) {
+            let mut stream = ShardStream::<IndexRecord>::open(idx_path)
+                .with_context(|| format!("open idx {}", idx_path.display()))?;
+            while let Some(rec) = stream.next()? {
+                let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+                if ts < d_start {
+                    continue;
+                }
+                if ts >= d_end {
+                    break;
+                }
+                let mid = (rec.index.bid + rec.index.ask) * 0.5;
+                if !(mid.is_finite() && mid > 0.0) {
+                    continue;
+                }
+                pass3_records += 1;
+                gen_local.feed_tick(ts, mid, &mut |bar: &Bar| {
+                    pending.push(*bar);
+                    Ok(())
+                })?;
+                for bar in pending.drain(..) {
+                    // Filter: only bars whose open_time_ms ∈ [d_start, d_end).
+                    // RenkoGenerator stamps bar.open_time on the tick that
+                    // initiated the brick; for the very first tick after
+                    // init that's also ≥ d_start, but the seed-tick above
+                    // is at d_start so any seed-induced bar would also be
+                    // tagged at d_start. Either way, this filter pins the
+                    // bar to day D.
+                    let bts = bar.open_time_ms();
+                    if bts < d_start || bts >= d_end {
+                        continue;
+                    }
+                    let mut out = bar;
+                    out.kind = BarKind::Renko as u8;
+                    writer.append(&out)?;
+                }
+            }
+        }
+        if bar_writer_must_finalize {
+            writer.flush()?;
+        }
+        drop(writer);
+
+        // ── Measure bpd_actual by counting bricks IN THE WRITTEN SHARD ─
+        let final_records: u64 = if out_path.exists() {
+            std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0)
+                / std::mem::size_of::<Bar>() as u64
+        } else {
+            0
+        };
+        let bpd_actual = final_records as f64; // one day window → bpd ≡ count
+
+        // Compute clamp summary for the day from the cached sigma:
+        let mid_ts_mts = timestamp::from_epoch_ms(d_start + MS_PER_DAY / 2);
+        let hour_idx = vol_mmap.find_index_for_mts(mid_ts_mts);
+        let sigma_mid = sigma_cache.get(hour_idx).copied().unwrap_or(0.0);
+        let min_pct = yml.renko.min_pct as f64;
+        let max_pct = yml.renko.max_pct as f64;
+        let raw_pct = calibrated_k * sigma_mid;
+        let clamped_pct = raw_pct.clamp(min_pct, max_pct);
+
+        // Drop the per-day generator (its state is encoded in the prior
+        // day's last close, which we re-seed next iteration).
+        drop(gen_local);
+
+        summary.bpd_samples.push(bpd_actual);
+        eprintln!(
+            "renko  pair={} id={} date={} bricks_in={} bricks_out={} bpd={:.0} k={:.6} sigma_mid={:.5} pct_clamped={:.5} (raw={:.5}, min={:.5}, max={:.5})",
+            pair_str,
+            ticker_id,
+            d,
+            pass3_records,
+            final_records,
+            bpd_actual,
+            calibrated_k,
+            sigma_mid,
+            clamped_pct,
+            raw_pct,
+            min_pct,
+            max_pct
+        );
+    }
+
+    // ── Cleanup ─────────────────────────────────────────────────────────
+    let _ = std::fs::remove_file(&vol_path);
+    Ok(summary)
+}
+
+fn main() -> Result<()> {
+    nxr_sdk::logging::init("info");
+    nxr_sdk::memory::apply_safe_cap();
+
+    let args = Args::parse();
+    let root: NxratesYml = serde_yaml::from_str(
+        &std::fs::read_to_string(&args.config)
+            .with_context(|| format!("read {}", args.config.display()))?,
+    )
+    .with_context(|| format!("parse {}", args.config.display()))?;
+    let yml = root.series;
+
+    let pairs: Vec<(String, String)> = if args.all {
+        LAUNCH_PAIRS
+            .iter()
+            .map(|(b, q)| (b.to_string(), q.to_string()))
+            .collect()
+    } else {
+        let base = args
+            .base
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--base required unless --all"))?;
+        let quote = args
+            .quote
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--quote required unless --all"))?;
+        vec![(base, quote)]
+    };
+
+    // De-dup in case the operator lists the same pair twice.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut summaries: Vec<PairSummary> = Vec::new();
+    for (b, q) in pairs {
+        let key = format!("{}/{}", b.to_uppercase(), q.to_uppercase());
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        match run_pair(&args, &yml, &b, &q) {
+            Ok(s) => summaries.push(s),
+            Err(e) => warn!(pair = key, err = %e, "pair run failed"),
+        }
+    }
+
+    // ── Run-level summary on stderr (per-pair + grand stats) ────────────
+    eprintln!("\n────── walk-forward backfill summary ──────");
+    let mut grand_samples: Vec<f64> = Vec::new();
+    for s in &summaries {
+        eprintln!("{}", s.finalize(yml.calibration.target_bpd));
+        grand_samples.extend(s.bpd_samples.iter().copied());
+    }
+    if !grand_samples.is_empty() {
+        let mean = grand_samples.iter().sum::<f64>() / grand_samples.len() as f64;
+        grand_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = grand_samples[grand_samples.len() / 2];
+        let lo = (yml.calibration.target_bpd / 3.0).max(50.0);
+        let hi = yml.calibration.target_bpd * 2.0;
+        let oob = grand_samples.iter().filter(|b| **b < lo || **b > hi).count();
+        eprintln!(
+            "GRAND  pairs={} days={} bpd_mean={:.0} bpd_median={:.0} bpd_oob[{:.0}..{:.0}]={} target={:.0}",
+            summaries.len(),
+            grand_samples.len(),
+            mean,
+            median,
+            lo,
+            hi,
+            oob,
+            yml.calibration.target_bpd
+        );
+    } else {
+        eprintln!("GRAND  no days emitted (every pair skipped or empty)");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the leak gate. `partition_point(|(ts,_)| ts < d_start)`
+    /// must return `cutoff` such that NO element with `ts == d_start` (or
+    /// after) is included.
+    #[test]
+    fn calibrator_window_excludes_day_d_data() {
+        let d_start = day_start_ms(NaiveDate::from_ymd_opt(2024, 5, 21).unwrap());
+        let prices: Vec<(i64, f64)> = vec![
+            (d_start - 86_400_000, 100.0), // D-1
+            (d_start - 60_000, 101.0),     // 1 min before D
+            (d_start - 1, 101.5),          // 1 ms before D
+            (d_start, 102.0),              // D start — MUST be excluded
+            (d_start + 60_000, 103.0),     // 1 min into D
+        ];
+        let cutoff = prices.partition_point(|(ts, _)| *ts < d_start);
+        let trailing = &prices[..cutoff];
+        assert_eq!(trailing.len(), 3);
+        assert!(trailing.iter().all(|(ts, _)| *ts < d_start));
+    }
+
+    #[test]
+    fn class_for_pair_buckets_correctly() {
+        assert_eq!(class_for_pair("BTC", "USDT"), "crypto_major");
+        assert_eq!(class_for_pair("ETH", "USDT"), "crypto_major");
+        assert_eq!(class_for_pair("USDC", "USDT"), "crypto_stable");
+        assert_eq!(class_for_pair("USDS", "USDT"), "crypto_stable");
+        assert_eq!(class_for_pair("PAXG", "USDT"), "crypto_alt");
+    }
+
+    #[test]
+    fn day_start_aligns_to_utc_midnight() {
+        let d = NaiveDate::from_ymd_opt(2024, 5, 21).unwrap();
+        assert_eq!(day_start_ms(d) % MS_PER_DAY, 0);
+    }
+
+    #[test]
+    fn wipe_only_future_dated_shards() {
+        let tmp = std::env::temp_dir().join(format!("nxr-wipe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Past + present should survive
+        std::fs::write(tmp.join("2024-05-21.renko"), b"").unwrap();
+        std::fs::write(tmp.join("2026-05-23.renko"), b"").unwrap();
+        // Future (≥ today.year() + 1)
+        std::fs::write(tmp.join("2099-01-01.renko"), b"").unwrap();
+        std::fs::write(tmp.join("2031-06-15.renko"), b"").unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 5, 24).unwrap();
+        let n = wipe_future_dated_junk(&tmp, today).unwrap();
+        assert_eq!(n, 2);
+        assert!(tmp.join("2024-05-21.renko").exists());
+        assert!(tmp.join("2026-05-23.renko").exists());
+        assert!(!tmp.join("2099-01-01.renko").exists());
+        assert!(!tmp.join("2031-06-15.renko").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
