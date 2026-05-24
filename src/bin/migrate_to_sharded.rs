@@ -212,10 +212,10 @@ fn migrate_idx(
             Some(IdxShardWriter::open_with(root, id, true, false)
                 .with_context(|| format!("open writer {id}"))?)
         };
-        // Inline gate-simulation state for report mode.
-        let mut sim_last: Option<(f64, f64)> = None;
+        // Inline gate-simulation state for report mode (mirrors IdxShardWriter:
+        // drop only when the full market tuple (bid,ask,vbid,vask,ci) repeats).
+        let mut sim_last: Option<(f64, f64, u32, u32, u16)> = None;
         let mut sim_date: Option<chrono::NaiveDate> = None;
-        let mut sim_sentinel = i64::MIN;
         let mut written = 0usize;
         let mut seen = 0usize;
 
@@ -237,16 +237,14 @@ fn migrate_idx(
                 // Replicate IdxShardWriter gate for the dry-run count.
                 let date = shard::ts_ms_to_utc_date(ts);
                 let body = rec.index;
-                let (bid, ask) = (body.bid, body.ask);
+                let (bid, ask, vbid, vask, ci) = (body.bid, body.ask, body.vbid, body.vask, body.ci);
                 let new_day = sim_date != Some(date);
-                let changed = sim_last.map(|(b, a)| bid != b || ask != a).unwrap_or(true);
+                let changed = sim_last
+                    .map(|(b, a, vb, va, c)| bid != b || ask != a || vbid != vb || vask != va || ci != c)
+                    .unwrap_or(true);
                 if changed || new_day {
                     *written += 1;
-                    sim_last = Some((bid, ask));
-                    sim_sentinel = ts;
-                } else if ts - sim_sentinel >= shard::SENTINEL_INTERVAL_MS {
-                    *written += 1; // liveness sentinel
-                    sim_sentinel = ts;
+                    sim_last = Some((bid, ask, vbid, vask, ci));
                 }
                 sim_date = Some(date);
             }
