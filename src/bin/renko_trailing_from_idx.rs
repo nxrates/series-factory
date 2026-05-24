@@ -553,7 +553,15 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
     // We can't carry the generator object across days because RenkoConfig is
     // copied at construction and RenkoGenerator has no `set_multiplier` API
     // (a future-proofing improvement, tracked in the follow-ups).
-    let mut last_good_k: f64 = 0.075;
+    //
+    // `prior_k` is used ONLY as a search-prior for the log-space binary
+    // search (calibrate's `base.multiplier`). It is NEVER used as a fallback
+    // emit value: if calibration fails for a given day (insufficient
+    // trailing history OR all-windows-empty), the day is SKIPPED entirely
+    // (no shard written). Operator policy 2026-05-24: hard-coded k is
+    // unacceptable; absence of renko data on early days is the correct
+    // outcome until ≥ min_window_days of trailing history accumulates.
+    let mut prior_k: f64 = 0.4; // mid of config mult_bounds [0.05, 4.0]; only a prior
     let mut summary = PairSummary {
         pair: pair_str.clone(),
         ticker_id,
@@ -607,13 +615,23 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         let trailing: &[(i64, f64)] = &prices[..cutoff_idx];
 
         let base_cfg = RenkoConfig {
-            multiplier: last_good_k as f32,
+            multiplier: prior_k as f32,
             min_pct: yml.renko.min_pct,
         };
-        let calibrated_k: f64 = if trailing.len() < 2 {
-            // Too little history: keep prior k, mark this day as failed-cal.
-            summary.failed_days += 1;
-            last_good_k
+        // Hard rule (operator 2026-05-24): NO k fallback. If calibration
+        // fails (insufficient history OR all-windows-empty OR non-finite),
+        // skip the day entirely. Do NOT write a shard with a stub/last-good
+        // multiplier — that produces wrong-multiplier bricks that look like
+        // data but encode nothing meaningful.
+        //
+        // 2-expert review (Aoife HFT-quant ↔ Tomás storage):
+        //   Aoife: "Stub k = garbage data downstream. Walk-forward integrity
+        //    requires every emitted day to have an actually-calibrated k.
+        //    Absence of bars in the first ~30 d of source is the correct
+        //    signal that the model is warming up."
+        //   Tomás: "Skipping is also storage-cheaper — no torn shards to heal."
+        let calibrated_k_opt: Option<f64> = if trailing.len() < 2 {
+            None
         } else {
             let k = calibrate_mtf_with_target(
                 trailing,
@@ -624,15 +642,24 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
                 &sigma_cache,
                 target_bpd,
             ) as f64;
-            if k > 0.0 && k.is_finite() {
-                last_good_k = k;
+            if k > 0.0 && k.is_finite() { Some(k) } else { None }
+        };
+
+        let calibrated_k = match calibrated_k_opt {
+            Some(k) => {
+                prior_k = k; // update search prior for next day
+                summary.used_k_samples.push(k);
                 k
-            } else {
+            }
+            None => {
                 summary.failed_days += 1;
-                last_good_k
+                eprintln!(
+                    "skip   pair={} id={} date={} reason=calibration_unavailable trailing_n={}",
+                    pair_str, ticker_id, d, trailing.len()
+                );
+                continue;
             }
         };
-        summary.used_k_samples.push(calibrated_k);
 
         // ── Apply k(D) to the renko generator (init or swap multiplier) ─
         let renko_cfg = RenkoConfig {
