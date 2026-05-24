@@ -18,6 +18,7 @@ use clap::Parser;
 use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
 use nxr_sdk::shard::{ShardStream, MS_PER_30MIN, MS_PER_DAY};
+use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{BarAccumulator, resolve_ticker_id};
 use serde::Deserialize;
 use series_factory::sharding::{
@@ -157,8 +158,25 @@ fn main() -> Result<()> {
     // ═══ PASS 2: feed composite mid → RenkoGenerator ═══
     let bootstrap_end = first_ts + yml.pipeline.bootstrap_days * MS_PER_DAY;
 
+    // Phase 55 W3.C: read the calibrated k from ticker-params.json. The prior
+    // hardcoded `multiplier: 0.075` was the root cause of the 22× bars/day
+    // overshoot on majors (BTC 8645, ETH 6786, BNB 6114): nxr-calibrate writes
+    // per-ticker k values into `ticker-params.json`, but this offline emitter
+    // ignored them and ran every pair at the bootstrap k=0.075. Fall back to
+    // 0.075 only when the calibration table has no entry (new tickers /
+    // first-ever build before the calibrator runs).
+    let ticker_id = resolve_ticker_id(&format!("{}/{}", base, quote));
+    let calibrated_k = load_calibrated_k(ticker_id);
+    let multiplier = calibrated_k.unwrap_or(0.075) as f32;
+    info!(
+        ticker_id,
+        k = multiplier,
+        source = if calibrated_k.is_some() { "ticker-params.json" } else { "default" },
+        "renko k resolved"
+    );
+
     let renko_config = RenkoConfig {
-        multiplier: 0.075,
+        multiplier,
         min_pct: yml.renko.min_pct,
         max_pct: yml.renko.max_pct,
     };
@@ -263,7 +281,6 @@ fn main() -> Result<()> {
 
     // ═══ MANIFEST ═══
     let ticker_str = format!("{}-{}", base, quote);
-    let ticker_id = resolve_ticker_id(&format!("{}/{}", base, quote));
     let mpath = manifest_path(&out_dir);
     let mut manifest = read_manifest(&mpath)?
         .unwrap_or_else(|| Manifest::new(ticker_str.clone(), ticker_id, "renko"));
@@ -274,4 +291,32 @@ fn main() -> Result<()> {
 
     info!(out_dir = %out_dir.display(), manifest = %mpath.display(), "manifest updated");
     Ok(())
+}
+
+/// Look up the calibrated Renko multiplier for `ticker_id` in
+/// `$NXR_TICKER_PARAMS_PATH` (default `/data/config/ticker-params.json`).
+/// Returns `None` and logs a single warning if the file is missing, malformed,
+/// or has no entry for this ticker — callers fall back to the bootstrap k.
+fn load_calibrated_k(ticker_id: u64) -> Option<f64> {
+    let cfg = nxr_sdk::NxrConfig::from_env();
+    let path = PathBuf::from(&cfg.ticker_params_path);
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), err = %e, "ticker-params.json read failed; using bootstrap k");
+            return None;
+        }
+    };
+    let weights: WeightsFile = match serde_json::from_str(&raw) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), err = %e, "ticker-params.json parse failed; using bootstrap k");
+            return None;
+        }
+    };
+    weights
+        .renko_k_per_ticker
+        .get(&ticker_id.to_string())
+        .copied()
+        .filter(|k| *k > 0.0 && k.is_finite())
 }

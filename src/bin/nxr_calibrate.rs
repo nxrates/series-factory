@@ -189,8 +189,10 @@ fn classify_pair(pair: &str, ticker_id: u64, stables: &[String]) -> AssetClassBu
     };
 
     // Decode base/quote MITCH class bits from the ticker_id. Bits [59:56] = base
-    // class, [39:36] = quote class. We use these as the primary discriminator
-    // and fall back to symbol-string heuristics for the major/alt/stable split.
+    // class, [39:36] = quote class. We use these as a hint and fall back to
+    // symbol-string heuristics; MITCH puts some stables under non-CR classes
+    // (e.g. USDS appears as PM=7 in the registry) so name-based detection is
+    // authoritative for the stable / non-stable split.
     let base_class = ((ticker_id >> 56) & 0x0F) as u8;
     let quote_class = ((ticker_id >> 36) & 0x0F) as u8;
 
@@ -198,21 +200,38 @@ fn classify_pair(pair: &str, ticker_id: u64, stables: &[String]) -> AssetClassBu
     let is_quote_stable = stables.iter().any(|s| s.eq_ignore_ascii_case(&quote))
         || quote == "USD" || quote == "USDT" || quote == "USDC";
 
+    // Phase 55 W3.C: name-based stable detection is authoritative. USDS-style
+    // pairs were leaking through with k=0.075 because they didn't have both
+    // base_class and quote_class == CR, so the MITCH-bit gate above rejected
+    // them and they fell into Unknown → default target_bpd. Result: 6360 bpd
+    // bricks on stable-quoted stables.  Catch them by name FIRST regardless
+    // of MITCH class bits.
+    if is_base_stable && is_quote_stable {
+        return AssetClassBucket::CryptoStable;
+    }
+
     match (base_class, quote_class) {
         (ASSET_CLASS_FX, ASSET_CLASS_FX) => {
             let majors_only = FX_MAJORS.contains(&base.as_str()) && FX_MAJORS.contains(&quote.as_str());
             if majors_only { AssetClassBucket::FxMajor } else { AssetClassBucket::FxCross }
         }
         (ASSET_CLASS_CR, _) | (_, ASSET_CLASS_CR) => {
-            if is_base_stable && is_quote_stable {
-                AssetClassBucket::CryptoStable
-            } else if CRYPTO_MAJORS.contains(&base.as_str()) {
+            if CRYPTO_MAJORS.contains(&base.as_str()) {
                 AssetClassBucket::CryptoMajor
             } else {
                 AssetClassBucket::CryptoAlt
             }
         }
-        _ => AssetClassBucket::Unknown,
+        _ => {
+            // Final fallback: if the base looks like a known crypto major (or
+            // unknown alt) by symbol, classify accordingly so we don't lose
+            // tickers whose MITCH bits are quirky.
+            if CRYPTO_MAJORS.contains(&base.as_str()) {
+                AssetClassBucket::CryptoMajor
+            } else {
+                AssetClassBucket::Unknown
+            }
+        }
     }
 }
 
