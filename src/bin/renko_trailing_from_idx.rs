@@ -433,11 +433,21 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
     let mut tick_stream: Vec<(i64, f64)> = Vec::new();
     let mut total_records: u64 = 0;
 
-    // Sliding window for tick retention: only keep `max(windows_days)` days
-    // back from the last calibration point we care about (= last day to be
-    // emitted). For trailing backfill this is `to`'s d_end; for fresh runs
-    // we don't know it yet, so we collect everything and prune in pass-1's
-    // tail. Simpler: retain ticks newer than `to_d_end - max_window_ms`.
+    // Retention window for the tick stream that feeds the per-day calibrator.
+    //
+    // 2-expert review (Aoife HFT-quant ↔ Tomás storage):
+    //   Aoife: "Day D's calibration needs trailing ticks back to D - max(windows_days).
+    //    For a backfill spanning [from, to], that means we need ticks from
+    //    `from_d_start - max_window_days` onward — anchoring to `to` only keeps
+    //    the trailing window for the LAST emitted day; every earlier day gets
+    //    an empty slice → fallback to last_good_k → 22× bpd overshoot on 85%
+    //    of days. We just saw this fire in the 716462d sanity run."
+    //   Tomás: "RAM: 850 d × 10 Hz × 16 B = ~1.2 GB / pair. Pods are 8 Gi
+    //    requests / 32 Gi limits — fits with headroom. --all processes pairs
+    //    serially so peak RAM is single-pair."
+    // Consensus: anchor at `from_d_start`, not `to_d_end`. Same memory cost
+    // on a single-day backfill, much more memory on a 2-year backfill — but
+    // RAM budget allows it and correctness is non-negotiable.
     let max_window_days = yml
         .calibration
         .windows_days
@@ -445,8 +455,8 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         .copied()
         .max()
         .unwrap_or(120);
-    let to_d_end = day_start_ms(to) + MS_PER_DAY;
-    let tick_retain_from = to_d_end - (max_window_days as i64) * MS_PER_DAY;
+    let from_d_start = day_start_ms(from);
+    let tick_retain_from = from_d_start - (max_window_days as i64) * MS_PER_DAY;
 
     for (_d, path) in &shards {
         let mut stream = ShardStream::<IndexRecord>::open(path)
