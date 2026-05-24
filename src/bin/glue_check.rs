@@ -33,12 +33,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use memmap2::Mmap;
 use mitch::timestamp;
+use nxr_sdk::shard::read_shard_aligned;
 use nxr_sdk::{ipc::record::IndexRecord, resolve_ticker_id, tdwap::decode_ci_ubp};
 use serde::Serialize;
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -332,10 +331,13 @@ fn check_one(ticker: &str, args: &Args) -> Result<TickerReport> {
         });
     }
 
-    let bf_map = mmap_idx(&backfill_path)?;
-    let lv_map = mmap_idx(&live_path)?;
-    let bf: &[IndexRecord] = bf_slice(&bf_map.0)?;
-    let lv: &[IndexRecord] = bf_slice(&lv_map.0)?;
+    // Cold-path tool: read whole shards into memory via the canonical
+    // align-aware reader instead of a hand-rolled mmap+slice. Loses zero-copy,
+    // but a per-day shard is small and this binary is binary-search bound.
+    let bf_vec: Vec<IndexRecord> = read_shard_aligned(&backfill_path)?;
+    let lv_vec: Vec<IndexRecord> = read_shard_aligned(&live_path)?;
+    let bf: &[IndexRecord] = &bf_vec;
+    let lv: &[IndexRecord] = &lv_vec;
 
     if bf.is_empty() || lv.is_empty() {
         return Ok(TickerReport {
@@ -571,30 +573,6 @@ fn resolve_names(arg: &str) -> (String, Option<u64>) {
     let symbol = pair.replace('-', "/");
     let id = resolve_ticker_id(&symbol);
     (pair, Some(id))
-}
-
-/// mmap the file; returns the `Mmap` (caller pins it for slice lifetime).
-fn mmap_idx(path: &Path) -> Result<(Mmap, u64)> {
-    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let len = f.metadata()?.len();
-    if len == 0 {
-        // memmap2 refuses zero-length maps; create an empty stand-in via a tiny placeholder.
-        // Easier: bail w/ note → caller treats as empty.
-        return Err(anyhow!("file is empty: {}", path.display()));
-    }
-    let m = unsafe { Mmap::map(&f) }.with_context(|| format!("mmap {}", path.display()))?;
-    Ok((m, len))
-}
-
-/// Reinterpret an mmap as `&[IndexRecord]`. Tail bytes (file not %56) are dropped.
-fn bf_slice<'a>(m: &'a Mmap) -> Result<&'a [IndexRecord]> {
-    let rec = std::mem::size_of::<IndexRecord>();
-    let nbytes = m.len();
-    let aligned = (nbytes / rec) * rec;
-    if aligned == 0 {
-        return Ok(&[]);
-    }
-    Ok(bytemuck::cast_slice::<u8, IndexRecord>(&m[..aligned]))
 }
 
 #[inline]
