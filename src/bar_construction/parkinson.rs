@@ -41,7 +41,7 @@ impl Default for VolConfig {
     fn default() -> Self {
         Self {
             ema_period: 28,
-            mtf_lookback_days: vec![30, 60, 180],
+            mtf_lookback_days: vec![14, 60, 180],
             winsorize_pct: [0.05, 0.95],
             winsorize_min_samples: 5,
         }
