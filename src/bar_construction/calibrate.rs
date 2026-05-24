@@ -143,10 +143,13 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
         for round in 0..cal.max_rounds {
             let log_mid = (log_lo + log_hi) / 2.0;
             let mult = log_mid.exp() as f32;
+            // Trial config inherits min_pct only; max_pct dropped (operator
+            // override 2026-05-24). Debate (Aoife ↔ Tomás): clone all fields
+            // vs explicit construct — explicit wins, prevents future struct
+            // additions from silently leaking into trial.
             let trial = RenkoConfig {
                 multiplier: mult,
                 min_pct: base.min_pct,
-                ..*base
             };
             let t_round = std::time::Instant::now();
             let diag = round == 0;

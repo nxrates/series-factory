@@ -45,10 +45,11 @@ struct PipelineYml {
     pipeline: PipelineParams,
 }
 
+// max_pct dropped 2026-05-24 (operator override). Debate (Aoife ↔ Tomás):
+// keep parsing for back-compat vs strict. Strict; legacy yaml just ignored.
 #[derive(Debug, Deserialize)]
 struct RenkoYml {
     min_pct: f32,
-    max_pct: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,10 +237,9 @@ fn main() -> Result<()> {
         let mut config: RenkoConfig = if config_path.exists() {
             serde_json::from_str(&fs::read_to_string(&config_path)?)?
         } else {
-            RenkoConfig { multiplier: 0.075, min_pct: yml.renko.min_pct, max_pct: yml.renko.max_pct }
+            RenkoConfig { multiplier: 0.075, min_pct: yml.renko.min_pct }
         };
         config.min_pct = yml.renko.min_pct;
-        config.max_pct = yml.renko.max_pct;
         config.validate()?;
 
         let tick_files = discover_tick_files(&ticks_dir, pair, &yml.pipeline.exchanges);

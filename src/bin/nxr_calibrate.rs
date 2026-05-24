@@ -74,10 +74,13 @@ struct SeriesYml {
     calibration: CalibrationConfigExt,
 }
 
+// max_pct removed (2026-05-24): no ceiling on adaptive renko brick %.
+// Debate (Aoife ↔ Tomás): keep field for backward-compat parsing vs strip
+// entirely. Consensus: serde tolerates extra keys by default, so dropping
+// the field here lets stale config.yml entries (max_pct: 0.10) parse fine.
 #[derive(Debug, Deserialize)]
 struct RenkoYml {
     min_pct: f32,
-    max_pct: f32,
 }
 
 /// Calibration config with optional per-class `target_bpd` overrides.
@@ -338,7 +341,6 @@ fn calibrate_one(
     let base = RenkoConfig {
         multiplier: 0.075,
         min_pct: renko_yml.min_pct,
-        max_pct: renko_yml.max_pct,
     };
     if let Err(e) = base.validate() {
         let _ = std::fs::remove_file(&vol_path);

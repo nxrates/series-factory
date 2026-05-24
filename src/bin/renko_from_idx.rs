@@ -61,10 +61,12 @@ struct SeriesYml {
     vol: VolConfig,
     pipeline: PipelineYml,
 }
+// max_pct removed (2026-05-24, operator: no cap on adaptive renko).
+// Debate (Aoife ↔ Tomás): explicit struct vs serde default — explicit so a
+// stray `max_pct:` in older config.yml doesn't silently feed a stale value.
 #[derive(Deserialize)]
 struct RenkoYml {
     min_pct: f32,
-    max_pct: f32,
 }
 #[derive(Deserialize)]
 struct PipelineYml {
@@ -178,7 +180,6 @@ fn main() -> Result<()> {
     let renko_config = RenkoConfig {
         multiplier,
         min_pct: yml.renko.min_pct,
-        max_pct: yml.renko.max_pct,
     };
     renko_config.validate()?;
 

@@ -30,7 +30,8 @@
 //! - `.bars` (`mitch::Bar`, 96 B): length % 96 == 0; `open_ts <= close_ts`;
 //!   `high >= max(o,c,l)`, `low <= min(o,c,h)`; `kind ∈ {0,1,2,3}`;
 //!   `realized_var, bipower_var >= 0`. Renko (`kind == 1`):
-//!   `close[i-1] == open[i]`; `|(close-open)/open|` ∈ `[min_pct, max_pct]`
+//!   `close[i-1] == open[i]`; `|(close-open)/open|` ≥ `min_pct` (no ceiling
+//!   post 2026-05-24: adaptive renko has no max_pct cap, see config.yml).
 //!   from `config.yml::series.renko`. Kline (`kind == 0`):
 //!   `close_ts[i-1] == open_ts[i]`. Strict → bars/day ∈ `[10, 2000]`.
 //! - `.vol` (`series_factory::vol_bin::VolRecord`, 14 B): length % 14 == 0;
@@ -180,11 +181,17 @@ struct CfgRoot { series: CfgSeries }
 #[derive(Debug, Deserialize)]
 struct CfgSeries { renko: CfgRenko }
 #[derive(Debug, Deserialize)]
-struct CfgRenko { min_pct: f64, max_pct: f64 }
+struct CfgRenko { min_pct: f64 }
 
-/// Load `(min_pct, max_pct)` from `config.yml`, falling back to (0.0001, 0.10).
+/// Load `min_pct` from `config.yml`, falling back to `0.0001`.
 /// Lookup order: `$NXR_CONFIG`, `./config.yml`, `series-factory/config.yml`.
-fn load_renko_bounds() -> (f64, f64) {
+///
+/// Debate (Aoife ↔ Tomás): post-2026-05-24 max_pct is gone; integrity_check
+/// loses its upper-bound enforcement. Aoife: "Replace with anomaly log only."
+/// Tomás: "Floor still matters — a brick < min_pct means generator math
+/// underflowed and the bar is invalid storage-wise." Consensus: keep floor
+/// check, drop ceiling.
+fn load_renko_bounds() -> f64 {
     let candidates: Vec<PathBuf> = std::env::var("NXR_CONFIG")
         .map(PathBuf::from)
         .into_iter()
@@ -193,11 +200,11 @@ fn load_renko_bounds() -> (f64, f64) {
     for p in candidates {
         if let Ok(s) = std::fs::read_to_string(&p) {
             if let Ok(cfg) = serde_yaml::from_str::<CfgRoot>(&s) {
-                return (cfg.series.renko.min_pct, cfg.series.renko.max_pct);
+                return cfg.series.renko.min_pct;
             }
         }
     }
-    (0.0001, 0.10)
+    0.0001
 }
 
 // ── Mmap helper ─────────────────────────────────────────────────────────────
@@ -419,7 +426,7 @@ fn check_bars(path: &Path, strict: bool) -> Result<FileReport> {
     let bars: &[mitch::bar::Bar] = cast_slice(&mmap[..]);
     let n = bars.len();
 
-    let (renko_min_pct, renko_max_pct) = load_renko_bounds();
+    let renko_min_pct = load_renko_bounds();
 
     let mut prev_close_ts_ms: Option<i64> = None;
     let mut prev_close: Option<f64> = None;
@@ -526,15 +533,16 @@ fn check_bars(path: &Path, strict: bool) -> Result<FileReport> {
             }
         }
 
-        // Renko brick magnitude must be within [min_pct, max_pct].
+        // Renko brick magnitude must be ≥ min_pct (floor only — no ceiling
+        // post 2026-05-24: adaptive renko has no max_pct cap).
         if kind == 1 && open > 0.0 {
             let brick = ((close - open) / open).abs();
-            if brick < renko_min_pct || brick > renko_max_pct {
+            if brick < renko_min_pct {
                 errors.push(Finding {
                     record_ix: Some(i),
                     msg: format!(
-                        "renko brick {:.6} outside [{}, {}]",
-                        brick, renko_min_pct, renko_max_pct
+                        "renko brick {:.6} below floor {}",
+                        brick, renko_min_pct
                     ),
                 });
             }
