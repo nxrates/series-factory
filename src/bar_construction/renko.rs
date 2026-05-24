@@ -1,11 +1,22 @@
 //! Adaptive Renko bar generation.
 //!
 //! Brick size formula:
-//!   b_t = p_t * clamp(multiplier * sigma_blend(t), min_pct, max_pct)
+//!   b_t = p_t * max(multiplier * sigma_blend(t), min_pct)
 //!
 //! where sigma_blend comes from [`super::parkinson::MtfParkinsonCalculator`]
 //! over any [`super::parkinson::VolSource`] (mmap for backtest, ring buffer
-//! for real-time).
+//! for real-time). NO upper ceiling — operator directive 2026-05-24
+//! ("markets be markets"): an adaptive Renko that caps brick % on high-σ
+//! days biases calibration's binary search downward (the search assumes the
+//! clamp does not fire). Removing `max_pct` keeps `k(σ)` honest. The only
+//! remaining safety is `min_pct` (floor against div-by-zero / sigma=0).
+//!
+//! Debate (Aoife HFT-quant ↔ Tomás storage):
+//!   - Aoife: "Ceiling distorts calibration on 2020-style σ spikes —
+//!     bpd undershoots because the brick is too small relative to k."
+//!   - Tomás: "But 10% absolute brick on a 5σ day still survives our 96B
+//!     Bar layout; nothing downstream breaks if pct grows."
+//!   - Consensus: drop the ceiling, keep min_pct=0.0001 floor.
 //!
 //! Design:
 //!   * Streaming, never holds all bars in RAM
@@ -25,16 +36,16 @@ use super::parkinson::{MtfParkinsonCalculator, VolConfig, VolSource};
 ///
 /// `multiplier` controls bars/day via `brick_pct = multiplier * sigma_blend`
 /// (auto-calibrated via target bars/day). `min_pct` is a safety floor.
+/// No upper ceiling — see module docstring.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RenkoConfig {
     pub multiplier: f32,
     pub min_pct: f32,
-    pub max_pct: f32,
 }
 
 impl Default for RenkoConfig {
     fn default() -> Self {
-        Self { multiplier: 0.075, min_pct: 0.001, max_pct: 0.10 }
+        Self { multiplier: 0.075, min_pct: 0.0001 }
     }
 }
 
@@ -52,8 +63,11 @@ impl RenkoConfig {
         if !(0.001..=1.0).contains(&self.multiplier) {
             anyhow::bail!("multiplier out of range: {}", self.multiplier);
         }
-        if self.min_pct >= self.max_pct {
-            anyhow::bail!("min_pct must be < max_pct");
+        // Debate (Aoife ↔ Tomás): allow min_pct == 0 (no floor) vs require > 0
+        // (div-by-zero guard). Consensus: must be ≥ 0; the brick formula's
+        // `max(_, min_pct)` already handles the zero case safely.
+        if self.min_pct < 0.0 {
+            anyhow::bail!("min_pct must be >= 0");
         }
         Ok(())
     }
@@ -125,7 +139,11 @@ impl<'a, S: VolSource + ?Sized> RenkoGenerator<'a, S> {
         };
 
         let raw_pct = self.config.multiplier as f64 * sigma;
-        let clamped_pct = raw_pct.clamp(self.config.min_pct as f64, self.config.max_pct as f64);
+        // Floor only — no ceiling (markets be markets, see module doc).
+        // Debate (Aoife ↔ Tomás): without a cap, a flash crash could mint
+        // a 50% brick. But that's the right answer for adaptive renko —
+        // calibration's binary search needs a monotone pct→bpd curve.
+        let clamped_pct = raw_pct.max(self.config.min_pct as f64);
         let raw_brick = price * clamped_pct;
         let brick_size = snap_to_25_grid(raw_brick);
         self.current_brick_size = brick_size;
@@ -271,11 +289,16 @@ mod tests {
         assert!(RenkoConfig::default().validate().is_ok());
         let bad = RenkoConfig { multiplier: 0.0, ..Default::default() };
         assert!(bad.validate().is_err());
+        // min_pct=0 is now allowed (no floor); negative is still rejected.
+        let zero_floor = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+        assert!(zero_floor.validate().is_ok());
+        let neg = RenkoConfig { multiplier: 0.075, min_pct: -1e-6 };
+        assert!(neg.validate().is_err());
     }
 
     #[test]
     fn config_id() {
-        let config = RenkoConfig { multiplier: 0.075, min_pct: 0.000830, ..Default::default() };
+        let config = RenkoConfig { multiplier: 0.075, min_pct: 0.000830 };
         assert_eq!(config.id(), "m0750_mp0830");
     }
 }

@@ -315,7 +315,7 @@ fn main() -> Result<()> {
         writeln!(f, "reversal:   {:.3}", score.reversal_delay)?;
         writeln!(f, "multiplier:     {:.6}", config.multiplier)?;
         writeln!(f, "min_pct:        {:.6}", config.min_pct)?;
-        writeln!(f, "max_pct:        {:.4}", config.max_pct)?;
+        // max_pct removed 2026-05-24 (operator: no cap on adaptive renko).
         writeln!(f, "total_trials:   {}", n_phase_a + phase_b_done)?;
 
         info!("=== Optimisation complete ===");
