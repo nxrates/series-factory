@@ -725,10 +725,32 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
                     continue;
                 }
                 pass3_records += 1;
-                gen_local.feed_tick(ts, mid, &mut |bar: &Bar| {
-                    pending.push(*bar);
-                    Ok(())
-                })?;
+                // Emission path: use the full IndexRecord (bid/ask/vbid/vask/
+                // ci_ubp/accepted/rejected) so the emitted Bar carries the
+                // microstructure enrichment block (realized_var, bipower_var,
+                // drift, vol_imbalance, avg_spread_bps, max_abs_return,
+                // avg_ci_ubp, reject_rate). 2026-05-25 fix: prior version
+                // used `feed_tick(ts, mid)` which left all micros at zero.
+                // ci_ubp wire encoding: u16 sqrt-compressed; decode via
+                // (ci/CI_SCALE)^2 (see mitch/common::CI_SCALE).
+                let ci_decoded = {
+                    let c = rec.index.ci as f64 / mitch::common::CI_SCALE;
+                    c * c
+                };
+                gen_local.feed_index_record(
+                    ts,
+                    rec.index.bid,
+                    rec.index.ask,
+                    rec.index.vbid,
+                    rec.index.vask,
+                    ci_decoded,
+                    rec.index.accepted as u32,
+                    rec.index.rejected as u32,
+                    &mut |bar: &Bar| {
+                        pending.push(*bar);
+                        Ok(())
+                    },
+                )?;
                 for bar in pending.drain(..) {
                     // Filter: only bars whose open_time_ms ∈ [d_start, d_end).
                     // RenkoGenerator stamps bar.open_time on the tick that

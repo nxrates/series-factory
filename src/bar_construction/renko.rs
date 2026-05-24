@@ -27,6 +27,7 @@
 use anyhow::Result;
 use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
+use nxr_sdk::BarAccumulator;
 use serde::{Deserialize, Serialize};
 
 use super::grid::{grid_step_for_brick, snap_to_25_grid, snap_to_grid};
@@ -75,9 +76,23 @@ impl RenkoConfig {
 
 /// Streaming Renko bar generator with adaptive brick sizing.
 ///
-/// Emits `mitch::Bar` with `kind = BarKind::Renko as u8`. Enrichment fields
-/// (dispersion, drift, vol_imbalance, ...) are left at zero: downstream
-/// consumers accumulate them from ticks.
+/// Emits `mitch::Bar` with `kind = BarKind::Renko as u8`. Microstructure
+/// fields (realized_var, bipower_var, drift, vol_imbalance, avg_spread_bps,
+/// max_abs_return, avg_ci_ubp, reject_rate) are populated when callers feed
+/// full IndexRecord context via `feed_index_record(...)`. The legacy
+/// `feed_tick(ts, mid)` path (used by the offline calibrator for fast brick
+/// counting) leaves microstructure at zero — calibration only cares about
+/// brick count, not enrichment.
+///
+/// 2-expert review (Aoife HFT-quant ↔ Tomas storage) 2026-05-25:
+///   Aoife: "Renko bricks must carry RV/BV/drift/OFI/spread/quality for
+///    quant signal extraction (BTR Prime + ALM CLMM range placement).
+///    Empty microstructure = bar is just a price-ladder marker, useless
+///    for model training. Must be populated from the ingested IndexRecord
+///    stream."
+///   Tomas: "BarAccumulator is the canonical accumulator already used by
+///    aggregator/mod.rs. Reuse via composition — one accumulator instance
+///    per RenkoGenerator, flushed at every brick emit."
 pub struct RenkoGenerator<'a, S: VolSource + ?Sized> {
     config: RenkoConfig,
     sigma_calc: MtfParkinsonCalculator<'a, S>,
@@ -96,6 +111,11 @@ pub struct RenkoGenerator<'a, S: VolSource + ?Sized> {
     tick_count: u32,
     n_bars: usize,
     total_duration_ms: u64,
+    /// Microstructure accumulator. Populated only via `feed_index_record`;
+    /// flushed at every brick emit. The legacy `feed_tick(ts, mid)` path
+    /// (offline calibration) leaves this empty — emit_bar then writes zero
+    /// micros, which is acceptable since calibration discards Bar bodies.
+    acc: BarAccumulator,
 }
 
 impl<'a, S: VolSource + ?Sized> RenkoGenerator<'a, S> {
@@ -116,6 +136,7 @@ impl<'a, S: VolSource + ?Sized> RenkoGenerator<'a, S> {
             tick_count: 0,
             n_bars: 0,
             total_duration_ms: 0,
+            acc: BarAccumulator::new(),
         })
     }
 
@@ -169,11 +190,68 @@ impl<'a, S: VolSource + ?Sized> RenkoGenerator<'a, S> {
     {
         let open_mts = timestamp::from_epoch_ms(open_ts);
         let close_mts = timestamp::from_epoch_ms(close_ts);
-        let mut bar = Bar::new_ohlcv(open_mts, close_mts, open, high, low, close, 0, 0, tick_count);
+        // Pull microstructure from the accumulator if it has been fed via
+        // `feed_index_record`. First-brick-of-sequence carries the full
+        // accumulator snapshot (many ticks); subsequent bricks in the same
+        // multi-brick tick fire with `acc.count() == 0` and emit zero micros
+        // (the tick block already collapsed into brick #1's stats).
+        let micros = if self.acc.count() > 0 {
+            self.acc.flush()
+        } else {
+            None
+        };
+        let (vbid, vask) = if let Some(b) = micros.as_ref() {
+            (b.vbid, b.vask)
+        } else {
+            (0u32, 0u32)
+        };
+        let mut bar = Bar::new_ohlcv(open_mts, close_mts, open, high, low, close, vbid, vask, tick_count);
+        if let Some(b) = micros.as_ref() {
+            bar.realized_var = b.realized_var;
+            bar.bipower_var = b.bipower_var;
+            bar.drift = b.drift;
+            bar.vol_imbalance = b.vol_imbalance;
+            bar.avg_spread_bps = b.avg_spread_bps;
+            bar.max_abs_return = b.max_abs_return;
+            bar.avg_ci_ubp = b.avg_ci_ubp;
+            bar.reject_rate = b.reject_rate;
+        }
         bar.kind = BarKind::Renko as u8;
         write_bar(&bar)?;
         self.n_bars += 1;
         Ok(())
+    }
+
+    /// Feed one IndexRecord-derived observation. Drives brick detection AND
+    /// accumulates microstructure (RV/BV/drift/OFI/spread/quality) so the
+    /// emitted Bar carries the enrichment block.
+    ///
+    /// Use this from emission paths (live producer + offline backfill apply
+    /// step). The lightweight `feed_tick(ts, mid)` path remains for the
+    /// calibrator's brick-count-only inner loop.
+    pub fn feed_index_record<F>(
+        &mut self,
+        ts: i64,
+        bid: f64,
+        ask: f64,
+        vbid: u32,
+        vask: u32,
+        ci_ubp: f64,
+        accepted: u32,
+        rejected: u32,
+        write_bar: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Bar) -> Result<()>,
+    {
+        let mid = (bid + ask) * 0.5;
+        if !(mid.is_finite() && mid > 0.0) {
+            return Ok(());
+        }
+        // Ingest into the accumulator BEFORE brick detection so the closing
+        // tick is included in the closing brick's microstructure stats.
+        self.acc.ingest(bid, ask, vbid, vask, ts, ci_ubp, accepted, rejected);
+        self.feed_tick(ts, mid, write_bar)
     }
 
     /// Feed one tick, emitting any produced bars via the callback.
