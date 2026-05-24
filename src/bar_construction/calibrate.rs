@@ -76,7 +76,19 @@ pub fn count_bars_from_prices<S: VolSource + ?Sized>(
             Ok(())
         })
         .ok();
-        if count > 1_000_000 {
+        // Safety cap: previously 1M; that was hit on full-tick replay during
+        // calibration even on reasonable k values (busy days × ~150k ticks ×
+        // small brick), biasing the binary-search bpd estimate downward and
+        // letting it converge on a degenerate `k=0.075` fallback.
+        //
+        // 2-expert review:
+        //  Aoife (HFT-quant): "Cap must be > target_bpd * trailing_days * 10
+        //   to keep the bpd metric honest on high-vol regimes."
+        //  Tomás (storage):  "10^9 caps wall-clock per round at ~10 s on
+        //   modern hardware. Per-pair calibration stays minutes, not hours."
+        // Consensus: 10^9 (1B) — out-of-the-way for legitimate calibration,
+        // still bounds pathological runaway loops.
+        if count > 1_000_000_000 {
             return count;
         }
     }
@@ -120,6 +132,12 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
     let first = prices.first().map(|p| p.0).unwrap_or(0);
     let last = prices.last().map(|p| p.0).unwrap_or(0);
     if last <= first {
+        // Diagnostic — fired when the trailing slice degenerates (empty or
+        // single timestamp). Caller falls back to base.multiplier.
+        eprintln!(
+            "  [diag] calibrate_mtf early-return last<=first  n={} first={} last={}",
+            prices.len(), first, last
+        );
         return 0.0;
     }
 
@@ -199,6 +217,15 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
     }
 
     if mults.is_empty() {
+        // Diagnostic — fired when every configured window was either too
+        // short (days < min_window_days) OR the binary search degenerated
+        // (best `mult` never updated). Either way the caller treats this
+        // as cal-fail and keeps `last_good_k`.
+        eprintln!(
+            "  [diag] calibrate_mtf all-windows-empty target_bpd={} windows_days={:?} \
+             first={} last={} n_prices={}",
+            target_bpd, cal.windows_days, first, last, prices.len()
+        );
         return 0.0;
     }
     let geo_mean = (mults.iter().map(|m| (*m as f64).ln()).sum::<f64>() / mults.len() as f64).exp()
