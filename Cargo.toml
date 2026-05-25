@@ -71,6 +71,10 @@ path = "src/bin/integrity_check.rs"
 name = "glue-check"
 path = "src/bin/glue_check.rs"
 
+[[bin]]
+name = "mtf-sweep"
+path = "src/bin/mtf_sweep.rs"
+
 [dependencies]
 # Core async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util"] }
