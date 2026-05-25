@@ -35,13 +35,28 @@ use series_factory::bar_construction::{
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
-// ── Launch symbol set (subset for the sweep — operator brief 2026-05-25) ────
+// ── Launch symbol set (operator brief 2026-05-25 rev-3): universal config,
+//    cross-ticker mean-error minimization, no per-sym overfitting. 13 syms:
+//    5 volatile USDT-quoted + 5 crypto crosses + 3 stable/USDT.
+//    Class-tuned target (vol=300, stable=50) applied per sym; SAME windows_days
+//    across all of them — that's the universality the sweep is testing.
 const SWEEP_PAIRS: &[(&str, &str)] = &[
+    // Volatile USDT-quoted
     ("BTC", "USDT"),
     ("ETH", "USDT"),
     ("BNB", "USDT"),
     ("SOL", "USDT"),
     ("PAXG", "USDT"),
+    // Crypto crosses (operator priority)
+    ("ETH", "BTC"),
+    ("BNB", "ETH"),
+    ("BNB", "BTC"),
+    ("SOL", "BTC"),
+    ("SOL", "ETH"),
+    // Stable/USDT (target = 50)
+    ("USDC", "USDT"),
+    ("USDE", "USDT"),
+    ("USD1", "USDT"),
 ];
 
 // ── Candidate windows_days configs (7, chosen pre-sweep, no per-sym tuning) ─
