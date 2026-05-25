@@ -666,9 +666,19 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
             multiplier: calibrated_k as f32,
             min_pct: yml.renko.min_pct,
         };
-        renko_cfg
-            .validate()
-            .with_context(|| format!("invalid renko cfg on {}", d))?;
+        // Validate-on-day-skip (2026-05-25): a calibrator that converges
+        // outside RenkoConfig sanity bounds (multiplier out of [0.001, 4.0])
+        // is a per-day outlier, not a pair-wide failure. Skip the day, log
+        // the reason, continue to D+1. Pre-fix: any one bad day bailed the
+        // entire pair (SOL/PAXG lost 6+ days each on 2026-02 high-vol).
+        if let Err(e) = renko_cfg.validate() {
+            summary.failed_days += 1;
+            eprintln!(
+                "skip   pair={} id={} date={} reason=invalid_renko_cfg k={:.6} err={}",
+                pair_str, ticker_id, d, calibrated_k, e
+            );
+            continue;
+        }
 
         // Rebuild the generator with the new multiplier each day. Carrying
         // bar state across days would require a `set_multiplier` API on
