@@ -494,10 +494,13 @@ fn run_pair(
                 continue;
             }
 
-            // Count bricks for day D under k, replaying ONLY day-D ticks via
-            // the `count_bars_from_prices` helper (it filters by ts range).
+            // Count bricks for day D under k. `count_bars_from_prices`
+            // iterates linearly; pass a sub-slice [day_lo..day_hi] so we
+            // only touch O(day_ticks) entries instead of O(all_prices)
+            // per (config, day). Massive speedup w/ retain=120d ticks.
+            let day_slice: &[(i64, f64)] = &prices[day_lo..day_hi];
             let bars = count_bars_from_prices(
-                &prices,
+                day_slice,
                 &renko_cfg,
                 &vol_mmap,
                 &yml.vol,
