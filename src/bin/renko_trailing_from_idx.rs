@@ -630,8 +630,24 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         //    Absence of bars in the first ~30 d of source is the correct
         //    signal that the model is warming up."
         //   Tomás: "Skipping is also storage-cheaper — no torn shards to heal."
-        let calibrated_k_opt: Option<f64> = if trailing.len() < 2 {
-            None
+        // Operator policy 2026-05-25 (revision 2): NEVER skip a day. Every day
+        // must emit bricks. If the calibrator can't return a clean k for any
+        // reason (insufficient history, all-windows-empty, NaN, validate
+        // out-of-range), we degrade gracefully:
+        //   1. Try calibration if trailing history exists.
+        //   2. On clean success -> use that k.
+        //   3. On dirty result (0, NaN, infinite, out-of-validate-range) ->
+        //      carry forward `prior_k` (most recent good k). This is NOT a
+        //      hardcoded stub like the original 0.075; it's a continuity
+        //      bridge that decays to the last empirically calibrated value.
+        //   4. On genesis (no prior_k yet) -> use class-default k from
+        //      `base_cfg.multiplier` (operator-tuned per asset class), clamped
+        //      to the validate range. Better an approximate emission than a
+        //      missing day.
+        // This trades some daily-precision for the hard contract that every
+        // configured day produces a shard.
+        let raw_k: f64 = if trailing.len() < 2 {
+            prior_k // genesis days carry the seed prior
         } else {
             let k = calibrate_mtf_with_target(
                 trailing,
@@ -642,42 +658,53 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
                 &sigma_cache,
                 target_bpd,
             ) as f64;
-            if k > 0.0 && k.is_finite() { Some(k) } else { None }
-        };
-
-        let calibrated_k = match calibrated_k_opt {
-            Some(k) => {
-                prior_k = k; // update search prior for next day
-                summary.used_k_samples.push(k);
+            if k > 0.0 && k.is_finite() {
                 k
-            }
-            None => {
+            } else {
                 summary.failed_days += 1;
                 eprintln!(
-                    "skip   pair={} id={} date={} reason=calibration_unavailable trailing_n={}",
-                    pair_str, ticker_id, d, trailing.len()
+                    "carry pair={} id={} date={} reason=calibration_dirty fallback_k={:.6}",
+                    pair_str, ticker_id, d, prior_k
                 );
-                continue;
+                prior_k
             }
         };
+
+        // Clamp into validate bounds. The bounds (currently 0.001..=4.0 in
+        // RenkoConfig::validate) reflect numerical sanity, NOT a market cap.
+        // Days where geo_mean walks above 4.0 (extreme vol on SOL 2026-05-21,
+        // PAXG 2026-02-11, etc.) clamp at 4.0 and continue. Operator note:
+        // "no skip ever". Logged when it fires so the regime shift is
+        // visible in audit.
+        let mut calibrated_k = raw_k;
+        if !(0.001..=4.0).contains(&calibrated_k) {
+            let clamped = calibrated_k.clamp(0.001, 4.0);
+            eprintln!(
+                "clamp pair={} id={} date={} raw_k={:.6} clamped_k={:.6}",
+                pair_str, ticker_id, d, calibrated_k, clamped
+            );
+            calibrated_k = clamped;
+        }
+        prior_k = calibrated_k;
+        summary.used_k_samples.push(calibrated_k);
 
         // ── Apply k(D) to the renko generator (init or swap multiplier) ─
         let renko_cfg = RenkoConfig {
             multiplier: calibrated_k as f32,
             min_pct: yml.renko.min_pct,
         };
-        // Validate-on-day-skip (2026-05-25): a calibrator that converges
-        // outside RenkoConfig sanity bounds (multiplier out of [0.001, 4.0])
-        // is a per-day outlier, not a pair-wide failure. Skip the day, log
-        // the reason, continue to D+1. Pre-fix: any one bad day bailed the
-        // entire pair (SOL/PAXG lost 6+ days each on 2026-02 high-vol).
+        // validate() should NEVER fire after the clamp above, but kept as a
+        // hard wall: if it does, log loud + continue with the clamped k so
+        // we still emit something.
         if let Err(e) = renko_cfg.validate() {
-            summary.failed_days += 1;
             eprintln!(
-                "skip   pair={} id={} date={} reason=invalid_renko_cfg k={:.6} err={}",
+                "WARN pair={} id={} date={} unexpected_validate_fail_after_clamp k={:.6} err={}",
                 pair_str, ticker_id, d, calibrated_k, e
             );
-            continue;
+            // Don't skip; force the floor.
+            let mut c = renko_cfg;
+            c.multiplier = 0.001;
+            let _ = c.validate(); // sanity
         }
 
         // Rebuild the generator with the new multiplier each day. Carrying
