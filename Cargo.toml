@@ -75,6 +75,10 @@ path = "src/bin/glue_check.rs"
 name = "mtf-sweep"
 path = "src/bin/mtf_sweep.rs"
 
+[[bin]]
+name = "synth-sigma-benchmark"
+path = "src/bin/synth_sigma_benchmark.rs"
+
 [dependencies]
 # Core async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util"] }
