@@ -194,7 +194,14 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
                 t_round.elapsed().as_millis()
             );
 
-            if err < best.1 {
+            // CRITICAL (2026-05-26 audit): `bars=0` is never a valid solution.
+            // At `bpd=0` → `err = |0/target - 1| = 1.0 = 100%` (clamped by abs).
+            // This 100% spuriously beats any overshoot round (e.g. bpd=1232 →
+            // err=1132%), causing the search to lock onto the brick-too-big
+            // cliff (incident: SOL/BTC synth converged on k=4.217 / 0 bars).
+            // Skip best-update when n==0; direction logic below still steers
+            // search downward (bpd=0 < target → log_hi=log_mid → smaller mult).
+            if n > 0 && err < best.1 {
                 best = (mult, err);
             }
             if err < cal.tolerance {
