@@ -213,6 +213,28 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
             best.0,
             best.1 * 100.0
         );
+        // Boundary-clamp detector (post 2026-05-26 audit). If best mult landed
+        // within 1% of either mult_bound, the binary search converged at the
+        // edge rather than at an optimum — most commonly because the input
+        // sigma is degenerate (e.g. synth cross-pair Parkinson H-L
+        // under-estimating true σ). Returning the boundary value would ship
+        // a degenerate k into prod (ETH/BTC k=0.01 incident → live producer
+        // brick-storm). Treat as window-fail; outer geo-mean handles the
+        // remaining windows. If ALL windows clamp, the function returns 0.0
+        // and the caller carries prior_k.
+        let lo_clamp = (best.0 as f64 - cal.mult_bounds[0]).abs() / cal.mult_bounds[0] < 0.01;
+        let hi_clamp = (best.0 as f64 - cal.mult_bounds[1]).abs() / cal.mult_bounds[1] < 0.01;
+        if lo_clamp || hi_clamp {
+            eprintln!(
+                "  [clamp-detector] window={}d mult={:.6} at-{} bound mult_bounds={:?} — \
+                 dropping from MTF blend (likely degenerate σ; see audit 2026-05-26)",
+                window_days,
+                best.0,
+                if lo_clamp { "lower" } else { "upper" },
+                cal.mult_bounds
+            );
+            continue;
+        }
         mults.push(best.0);
     }
 

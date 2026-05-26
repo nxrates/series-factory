@@ -165,7 +165,14 @@ impl<'a, S: VolSource + ?Sized> RenkoGenerator<'a, S> {
             self.sigma_calc.compute_sigma(hour_idx)
         };
 
-        let raw_pct = self.config.multiplier as f64 * sigma;
+        // K_FLOOR on multiplier defends against boundary-clamped k from a
+        // degenerate calibration (see docs/internal/renko-synth-audit-2026-05-26.md).
+        // The clamp-detector in calibrate.rs is the upstream guard; this is
+        // belt-and-suspenders for downstream consumers of any stale
+        // ticker-params.json that still carries a degenerate value.
+        const K_FLOOR_OFFLINE: f64 = 0.05;
+        let k_eff = (self.config.multiplier as f64).max(K_FLOOR_OFFLINE);
+        let raw_pct = k_eff * sigma;
         // Floor only — no ceiling (markets be markets, see module doc).
         // Debate (Aoife ↔ Tomás): without a cap, a flash crash could mint
         // a 50% brick. But that's the right answer for adaptive renko —

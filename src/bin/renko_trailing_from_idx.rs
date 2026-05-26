@@ -222,7 +222,17 @@ fn class_for_pair(base: &str, quote: &str) -> &'static str {
     if base_stable && quote_stable {
         return "crypto_stable";
     }
-    if CRYPTO_MAJORS.contains(&b.as_str()) {
+    let base_major = CRYPTO_MAJORS.contains(&b.as_str());
+    let quote_major = CRYPTO_MAJORS.contains(&q.as_str());
+    // Crypto-cross: both legs are non-stable majors (e.g. ETH/BTC, SOL/BTC,
+    // BNB/ETH). Cross-pair realised vol is ≈0.4-0.6× the USD-quoted leg's,
+    // so forcing the same target_bpd as crypto_major drives the calibrator
+    // to compress k far below sane values (k=0.01 boundary-clamp observed
+    // 2026-05-26 incident — see docs/internal/renko-synth-audit-2026-05-26.md).
+    if base_major && quote_major {
+        return "crypto_cross";
+    }
+    if base_major {
         return "crypto_major";
     }
     "crypto_alt"

@@ -150,6 +150,7 @@ impl CalibrationConfigExt {
 enum AssetClassBucket {
     CryptoMajor,
     CryptoAlt,
+    CryptoCross,
     CryptoStable,
     FxMajor,
     FxCross,
@@ -161,6 +162,7 @@ impl AssetClassBucket {
         match self {
             Self::CryptoMajor => "crypto_major",
             Self::CryptoAlt => "crypto_alt",
+            Self::CryptoCross => "crypto_cross",
             Self::CryptoStable => "crypto_stable",
             Self::FxMajor => "fx_major",
             Self::FxCross => "fx_cross",
@@ -219,7 +221,17 @@ fn classify_pair(pair: &str, ticker_id: u64, stables: &[String]) -> AssetClassBu
             if majors_only { AssetClassBucket::FxMajor } else { AssetClassBucket::FxCross }
         }
         (ASSET_CLASS_CR, _) | (_, ASSET_CLASS_CR) => {
-            if CRYPTO_MAJORS.contains(&base.as_str()) {
+            let base_major = CRYPTO_MAJORS.contains(&base.as_str());
+            let quote_major = CRYPTO_MAJORS.contains(&quote.as_str());
+            // Crypto-cross: both legs non-stable majors (ETH/BTC, SOL/BTC,
+            // BNB/ETH, ...). Cross-pair realised vol ≈0.4-0.6× the
+            // USD-quoted leg's. Routing to crypto_major target_bpd=300
+            // drives the calibrator to compress k toward mult_bounds[0]
+            // (observed k=0.01 boundary-clamp 2026-05-26). Bucket
+            // separately so target_bpd can be tuned (~100 bpd).
+            if base_major && quote_major {
+                AssetClassBucket::CryptoCross
+            } else if base_major {
                 AssetClassBucket::CryptoMajor
             } else {
                 AssetClassBucket::CryptoAlt
