@@ -153,9 +153,16 @@ struct LegTick {
     ask: f64,
 }
 
-/// Load every tick from every shard of a ticker, sorted ascending by ts.
-/// Returns `Vec<LegTick>` so downstream consumers can iterate freely.
-fn load_leg_ticks(data_root: &Path, ticker_id: u64) -> Result<Vec<LegTick>> {
+/// Load ticks from shards within `[from_date, to_date]` (inclusive), sorted
+/// ascending by ts. Returns `Vec<LegTick>` so downstream consumers can iterate
+/// freely. Shards outside the range are skipped at the filename level to keep
+/// peak RAM proportional to the requested window — not to total history.
+fn load_leg_ticks(
+    data_root: &Path,
+    ticker_id: u64,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+) -> Result<Vec<LegTick>> {
     let dir = idx_dir(data_root, ticker_id);
     let shards = list_shards(&dir, "idx")
         .with_context(|| format!("list shards {}", dir.display()))?;
@@ -163,7 +170,10 @@ fn load_leg_ticks(data_root: &Path, ticker_id: u64) -> Result<Vec<LegTick>> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for (_d, path) in shards {
+    for (d, path) in shards {
+        if d < from_date || d > to_date {
+            continue;
+        }
         let mut stream = ShardStream::<IndexRecord>::open(&path)
             .with_context(|| format!("open idx {}", path.display()))?;
         while let Some(rec) = stream.next()? {
@@ -581,10 +591,10 @@ fn main() -> Result<()> {
         "synth-sigma-benchmark start"
     );
 
-    // ── Load leg ticks ──────────────────────────────────────────────────────
-    let leg_a = load_leg_ticks(&data_root, args.leg_a)
+    // ── Load leg ticks (date-filtered to keep peak RAM bounded) ─────────────
+    let leg_a = load_leg_ticks(&data_root, args.leg_a, from_date, to_date)
         .with_context(|| format!("load leg A id={}", args.leg_a))?;
-    let leg_b = load_leg_ticks(&data_root, args.leg_b)
+    let leg_b = load_leg_ticks(&data_root, args.leg_b, from_date, to_date)
         .with_context(|| format!("load leg B id={}", args.leg_b))?;
     info!(
         n_leg_a = leg_a.len(),
@@ -615,7 +625,8 @@ fn main() -> Result<()> {
     );
 
     // ── Method C: native cross-pair, if available ───────────────────────────
-    let native_cross = load_leg_ticks(&data_root, args.cross).unwrap_or_default();
+    let native_cross =
+        load_leg_ticks(&data_root, args.cross, from_date, to_date).unwrap_or_default();
     let (hlc_c, sigma_c, native_available) = if native_cross.is_empty() {
         info!(
             cross = args.cross,
