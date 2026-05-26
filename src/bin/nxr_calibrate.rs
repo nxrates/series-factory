@@ -28,7 +28,7 @@ use clap::Parser;
 use mitch::timestamp;
 use mitch::common::InstrumentType;
 use nxr_sdk::ipc::record::IndexRecord;
-use nxr_sdk::shard::{idx_dir, list_shards, ShardStream, MS_PER_30MIN};
+use nxr_sdk::shard::{list_shards, ShardStream, MS_PER_30MIN};
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
@@ -423,8 +423,13 @@ fn calibrate_one(
 
 /// Stream one leg's `.idx` shards into a single ascending-ts iterator of
 /// `(ts, bid, ask)` triples. Returns Err if no shards or any read fails.
+///
+/// `idx_root` must point at the indexes directory itself (e.g. `/data/indexes`,
+/// NOT `/data` — `nxr-calibrate`'s NxrConfig::indexes_dir already includes
+/// the `indexes/` suffix). Per-ticker shards live at
+/// `<idx_root>/<ticker_id>/<YYYY-MM-DD>.idx`.
 fn load_leg_ticks_all_shards(idx_root: &Path, ticker_id: u64) -> Result<Vec<(i64, f64, f64)>> {
-    let dir = idx_dir(idx_root, ticker_id);
+    let dir = idx_root.join(ticker_id.to_string());
     let shards = list_shards(&dir, "idx")
         .with_context(|| format!("list shards {}", dir.display()))?;
     if shards.is_empty() {
