@@ -17,7 +17,8 @@
 //! Usage: `nxr-calibrate [--once] [--parallel N]`. `--once` exits after one run
 //! (default for k8s CronJob); without it the binary sleeps 24h between runs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -25,10 +26,11 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use clap::Parser;
 use mitch::timestamp;
+use mitch::common::InstrumentType;
 use nxr_sdk::ipc::record::IndexRecord;
-use nxr_sdk::shard::{ShardStream, MS_PER_30MIN};
+use nxr_sdk::shard::{idx_dir, list_shards, ShardStream, MS_PER_30MIN};
 use nxr_sdk::weights_schema::WeightsFile;
-use nxr_sdk::resolve_ticker_id;
+use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
 use serde::Deserialize;
 use series_factory::bar_construction::{
@@ -37,6 +39,25 @@ use series_factory::bar_construction::{
 };
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
+
+// ── Synth pair registry (mirrors core/src/synth_registry.rs INITIAL_PAIRS) ──
+// Kept inline here because series-factory is a workspace-EXCLUDED crate and
+// cannot depend on the core crate; the 5-pair list is small + rarely
+// changes. Out-of-sync drift is caught manually until the registry moves to
+// nxr-sdk (a future refactor).
+struct SynthPairSpec {
+    synth_sym: &'static str,
+    base_sym: &'static str,
+    quote_sym: &'static str,
+}
+
+const SYNTH_PAIRS: &[SynthPairSpec] = &[
+    SynthPairSpec { synth_sym: "ETH/BTC", base_sym: "ETH/USDT", quote_sym: "BTC/USDT" },
+    SynthPairSpec { synth_sym: "SOL/BTC", base_sym: "SOL/USDT", quote_sym: "BTC/USDT" },
+    SynthPairSpec { synth_sym: "BNB/BTC", base_sym: "BNB/USDT", quote_sym: "BTC/USDT" },
+    SynthPairSpec { synth_sym: "BNB/ETH", base_sym: "BNB/USDT", quote_sym: "ETH/USDT" },
+    SynthPairSpec { synth_sym: "SOL/ETH", base_sym: "SOL/USDT", quote_sym: "ETH/USDT" },
+];
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -381,6 +402,221 @@ fn calibrate_one(
     CalOutcome::Ok { ticker_id, k: mult as f64 }
 }
 
+// ── Synth-pair calibration ───────────────────────────────────────────────────
+//
+// For each configured synth cross (e.g. ETH/BTC), reconstruct synth ticks
+// from the two underlying USDT-quoted leg `.idx` files via event-driven
+// min-heap merge, then run the SAME MTF calibrator that the base path uses.
+// Output is a single `renko_k` value per synth ticker_id, written to
+// `ticker-params.json` alongside base entries; live `bars_renko_synth`
+// picks it up via the existing weights hot-reload path.
+//
+// **Why NOT persist a synth `.idx`:** the kernel design (see audit doc
+// `synth-pipeline-design-2026-05-26.md`) keeps synth on the wire only —
+// disk has bars + σ, never synth ticks. Calibration is the one place we
+// reconstruct ticks transiently in memory.
+//
+// **Why NOT K_FLOOR fallback on synth:** Method-B σ from event-merged
+// ticks is the operator's quality target; if calibrate fails (e.g.
+// clamp-detector drops every window), `Failed` is the honest outcome and
+// the caller carries the prior value rather than fabricating one.
+
+/// Stream one leg's `.idx` shards into a single ascending-ts iterator of
+/// `(ts, bid, ask)` triples. Returns Err if no shards or any read fails.
+fn load_leg_ticks_all_shards(idx_root: &Path, ticker_id: u64) -> Result<Vec<(i64, f64, f64)>> {
+    let dir = idx_dir(idx_root, ticker_id);
+    let shards = list_shards(&dir, "idx")
+        .with_context(|| format!("list shards {}", dir.display()))?;
+    if shards.is_empty() {
+        anyhow::bail!("no .idx shards under {}", dir.display());
+    }
+    let mut out: Vec<(i64, f64, f64)> = Vec::new();
+    for (_d, path) in shards {
+        let mut stream = ShardStream::<IndexRecord>::open(&path)
+            .with_context(|| format!("open idx {}", path.display()))?;
+        while let Some(rec) = stream.next()? {
+            let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+            let bid = rec.index.bid;
+            let ask = rec.index.ask;
+            if !(bid.is_finite() && ask.is_finite()) { continue; }
+            if bid <= 0.0 || ask <= 0.0 { continue; }
+            out.push((ts, bid, ask));
+        }
+    }
+    out.sort_by_key(|t| t.0);
+    Ok(out)
+}
+
+fn calibrate_one_synth(
+    synth_id: u64,
+    synth_sym: &str,
+    leg_a_id: u64,
+    leg_b_id: u64,
+    idx_root: &Path,
+    cal_ext: &CalibrationConfigExt,
+    target_bpd: f64,
+    vol_cfg: &VolConfig,
+    renko_yml: &RenkoYml,
+) -> CalOutcome {
+    // ── 1. Load both legs ────────────────────────────────────────────────────
+    let leg_a = match load_leg_ticks_all_shards(idx_root, leg_a_id) {
+        Ok(v) => v,
+        Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("leg_a={} {}", leg_a_id, e) },
+    };
+    let leg_b = match load_leg_ticks_all_shards(idx_root, leg_b_id) {
+        Ok(v) => v,
+        Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("leg_b={} {}", leg_b_id, e) },
+    };
+    if leg_a.is_empty() || leg_b.is_empty() {
+        return CalOutcome::Skipped { ticker_id: synth_id, reason: "empty leg".into() };
+    }
+
+    // ── 2. Event-driven 2-stream merge → synth (ts, bid, ask, mid) ───────────
+    // At every leg tick we update last-known of that leg, then if both legs
+    // primed emit a synth tick using the worst-case-spread convention:
+    //   synth.bid = leg_a.bid / leg_b.ask
+    //   synth.ask = leg_a.ask / leg_b.bid
+    // (mirrors core/src/synth_kernel.rs:185 + triangulator.rs:17).
+    let mut heap: BinaryHeap<Reverse<(i64, u8, usize)>> = BinaryHeap::new();
+    heap.push(Reverse((leg_a[0].0, 0u8, 0usize)));
+    heap.push(Reverse((leg_b[0].0, 1u8, 0usize)));
+    let mut a_last: Option<(f64, f64)> = None;
+    let mut b_last: Option<(f64, f64)> = None;
+    // Two parallel maps (mirroring `calibrate_one`) — 30-min HLC for the
+    // vol input, 1-min last-mid downsample for the calibrator's tick
+    // replay. Sized at full leg total as an upper bound; over-allocation
+    // is preferable to reallocation on the hot path.
+    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
+    while let Some(Reverse((ts, which, idx))) = heap.pop() {
+        match which {
+            0 => {
+                let (_, b, a) = leg_a[idx];
+                a_last = Some((b, a));
+                let next = idx + 1;
+                if next < leg_a.len() {
+                    heap.push(Reverse((leg_a[next].0, 0, next)));
+                }
+            }
+            _ => {
+                let (_, b, a) = leg_b[idx];
+                b_last = Some((b, a));
+                let next = idx + 1;
+                if next < leg_b.len() {
+                    heap.push(Reverse((leg_b[next].0, 1, next)));
+                }
+            }
+        }
+        // Both legs primed → emit synth tick.
+        if let (Some((ab, aa)), Some((bb, ba))) = (a_last, b_last) {
+            // Worst-case spread compounding (mirrors live kernel).
+            let synth_bid = ab / ba;
+            let synth_ask = aa / bb;
+            if !(synth_bid.is_finite() && synth_ask.is_finite()
+                && synth_bid > 0.0 && synth_ask > 0.0) {
+                continue;
+            }
+            let mid = (synth_bid + synth_ask) * 0.5;
+            // 30-min H/L bucket (H = ask, L = bid).
+            let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
+            let e = hlc.entry(key).or_insert((synth_ask.max(mid), synth_bid.min(mid)));
+            if synth_ask > e.0 { e.0 = synth_ask; }
+            if synth_bid < e.1 && synth_bid > 0.0 { e.1 = synth_bid; }
+            // 1-min last-mid downsample.
+            let bucket = (ts / 60_000) * 60_000;
+            let pe = price_buckets.entry(bucket).or_insert((ts, mid));
+            if ts >= pe.0 { *pe = (ts, mid); }
+        }
+    }
+
+    if hlc.is_empty() {
+        return CalOutcome::Skipped { ticker_id: synth_id, reason: "empty merged stream".into() };
+    }
+
+    // ── 3. VolWriter / VolMmap / sigma cache (identical to base path) ────────
+    let vol_path = std::env::temp_dir()
+        .join(format!("nxr-calibrate-synth-{}-{}.vol", synth_id, std::process::id()));
+    {
+        let mut writer = match VolWriter::new(&vol_path) {
+            Ok(w) => w,
+            Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol writer: {}", e) },
+        };
+        if let Err(e) = build_vol_from_hlc(&hlc, vol_cfg, &mut writer) {
+            return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol build: {}", e) };
+        }
+        if let Err(e) = writer.finish() {
+            return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol finish: {}", e) };
+        }
+    }
+    let vol_mmap = match VolMmap::open(&vol_path) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_file(&vol_path);
+            return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol mmap: {}", e) };
+        }
+    };
+    let sigma_cache = {
+        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, vol_cfg.clone());
+        calc.precompute_sigma_cache()
+    };
+
+    let tick_prices: Vec<(i64, f64)> = price_buckets
+        .into_iter()
+        .map(|(_, (ts, mid))| (ts, mid))
+        .collect();
+
+    let base = RenkoConfig {
+        multiplier: 0.075,
+        min_pct: renko_yml.min_pct,
+    };
+    if let Err(e) = base.validate() {
+        let _ = std::fs::remove_file(&vol_path);
+        return CalOutcome::Failed { ticker_id: synth_id, reason: format!("base renko cfg: {}", e) };
+    }
+
+    info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd, "calibrating synth");
+    let mult = calibrate_mtf_with_target(
+        &tick_prices,
+        &cal_ext.inner(),
+        &base,
+        &vol_mmap,
+        vol_cfg,
+        &sigma_cache,
+        target_bpd,
+    );
+    let _ = std::fs::remove_file(&vol_path);
+
+    if !(mult > 0.0 && (mult as f64).is_finite()) {
+        return CalOutcome::Failed {
+            ticker_id: synth_id,
+            reason: "synth calibration returned 0 (clamp-dropped windows or insufficient data)".into(),
+        };
+    }
+    CalOutcome::Ok { ticker_id: synth_id, k: mult as f64 }
+}
+
+/// Resolve all `SYNTH_PAIRS` entries to `(synth_id, sym, leg_a_id, leg_b_id)`.
+/// Entries that fail to resolve any leg are dropped with a warn.
+fn resolve_synth_work() -> Vec<(u64, &'static str, u64, u64)> {
+    let mut out = Vec::with_capacity(SYNTH_PAIRS.len());
+    for spec in SYNTH_PAIRS {
+        let resolve = |sym: &str| -> Option<u64> {
+            match resolve_ticker(sym, InstrumentType::SPOT) {
+                Ok(m) => Some(m.ticker.id),
+                Err(e) => {
+                    warn!(sym, err = ?e, "synth pair resolve failed; skipping");
+                    None
+                }
+            }
+        };
+        let synth_id = match resolve(spec.synth_sym) { Some(v) => v, None => continue };
+        let leg_a_id = match resolve(spec.base_sym) { Some(v) => v, None => continue };
+        let leg_b_id = match resolve(spec.quote_sym) { Some(v) => v, None => continue };
+        out.push((synth_id, spec.synth_sym, leg_a_id, leg_b_id));
+    }
+    out
+}
+
 // ── Main run ─────────────────────────────────────────────────────────────────
 
 fn run_once(args: &Args) -> Result<()> {
@@ -515,8 +751,54 @@ fn run_once(args: &Args) -> Result<()> {
         skipped,
         failed,
         total = outcomes.len(),
-        "calibration summary"
+        "calibration summary (base)"
     );
+
+    // ── Synth-pair pass (5 crosses) ──────────────────────────────────────────
+    // Runs unconditionally after the base pass. Cheap (5 pairs, mostly
+    // bound by leg .idx I/O which the base pass already warmed in page
+    // cache). The clamp-detector inside `calibrate_mtf_with_target` drops
+    // degenerate windows; if all windows fail, k is NOT persisted (caller
+    // keeps prior). The crypto_cross target_bpd applies.
+    let synth_target = cal_ext
+        .target_for(AssetClassBucket::CryptoCross)
+        .unwrap_or_else(|| {
+            warn!("crypto_cross target_bpd missing; falling back to default");
+            cal_ext.target_bpd
+        });
+    let synth_work = resolve_synth_work();
+    info!(n_synth = synth_work.len(), synth_target_bpd = synth_target, "synth calibration pass starting");
+    let (mut s_passed, mut s_skipped, mut s_failed) = (0usize, 0usize, 0usize);
+    for (synth_id, synth_sym, leg_a_id, leg_b_id) in synth_work {
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            calibrate_one_synth(
+                synth_id, synth_sym, leg_a_id, leg_b_id,
+                &idx_dir, cal_ext, synth_target, vol_cfg, renko_yml,
+            )
+        }))
+        .unwrap_or_else(|p| {
+            let msg = if let Some(s) = p.downcast_ref::<&str>() { s.to_string() }
+                      else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
+                      else { "unknown panic".to_string() };
+            CalOutcome::Failed { ticker_id: synth_id, reason: format!("panic: {}", msg) }
+        });
+        match outcome {
+            CalOutcome::Ok { ticker_id, k } => {
+                s_passed += 1;
+                info!(synth_id = ticker_id, synth_sym, k, "synth calibrated");
+                renko_k.insert(ticker_id.to_string(), k);
+            }
+            CalOutcome::Skipped { ticker_id, reason } => {
+                s_skipped += 1;
+                info!(synth_id = ticker_id, synth_sym, %reason, "synth skipped");
+            }
+            CalOutcome::Failed { ticker_id, reason } => {
+                s_failed += 1;
+                warn!(synth_id = ticker_id, synth_sym, %reason, "synth failed");
+            }
+        }
+    }
+    info!(s_passed, s_skipped, s_failed, "calibration summary (synth)");
 
     weights_file.renko_k_per_ticker = renko_k;
     weights_file.calibrated_at = Some(
