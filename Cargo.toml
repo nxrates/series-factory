@@ -79,6 +79,10 @@ path = "src/bin/mtf_sweep.rs"
 name = "synth-sigma-benchmark"
 path = "src/bin/synth_sigma_benchmark.rs"
 
+[[bin]]
+name = "synth-backfill-from-idx"
+path = "src/bin/synth_backfill_from_idx.rs"
+
 [dependencies]
 # Core async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util"] }
