@@ -36,6 +36,207 @@ pub struct CalibrationConfig {
     pub mult_bounds: [f64; 2],
 }
 
+/// Bucket size for "per UTC day" calibration scoring (M3 sprint).
+const MS_PER_DAY: i64 = 86_400_000;
+
+/// Per-day bar count + summary stats. Output of [`count_bars_per_day_from_prices`].
+#[derive(Debug, Clone)]
+pub struct DailyBpdStats {
+    /// Per-day brick counts, ordered by UTC date (consecutive days, gap-filled with 0).
+    pub bricks_per_day: Vec<u64>,
+    /// Median bricks per day (robust to regime tails).
+    pub median: f64,
+    /// Mean bricks per day.
+    pub mean: f64,
+    /// Median Absolute Deviation (robust dispersion).
+    pub mad: f64,
+    /// Number of days observed.
+    pub days: usize,
+}
+
+impl DailyBpdStats {
+    /// Calibration score: weighted (median deviation from target) + (MAD dispersion).
+    /// Operator policy 2026-05-26: "median should be 300, average error low,
+    /// wide swings OK up to 5×". MAD is robust to regime-spike days (5× tail
+    /// inflates MAD only when sustained), so weighting MAD * 0.3 keeps the
+    /// optimizer focused on median accuracy without forbidding regime moves.
+    ///
+    /// Lower = better. Returns `f64::INFINITY` when `days == 0` (cal-fail).
+    pub fn score(&self, target_bpd: f64) -> f64 {
+        if self.days == 0 || target_bpd <= 0.0 {
+            return f64::INFINITY;
+        }
+        let median_err = (self.median / target_bpd - 1.0).abs();
+        let mad_norm = self.mad / target_bpd;
+        median_err + 0.3 * mad_norm
+    }
+}
+
+fn median_sorted(sorted: &[u64]) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 1 {
+        sorted[n / 2] as f64
+    } else {
+        0.5 * (sorted[n / 2 - 1] as f64 + sorted[n / 2] as f64)
+    }
+}
+
+/// Replay `prices` through a fresh `RenkoGenerator(config)`, bucket emitted
+/// bricks into per-UTC-day counts, and return median/MAD-friendly stats.
+///
+/// This is the M3 (2026-05-26) successor to [`count_bars_from_prices`]. The
+/// scalar `count / days = mean_bpd` was vulnerable to regime-spike days
+/// (one 5× day pushes mean above target → calibrator shrinks brick → next
+/// quiet day under-emits). Median+MAD focuses the optimizer on what the
+/// operator actually wants: typical-day brick density.
+pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
+    prices: &[(i64, f64)],
+    config: &RenkoConfig,
+    vol_source: &S,
+    vol_config: &VolConfig,
+    sigma_cache: &[f64],
+    from_ts: i64,
+    to_ts: i64,
+) -> DailyBpdStats {
+    let mut gen = match RenkoGenerator::new(*config, vol_source, vol_config.clone()) {
+        Ok(g) => g,
+        Err(_) => {
+            return DailyBpdStats {
+                bricks_per_day: Vec::new(), median: 0.0, mean: 0.0, mad: 0.0, days: 0,
+            };
+        }
+    };
+    gen.set_sigma_cache(sigma_cache);
+
+    if to_ts <= from_ts {
+        return DailyBpdStats {
+            bricks_per_day: Vec::new(), median: 0.0, mean: 0.0, mad: 0.0, days: 0,
+        };
+    }
+    let n_days = ((to_ts - from_ts) / MS_PER_DAY).max(1) as usize;
+    let mut per_day: Vec<u64> = vec![0; n_days];
+
+    for &(ts, mid) in prices {
+        if ts < from_ts { continue; }
+        if ts > to_ts { break; }
+        let day_idx = ((ts - from_ts) / MS_PER_DAY).clamp(0, n_days as i64 - 1) as usize;
+        gen.feed_tick(ts, mid, &mut |_| {
+            per_day[day_idx] = per_day[day_idx].saturating_add(1);
+            Ok(())
+        })
+        .ok();
+    }
+
+    let total: u64 = per_day.iter().sum();
+    let mean = total as f64 / n_days as f64;
+    let mut sorted = per_day.clone();
+    sorted.sort_unstable();
+    let median = median_sorted(&sorted);
+    let mut devs: Vec<u64> = per_day
+        .iter()
+        .map(|&b| (b as f64 - median).abs().round() as u64)
+        .collect();
+    devs.sort_unstable();
+    let mad = median_sorted(&devs);
+
+    DailyBpdStats { bricks_per_day: per_day, median, mean, mad, days: n_days }
+}
+
+/// Walk-forward calibration with non-overlapping cal/eval windows
+/// (audit point #5(i), 2026-05-26).
+///
+/// For each `window_days` in `cal.windows_days`, split the trailing slice:
+///   - `cal_slice  = [last - window_days,           last - eval_holdout_days]`
+///   - `eval_slice = [last - eval_holdout_days,     last]`
+///
+/// Binary-search `mult` to minimise the score on `eval_slice` (NOT cal_slice
+/// — that's the walk-forward property). Score = `DailyBpdStats::score`
+/// (median deviation + 0.3 × MAD). Same clamp-detector as `calibrate_mtf`:
+/// boundary-hit windows are dropped, not blended in. Returns geo-mean across
+/// surviving windows or 0.0 (cal-fail → caller keeps prior_k).
+///
+/// `eval_holdout_days` typically 7. With windows_days=[7,14,30], the 7d
+/// window degenerates (cal_slice is empty) — caller should size windows >=
+/// 2 * eval_holdout_days.
+pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
+    prices: &[(i64, f64)],
+    cal: &CalibrationConfig,
+    base: &RenkoConfig,
+    vol_source: &S,
+    vol_config: &VolConfig,
+    sigma_cache: &[f64],
+    target_bpd: f64,
+    eval_holdout_days: usize,
+) -> f32 {
+    let first = prices.first().map(|p| p.0).unwrap_or(0);
+    let last = prices.last().map(|p| p.0).unwrap_or(0);
+    if last <= first || eval_holdout_days == 0 {
+        return 0.0;
+    }
+    let eval_ms = (eval_holdout_days as i64) * MS_PER_DAY;
+    let eval_from = last - eval_ms;
+    if eval_from <= first {
+        return 0.0;
+    }
+
+    let mut mults: Vec<f32> = Vec::new();
+    for &window_days in &cal.windows_days {
+        let cal_from = (last - (window_days as i64) * MS_PER_DAY).max(first);
+        let cal_days = (eval_from - cal_from) as f64 / MS_PER_DAY as f64;
+        if cal_days < cal.min_window_days as f64 {
+            continue;
+        }
+        let (mut log_lo, mut log_hi) = (cal.mult_bounds[0].ln(), cal.mult_bounds[1].ln());
+        let mut best = (base.multiplier, f64::INFINITY);
+
+        for _round in 0..cal.max_rounds {
+            let log_mid = (log_lo + log_hi) / 2.0;
+            let mult = log_mid.exp() as f32;
+            let trial = RenkoConfig { multiplier: mult, min_pct: base.min_pct };
+
+            // Score on EVAL slice (walk-forward).
+            let eval_stats = count_bars_per_day_from_prices(
+                prices, &trial, vol_source, vol_config, sigma_cache,
+                eval_from, last,
+            );
+            let score = eval_stats.score(target_bpd);
+            if score < best.1 {
+                best = (mult, score);
+            }
+            if score < cal.tolerance {
+                break;
+            }
+            // Direction: use eval median to choose half (consistent with score).
+            if eval_stats.median > target_bpd {
+                log_lo = log_mid;
+            } else {
+                log_hi = log_mid;
+            }
+        }
+
+        // Clamp detector — same policy as calibrate_mtf.
+        let lo_clamp = (best.0 as f64 - cal.mult_bounds[0]).abs() / cal.mult_bounds[0] < 0.01;
+        let hi_clamp = (best.0 as f64 - cal.mult_bounds[1]).abs() / cal.mult_bounds[1] < 0.01;
+        if lo_clamp || hi_clamp {
+            eprintln!(
+                "  [wf clamp-detector] window={}d mult={:.6} at-{} bound — dropped",
+                window_days, best.0,
+                if lo_clamp { "lower" } else { "upper" }
+            );
+            continue;
+        }
+        mults.push(best.0);
+    }
+
+    if mults.is_empty() {
+        return 0.0;
+    }
+    (mults.iter().map(|m| (*m as f64).ln()).sum::<f64>() / mults.len() as f64).exp() as f32
+}
+
 /// Replay `prices` through a fresh `RenkoGenerator(config)` and count bars
 /// emitted between `[from_ts, to_ts]`. Caps at 1_000_000 bars as a safety brake.
 pub fn count_bars_from_prices<S: VolSource + ?Sized>(
@@ -198,20 +399,31 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
             // At `bpd=0` → `err = |0/target - 1| = 1.0 = 100%` (clamped by abs).
             // This 100% spuriously beats any overshoot round (e.g. bpd=1232 →
             // err=1132%), causing the search to lock onto the brick-too-big
-            // cliff (incident: SOL/BTC synth converged on k=4.217 / 0 bars).
-            // Skip best-update when n==0; direction logic below still steers
-            // search downward (bpd=0 < target → log_hi=log_mid → smaller mult).
+            // cliff (SOL/BTC/BNB synth, k=4.217). Skip update when n==0.
             if n > 0 && err < best.1 {
                 best = (mult, err);
             }
-            if err < cal.tolerance {
+            if err < cal.tolerance && n > 0 {
                 break;
             }
+            // Direction: bars=0 → bpd=0 < target → log_hi = log_mid → next
+            // mult smaller (correct: cliff = brick too big, want to go down).
             if bpd > target_bpd {
                 log_lo = log_mid;
             } else {
                 log_hi = log_mid;
             }
+        }
+
+        // If no round produced a non-zero brick count, best.1 remains f64::MAX
+        // → window-fail (drop, do NOT push base.multiplier as fake solution).
+        if best.1 == f64::MAX {
+            eprintln!(
+                "  [diag] window={}d had ZERO non-empty rounds — likely synth tick gap or \
+                 brick-too-big cliff; dropping from MTF blend",
+                window_days
+            );
+            continue;
         }
 
         info!(

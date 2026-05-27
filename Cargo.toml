@@ -83,6 +83,10 @@ path = "src/bin/synth_sigma_benchmark.rs"
 name = "synth-backfill-from-idx"
 path = "src/bin/synth_backfill_from_idx.rs"
 
+[[bin]]
+name = "renko-continuity-check"
+path = "src/bin/renko_continuity_check.rs"
+
 [dependencies]
 # Core async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util"] }
