@@ -34,7 +34,7 @@ use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
 use serde::Deserialize;
 use series_factory::bar_construction::{
-    build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig, MtfParkinsonCalculator,
+    build_vol_from_hlc, calibrate_mtf_walkforward, CalibrationConfig, MtfParkinsonCalculator,
     RenkoConfig, VolConfig,
 };
 use series_factory::vol_bin::{VolMmap, VolWriter};
@@ -109,7 +109,11 @@ struct RenkoYml {
 #[derive(Debug, Deserialize)]
 struct CalibrationConfigExt {
     target_bpd: f64,
-    windows_days: Vec<usize>,
+    /// Phase 58.L.0 (2026-05-27): renamed from `windows_days` to disambiguate
+    /// from the σ-blend MTF (`VolConfig.sigma_blend_windows_days`). Serde
+    /// alias keeps existing YAML configs working.
+    #[serde(alias = "windows_days")]
+    k_fit_windows_days: Vec<usize>,
     min_window_days: usize,
     max_rounds: usize,
     tolerance: f64,
@@ -145,7 +149,7 @@ impl CalibrationConfigExt {
     fn inner(&self) -> CalibrationConfig {
         CalibrationConfig {
             target_bpd: self.target_bpd,
-            windows_days: self.windows_days.clone(),
+            k_fit_windows_days: self.k_fit_windows_days.clone(),
             min_window_days: self.min_window_days,
             max_rounds: self.max_rounds,
             tolerance: self.tolerance,
@@ -380,8 +384,14 @@ fn calibrate_one(
         return CalOutcome::Failed { ticker_id, reason: format!("base renko cfg: {}", e) };
     }
 
-    info!(ticker_id, pair, class = class.as_str(), target_bpd, "calibrating");
-    let mult = calibrate_mtf_with_target(
+    info!(ticker_id, pair, class = class.as_str(), target_bpd, "calibrating (walk-forward)");
+    // Phase 58.L.0 (2026-05-27): switched from in-sample
+    // `calibrate_mtf_with_target` to `calibrate_mtf_walkforward` per audit
+    // point #5(i) 2026-05-26. The 7d holdout is non-overlapping with the
+    // training slice, eliminating the regime-leak overfit that produced
+    // k≈0.01 boundary-clamps on cross-pairs (live brick-storm root cause).
+    const EVAL_HOLDOUT_DAYS: usize = 7;
+    let mult = calibrate_mtf_walkforward(
         &tick_prices,
         &cal_ext.inner(),
         &base,
@@ -389,6 +399,7 @@ fn calibrate_one(
         vol_cfg,
         &sigma_cache,
         target_bpd,
+        EVAL_HOLDOUT_DAYS,
     );
 
     let _ = std::fs::remove_file(&vol_path);
@@ -579,8 +590,10 @@ fn calibrate_one_synth(
         return CalOutcome::Failed { ticker_id: synth_id, reason: format!("base renko cfg: {}", e) };
     }
 
-    info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd, "calibrating synth");
-    let mult = calibrate_mtf_with_target(
+    info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd, "calibrating synth (walk-forward)");
+    // Phase 58.L.0: same walk-forward swap as direct path above.
+    const EVAL_HOLDOUT_DAYS: usize = 7;
+    let mult = calibrate_mtf_walkforward(
         &tick_prices,
         &cal_ext.inner(),
         &base,
@@ -588,6 +601,7 @@ fn calibrate_one_synth(
         vol_cfg,
         &sigma_cache,
         target_bpd,
+        EVAL_HOLDOUT_DAYS,
     );
     let _ = std::fs::remove_file(&vol_path);
 

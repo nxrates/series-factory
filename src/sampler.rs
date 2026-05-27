@@ -3,7 +3,7 @@
 //! 1D search space: multiplier (log-uniform 0.005–0.5).
 //! Phase A: log-uniform exploration, Phase B: local refinement around best.
 
-use crate::bar_construction::RenkoConfig;
+use nxr_sdk::renko::RenkoConfig;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::Normal;

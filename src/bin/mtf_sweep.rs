@@ -133,8 +133,10 @@ struct RenkoYml {
 #[derive(Deserialize)]
 struct CalibrationYml {
     target_bpd: f64,
+    /// Phase 58.L.0: see `CalibrationConfig.k_fit_windows_days`.
     #[allow(dead_code)]
-    windows_days: Vec<usize>,
+    #[serde(alias = "windows_days")]
+    k_fit_windows_days: Vec<usize>,
     min_window_days: usize,
     max_rounds: usize,
     tolerance: f64,
@@ -476,7 +478,7 @@ fn run_pair(
         for (key, windows) in candidates {
             let cal = CalibrationConfig {
                 target_bpd,
-                windows_days: windows.to_vec(),
+                k_fit_windows_days: windows.to_vec(),
                 min_window_days: cal_base.min_window_days,
                 max_rounds: cal_base.max_rounds,
                 tolerance: cal_base.tolerance,
@@ -501,8 +503,15 @@ fn run_pair(
             if !(k > 0.0 && k.is_finite()) {
                 continue;
             }
+            // Phase 58.L.0 (2026-05-27): apply K_FLOOR explicitly so the
+            // reported k matches the engine's effective k. The engine
+            // (`nxr_sdk::renko::RenkoGenerator::compute_brick_size`) already
+            // clamps k → max(k, K_FLOOR) internally; without this explicit
+            // clamp on the sweep side the candidate logs k=0.01 but the
+            // brick count reflects k=0.05 — accounting fraud.
+            let k_clamped = k.max(nxr_sdk::renko::K_FLOOR);
             let renko_cfg = RenkoConfig {
-                multiplier: k as f32,
+                multiplier: k_clamped as f32,
                 min_pct: yml.renko.min_pct,
             };
             if renko_cfg.validate().is_err() {
@@ -644,7 +653,12 @@ fn main() -> Result<()> {
                 / means_per_pair.len() as f64;
             let score_var = var.sqrt();
             let score_oob = oobs_per_pair.iter().sum::<f64>() / oobs_per_pair.len() as f64;
-            let composite = score_mean + 0.5 * score_var;
+            // Phase 58.L.0 (2026-05-27): OOB weight raised from 0.0 → 5.0
+            // per cohort audit. Previously the sweep's "composite" picked
+            // candidates with low mean error even when 30%+ of days fell
+            // outside [target/3, 2*target] — i.e. a regime-leaky candidate
+            // could beat a stable one because OOB carried zero weight.
+            let composite = score_mean + 0.5 * score_var + 5.0 * score_oob;
             eprintln!(
                 "AGG    candidate={} score_mean={:.2} score_var={:.2} score_oob={:.2} composite={:.2}",
                 cand_key, score_mean, score_var, score_oob, composite
