@@ -724,8 +724,12 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         // acceptable: the first tick seeds last_close to its grid-snapped
         // value, and that's the same value the live producer would settle
         // to at midnight rollover anyway (within one brick of slop).
-        let mut gen_local = RenkoGenerator::new(renko_cfg, &vol_mmap, yml.vol.clone())?;
-        gen_local.set_sigma_cache(&sigma_cache);
+        let mut gen_local = RenkoGenerator::new(renko_cfg)?;
+        let sigma_at = |ts: i64| -> f64 {
+            let mts = timestamp::from_epoch_ms(ts);
+            let i = vol_mmap.find_index_for_mts(mts);
+            sigma_cache.get(i).copied().unwrap_or(0.01)
+        };
 
         // Optionally seed from the prior generator's last_close so the
         // brick chain is continuous across day boundaries. We can't read
@@ -741,7 +745,8 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
                         // Seed: a synthetic tick at d_start carries the
                         // prior close. The generator initialises last_close
                         // via snap_to_grid. No bar is emitted (one tick).
-                        let _ = gen_local.feed_tick(d_start, last.close, &mut |_: &Bar| Ok(()));
+                        let sigma = sigma_at(d_start);
+                        let _ = gen_local.feed_tick_with_sigma(d_start, last.close, sigma, &mut |_: &Bar| Ok(()));
                     }
                 }
             }
@@ -798,6 +803,7 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
                     let c = rec.index.ci as f64 / mitch::common::CI_SCALE;
                     c * c
                 };
+                let sigma = sigma_at(ts);
                 gen_local.feed_index_record(
                     ts,
                     rec.index.bid,
@@ -807,6 +813,7 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
                     ci_decoded,
                     rec.index.accepted as u32,
                     rec.index.rejected as u32,
+                    sigma,
                     &mut |bar: &Bar| {
                         pending.push(*bar);
                         Ok(())

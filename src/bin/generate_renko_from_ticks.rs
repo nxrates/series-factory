@@ -19,7 +19,8 @@ use series_factory::{
     vol_bin::{VolMmap, VolWriter},
     TickFrame,
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig, VolSource};
+use nxr_sdk::mitch::timestamp;
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use std::{
     collections::BTreeMap,
@@ -351,7 +352,12 @@ fn run_pipeline(
     let mut bars: Vec<Bar> = Vec::new();
     let mut accum = BarAccumulator::new();
     let mut pending: Vec<Bar> = Vec::new();
-    let mut generator = RenkoGenerator::new(*config, &vol_mmap, yml.vol.clone())?;
+    let mut generator = RenkoGenerator::new(*config)?;
+    let sigma_at = |ts: i64| -> f64 {
+        let mts = timestamp::from_epoch_ms(ts);
+        let i = vol_mmap.find_index_for_mts(mts);
+        sigma_cache.get(i).copied().unwrap_or(0.01)
+    };
     let mut pass2_tick_count = 0u64;
     let mut pass2_post_bootstrap = 0u64;
 
@@ -372,19 +378,20 @@ fn run_pipeline(
             }
 
             if ts < bootstrap_end {
-                generator.feed_tick(ts, mid, &mut |_: &Bar| Ok(()))?;
+                let sigma = sigma_at(ts);
+                generator.feed_tick_with_sigma(ts, mid, sigma, &mut |_: &Bar| Ok(()))?;
                 continue;
             }
 
             pass2_post_bootstrap += 1;
             if pass2_post_bootstrap == 1 {
                 eprintln!("  [diag] first post-bootstrap tick: ts={} mid={:.2} (bootstrap_end={})", ts, mid, bootstrap_end);
-                let (nb, _) = generator.stats();
-                eprintln!("  [diag] generator state after bootstrap: n_bars={}", nb);
+                eprintln!("  [diag] generator state after bootstrap: n_bars={}", generator.n_bars());
             }
 
             accum.ingest(body.bid, body.ask, body.vbid, body.vask, ts, 0.0, 1, 0);
-            generator.feed_tick(ts, mid, &mut |bar: &Bar| { pending.push(*bar); Ok(()) })?;
+            let sigma = sigma_at(ts);
+            generator.feed_tick_with_sigma(ts, mid, sigma, &mut |bar: &Bar| { pending.push(*bar); Ok(()) })?;
 
             if !pending.is_empty() {
                 // Flush accumulator once per burst of emissions (enrichment

@@ -29,7 +29,7 @@ use series_factory::{
     bar_construction::build_vol_from_hlc,
     vol_bin::{VolMmap, VolWriter},
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig, VolSource};
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -189,10 +189,14 @@ fn main() -> Result<()> {
         let mut calc = MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
         calc.precompute_sigma_cache()
     };
+    let sigma_at = |ts: i64| -> f64 {
+        let mts = timestamp::from_epoch_ms(ts);
+        let i = vol_mmap.find_index_for_mts(mts);
+        sigma_cache.get(i).copied().unwrap_or(0.01)
+    };
 
     let t1 = std::time::Instant::now();
-    let mut generator = RenkoGenerator::new(renko_config, &vol_mmap, yml.vol.clone())?;
-    generator.set_sigma_cache(&sigma_cache);
+    let mut generator = RenkoGenerator::new(renko_config)?;
 
     let mut bars_by_date: BTreeMap<NaiveDate, Vec<Bar>> = BTreeMap::new();
     let mut accum = BarAccumulator::new();
@@ -213,7 +217,8 @@ fn main() -> Result<()> {
             pass2_count += 1;
 
             if ts < bootstrap_end {
-                generator.feed_tick(ts, mid, &mut |_: &Bar| Ok(()))?;
+                let sigma = sigma_at(ts);
+                generator.feed_tick_with_sigma(ts, mid, sigma, &mut |_: &Bar| Ok(()))?;
                 continue;
             }
             post_bootstrap += 1;
@@ -229,7 +234,8 @@ fn main() -> Result<()> {
                 idx.accepted as u32,
                 idx.rejected as u32,
             );
-            generator.feed_tick(ts, mid, &mut |bar: &Bar| {
+            let sigma = sigma_at(ts);
+            generator.feed_tick_with_sigma(ts, mid, sigma, &mut |bar: &Bar| {
                 pending.push(*bar);
                 Ok(())
             })?;
