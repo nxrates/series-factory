@@ -109,8 +109,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Cryptographic hashing (sharded manifest sha256)
 sha2 = "0.10"
-# Hex encoding (manifest sha256 stringification)
-hex = "0.4"
 # Random number generation for synthetic data
 rand = "0.8"
 rand_chacha = "0.3"
