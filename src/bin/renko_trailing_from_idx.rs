@@ -53,11 +53,10 @@ use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, read_shard_aligned, shard_path, BarShardWriter, ShardStream,
     MS_PER_30MIN, MS_PER_DAY,
 };
-use serde::Deserialize;
 use series_factory::bar_construction::{
     build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig,
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig, VolSource};
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolSource};
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
@@ -120,81 +119,18 @@ struct Args {
 
 // ── Config (subset of nxrates.yml) ──────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct NxratesYml {
-    series: SeriesYml,
-}
+use nxr_sdk::pipeline_config::{CalibrationYml, PipelineYml};
 
-#[derive(Deserialize)]
-struct SeriesYml {
-    renko: RenkoYml,
-    vol: VolConfig,
-    calibration: CalibrationYml,
-}
-
-// max_pct dropped 2026-05-24 (operator: markets be markets). Serde tolerates
-// stray legacy keys in yaml.
-#[derive(Deserialize)]
-struct RenkoYml {
-    min_pct: f32,
-}
-
-/// Mirrors `nxr_calibrate.rs::CalibrationConfigExt` minus the per-class table
-/// (we resolve the bucket once per pair at startup, then plumb a flat
-/// `target_bpd` into every day's calibration).
-#[derive(Deserialize)]
-struct CalibrationYml {
-    target_bpd: f64,
-    k_fit_windows_days: Vec<usize>,
-    min_window_days: usize,
-    max_rounds: usize,
-    tolerance: f64,
-    mult_bounds: [f64; 2],
-    #[serde(default)]
-    target_bpd_by_class: BTreeMap<String, ClassTarget>,
-}
-
-#[derive(Deserialize, Clone)]
-#[serde(untagged)]
-enum ClassTarget {
-    Bpd(f64),
-    Sentinel(String),
-}
-
-impl ClassTarget {
-    fn resolved(&self) -> Option<f64> {
-        match self {
-            ClassTarget::Bpd(v) if *v > 0.0 => Some(*v),
-            ClassTarget::Bpd(_) => None,
-            ClassTarget::Sentinel(s) if s.eq_ignore_ascii_case("skip") => None,
-            ClassTarget::Sentinel(_) => None,
-        }
-    }
-}
-
-impl CalibrationYml {
-    fn inner(&self) -> CalibrationConfig {
-        CalibrationConfig {
-            target_bpd: self.target_bpd,
-            k_fit_windows_days: self.k_fit_windows_days.clone(),
-            min_window_days: self.min_window_days,
-            max_rounds: self.max_rounds,
-            tolerance: self.tolerance,
-            mult_bounds: self.mult_bounds,
-        }
-    }
-
-    /// Per-asset-class target. Same string keys as `nxr-calibrate` consumes
-    /// (`crypto_major`, `crypto_alt`, `crypto_stable`, `fx_major`, `fx_cross`,
-    /// `default`). `None` ⇒ skip this pair.
-    fn target_for_class(&self, class_key: &str) -> Option<f64> {
-        if let Some(t) = self.target_bpd_by_class.get(class_key) {
-            return t.resolved();
-        }
-        if let Some(t) = self.target_bpd_by_class.get("default") {
-            return t.resolved();
-        }
-        Some(self.target_bpd)
+/// Convert the shared `CalibrationYml` into the inner `CalibrationConfig` the
+/// MTF calibrator consumes.
+fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
+    CalibrationConfig {
+        target_bpd: c.target_bpd,
+        k_fit_windows_days: c.k_fit_windows_days.clone(),
+        min_window_days: c.min_window_days,
+        max_rounds: c.max_rounds,
+        tolerance: c.tolerance,
+        mult_bounds: c.mult_bounds,
     }
 }
 
@@ -349,7 +285,7 @@ impl PairSummary {
 }
 
 /// One-shot walk-forward backfill for `(base, quote)`.
-fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<PairSummary> {
+fn run_pair(args: &Args, yml: &nxr_sdk::pipeline_config::SeriesYml, base: &str, quote: &str) -> Result<PairSummary> {
     let cfg = nxr_sdk::NxrConfig::from_env();
     let data_root = Path::new(&cfg.indexes_dir)
         .parent()
@@ -661,7 +597,7 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         } else {
             let k = calibrate_mtf_with_target(
                 trailing,
-                &yml.calibration.inner(),
+                &calibration_inner(&yml.calibration),
                 &base_cfg,
                 &vol_mmap,
                 &yml.vol,
@@ -891,7 +827,7 @@ fn main() -> Result<()> {
     nxr_sdk::memory::apply_safe_cap();
 
     let args = Args::parse();
-    let root: NxratesYml = serde_yaml::from_str(
+    let root: PipelineYml = serde_yaml::from_str(
         &std::fs::read_to_string(&args.config)
             .with_context(|| format!("read {}", args.config.display()))?,
     )

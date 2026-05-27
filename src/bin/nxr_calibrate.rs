@@ -32,7 +32,6 @@ use nxr_sdk::shard::{list_shards, ShardStream, MS_PER_30MIN};
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
-use serde::Deserialize;
 use series_factory::bar_construction::{
     build_vol_from_hlc, calibrate_mtf_walkforward, CalibrationConfig,
 };
@@ -76,93 +75,25 @@ struct Args {
 
 // ── Config (subset of nxrates.yml) ───────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct NxratesYml {
-    #[serde(default)]
-    cexs: CexsYml,
-    series: SeriesYml,
-}
+use nxr_sdk::pipeline_config::{CalibrationYml, PipelineYml};
 
-#[derive(Debug, Default, Deserialize)]
-struct CexsYml {
-    #[serde(default)]
-    stablecoins: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SeriesYml {
-    renko: RenkoYml,
-    vol: VolConfig,
-    calibration: CalibrationConfigExt,
-}
-
-// max_pct removed (2026-05-24): no ceiling on adaptive renko brick %.
-// Serde tolerates extra keys; stale config.yml entries (max_pct: 0.10) are
-// silently ignored.
-#[derive(Debug, Deserialize)]
-struct RenkoYml {
-    min_pct: f32,
-}
-
-/// Calibration config with optional per-class `target_bpd` overrides.
-/// Defaults to the flat `target_bpd` for the inner `CalibrationConfig`.
-#[derive(Debug, Deserialize)]
-struct CalibrationConfigExt {
-    target_bpd: f64,
-    k_fit_windows_days: Vec<usize>,
-    min_window_days: usize,
-    max_rounds: usize,
-    tolerance: f64,
-    mult_bounds: [f64; 2],
-    #[serde(default)]
-    target_bpd_by_class: BTreeMap<String, ClassTarget>,
-}
-
-/// "300" → Bpd(300.0); "skip" → Skip.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum ClassTarget {
-    Bpd(f64),
-    Sentinel(String),
-}
-
-impl ClassTarget {
-    /// `None` ⇒ skip this class; `Some(v)` ⇒ use `v` as target bpd.
-    fn resolved(&self) -> Option<f64> {
-        match self {
-            ClassTarget::Bpd(v) if *v > 0.0 => Some(*v),
-            ClassTarget::Bpd(_) => None,
-            ClassTarget::Sentinel(s) if s.eq_ignore_ascii_case("skip") => None,
-            ClassTarget::Sentinel(s) => {
-                warn!(sentinel = s, "unknown target_bpd_by_class sentinel — treating as skip");
-                None
-            }
-        }
+/// Convert the shared calibration block into the inner `CalibrationConfig`
+/// the MTF calibrator consumes.
+fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
+    CalibrationConfig {
+        target_bpd: c.target_bpd,
+        k_fit_windows_days: c.k_fit_windows_days.clone(),
+        min_window_days: c.min_window_days,
+        max_rounds: c.max_rounds,
+        tolerance: c.tolerance,
+        mult_bounds: c.mult_bounds,
     }
 }
 
-impl CalibrationConfigExt {
-    fn inner(&self) -> CalibrationConfig {
-        CalibrationConfig {
-            target_bpd: self.target_bpd,
-            k_fit_windows_days: self.k_fit_windows_days.clone(),
-            min_window_days: self.min_window_days,
-            max_rounds: self.max_rounds,
-            tolerance: self.tolerance,
-            mult_bounds: self.mult_bounds,
-        }
-    }
-
-    fn target_for(&self, class: AssetClassBucket) -> Option<f64> {
-        let key = class.as_str();
-        if let Some(t) = self.target_bpd_by_class.get(key) {
-            return t.resolved();
-        }
-        if let Some(t) = self.target_bpd_by_class.get("default") {
-            return t.resolved();
-        }
-        Some(self.target_bpd)
-    }
+/// Resolve `target_bpd` for an `AssetClassBucket` via the shared
+/// `target_bpd_by_class` map (with `default` fallback then flat target).
+fn target_for_class(c: &CalibrationYml, class: AssetClassBucket) -> Option<f64> {
+    c.target_for_class(class.as_str())
 }
 
 // ── Asset-class bucket detection ─────────────────────────────────────────────
@@ -285,10 +216,10 @@ fn calibrate_one(
     pair: &str,
     class: AssetClassBucket,
     idx_dir: &Path,
-    cal_ext: &CalibrationConfigExt,
+    cal_ext: &CalibrationYml,
     target_bpd: f64,
     vol_cfg: &VolConfig,
-    renko_yml: &RenkoYml,
+    renko_yml: &nxr_sdk::pipeline_config::RenkoYml,
 ) -> CalOutcome {
     let idx_path = idx_dir.join(format!("{}.idx", ticker_id));
     if !idx_path.exists() {
@@ -388,7 +319,7 @@ fn calibrate_one(
     const EVAL_HOLDOUT_DAYS: usize = 7;
     let mult = calibrate_mtf_walkforward(
         &tick_prices,
-        &cal_ext.inner(),
+        &calibration_inner(cal_ext),
         &base,
         &vol_mmap,
         vol_cfg,
@@ -464,10 +395,10 @@ fn calibrate_one_synth(
     leg_a_id: u64,
     leg_b_id: u64,
     idx_root: &Path,
-    cal_ext: &CalibrationConfigExt,
+    cal_ext: &CalibrationYml,
     target_bpd: f64,
     vol_cfg: &VolConfig,
-    renko_yml: &RenkoYml,
+    renko_yml: &nxr_sdk::pipeline_config::RenkoYml,
 ) -> CalOutcome {
     // ── 1. Load both legs ────────────────────────────────────────────────────
     let leg_a = match load_leg_ticks_all_shards(idx_root, leg_a_id) {
@@ -590,7 +521,7 @@ fn calibrate_one_synth(
     const EVAL_HOLDOUT_DAYS: usize = 7;
     let mult = calibrate_mtf_walkforward(
         &tick_prices,
-        &cal_ext.inner(),
+        &calibration_inner(cal_ext),
         &base,
         &vol_mmap,
         vol_cfg,
@@ -635,7 +566,7 @@ fn resolve_synth_work() -> Vec<(u64, &'static str, u64, u64)> {
 
 fn run_once(args: &Args) -> Result<()> {
     let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "config.yml".to_string());
-    let root: NxratesYml = serde_yaml::from_str(
+    let root: PipelineYml = serde_yaml::from_str(
         &std::fs::read_to_string(&cfg_path).with_context(|| format!("read {}", cfg_path))?,
     )
     .with_context(|| format!("parse {}", cfg_path))?;
@@ -695,7 +626,7 @@ fn run_once(args: &Args) -> Result<()> {
 
     pool.install(|| {
         work.par_iter().for_each(|(ticker_id, pair, class)| {
-            let target_bpd = match cal_ext.target_for(*class) {
+            let target_bpd = match target_for_class(cal_ext, *class) {
                 Some(t) => t,
                 None => {
                     results.lock().unwrap().push(CalOutcome::Skipped {
@@ -774,8 +705,7 @@ fn run_once(args: &Args) -> Result<()> {
     // cache). The clamp-detector inside `calibrate_mtf_with_target` drops
     // degenerate windows; if all windows fail, k is NOT persisted (caller
     // keeps prior). The crypto_cross target_bpd applies.
-    let synth_target = cal_ext
-        .target_for(AssetClassBucket::CryptoCross)
+    let synth_target = target_for_class(cal_ext, AssetClassBucket::CryptoCross)
         .unwrap_or_else(|| {
             warn!("crypto_cross target_bpd missing; falling back to default");
             cal_ext.target_bpd

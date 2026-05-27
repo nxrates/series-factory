@@ -27,11 +27,11 @@ use nxr_sdk::resolve_ticker_id;
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, ShardStream, MS_PER_30MIN, MS_PER_DAY,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use series_factory::bar_construction::{
     build_vol_from_hlc, calibrate_mtf_with_target, count_bars_from_prices, CalibrationConfig,
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::parkinson::MtfParkinsonCalculator;
 use nxr_sdk::renko::RenkoConfig;
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
@@ -115,65 +115,7 @@ struct Args {
     to: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct NxratesYml {
-    series: SeriesYml,
-}
-
-#[derive(Deserialize)]
-struct SeriesYml {
-    renko: RenkoYml,
-    vol: VolConfig,
-    calibration: CalibrationYml,
-}
-
-#[derive(Deserialize)]
-struct RenkoYml {
-    min_pct: f32,
-}
-
-#[derive(Deserialize)]
-struct CalibrationYml {
-    target_bpd: f64,
-    #[allow(dead_code)]
-    k_fit_windows_days: Vec<usize>,
-    min_window_days: usize,
-    max_rounds: usize,
-    tolerance: f64,
-    mult_bounds: [f64; 2],
-    #[serde(default)]
-    target_bpd_by_class: BTreeMap<String, ClassTarget>,
-}
-
-#[derive(Deserialize, Clone)]
-#[serde(untagged)]
-enum ClassTarget {
-    Bpd(f64),
-    Sentinel(String),
-}
-
-impl ClassTarget {
-    fn resolved(&self) -> Option<f64> {
-        match self {
-            ClassTarget::Bpd(v) if *v > 0.0 => Some(*v),
-            ClassTarget::Bpd(_) => None,
-            ClassTarget::Sentinel(s) if s.eq_ignore_ascii_case("skip") => None,
-            ClassTarget::Sentinel(_) => None,
-        }
-    }
-}
-
-impl CalibrationYml {
-    fn target_for_class(&self, class_key: &str) -> Option<f64> {
-        if let Some(t) = self.target_bpd_by_class.get(class_key) {
-            return t.resolved();
-        }
-        if let Some(t) = self.target_bpd_by_class.get("default") {
-            return t.resolved();
-        }
-        Some(self.target_bpd)
-    }
-}
+use nxr_sdk::pipeline_config::PipelineYml;
 
 // ── Asset-class bucketing (copy of renko-trailing logic) ────────────────────
 const CRYPTO_MAJORS: &[&str] = &[
@@ -287,7 +229,7 @@ fn parse_candidates(arg: Option<&str>) -> Vec<(&'static str, &'static [usize])> 
 
 fn run_pair(
     args: &Args,
-    yml: &SeriesYml,
+    yml: &nxr_sdk::pipeline_config::SeriesYml,
     base: &str,
     quote: &str,
     candidates: &[(&'static str, &'static [usize])],
@@ -577,7 +519,7 @@ fn main() -> Result<()> {
     nxr_sdk::memory::apply_safe_cap();
 
     let args = Args::parse();
-    let root: NxratesYml = serde_yaml::from_str(
+    let root: PipelineYml = serde_yaml::from_str(
         &std::fs::read_to_string(&args.config)
             .with_context(|| format!("read {}", args.config.display()))?,
     )
