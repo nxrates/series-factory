@@ -40,6 +40,11 @@ use nxr_sdk::renko::RenkoConfig;
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
+/// Walk-forward calibration holdout window. Used by both the direct and the
+/// synth calibration paths; defined once at module scope to keep the two
+/// branches in lock-step (audit point #5(i), 2026-05-26 — `feedback_no_k_fallback`).
+const EVAL_HOLDOUT_DAYS: usize = 7;
+
 // ── Synth pair registry (mirrors core/src/synth_registry.rs INITIAL_PAIRS) ──
 // Kept inline here because series-factory is a workspace-EXCLUDED crate and
 // cannot depend on the core crate; the 5-pair list is small + rarely
@@ -315,8 +320,7 @@ fn calibrate_one(
     // Walk-forward calibration (7d holdout non-overlapping with the training
     // slice) per audit point #5(i) 2026-05-26. Eliminates the regime-leak
     // overfit that produced k≈0.01 boundary-clamps on cross-pairs (live
-    // brick-storm root cause).
-    const EVAL_HOLDOUT_DAYS: usize = 7;
+    // brick-storm root cause). Holdout const hoisted to module scope.
     let mult = calibrate_mtf_walkforward(
         &tick_prices,
         &calibration_inner(cal_ext),
@@ -517,8 +521,7 @@ fn calibrate_one_synth(
     }
 
     info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd, "calibrating synth (walk-forward)");
-    // Walk-forward 7d holdout (matches direct path above).
-    const EVAL_HOLDOUT_DAYS: usize = 7;
+    // Walk-forward 7d holdout (matches direct path above; const at module scope).
     let mult = calibrate_mtf_walkforward(
         &tick_prices,
         &calibration_inner(cal_ext),
