@@ -468,12 +468,22 @@ fn generate_bars(
     config: &RenkoConfig,
     vol_mmap: &VolMmap,
 ) -> Vec<Bar> {
-    let mut generator = match RenkoGenerator::new(*config, vol_mmap, VolConfig::default()) {
+    let mut generator = match RenkoGenerator::new(*config) {
         Ok(g) => g,
         Err(_) => return Vec::new(),
     };
+    // Resolve σ per tick via the vol mmap directly (this binary's hot path
+    // is single-pass over already-decoded tick prices, no cache).
+    let mut calc = nxr_sdk::parkinson::MtfParkinsonCalculator::new(vol_mmap, VolConfig::default());
+    let sigma_cache = calc.precompute_sigma_cache();
     let mut bars = Vec::new();
-    let _ = generator.generate(tick_prices.iter().copied(), |bar: &Bar| {
+    let iter = tick_prices.iter().map(|&(ts, mid)| {
+        let mts = nxr_sdk::mitch::timestamp::from_epoch_ms(ts);
+        let i = vol_mmap.find_index_for_mts(mts);
+        let sigma = sigma_cache.get(i).copied().unwrap_or(0.01);
+        (ts, mid, sigma)
+    });
+    let _ = generator.generate(iter, |bar: &Bar| {
         bars.push(*bar);
         Ok(())
     });

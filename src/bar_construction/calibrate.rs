@@ -17,6 +17,20 @@ use tracing::info;
 
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use nxr_sdk::parkinson::{VolConfig, VolSource};
+use nxr_sdk::mitch::timestamp;
+
+/// Resolve σ_pct for a given epoch-ms timestamp via the precomputed cache.
+/// Used in hot loops where the engine no longer owns the σ source.
+#[inline]
+fn sigma_for_ts<S: VolSource + ?Sized>(
+    ts_ms: i64,
+    vol_source: &S,
+    sigma_cache: &[f64],
+) -> f64 {
+    let mts = timestamp::from_epoch_ms(ts_ms);
+    let i = vol_source.find_index_for_mts(mts);
+    sigma_cache.get(i).copied().unwrap_or(0.01)
+}
 
 /// Calibration knobs. Maps to `series.calibration` in `config.yml`.
 ///
@@ -100,12 +114,12 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
     prices: &[(i64, f64)],
     config: &RenkoConfig,
     vol_source: &S,
-    vol_config: &VolConfig,
+    _vol_config: &VolConfig,
     sigma_cache: &[f64],
     from_ts: i64,
     to_ts: i64,
 ) -> DailyBpdStats {
-    let mut gen = match RenkoGenerator::new(*config, vol_source, vol_config.clone()) {
+    let mut gen = match RenkoGenerator::new(*config) {
         Ok(g) => g,
         Err(_) => {
             return DailyBpdStats {
@@ -113,7 +127,6 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
             };
         }
     };
-    gen.set_sigma_cache(sigma_cache);
 
     if to_ts <= from_ts {
         return DailyBpdStats {
@@ -127,7 +140,8 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
         if ts < from_ts { continue; }
         if ts > to_ts { break; }
         let day_idx = ((ts - from_ts) / MS_PER_DAY).clamp(0, n_days as i64 - 1) as usize;
-        gen.feed_tick(ts, mid, &mut |_| {
+        let sigma = sigma_for_ts(ts, vol_source, sigma_cache);
+        gen.feed_tick_with_sigma(ts, mid, sigma, &mut |_| {
             per_day[day_idx] = per_day[day_idx].saturating_add(1);
             Ok(())
         })
@@ -247,13 +261,13 @@ pub fn count_bars_from_prices<S: VolSource + ?Sized>(
     prices: &[(i64, f64)],
     config: &RenkoConfig,
     vol_source: &S,
-    vol_config: &VolConfig,
+    _vol_config: &VolConfig,
     sigma_cache: &[f64],
     from_ts: i64,
     to_ts: i64,
     diag: bool,
 ) -> usize {
-    let mut gen = match RenkoGenerator::new(*config, vol_source, vol_config.clone()) {
+    let mut gen = match RenkoGenerator::new(*config) {
         Ok(g) => g,
         Err(e) => {
             if diag {
@@ -262,7 +276,6 @@ pub fn count_bars_from_prices<S: VolSource + ?Sized>(
             return 0;
         }
     };
-    gen.set_sigma_cache(sigma_cache);
     let mut count = 0usize;
     let mut n_in_range = 0usize;
     let mut n_skipped_before = 0usize;
@@ -276,7 +289,8 @@ pub fn count_bars_from_prices<S: VolSource + ?Sized>(
             break;
         }
         n_in_range += 1;
-        gen.feed_tick(ts, mid, &mut |_| {
+        let sigma = sigma_for_ts(ts, vol_source, sigma_cache);
+        gen.feed_tick_with_sigma(ts, mid, sigma, &mut |_| {
             count += 1;
             Ok(())
         })
