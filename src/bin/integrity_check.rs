@@ -1,4 +1,4 @@
-//! NXR Phase 55 — file integrity test binary.
+//! NXR file integrity test binary.
 //!
 //! Validates on-disk `.idx`, `.bars`, `.vol` files produced by the series
 //! factory pipeline. Designed to run both as a CI smoke gate and as a

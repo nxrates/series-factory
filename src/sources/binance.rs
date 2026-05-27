@@ -36,9 +36,10 @@ impl BinanceSource {
 #[async_trait::async_trait]
 impl TickSource for BinanceSource {
     async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
-        // Phase 58.D: uppercase symbol for URL + dir consistency. Binance public
-        // archive URLs are uppercase-only (e.g. USDEUSDT not USDeUSDT for Ethena's
-        // USDe), and t2i / merge-idx use uppercase BASE+QUOTE conventions on disk.
+        // Uppercase symbol for URL + dir consistency. Binance public archive
+        // URLs are uppercase-only (e.g. USDEUSDT not USDeUSDT for Ethena's
+        // USDe), and t2i / merge-idx use uppercase BASE+QUOTE conventions on
+        // disk.
         let sym = format!("{}{}", config.base.to_uppercase(), config.quote.to_uppercase());
         let tid = nxr_sdk::resolve_ticker_id(&sym);
         info!("Fetching Binance data for {}", sym);

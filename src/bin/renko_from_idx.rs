@@ -140,18 +140,18 @@ fn main() -> Result<()> {
     // ═══ PASS 2: feed composite mid → RenkoGenerator ═══
     let bootstrap_end = first_ts + yml.pipeline.bootstrap_days * MS_PER_DAY;
 
-    // Phase 55 W3.C: read the calibrated k from ticker-params.json. The prior
-    // hardcoded `multiplier: 0.075` was the root cause of the 22× bars/day
-    // overshoot on majors (BTC 8645, ETH 6786, BNB 6114): nxr-calibrate writes
-    // per-ticker k values into `ticker-params.json`, but this offline emitter
-    // ignored them and ran every pair at the bootstrap k=0.075.
+    // Read the calibrated k from ticker-params.json. A prior hardcoded
+    // `multiplier: 0.075` was the root cause of a 22× bars/day overshoot on
+    // majors (BTC 8645, ETH 6786, BNB 6114): nxr-calibrate writes per-ticker
+    // k values into `ticker-params.json`, and this offline emitter must
+    // honour them.
     //
-    // Phase 58.L.1 W2: per durable rule `feedback_no_k_fallback` we ABORT when
-    // no calibrated k exists rather than bootstrapping a degenerate 0.075.
-    // Skipping is the right call: a missing entry means nxr-calibrate has not
-    // yet processed this ticker (new ticker, fresh deploy, or calibrator failed
-    // for the day). Running with 0.075 produces the brick-storm overshoots we
-    // already paid for once.
+    // Per durable rule `feedback_no_k_fallback` we ABORT when no calibrated k
+    // exists rather than bootstrapping a degenerate 0.075. Skipping is the
+    // right call: a missing entry means nxr-calibrate has not yet processed
+    // this ticker (new ticker, fresh deploy, or calibrator failed for the
+    // day). Running with 0.075 produces brick-storm overshoots we already
+    // paid for once.
     let ticker_id = resolve_ticker_id(&format!("{}/{}", base, quote));
     let calibrated_k = load_calibrated_k(ticker_id);
     let multiplier = match calibrated_k {

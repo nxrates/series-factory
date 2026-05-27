@@ -1,4 +1,4 @@
-//! Daily-shard helpers (Phase 55 W4).
+//! Daily-shard helpers. See `docs/sharding-spec.md`.
 //!
 //! Spec: `docs/sharding-spec.md`. The canonical shard-storage primitives now
 //! live in the `nxr-sdk` crate at `nxr_sdk::shard` (single source of truth for

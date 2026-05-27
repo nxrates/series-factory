@@ -39,7 +39,7 @@ impl BitgetSource {
 #[async_trait::async_trait]
 impl TickSource for BitgetSource {
     async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
-        // Phase 58.D: uppercase symbol for URL + dir consistency (see binance.rs).
+        // Uppercase symbol for URL + dir consistency (see binance.rs).
         let sym = format!("{}{}", config.base.to_uppercase(), config.quote.to_uppercase());
         let tid = nxr_sdk::resolve_ticker_id(&sym);
         info!("Fetching Bitget data for {}", sym);
