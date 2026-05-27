@@ -214,7 +214,9 @@ struct YmlSeries {
 
 #[derive(Debug, Deserialize)]
 struct YmlCalibration {
-    windows_days: Vec<i64>,
+    /// Phase 58.L.0: see `CalibrationConfig.k_fit_windows_days`.
+    #[serde(alias = "windows_days")]
+    k_fit_windows_days: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,7 +261,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("no exchanges to fetch (empty config.series.pipeline.exchanges and no --exchanges)");
     }
 
-    let max_window = root.series.calibration.windows_days.iter().max().copied().unwrap_or(180);
+    let max_window = root.series.calibration.k_fit_windows_days.iter().max().copied().unwrap_or(180);
     let default_days = root.series.pipeline.bootstrap_days + max_window;
     let days = args.days.unwrap_or(default_days);
 

@@ -91,7 +91,7 @@ pub struct VolMmap {
 unsafe impl Send for VolMmap {}
 unsafe impl Sync for VolMmap {}
 
-impl crate::bar_construction::VolSource for VolMmap {
+impl nxr_sdk::parkinson::VolSource for VolMmap {
     #[inline]
     fn len(&self) -> usize { self.records.len() }
 

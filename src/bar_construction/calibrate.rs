@@ -15,17 +15,27 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::bar_construction::{RenkoConfig, RenkoGenerator, VolConfig};
-use crate::bar_construction::parkinson::VolSource;
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
+use nxr_sdk::parkinson::{VolConfig, VolSource};
 
 /// Calibration knobs. Maps to `series.calibration` in `config.yml`.
+///
+/// Field naming clarified in Phase 58.L.0 (2026-05-27): `k_fit_windows_days`
+/// is the OUTER MTF loop (k-fit binary search per window, geo-mean blended).
+/// Do not confuse with `VolConfig.sigma_blend_windows_days` (the INNER
+/// σ-blend MTF). Both used to be called "windows_days" / "mtf_lookback_days"
+/// at the call-site, which fed long-running incidents (e.g. wrong-layer tweak
+/// reverts). `#[serde(alias = ...)]` keeps existing YAML configs working.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CalibrationConfig {
     /// Target bars-per-day to converge to (default 300 for crypto majors).
     pub target_bpd: f64,
-    /// Lookback windows in days. Each window runs an independent log-space
-    /// binary search; results are geometric-mean blended.
-    pub windows_days: Vec<usize>,
+    /// k-fit lookback windows in days. Each window runs an independent
+    /// log-space binary search; results are geometric-mean blended. Renamed
+    /// from `windows_days` 2026-05-27 to disambiguate from `VolConfig.
+    /// sigma_blend_windows_days` (the σ-estimator's MTF blend).
+    #[serde(alias = "windows_days")]
+    pub k_fit_windows_days: Vec<usize>,
     /// Minimum days required to evaluate a window (skipped otherwise).
     pub min_window_days: usize,
     /// Binary-search iteration cap per window.
@@ -148,7 +158,7 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
 /// Walk-forward calibration with non-overlapping cal/eval windows
 /// (audit point #5(i), 2026-05-26).
 ///
-/// For each `window_days` in `cal.windows_days`, split the trailing slice:
+/// For each `window_days` in `cal.k_fit_windows_days`, split the trailing slice:
 ///   - `cal_slice  = [last - window_days,           last - eval_holdout_days]`
 ///   - `eval_slice = [last - eval_holdout_days,     last]`
 ///
@@ -183,7 +193,7 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
     }
 
     let mut mults: Vec<f32> = Vec::new();
-    for &window_days in &cal.windows_days {
+    for &window_days in &cal.k_fit_windows_days {
         let cal_from = (last - (window_days as i64) * MS_PER_DAY).max(first);
         let cal_days = (eval_from - cal_from) as f64 / MS_PER_DAY as f64;
         if cal_days < cal.min_window_days as f64 {
@@ -304,7 +314,7 @@ pub fn count_bars_from_prices<S: VolSource + ?Sized>(
 
 /// Multi-timeframe `multiplier` calibration.
 ///
-/// For each window in `cal.windows_days`, runs a log-space binary search over
+/// For each window in `cal.k_fit_windows_days`, runs a log-space binary search over
 /// `mult_bounds` to find the multiplier that yields `target_bpd` bars per day on
 /// the trailing slice of `prices`. Returns the geometric mean across windows
 /// (or `0.0` if no window had enough data — caller keeps the prior multiplier).
@@ -345,7 +355,7 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
     let t0 = std::time::Instant::now();
     let mut mults: Vec<f32> = Vec::new();
 
-    for &window_days in &cal.windows_days {
+    for &window_days in &cal.k_fit_windows_days {
         let from = (last - window_days as i64 * 86_400_000).max(first);
         let days = (last - from) as f64 / 86_400_000.0;
         if days < cal.min_window_days as f64 {
@@ -465,7 +475,7 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
         eprintln!(
             "  [diag] calibrate_mtf all-windows-empty target_bpd={} windows_days={:?} \
              first={} last={} n_prices={}",
-            target_bpd, cal.windows_days, first, last, prices.len()
+            target_bpd, cal.k_fit_windows_days, first, last, prices.len()
         );
         return 0.0;
     }

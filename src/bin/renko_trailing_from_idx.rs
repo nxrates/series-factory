@@ -145,7 +145,9 @@ struct RenkoYml {
 #[derive(Deserialize)]
 struct CalibrationYml {
     target_bpd: f64,
-    windows_days: Vec<usize>,
+    /// Phase 58.L.0: see `CalibrationConfig.k_fit_windows_days`.
+    #[serde(alias = "windows_days")]
+    k_fit_windows_days: Vec<usize>,
     min_window_days: usize,
     max_rounds: usize,
     tolerance: f64,
@@ -176,7 +178,7 @@ impl CalibrationYml {
     fn inner(&self) -> CalibrationConfig {
         CalibrationConfig {
             target_bpd: self.target_bpd,
-            windows_days: self.windows_days.clone(),
+            k_fit_windows_days: self.k_fit_windows_days.clone(),
             min_window_days: self.min_window_days,
             max_rounds: self.max_rounds,
             tolerance: self.tolerance,
@@ -460,7 +462,7 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
     // RAM budget allows it and correctness is non-negotiable.
     let max_window_days = yml
         .calibration
-        .windows_days
+        .k_fit_windows_days
         .iter()
         .copied()
         .max()

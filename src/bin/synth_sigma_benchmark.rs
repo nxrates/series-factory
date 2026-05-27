@@ -493,7 +493,7 @@ fn simulate_calibrator(
 
     let cal = CalibrationConfig {
         target_bpd,
-        windows_days: windows_days.to_vec(),
+        k_fit_windows_days: windows_days.to_vec(),
         min_window_days: 7,
         max_rounds: 12,
         tolerance: 0.05,

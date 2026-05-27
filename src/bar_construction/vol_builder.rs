@@ -19,7 +19,7 @@ use mitch::timestamp;
 use nxr_sdk::{ipc::record::IndexRecord, parkinson_sigma};
 use std::collections::BTreeMap;
 
-use crate::bar_construction::VolConfig;
+use nxr_sdk::parkinson::VolConfig;
 use crate::vol_bin::VolWriter;
 
 /// 30-min bucket width in milliseconds.
