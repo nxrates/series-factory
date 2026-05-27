@@ -20,21 +20,15 @@ use nxr_sdk::parkinson::{VolConfig, VolSource};
 
 /// Calibration knobs. Maps to `series.calibration` in `config.yml`.
 ///
-/// Field naming clarified in Phase 58.L.0 (2026-05-27): `k_fit_windows_days`
-/// is the OUTER MTF loop (k-fit binary search per window, geo-mean blended).
-/// Do not confuse with `VolConfig.sigma_blend_windows_days` (the INNER
-/// σ-blend MTF). Both used to be called "windows_days" / "mtf_lookback_days"
-/// at the call-site, which fed long-running incidents (e.g. wrong-layer tweak
-/// reverts). `#[serde(alias = ...)]` keeps existing YAML configs working.
+/// `k_fit_windows_days` is the OUTER MTF loop (k-fit binary search per
+/// window, geo-mean blended). The INNER σ-blend MTF lives on
+/// `VolConfig.sigma_blend_windows_days`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CalibrationConfig {
     /// Target bars-per-day to converge to (default 300 for crypto majors).
     pub target_bpd: f64,
     /// k-fit lookback windows in days. Each window runs an independent
-    /// log-space binary search; results are geometric-mean blended. Renamed
-    /// from `windows_days` 2026-05-27 to disambiguate from `VolConfig.
-    /// sigma_blend_windows_days` (the σ-estimator's MTF blend).
-    #[serde(alias = "windows_days")]
+    /// log-space binary search; results are geometric-mean blended.
     pub k_fit_windows_days: Vec<usize>,
     /// Minimum days required to evaluate a window (skipped otherwise).
     pub min_window_days: usize,
@@ -168,9 +162,9 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
 /// boundary-hit windows are dropped, not blended in. Returns geo-mean across
 /// surviving windows or 0.0 (cal-fail → caller keeps prior_k).
 ///
-/// `eval_holdout_days` typically 7. With windows_days=[7,14,30], the 7d
-/// window degenerates (cal_slice is empty) — caller should size windows >=
-/// 2 * eval_holdout_days.
+/// `eval_holdout_days` typically 7. With `k_fit_windows_days=[7,14,30]`, the
+/// 7d window degenerates (cal_slice is empty) — caller should size windows
+/// >= 2 * eval_holdout_days.
 pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
     prices: &[(i64, f64)],
     cal: &CalibrationConfig,
@@ -473,7 +467,7 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
         // (best `mult` never updated). Either way the caller treats this
         // as cal-fail and keeps `last_good_k`.
         eprintln!(
-            "  [diag] calibrate_mtf all-windows-empty target_bpd={} windows_days={:?} \
+            "  [diag] calibrate_mtf all-windows-empty target_bpd={} k_fit_windows_days={:?} \
              first={} last={} n_prices={}",
             target_bpd, cal.k_fit_windows_days, first, last, prices.len()
         );

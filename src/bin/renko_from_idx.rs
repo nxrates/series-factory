@@ -26,9 +26,11 @@ use series_factory::sharding::{
     ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
 };
 use series_factory::{
-    bar_construction::{build_vol_from_hlc, MtfParkinsonCalculator, RenkoConfig, RenkoGenerator, VolConfig},
+    bar_construction::build_vol_from_hlc,
     vol_bin::{VolMmap, VolWriter},
 };
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};

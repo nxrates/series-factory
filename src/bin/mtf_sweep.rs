@@ -1,4 +1,4 @@
-//! Empirical sweep of MTF calibration `windows_days` configs.
+//! Empirical sweep of MTF calibration `k_fit_windows_days` configs.
 //!
 //! For each `(pair, candidate_config)`, replays a stratified sample of UTC days
 //! through `calibrate_mtf_with_target` (using strict-no-leak trailing prices)
@@ -8,7 +8,7 @@
 //! Output is a single newline-delimited JSON stream on stdout, one record per
 //! (pair, config, day), plus aggregated SWEEP summary lines on stderr.
 //!
-//! Goal: find a single `windows_days` config that minimises mean |bpd - target|
+//! Goal: find a single `k_fit_windows_days` config that minimises mean |bpd - target|
 //! across the launch symbol set, without per-asset overfitting.
 //!
 //! Lifted heavily from `bin/renko_trailing_from_idx.rs` — same pass-1 loading
@@ -30,16 +30,18 @@ use nxr_sdk::shard::{
 use serde::{Deserialize, Serialize};
 use series_factory::bar_construction::{
     build_vol_from_hlc, calibrate_mtf_with_target, count_bars_from_prices, CalibrationConfig,
-    MtfParkinsonCalculator, RenkoConfig, VolConfig,
 };
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::renko::RenkoConfig;
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
 // ── Launch symbol set (operator brief 2026-05-25 rev-3): universal config,
 //    cross-ticker mean-error minimization, no per-sym overfitting. 13 syms:
 //    5 volatile USDT-quoted + 5 crypto crosses + 3 stable/USDT.
-//    Class-tuned target (vol=300, stable=50) applied per sym; SAME windows_days
-//    across all of them — that's the universality the sweep is testing.
+//    Class-tuned target (vol=300, stable=50) applied per sym; SAME
+//    k_fit_windows_days across all of them — that's the universality the
+//    sweep is testing.
 const SWEEP_PAIRS: &[(&str, &str)] = &[
     // Volatile USDT-quoted
     ("BTC", "USDT"),
@@ -59,7 +61,7 @@ const SWEEP_PAIRS: &[(&str, &str)] = &[
     ("USD1", "USDT"),
 ];
 
-// ── Candidate windows_days configs (7, chosen pre-sweep, no per-sym tuning) ─
+// ── Candidate k_fit_windows_days configs (7, chosen pre-sweep, no per-sym tuning) ─
 //
 // Operator brief 2026-05-25:
 //   - baseline:        [30, 60, 120]  (currently shipped)
@@ -81,7 +83,7 @@ const CANDIDATES: &[(&str, &[usize])] = &[
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Empirical MTF windows_days sweep. Replays calibrate+count over a stratified \
+    about = "Empirical MTF k_fit_windows_days sweep. Replays calibrate+count over a stratified \
              day sample for each candidate; emits NDJSON on stdout."
 )]
 struct Args {
@@ -133,9 +135,7 @@ struct RenkoYml {
 #[derive(Deserialize)]
 struct CalibrationYml {
     target_bpd: f64,
-    /// Phase 58.L.0: see `CalibrationConfig.k_fit_windows_days`.
     #[allow(dead_code)]
-    #[serde(alias = "windows_days")]
     k_fit_windows_days: Vec<usize>,
     min_window_days: usize,
     max_rounds: usize,
@@ -214,7 +214,7 @@ fn parse_date(s: &str) -> Result<NaiveDate> {
 struct SweepRecord<'a> {
     pair: &'a str,
     candidate: &'a str,
-    windows_days: &'a [usize],
+    k_fit_windows_days: &'a [usize],
     date: String,
     target_bpd: f64,
     k: f64,
@@ -503,12 +503,12 @@ fn run_pair(
             if !(k > 0.0 && k.is_finite()) {
                 continue;
             }
-            // Phase 58.L.0 (2026-05-27): apply K_FLOOR explicitly so the
-            // reported k matches the engine's effective k. The engine
+            // Apply K_FLOOR explicitly so the reported k matches the engine's
+            // effective k. The engine
             // (`nxr_sdk::renko::RenkoGenerator::compute_brick_size`) already
             // clamps k → max(k, K_FLOOR) internally; without this explicit
-            // clamp on the sweep side the candidate logs k=0.01 but the
-            // brick count reflects k=0.05 — accounting fraud.
+            // clamp on the sweep side the candidate logs k=0.01 but the brick
+            // count reflects k=0.05 — accounting fraud.
             let k_clamped = k.max(nxr_sdk::renko::K_FLOOR);
             let renko_cfg = RenkoConfig {
                 multiplier: k_clamped as f32,
@@ -544,7 +544,7 @@ fn run_pair(
             let rec = SweepRecord {
                 pair: &pair_str,
                 candidate: key,
-                windows_days: windows,
+                k_fit_windows_days: windows,
                 date: d.to_string(),
                 target_bpd,
                 k,
@@ -653,11 +653,11 @@ fn main() -> Result<()> {
                 / means_per_pair.len() as f64;
             let score_var = var.sqrt();
             let score_oob = oobs_per_pair.iter().sum::<f64>() / oobs_per_pair.len() as f64;
-            // Phase 58.L.0 (2026-05-27): OOB weight raised from 0.0 → 5.0
-            // per cohort audit. Previously the sweep's "composite" picked
-            // candidates with low mean error even when 30%+ of days fell
-            // outside [target/3, 2*target] — i.e. a regime-leaky candidate
-            // could beat a stable one because OOB carried zero weight.
+            // OOB weight 5.0 (raised from 0.0 per cohort audit). Previously
+            // the sweep's "composite" picked candidates with low mean error
+            // even when 30%+ of days fell outside [target/3, 2*target] —
+            // a regime-leaky candidate could beat a stable one because OOB
+            // carried zero weight.
             let composite = score_mean + 0.5 * score_var + 5.0 * score_oob;
             eprintln!(
                 "AGG    candidate={} score_mean={:.2} score_var={:.2} score_oob={:.2} composite={:.2}",

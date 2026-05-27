@@ -29,12 +29,14 @@ use rayon::prelude::*;
 use mitch::bar::{Bar, BarKind};
 use nxr_sdk::BarAccumulator;
 use series_factory::{
-    bar_construction::{build_vol_from_hlc, RenkoConfig, RenkoGenerator, VolConfig, VolSource},
+    bar_construction::build_vol_from_hlc,
     vol_bin::{VolMmap, VolWriter},
     sampler::{SearchConfig, SearchState},
     read_tick_file,
     stats::{aggregate_fold_scores, compute_returns, score_fold, GateSpec, StatAggregateScore},
 };
+use nxr_sdk::parkinson::{VolConfig, VolSource};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use std::{
     collections::BTreeMap,
     fs,

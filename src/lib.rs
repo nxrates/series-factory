@@ -15,13 +15,6 @@ pub use bar_construction::{
     calibrate_mtf, calibrate_mtf_walkforward, calibrate_mtf_with_target, count_bars_from_prices,
     count_bars_per_day_from_prices, CalibrationConfig, DailyBpdStats,
 };
-// Renko engine + Parkinson MTF + grid utilities now live in nxr-sdk
-// (Phase 58.L.0). Re-export the canonical names so existing bin/* callers
-// continue to compile through `series_factory::*`.
-pub use nxr_sdk::{
-    grid_step_for_brick, snap_to_25_grid, snap_to_grid,
-    MtfParkinsonCalculator, RenkoConfig, RenkoGenerator, TickEmaVolSource, VolConfig, VolSource,
-};
 pub use display::display_data_table;
 pub use sources::{create_source, TickSource};
 pub use sources::common::read_tick_file;

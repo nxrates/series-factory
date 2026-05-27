@@ -15,13 +15,12 @@ use mitch::bar::{Bar, BarKind};
 use nxr_sdk::BarAccumulator;
 use serde::Deserialize;
 use series_factory::{
-    bar_construction::{
-        build_vol_from_hlc, calibrate_mtf, CalibrationConfig, MtfParkinsonCalculator, RenkoConfig,
-        RenkoGenerator, VolConfig,
-    },
+    bar_construction::{build_vol_from_hlc, calibrate_mtf, CalibrationConfig},
     vol_bin::{VolMmap, VolWriter},
     TickFrame,
 };
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
@@ -45,8 +44,8 @@ struct PipelineYml {
     pipeline: PipelineParams,
 }
 
-// max_pct dropped 2026-05-24 (operator override). Debate (Aoife ↔ Tomás):
-// keep parsing for back-compat vs strict. Strict; legacy yaml just ignored.
+// max_pct dropped 2026-05-24 (operator override). Strict parse; legacy yaml
+// keys silently ignored.
 #[derive(Debug, Deserialize)]
 struct RenkoYml {
     min_pct: f32,
