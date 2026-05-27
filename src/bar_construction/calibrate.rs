@@ -13,7 +13,7 @@
 //! (`bin/nxr_calibrate.rs`) can drive it without owning a copy of the algorithm.
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use nxr_sdk::parkinson::{VolConfig, VolSource};
@@ -239,10 +239,11 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
         let lo_clamp = (best.0 as f64 - cal.mult_bounds[0]).abs() / cal.mult_bounds[0] < 0.01;
         let hi_clamp = (best.0 as f64 - cal.mult_bounds[1]).abs() / cal.mult_bounds[1] < 0.01;
         if lo_clamp || hi_clamp {
-            eprintln!(
-                "  [wf clamp-detector] window={}d mult={:.6} at-{} bound — dropped",
-                window_days, best.0,
-                if lo_clamp { "lower" } else { "upper" }
+            warn!(
+                window_days,
+                mult = best.0,
+                bound = if lo_clamp { "lower" } else { "upper" },
+                "wf clamp-detector — window dropped"
             );
             continue;
         }
@@ -271,7 +272,7 @@ pub fn count_bars_from_prices<S: VolSource + ?Sized>(
         Ok(g) => g,
         Err(e) => {
             if diag {
-                eprintln!("  [diag] RenkoGenerator::new failed: {}", e);
+                debug!(error = %e, "RenkoGenerator::new failed");
             }
             return 0;
         }
@@ -312,9 +313,12 @@ pub fn count_bars_from_prices<S: VolSource + ?Sized>(
         }
     }
     if diag {
-        eprintln!(
-            "  [diag] count_bars: skipped_before={} in_range={} bars={} mult={:.6}",
-            n_skipped_before, n_in_range, count, config.multiplier
+        debug!(
+            skipped_before = n_skipped_before,
+            in_range = n_in_range,
+            bars = count,
+            mult = config.multiplier,
+            "count_bars diagnostic"
         );
     }
     count
@@ -353,9 +357,11 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
     if last <= first {
         // Diagnostic — fired when the trailing slice degenerates (empty or
         // single timestamp). Caller falls back to base.multiplier.
-        eprintln!(
-            "  [diag] calibrate_mtf early-return last<=first  n={} first={} last={}",
-            prices.len(), first, last
+        warn!(
+            n = prices.len(),
+            first,
+            last,
+            "calibrate_mtf early-return: last<=first (degenerate slice)"
         );
         return 0.0;
     }
@@ -436,10 +442,10 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
         // If no round produced a non-zero brick count, best.1 remains f64::MAX
         // → window-fail (drop, do NOT push base.multiplier as fake solution).
         if best.1 == f64::MAX {
-            eprintln!(
-                "  [diag] window={}d had ZERO non-empty rounds — likely synth tick gap or \
-                 brick-too-big cliff; dropping from MTF blend",
-                window_days
+            warn!(
+                window_days,
+                "window had ZERO non-empty rounds — likely synth tick gap or \
+                 brick-too-big cliff; dropping from MTF blend"
             );
             continue;
         }
@@ -462,13 +468,12 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
         let lo_clamp = (best.0 as f64 - cal.mult_bounds[0]).abs() / cal.mult_bounds[0] < 0.01;
         let hi_clamp = (best.0 as f64 - cal.mult_bounds[1]).abs() / cal.mult_bounds[1] < 0.01;
         if lo_clamp || hi_clamp {
-            eprintln!(
-                "  [clamp-detector] window={}d mult={:.6} at-{} bound mult_bounds={:?} — \
-                 dropping from MTF blend (likely degenerate σ; see audit 2026-05-26)",
+            warn!(
                 window_days,
-                best.0,
-                if lo_clamp { "lower" } else { "upper" },
-                cal.mult_bounds
+                mult = best.0,
+                bound = if lo_clamp { "lower" } else { "upper" },
+                mult_bounds = ?cal.mult_bounds,
+                "clamp-detector — dropping window from MTF blend (likely degenerate σ; see audit 2026-05-26)"
             );
             continue;
         }
@@ -480,10 +485,13 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
         // short (days < min_window_days) OR the binary search degenerated
         // (best `mult` never updated). Either way the caller treats this
         // as cal-fail and keeps `last_good_k`.
-        eprintln!(
-            "  [diag] calibrate_mtf all-windows-empty target_bpd={} k_fit_windows_days={:?} \
-             first={} last={} n_prices={}",
-            target_bpd, cal.k_fit_windows_days, first, last, prices.len()
+        warn!(
+            target_bpd,
+            k_fit_windows_days = ?cal.k_fit_windows_days,
+            first,
+            last,
+            n_prices = prices.len(),
+            "calibrate_mtf all-windows-empty"
         );
         return 0.0;
     }
