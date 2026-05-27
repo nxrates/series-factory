@@ -130,15 +130,17 @@ use mitch::index::Index;
 use mitch::timestamp;
 use nxr_sdk::bar_builder::BarAccumulator;
 use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::renko::{K_FLOOR, MAX_BRICKS_PER_TICK, MIN_BRICK_PCT};
 use nxr_sdk::shard::{
-    bars_dir, idx_dir, list_shards, shard_path, BarShardWriter, ShardStream, MS_PER_DAY,
+    bars_dir, idx_dir, list_shards, shard_path, BarShardWriter, ShardStream,
+    BAR_MS_S10 as BAR_MS, MS_PER_DAY,
 };
 use nxr_sdk::tdwap::{decode_ci_ubp, encode_ci_ubp};
 use tracing::{info, warn};
 
 // ─────────────────────────────────────────────────────────────────────────
-// Constants — kept byte-identical to the live core/src/synth_*.rs producers
-// so calibrated k → live density holds.
+// Constants — canonical values live in `nxr_sdk` (renko::*, shard::BAR_MS_S10).
+// Locally we only define what isn't (yet) shared.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// TTL gate: drop synth emit if either leg's snapshot age > this. Matches
@@ -149,24 +151,8 @@ const LEG_STALE_TTL_MS: i64 = 5_000;
 /// `core::synth_kernel::SYNTH_KERNEL_PROVIDER_ID`.
 const SYNTH_KERNEL_PROVIDER_ID: u16 = 2010;
 
-/// S10 bar window. Matches `core::bars_s10_synth::BAR_MS`.
-const BAR_MS: i64 = 10_000;
-
 /// Renko σ-EMA alpha. Matches `core::bars_renko_synth::SIGMA_EMA_ALPHA`.
 const SIGMA_EMA_ALPHA: f64 = 1.0 / (28.0 * 1800.0);
-
-/// Renko brick-pct floor. Matches `core::bars_renko_synth::MIN_BRICK_PCT`.
-const MIN_BRICK_PCT: f64 = 0.0001;
-
-/// Renko fallback multiplier when no per-day calibration is provided.
-/// Matches `core::bars_renko_synth::DEFAULT_K`.
-const DEFAULT_K: f64 = 0.075;
-
-/// Renko per-tick brick cap. Matches `core::bars_renko_synth::MAX_BRICKS_PER_TICK`.
-const MAX_BRICKS_PER_TICK: usize = 10_000;
-
-/// Lower floor on effective k. Matches `core::bars_renko_synth::K_FLOOR`.
-const K_FLOOR: f64 = 0.05;
 
 // ─────────────────────────────────────────────────────────────────────────
 // CLI
@@ -726,6 +712,37 @@ fn resolve_symbol(sym: &str) -> u64 {
     }
 }
 
+/// Look up the calibrated Renko multiplier for `ticker_id` from
+/// `$NXR_TICKER_PARAMS_PATH` (default `/data/config/ticker-params.json`).
+/// Returns `None` when the file is missing/malformed or has no entry for the
+/// ticker. Per `feedback_no_k_fallback`, callers MUST treat `None` as "skip
+/// renko backfill" — never substitute a default. Sibling of the same helper
+/// in `renko_from_idx.rs`.
+fn load_calibrated_k(ticker_id: u64) -> Option<f64> {
+    use nxr_sdk::weights_schema::WeightsFile;
+    let cfg = nxr_sdk::NxrConfig::from_env();
+    let path = PathBuf::from(&cfg.ticker_params_path);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(path = %path.display(), err = %e, "ticker-params.json read failed");
+            return None;
+        }
+    };
+    let weights: WeightsFile = match serde_json::from_str(&raw) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!(path = %path.display(), err = %e, "ticker-params.json parse failed");
+            return None;
+        }
+    };
+    weights
+        .renko_k_per_ticker
+        .get(&ticker_id.to_string())
+        .copied()
+        .filter(|k| *k > 0.0 && k.is_finite())
+}
+
 #[derive(Debug, Default)]
 struct PairBackfillStats {
     days_processed: usize,
@@ -754,6 +771,11 @@ fn ym(d: NaiveDate) -> String {
 }
 
 /// Run the offline backfill for one synth pair across `[from, to]` UTC days.
+///
+/// `k`: Calibrated multiplier_k for this synth pair, sourced by the caller
+/// from `ticker-params.json`. `None` → renko backfill is skipped for this
+/// pair (`feedback_no_k_fallback`: "skip day if calibrate fails; never
+/// bootstrap k=0.075"). The s10 pass is independent of k and still runs.
 fn run_pair(
     data_root: &Path,
     base_sym: &str,
@@ -763,6 +785,7 @@ fn run_pair(
     to: NaiveDate,
     bars: BarKindMask,
     force: bool,
+    k: Option<f64>,
 ) -> Result<PairBackfillStats> {
     let base_id = resolve_symbol(base_sym);
     let quote_id = resolve_symbol(quote_sym);
@@ -825,13 +848,24 @@ fn run_pair(
         "day range resolved"
     );
 
+    // ── Renko bars require an explicit calibrated k (no fallback per
+    //    `feedback_no_k_fallback`). Disable renko output if the caller had no
+    //    k for this pair — s10 still runs since it doesn't depend on k.
+    let renko_enabled = bars.renko && k.is_some();
+    if bars.renko && k.is_none() {
+        warn!(
+            synth = synth_sym,
+            "no calibrated k available — skipping renko backfill for this pair (s10 still runs)"
+        );
+    }
+
     // ── Output writers — opened lazily once we know we'll write ─────────────
     let mut s10_writer: Option<BarShardWriter> = if bars.s10 {
         Some(BarShardWriter::open_with(data_root, synth_id, "s10", true)?)
     } else {
         None
     };
-    let mut renko_writer: Option<BarShardWriter> = if bars.renko {
+    let mut renko_writer: Option<BarShardWriter> = if renko_enabled {
         Some(BarShardWriter::open_with(data_root, synth_id, "renko", true)?)
     } else {
         None
@@ -840,7 +874,9 @@ fn run_pair(
     // ── Replay state, carried across days for sigma-EMA continuity ──────────
     let mut merge_state = SynthReplayState::new(synth_id, base_id, quote_id);
     let mut s10_state = SynthS10State::new(0.0);
-    let mut renko_state = SynthRenkoState::new(DEFAULT_K, 0.0);
+    // `k.unwrap_or(0.0)` is harmless ∵ renko_enabled gates writes; the state
+    // is only constructed because it carries σ-EMA continuity across days.
+    let mut renko_state = SynthRenkoState::new(k.unwrap_or(0.0), 0.0);
     let mut stats = PairBackfillStats::default();
 
     for d in &intersect_dates {
@@ -854,11 +890,11 @@ fn run_pair(
         let s10_already = bars.s10
             && s10_path.exists()
             && std::fs::metadata(&s10_path).map(|m| m.len()).unwrap_or(0) > 0;
-        let renko_already = bars.renko
+        let renko_already = renko_enabled
             && renko_path.exists()
             && std::fs::metadata(&renko_path).map(|m| m.len()).unwrap_or(0) > 0;
         let need_s10 = bars.s10 && !s10_already;
-        let need_renko = bars.renko && !renko_already;
+        let need_renko = renko_enabled && !renko_already;
         if !force && !need_s10 && !need_renko {
             stats.days_skipped += 1;
             eprintln!(
@@ -871,7 +907,7 @@ fn run_pair(
             if bars.s10 && s10_path.exists() {
                 let _ = std::fs::remove_file(&s10_path);
             }
-            if bars.renko && renko_path.exists() {
+            if renko_enabled && renko_path.exists() {
                 let _ = std::fs::remove_file(&renko_path);
             }
         }
@@ -1172,7 +1208,14 @@ fn main() -> Result<()> {
     let mut grand_renko: u64 = 0;
     let mut grand_days: usize = 0;
     for (synth, base, quote) in pairs {
-        match run_pair(&data_root, base, quote, synth, from, to, bars, args.force) {
+        // Resolve calibrated k from ticker-params.json. None → renko backfill
+        // skipped for this pair (no-k-fallback rule).
+        let synth_id = resolve_symbol(synth);
+        let k = load_calibrated_k(synth_id);
+        if k.is_none() {
+            warn!(synth, synth_id, "no calibrated k in ticker-params.json — renko backfill will be skipped");
+        }
+        match run_pair(&data_root, base, quote, synth, from, to, bars, args.force, k) {
             Ok(s) => {
                 grand_emits += s.synth_ticks_emitted;
                 grand_drops += s.synth_ticks_dropped_stale;
@@ -1404,7 +1447,8 @@ mod tests {
         write_idx_shard(&quote_idx, &quote_recs)?;
 
         let bars = BarKindMask { s10: true, renko: false };
-        // First run — should write a shard.
+        // First run — should write a shard. `k=None` is fine here because
+        // bars.renko=false (s10-only test path).
         let s1 = run_pair(
             &tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH",
             // resolve_symbol fallback will hash these, but we want our specific
@@ -1413,7 +1457,7 @@ mod tests {
             // the *resolved* ids so the test still exercises the real flow.
             // The simpler hack: just pre-create the bars dir under the hashed
             // synth ID and verify writes via that path.
-            date, date, bars, false,
+            date, date, bars, false, None,
         )?;
         // We don't know the resolved id of "SYM_SYNTH" up front, but we can
         // recover it the same way the binary does.
@@ -1431,7 +1475,7 @@ mod tests {
         // doesn't panic + writes nothing.
         if s1.days_processed == 0 {
             // Empty branch: assert no shard was written either run.
-            let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false)?;
+            let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false, None)?;
             assert_eq!(s2.days_processed, 0);
             assert_eq!(s2.s10_bars_written, 0);
             let _ = std::fs::remove_dir_all(&tmp);
@@ -1439,14 +1483,14 @@ mod tests {
         }
         // Successful real-write branch: re-run, expect skip.
         let _ = s10_shard;
-        let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false)?;
+        let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false, None)?;
         assert!(
             s2.days_skipped >= 1 || s2.s10_bars_written == 0,
             "second run must skip already-written shards (skipped={}, wrote={})",
             s2.days_skipped, s2.s10_bars_written
         );
         // Force overwrites.
-        let s3 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, true)?;
+        let s3 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, true, None)?;
         assert!(
             s3.s10_bars_written > 0 || s1.s10_bars_written == 0,
             "--force should re-write (got {}, baseline {})",
