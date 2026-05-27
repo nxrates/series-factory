@@ -203,8 +203,23 @@ fn migrate_idx(
             // growing manifest.json with an fsync each time is O(n^2) churn on
             // DRBD. The API reads via list_shards (manifest-free); a manifest can
             // be rebuilt cheaply afterward if needed.
-            Some(IdxShardWriter::open_with(root, id, true, false)
-                .with_context(|| format!("open writer {id}"))?)
+            //
+            // R1 H9: writer-lock contention means the live aggregator currently
+            // owns this ticker's stream. Migration is an offline tool — skip the
+            // ticker rather than failing the whole run, and let the operator
+            // re-run after scaling deploy/nxr to 0 if a full backfill is needed.
+            match IdxShardWriter::open_with(root, id, true, false) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    let msg = format!("{:#}", e);
+                    if msg.contains("writer-lock") {
+                        tracing::warn!(ticker_id = id, err = %msg,
+                            "skip: live aggregator holds writer-lock; scale deploy/nxr=0 to migrate");
+                        continue;
+                    }
+                    return Err(e).with_context(|| format!("open writer {id}"));
+                }
+            }
         };
         // Inline gate-simulation state for report mode (mirrors IdxShardWriter:
         // drop only when the full market tuple (bid,ask,vbid,vask,ci) repeats).

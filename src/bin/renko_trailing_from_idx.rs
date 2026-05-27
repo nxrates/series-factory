@@ -754,7 +754,21 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
         // in the next-day shard — we don't read them (ts < d_end).
         let mut pass3_records: u64 = 0;
         let mut pending: Vec<Bar> = Vec::new();
-        let mut writer = BarShardWriter::open_with(&data_root, ticker_id, "renko", true)?;
+        // R1 H9: live renko producer may currently own this stream's writer-lock.
+        // Skip the day rather than fail the whole sweep — operator can re-run
+        // with deploy/nxr scaled to 0 if a full historical rebuild is needed.
+        let mut writer = match BarShardWriter::open_with(&data_root, ticker_id, "renko", true) {
+            Ok(w) => w,
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                if msg.contains("writer-lock") {
+                    tracing::warn!(ticker_id, day = %d, err = %msg,
+                        "skip day: live renko producer holds writer-lock");
+                    continue;
+                }
+                return Err(e);
+            }
+        };
 
         if let Some(idx_path) = shards_by_date.get(d) {
             let mut stream = ShardStream::<IndexRecord>::open(idx_path)
