@@ -13,13 +13,12 @@ use anyhow::Result;
 use bytemuck::bytes_of;
 use mitch::bar::{Bar, BarKind};
 use nxr_sdk::BarAccumulator;
-use serde::Deserialize;
 use series_factory::{
     bar_construction::{build_vol_from_hlc, calibrate_mtf, CalibrationConfig},
     vol_bin::{VolMmap, VolWriter},
     TickFrame,
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig, VolSource};
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolSource};
 use nxr_sdk::mitch::timestamp;
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use std::{
@@ -32,34 +31,7 @@ use tracing::info;
 
 // ── Pipeline config (deserialized from nxrates.yml `series` section) ────────
 
-#[derive(Debug, Deserialize)]
-struct NxratesYml {
-    series: PipelineYml,
-}
-
-#[derive(Debug, Deserialize)]
-struct PipelineYml {
-    renko: RenkoYml,
-    vol: VolConfig,
-    calibration: CalibrationConfig,
-    pipeline: PipelineParams,
-}
-
-// max_pct dropped 2026-05-24 (operator override). Strict parse; legacy yaml
-// keys silently ignored.
-#[derive(Debug, Deserialize)]
-struct RenkoYml {
-    min_pct: f32,
-}
-
-#[derive(Debug, Deserialize)]
-struct PipelineParams {
-    bootstrap_days: i64,
-    max_bars: usize,
-    max_mem_gb: usize,
-    exchanges: Vec<String>,
-    pairs: Vec<String>,
-}
+use nxr_sdk::pipeline_config::PipelineYml as RootPipelineYml;
 
 // ── Tick file helpers ────────────────────────────────────────────────────────
 
@@ -213,7 +185,7 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let root: NxratesYml = serde_yaml::from_str(&fs::read_to_string(&args[1])?)?;
+    let root: RootPipelineYml = serde_yaml::from_str(&fs::read_to_string(&args[1])?)?;
     let yml = root.series;
 
     // Storage paths come from the unified NXR_DATA_* taxonomy:
@@ -258,7 +230,7 @@ fn main() -> Result<()> {
 
 fn run_pipeline(
     tick_files: &[PathBuf], config: &mut RenkoConfig,
-    yml: &PipelineYml, output_path: &PathBuf, config_path: &PathBuf,
+    yml: &nxr_sdk::pipeline_config::SeriesYml, output_path: &PathBuf, config_path: &PathBuf,
 ) -> Result<()> {
 
     // ═══ PASS 1: Build 30-min Parkinson vol + downsample 1-min prices ═══
@@ -334,7 +306,15 @@ fn run_pipeline(
     };
 
     {
-        let mult = calibrate_mtf(&tick_prices, &yml.calibration, config, &vol_mmap, &yml.vol, &sigma_cache);
+        let cal_inner = CalibrationConfig {
+            target_bpd: yml.calibration.target_bpd,
+            k_fit_windows_days: yml.calibration.k_fit_windows_days.clone(),
+            min_window_days: yml.calibration.min_window_days,
+            max_rounds: yml.calibration.max_rounds,
+            tolerance: yml.calibration.tolerance,
+            mult_bounds: yml.calibration.mult_bounds,
+        };
+        let mult = calibrate_mtf(&tick_prices, &cal_inner, config, &vol_mmap, &yml.vol, &sigma_cache);
         if mult > 0.0 { config.multiplier = mult; }
         info!("Calibrated: multiplier={:.6} (target {:.0} bpd)", config.multiplier, yml.calibration.target_bpd);
         if let Some(parent) = config_path.parent() { fs::create_dir_all(parent)?; }

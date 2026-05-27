@@ -20,7 +20,6 @@ use mitch::timestamp;
 use nxr_sdk::shard::{ShardStream, MS_PER_30MIN, MS_PER_DAY};
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{BarAccumulator, resolve_ticker_id};
-use serde::Deserialize;
 use series_factory::sharding::{
     bars_dir_pair, composite_dir, list_shards, manifest_path, read_manifest, shard_path,
     ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
@@ -29,7 +28,7 @@ use series_factory::{
     bar_construction::build_vol_from_hlc,
     vol_bin::{VolMmap, VolWriter},
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig, VolSource};
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolSource};
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -53,35 +52,14 @@ struct Args {
     out_dir: Option<PathBuf>,
 }
 
-#[derive(Deserialize)]
-struct NxratesYml {
-    series: SeriesYml,
-}
-#[derive(Deserialize)]
-struct SeriesYml {
-    renko: RenkoYml,
-    vol: VolConfig,
-    pipeline: PipelineYml,
-}
-// max_pct removed (2026-05-24, operator: no cap on adaptive renko).
-// Debate (Aoife ↔ Tomás): explicit struct vs serde default — explicit so a
-// stray `max_pct:` in older config.yml doesn't silently feed a stale value.
-#[derive(Deserialize)]
-struct RenkoYml {
-    min_pct: f32,
-}
-#[derive(Deserialize)]
-struct PipelineYml {
-    bootstrap_days: i64,
-    max_bars: usize,
-}
+use nxr_sdk::pipeline_config::PipelineYml;
 
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
     nxr_sdk::memory::apply_safe_cap();
 
     let args = Args::parse();
-    let root: NxratesYml = serde_yaml::from_str(&fs::read_to_string(&args.config)?)?;
+    let root: PipelineYml = serde_yaml::from_str(&fs::read_to_string(&args.config)?)?;
     let yml = root.series;
 
     let cfg = nxr_sdk::NxrConfig::from_env();

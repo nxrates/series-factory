@@ -17,7 +17,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use series_factory::{
     sources::{create_source, TickSource},
     types::{AggregationMode, Config, DataSource, TickFrame},
@@ -201,28 +201,7 @@ async fn head_ok(agent: &std::sync::Arc<ureq::Agent>, url: &str) -> bool {
     .unwrap_or(false)
 }
 
-#[derive(Debug, Deserialize)]
-struct YmlRoot {
-    series: YmlSeries,
-}
-
-#[derive(Debug, Deserialize)]
-struct YmlSeries {
-    calibration: YmlCalibration,
-    pipeline: YmlPipeline,
-}
-
-#[derive(Debug, Deserialize)]
-struct YmlCalibration {
-    k_fit_windows_days: Vec<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YmlPipeline {
-    bootstrap_days: i64,
-    exchanges: Vec<String>,
-    pairs: Vec<String>,
-}
+use nxr_sdk::pipeline_config::PipelineYml as YmlRoot;
 
 fn midnight_utc_today() -> DateTime<Utc> {
     Utc::now()
@@ -259,7 +238,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("no exchanges to fetch (empty config.series.pipeline.exchanges and no --exchanges)");
     }
 
-    let max_window = root.series.calibration.k_fit_windows_days.iter().max().copied().unwrap_or(180);
+    let max_window: i64 = root.series.calibration.k_fit_windows_days.iter().max().copied().unwrap_or(180) as i64;
     let default_days = root.series.pipeline.bootstrap_days + max_window;
     let days = args.days.unwrap_or(default_days);
 
