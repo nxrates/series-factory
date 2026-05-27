@@ -2,7 +2,7 @@
 //! `merge-idx` → `s10-from-idx` → `renko-from-idx` → `integrity-check` for
 //! many tickers in parallel and emits a single JSON report.
 //!
-//! Phase 55 W4 changes:
+//! Observability + shard emission:
 //! - tracing-subscriber init at startup (defaults to INFO; honours RUST_LOG)
 //! - per-step start/done structured logs w/ duration_ms, exit_code, bytes
 //! - per-ticker boundary logs + progress markers on disk under
@@ -479,7 +479,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     let mut steps_out: Vec<StepReport> = Vec::new();
     let cfg = ctx.args.config.to_string_lossy().to_string();
     let out_dir = &ctx.args.out_dir;
-    // Sharded paths (per Phase 55 W4 spec).
+    // Sharded paths (see `docs/sharding-spec.md`).
     let composite_dir = out_dir
         .join("indexes")
         .join("composite")

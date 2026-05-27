@@ -1,15 +1,14 @@
 //! Resample 20Hz (50ms-cadence) `.idx` AppendLogs to a lower output cadence
 //! (default 10Hz / 100ms bins).
 //!
-//! Why: NXR is moving from a 50ms aggregator cycle to 100ms (Phase 51 cadence
-//! audit). Existing `.idx` history is 20Hz; future writes are 10Hz. To keep
-//! consumers seeing a time-consistent series across the cutover, we
-//! down-sample the historical 50ms records into 100ms bins using a
-//! volume-weighted merge that preserves VWAP semantics + variance pooling on
-//! the encoded confidence interval. Atomic rename + `.bak` retention so
-//! rollback is trivial.
+//! Why: NXR is moving from a 50ms aggregator cycle to 100ms. Existing `.idx`
+//! history is 20Hz; future writes are 10Hz. To keep consumers seeing a
+//! time-consistent series across the cutover, we down-sample the historical
+//! 50ms records into 100ms bins using a volume-weighted merge that preserves
+//! VWAP semantics + variance pooling on the encoded confidence interval.
+//! Atomic rename + `.bak` retention so rollback is trivial.
 //!
-//! ## Merge formula (defended in Phase 51.A agent 6 report)
+//! ## Merge formula
 //!
 //! For two consecutive 50ms `IndexRecord`s A and B collapsed into one 100ms
 //! bin (general N-into-1 case for arbitrary `factor = target_ms / source_ms`):
@@ -268,11 +267,11 @@ fn filename_stem(path: &Path) -> String {
 fn resample_one(path: &Path, args: &Args, factor: usize) -> Result<FileReport> {
     let started = std::time::Instant::now();
     let id = filename_stem(path);
-    // Phase 53: filter records to the filename-ticker. Some prod .idx files
-    // contain mis-routed records (aggregator wrote some records under wrong
-    // filename — historical bug). Filtering to filename keeps the output
-    // semantically correct (this ticker's data only) while .bak retains
-    // ALL records for forensic recovery if needed.
+    // Filter records to the filename-ticker. Some prod .idx files contain
+    // mis-routed records (aggregator wrote some records under wrong filename
+    // — historical bug). Filtering to filename keeps the output semantically
+    // correct (this ticker's data only) while .bak retains ALL records for
+    // forensic recovery if needed.
     let expected_ticker: Option<u64> = id.parse::<u64>().ok();
 
     // --- Read whole file into a byte buffer ---
@@ -299,11 +298,11 @@ fn resample_one(path: &Path, args: &Args, factor: usize) -> Result<FileReport> {
     drop(bytes_buf);
     let raw_record_count = records.len();
 
-    // Phase 53: filter to filename-ticker. Aggregator mis-routed some records
-    // (historical bug — non-canonical ticker_ids in body for ~15-19% of records
-    // in some files). Keep only records whose body ticker matches the filename
-    // → output file is semantically clean for this ticker. .bak retains all
-    // raw records for forensic recovery.
+    // Filter to filename-ticker. Aggregator mis-routed some records
+    // (historical bug — non-canonical ticker_ids in body for ~15-19% of
+    // records in some files). Keep only records whose body ticker matches
+    // the filename → output file is semantically clean for this ticker.
+    // .bak retains all raw records for forensic recovery.
     let mut dropped_misrouted: usize = 0;
     if let Some(expected) = expected_ticker {
         let before = records.len();

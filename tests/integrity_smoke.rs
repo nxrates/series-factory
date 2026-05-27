@@ -6,10 +6,10 @@
 //! substrings.
 //!
 //! Note: this test relies on the `integrity-check` binary being wired in
-//! `Cargo.toml` (`[[bin]] name = "integrity-check"`). Until the Phase 55
-//! orchestrator adds that entry the test is dormant — Cargo will simply skip
-//! it. Once wired, `cargo test -p series-factory --test integrity_smoke`
-//! exercises every fixture.
+//! `Cargo.toml` (`[[bin]] name = "integrity-check"`). If the entry is
+//! missing the test is dormant — Cargo will simply skip it. Once wired,
+//! `cargo test -p series-factory --test integrity_smoke` exercises every
+//! fixture.
 
 #![cfg(test)]
 

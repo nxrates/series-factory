@@ -162,12 +162,12 @@ fn classify_pair(pair: &str, ticker_id: u64, stables: &[String]) -> AssetClassBu
     let is_quote_stable = stables.iter().any(|s| s.eq_ignore_ascii_case(&quote))
         || quote == "USD" || quote == "USDT" || quote == "USDC";
 
-    // Phase 55 W3.C: name-based stable detection is authoritative. USDS-style
-    // pairs were leaking through with k=0.075 because they didn't have both
-    // base_class and quote_class == CR, so the MITCH-bit gate above rejected
-    // them and they fell into Unknown → default target_bpd. Result: 6360 bpd
-    // bricks on stable-quoted stables.  Catch them by name FIRST regardless
-    // of MITCH class bits.
+    // Name-based stable detection is authoritative. USDS-style pairs were
+    // leaking through with k=0.075 because they didn't have both base_class
+    // and quote_class == CR, so the MITCH-bit gate above rejected them and
+    // they fell into Unknown → default target_bpd. Result: 6360 bpd bricks on
+    // stable-quoted stables. Catch them by name FIRST regardless of MITCH
+    // class bits.
     if is_base_stable && is_quote_stable {
         return AssetClassBucket::CryptoStable;
     }

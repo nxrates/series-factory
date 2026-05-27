@@ -105,11 +105,11 @@ fn median_sorted(sorted: &[u64]) -> f64 {
 /// Replay `prices` through a fresh `RenkoGenerator(config)`, bucket emitted
 /// bricks into per-UTC-day counts, and return median/MAD-friendly stats.
 ///
-/// This is the M3 (2026-05-26) successor to [`count_bars_from_prices`]. The
-/// scalar `count / days = mean_bpd` was vulnerable to regime-spike days
-/// (one 5× day pushes mean above target → calibrator shrinks brick → next
-/// quiet day under-emits). Median+MAD focuses the optimizer on what the
-/// operator actually wants: typical-day brick density.
+/// Successor to [`count_bars_from_prices`]. The scalar `count / days =
+/// mean_bpd` was vulnerable to regime-spike days (one 5× day pushes mean
+/// above target → calibrator shrinks brick → next quiet day under-emits).
+/// Median+MAD focuses the optimizer on what the operator actually wants:
+/// typical-day brick density.
 pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
     prices: &[(i64, f64)],
     config: &RenkoConfig,
