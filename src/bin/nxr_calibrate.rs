@@ -308,7 +308,7 @@ fn calibrate_one(
         .collect();
 
     let base = RenkoConfig {
-        multiplier: 0.075,
+        multiplier: RenkoConfig::default().multiplier,
         min_pct: renko_yml.min_pct,
     };
     if let Err(e) = base.validate() {
@@ -512,7 +512,7 @@ fn calibrate_one_synth(
         .collect();
 
     let base = RenkoConfig {
-        multiplier: 0.075,
+        multiplier: RenkoConfig::default().multiplier,
         min_pct: renko_yml.min_pct,
     };
     if let Err(e) = base.validate() {
