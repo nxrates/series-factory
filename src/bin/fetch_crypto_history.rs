@@ -41,7 +41,7 @@ struct Args {
     exchanges: Option<String>,
 
     /// History window in days (from = to - days).
-    /// Default covers `bootstrap_days + max(windows_days)` for full calibration.
+    /// Default covers `bootstrap_days + max(k_fit_windows_days)` for full calibration.
     #[arg(long)]
     days: Option<i64>,
 
@@ -214,8 +214,6 @@ struct YmlSeries {
 
 #[derive(Debug, Deserialize)]
 struct YmlCalibration {
-    /// Phase 58.L.0: see `CalibrationConfig.k_fit_windows_days`.
-    #[serde(alias = "windows_days")]
     k_fit_windows_days: Vec<i64>,
 }
 

@@ -55,9 +55,10 @@ use nxr_sdk::shard::{
 };
 use serde::Deserialize;
 use series_factory::bar_construction::{
-    build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig, MtfParkinsonCalculator,
-    RenkoConfig, RenkoGenerator, VolConfig, VolSource,
+    build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig,
 };
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig, VolSource};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
@@ -131,9 +132,8 @@ struct SeriesYml {
     calibration: CalibrationYml,
 }
 
-// max_pct dropped 2026-05-24 (operator: markets be markets).
-// Debate (Aoife ↔ Tomás): same as bar_construction/renko.rs — explicit
-// struct, serde tolerates stray legacy keys in yaml.
+// max_pct dropped 2026-05-24 (operator: markets be markets). Serde tolerates
+// stray legacy keys in yaml.
 #[derive(Deserialize)]
 struct RenkoYml {
     min_pct: f32,
@@ -145,8 +145,6 @@ struct RenkoYml {
 #[derive(Deserialize)]
 struct CalibrationYml {
     target_bpd: f64,
-    /// Phase 58.L.0: see `CalibrationConfig.k_fit_windows_days`.
-    #[serde(alias = "windows_days")]
     k_fit_windows_days: Vec<usize>,
     min_window_days: usize,
     max_rounds: usize,
@@ -438,7 +436,7 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
     //        stop. Downsample = bias. Full ticks are non-negotiable."
     //      - Tomás: "180d × 10 Hz × 16 B = 155 MB / ticker. RAM check?"
     //      - Consensus: trim to longest calibration window only (i.e.
-    //        max(windows_days) days back from `to`). 120-180d × 10 Hz ≈
+    //        max(k_fit_windows_days) days back from `to`). 120-180d × 10 Hz ≈
     //        130-200 MB, acceptable on 8 GiB pods. Symbols above 10 Hz are
     //        ignored — aggregator caps records at delta-gate cadence.
     let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
@@ -448,7 +446,7 @@ fn run_pair(args: &Args, yml: &SeriesYml, base: &str, quote: &str) -> Result<Pai
     // Retention window for the tick stream that feeds the per-day calibrator.
     //
     // 2-expert review (Aoife HFT-quant ↔ Tomás storage):
-    //   Aoife: "Day D's calibration needs trailing ticks back to D - max(windows_days).
+    //   Aoife: "Day D's calibration needs trailing ticks back to D - max(k_fit_windows_days).
     //    For a backfill spanning [from, to], that means we need ticks from
     //    `from_d_start - max_window_days` onward — anchoring to `to` only keeps
     //    the trailing window for the LAST emitted day; every earlier day gets

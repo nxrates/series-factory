@@ -58,8 +58,9 @@ use nxr_sdk::shard::{
 };
 use series_factory::bar_construction::{
     build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig,
-    MtfParkinsonCalculator, RenkoConfig, VolConfig,
 };
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::renko::RenkoConfig;
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
@@ -137,7 +138,7 @@ struct Args {
     /// MTF windows (days) for the calibrator simulation, comma-separated.
     /// Default "30,60,120" — the shipped post-revert config.
     #[arg(long, default_value = "30,60,120")]
-    windows_days: String,
+    k_fit_windows_days: String,
 
     /// If set, emit per-day rows as JSON on stdout in addition to the table.
     #[arg(long, default_value_t = false)]
@@ -467,7 +468,7 @@ fn simulate_calibrator(
     hlc: &BTreeMap<i64, (f64, f64)>,
     vol_cfg: &VolConfig,
     target_bpd: f64,
-    windows_days: &[usize],
+    k_fit_windows_days: &[usize],
     mult_bounds: [f64; 2],
 ) -> Result<f64> {
     if prices.is_empty() || hlc.is_empty() {
@@ -493,7 +494,7 @@ fn simulate_calibrator(
 
     let cal = CalibrationConfig {
         target_bpd,
-        k_fit_windows_days: windows_days.to_vec(),
+        k_fit_windows_days: k_fit_windows_days.to_vec(),
         min_window_days: 7,
         max_rounds: 12,
         tolerance: 0.05,
@@ -566,7 +567,7 @@ fn main() -> Result<()> {
     if to_date < from_date {
         anyhow::bail!("--to must be >= --from");
     }
-    let windows_days = parse_windows(&args.windows_days)?;
+    let k_fit_windows_days = parse_windows(&args.k_fit_windows_days)?;
     let mult_bounds = [args.mult_lo, args.mult_hi];
 
     let data_root = args
@@ -586,7 +587,7 @@ fn main() -> Result<()> {
         to = %to_date,
         data_root = %data_root.display(),
         target_bpd = args.target_bpd,
-        ?windows_days,
+        ?k_fit_windows_days,
         ?mult_bounds,
         "synth-sigma-benchmark start"
     );
@@ -749,7 +750,7 @@ fn main() -> Result<()> {
         &hlc_a,
         &vol_cfg,
         args.target_bpd,
-        &windows_days,
+        &k_fit_windows_days,
         mult_bounds,
     )
     .unwrap_or(0.0);
@@ -761,7 +762,7 @@ fn main() -> Result<()> {
         &hlc_b,
         &vol_cfg,
         args.target_bpd,
-        &windows_days,
+        &k_fit_windows_days,
         mult_bounds,
     )
     .unwrap_or(0.0);
@@ -774,7 +775,7 @@ fn main() -> Result<()> {
             &hlc_c,
             &vol_cfg,
             args.target_bpd,
-            &windows_days,
+            &k_fit_windows_days,
             mult_bounds,
         )
         .unwrap_or(0.0)

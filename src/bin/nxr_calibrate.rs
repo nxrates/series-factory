@@ -34,9 +34,10 @@ use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
 use serde::Deserialize;
 use series_factory::bar_construction::{
-    build_vol_from_hlc, calibrate_mtf_walkforward, CalibrationConfig, MtfParkinsonCalculator,
-    RenkoConfig, VolConfig,
+    build_vol_from_hlc, calibrate_mtf_walkforward, CalibrationConfig,
 };
+use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::renko::RenkoConfig;
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
@@ -96,9 +97,8 @@ struct SeriesYml {
 }
 
 // max_pct removed (2026-05-24): no ceiling on adaptive renko brick %.
-// Debate (Aoife ↔ Tomás): keep field for backward-compat parsing vs strip
-// entirely. Consensus: serde tolerates extra keys by default, so dropping
-// the field here lets stale config.yml entries (max_pct: 0.10) parse fine.
+// Serde tolerates extra keys; stale config.yml entries (max_pct: 0.10) are
+// silently ignored.
 #[derive(Debug, Deserialize)]
 struct RenkoYml {
     min_pct: f32,
@@ -109,10 +109,6 @@ struct RenkoYml {
 #[derive(Debug, Deserialize)]
 struct CalibrationConfigExt {
     target_bpd: f64,
-    /// Phase 58.L.0 (2026-05-27): renamed from `windows_days` to disambiguate
-    /// from the σ-blend MTF (`VolConfig.sigma_blend_windows_days`). Serde
-    /// alias keeps existing YAML configs working.
-    #[serde(alias = "windows_days")]
     k_fit_windows_days: Vec<usize>,
     min_window_days: usize,
     max_rounds: usize,
@@ -385,11 +381,10 @@ fn calibrate_one(
     }
 
     info!(ticker_id, pair, class = class.as_str(), target_bpd, "calibrating (walk-forward)");
-    // Phase 58.L.0 (2026-05-27): switched from in-sample
-    // `calibrate_mtf_with_target` to `calibrate_mtf_walkforward` per audit
-    // point #5(i) 2026-05-26. The 7d holdout is non-overlapping with the
-    // training slice, eliminating the regime-leak overfit that produced
-    // k≈0.01 boundary-clamps on cross-pairs (live brick-storm root cause).
+    // Walk-forward calibration (7d holdout non-overlapping with the training
+    // slice) per audit point #5(i) 2026-05-26. Eliminates the regime-leak
+    // overfit that produced k≈0.01 boundary-clamps on cross-pairs (live
+    // brick-storm root cause).
     const EVAL_HOLDOUT_DAYS: usize = 7;
     let mult = calibrate_mtf_walkforward(
         &tick_prices,
@@ -591,7 +586,7 @@ fn calibrate_one_synth(
     }
 
     info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd, "calibrating synth (walk-forward)");
-    // Phase 58.L.0: same walk-forward swap as direct path above.
+    // Walk-forward 7d holdout (matches direct path above).
     const EVAL_HOLDOUT_DAYS: usize = 7;
     let mult = calibrate_mtf_walkforward(
         &tick_prices,
@@ -828,8 +823,8 @@ fn run_once(args: &Args) -> Result<()> {
     );
 
     let json = serde_json::to_string_pretty(&weights_file)?;
-    // write_atomic requires Pod; we have a String → emit via a tiny shim that
-    // mirrors its tmp+rename semantics for the JSON case.
+    // write_atomic requires Pod; we have a String → emit via a tiny helper
+    // that mirrors its tmp+rename semantics for the JSON case.
     write_atomic_string(&params_path, &json)?;
     info!(path = %params_path.display(), bytes = json.len(), "ticker-params.json updated");
 
