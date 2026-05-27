@@ -144,16 +144,31 @@ fn main() -> Result<()> {
     // hardcoded `multiplier: 0.075` was the root cause of the 22× bars/day
     // overshoot on majors (BTC 8645, ETH 6786, BNB 6114): nxr-calibrate writes
     // per-ticker k values into `ticker-params.json`, but this offline emitter
-    // ignored them and ran every pair at the bootstrap k=0.075. Fall back to
-    // 0.075 only when the calibration table has no entry (new tickers /
-    // first-ever build before the calibrator runs).
+    // ignored them and ran every pair at the bootstrap k=0.075.
+    //
+    // Phase 58.L.1 W2: per durable rule `feedback_no_k_fallback` we ABORT when
+    // no calibrated k exists rather than bootstrapping a degenerate 0.075.
+    // Skipping is the right call: a missing entry means nxr-calibrate has not
+    // yet processed this ticker (new ticker, fresh deploy, or calibrator failed
+    // for the day). Running with 0.075 produces the brick-storm overshoots we
+    // already paid for once.
     let ticker_id = resolve_ticker_id(&format!("{}/{}", base, quote));
     let calibrated_k = load_calibrated_k(ticker_id);
-    let multiplier = calibrated_k.unwrap_or(0.075) as f32;
+    let multiplier = match calibrated_k {
+        Some(k) => k as f32,
+        None => {
+            tracing::warn!(
+                ticker_id,
+                pair = %format!("{}/{}", base, quote),
+                "no calibrated k in ticker-params.json — skipping renko build (run nxr-calibrate first)"
+            );
+            return Ok(());
+        }
+    };
     info!(
         ticker_id,
         k = multiplier,
-        source = if calibrated_k.is_some() { "ticker-params.json" } else { "default" },
+        source = "ticker-params.json",
         "renko k resolved"
     );
 

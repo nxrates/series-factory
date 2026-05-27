@@ -209,7 +209,7 @@ fn main() -> Result<()> {
         let mut config: RenkoConfig = if config_path.exists() {
             serde_json::from_str(&fs::read_to_string(&config_path)?)?
         } else {
-            RenkoConfig { multiplier: 0.075, min_pct: yml.renko.min_pct }
+            RenkoConfig { multiplier: RenkoConfig::default().multiplier, min_pct: yml.renko.min_pct }
         };
         config.min_pct = yml.renko.min_pct;
         config.validate()?;
