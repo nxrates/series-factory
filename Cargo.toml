@@ -8,10 +8,6 @@ name = "series_factory"
 path = "src/lib.rs"
 
 [[bin]]
-name = "series-factory"
-path = "src/main.rs"
-
-[[bin]]
 name = "generate-renko-from-ticks"
 path = "src/bin/generate_renko_from_ticks.rs"
 
