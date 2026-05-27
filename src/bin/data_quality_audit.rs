@@ -79,7 +79,16 @@ struct Cli {
     max_gap_ms: i64,
 
     /// `dt` (ms) tolerated for a sentinel-covered / pre-rollout quiet gap.
-    #[arg(long, default_value_t = 300_000)]
+    ///
+    /// R1 C6: default lowered from 300_000 → 0 until sentinels ship widely
+    /// across all live shards. With 0 tolerance the audit correctly fails
+    /// any gap > `max_gap_ms`; auto-quieting 2-5 min outages was masking
+    /// real producer downtime. After the sentinel-writing build (R1 C2)
+    /// has been live for ≥1 day across every ticker AND the audit confirms
+    /// sentinels are present in fresh shards, raise this to 60_000
+    /// (1 min slack above SENTINEL_INTERVAL_MS) so a single missed
+    /// sentinel doesn't trip a false alarm.
+    #[arg(long, default_value_t = 0)]
     quiet_tolerance_ms: i64,
 
     /// Calibration target: expected Renko bricks per UTC day.

@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use nxr_sdk::shard::{self, IdxShardWriter, ShardRecord, MS_PER_DAY};
+use nxr_sdk::shard::{self, IdxShardWriter, ShardRecord, FLAG_HISTORICAL_BACKFILL, MS_PER_DAY};
 use nxr_sdk::{resolve_ticker_id, Bar, IndexRecord};
 
 #[derive(Parser, Debug)]
@@ -224,7 +224,14 @@ fn migrate_idx(
             }
             *seen += 1;
             if let Some(w) = writer.as_mut() {
-                if w.append(rec)? {
+                // R1 H12: tag every migrated record as historical-backfill.
+                // This (a) makes the offline-replay origin self-describing
+                // for downstream consumers and (b) exempts the row from the
+                // R1 H1 future/ancient ts guard on IdxShardWriter (legitimate
+                // multi-year backfill writes ts far older than now-2y).
+                let mut tagged = *rec;
+                tagged.index.flags |= FLAG_HISTORICAL_BACKFILL;
+                if w.append(&tagged)? {
                     *written += 1;
                 }
             } else {

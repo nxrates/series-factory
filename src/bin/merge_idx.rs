@@ -33,6 +33,7 @@ use nxr_sdk::{
     ipc::append_log::AppendLog,
     ipc::record::IndexRecord,
     resolve_ticker_id,
+    shard::FLAG_HISTORICAL_BACKFILL,
     tdwap::ProviderEntry,
 };
 use series_factory::sharding::{
@@ -186,7 +187,11 @@ fn main() -> Result<()> {
                     let mts = mitch::timestamp::from_epoch_ms(boundary);
                     // provider_id=0 ∵ composite ! single provider
                     let header = MitchHeader::new(message_type::INDEX, 0, mts, 1);
-                    let rec_out = IndexRecord { header, index: composite };
+                    let mut idx = composite;
+                    // R1 H12: tag as offline-produced so consumers can tell
+                    // backfilled rows apart from live aggregator output.
+                    idx.flags |= FLAG_HISTORICAL_BACKFILL;
+                    let rec_out = IndexRecord { header, index: idx };
                     writer.append(boundary, &rec_out)?;
                     composites_written += 1;
                 }
@@ -220,7 +225,10 @@ fn main() -> Result<()> {
         ) {
             let mts = mitch::timestamp::from_epoch_ms(boundary);
             let header = MitchHeader::new(message_type::INDEX, 0, mts, 1);
-            let rec_out = IndexRecord { header, index: composite };
+            let mut idx = composite;
+            // R1 H12: tag as offline-produced (final-flush path).
+            idx.flags |= FLAG_HISTORICAL_BACKFILL;
+            let rec_out = IndexRecord { header, index: idx };
             writer.append(boundary, &rec_out)?;
             composites_written += 1;
         }

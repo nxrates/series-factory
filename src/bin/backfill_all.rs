@@ -80,9 +80,22 @@ struct Args {
     dry_run: bool,
     /// After successful validate, delete per-exchange `ticks/` and
     /// `indexes/<exch>/` intermediates for the pair. Keeps composite
-    /// shards + bars shards + .vol. Default: off (safe).
-    #[arg(long)]
+    /// shards + bars shards + .vol.
+    ///
+    /// R1 C4: default INVERTED from off→on. The composite `.idx` is
+    /// self-sufficient (s10 / renko / integrity-check all read it, never
+    /// the raw staging); keeping per-ticker staging on disk after a 31-pair
+    /// x 5y backfill is what overran the 500Gi PVC. Pass `--keep-staging`
+    /// to opt out (e.g. for forensic re-merges).
+    #[arg(long, default_value_t = true)]
     cleanup: bool,
+    /// Opt-out for the now-default cleanup. When set, raw `ticks/<exch>` and
+    /// per-provider `indexes/<exch>/<BASE>-<QUOTE>.idx` files are kept on
+    /// disk after a successful per-ticker validate. Useful for debugging a
+    /// suspect merge or for forensic re-runs; do NOT set in production
+    /// backfill jobs (it will refill the data PVC).
+    #[arg(long, default_value_t = false)]
+    keep_staging: bool,
     /// Skip availability probe (pre-fetch HEAD check). Useful for synthetic
     /// or offline environments.
     #[arg(long)]
@@ -433,7 +446,14 @@ fn cleanup_ticker_staging(
 
 fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     let (base, quote) = match split_pair(ticker) {
-        Ok(x) => x,
+        // R1 H10: uppercase both halves the moment we parse the pair so a
+        // lowercased CLI arg (`btc-usdt`) cannot silently shadow the
+        // uppercase fetcher output. Per-exchange `ticks/<exch>/<BASE><QUOTE>`
+        // staging is built by fetch-crypto-history under uppercase paths;
+        // a lowercase split_pair previously matched neither the staging
+        // dir nor the cleanup target, so cleanup was a no-op AND the
+        // composite merge silently picked an empty input.
+        Ok((b, q)) => (b.to_uppercase(), q.to_uppercase()),
         Err(e) => {
             return TickerReport {
                 ticker: ticker.to_string(),
@@ -618,7 +638,13 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         // per-provider .idx are now fully consumed. Purge them immediately,
         // per-ticker, so a long multi-ticker backfill keeps the data volume
         // bounded instead of hoarding every ticker's raw ticks until the end.
-        steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+        // R1 C4: cleanup is on by default; `--keep-staging` opts out.
+        let do_cleanup = ctx.args.cleanup && !ctx.args.keep_staging;
+        if do_cleanup {
+            steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+        } else {
+            info!(ticker, "staging cleanup skipped (--keep-staging or --cleanup=false)");
+        }
     }
 
     // 4) s10 → sharded bars_dir/*.s10
