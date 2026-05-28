@@ -125,6 +125,7 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use clap::Parser;
 use mitch::bar::{Bar, BarKind};
 use mitch::common::InstrumentType;
+#[cfg(test)]
 use mitch::header::MitchHeader;
 use mitch::index::Index;
 use mitch::timestamp;
@@ -135,7 +136,7 @@ use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, shard_path, BarShardWriter, ShardStream,
     BAR_MS_S10 as BAR_MS, MS_PER_DAY,
 };
-use nxr_sdk::tdwap::{decode_ci_ubp, encode_ci_ubp};
+use nxr_sdk::tdwap::decode_ci_ubp;
 use tracing::{info, warn};
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -143,13 +144,10 @@ use tracing::{info, warn};
 // Locally we only define what isn't (yet) shared.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// TTL gate: drop synth emit if either leg's snapshot age > this. Matches
-/// `core::synth_kernel::LEG_STALE_TTL_MS`.
-const LEG_STALE_TTL_MS: i64 = 5_000;
-
-/// Provider id stamped on synth records. Matches
-/// `core::synth_kernel::SYNTH_KERNEL_PROVIDER_ID`.
-const SYNTH_KERNEL_PROVIDER_ID: u16 = 2010;
+/// TTL + provider id are sourced from `nxr_sdk::synth` (single source of
+/// truth shared with the live kernel — W4 consolidation).
+#[allow(unused_imports)]
+use nxr_sdk::synth::{LEG_STALE_TTL_MS, SYNTH_KERNEL_PROVIDER_ID};
 
 /// Renko σ-EMA alpha. Matches `core::bars_renko_synth::SIGMA_EMA_ALPHA`.
 const SIGMA_EMA_ALPHA: f64 = 1.0 / (28.0 * 1800.0);
@@ -280,78 +278,22 @@ impl SynthReplayState {
         let (base, base_ts) = self.last_base?;
         let (quote, quote_ts) = self.last_quote?;
 
-        // TTL gate: same convention as core::synth_kernel (use max of now/leg
-        // timestamps as the reference clock so replay-clock skew can never
-        // spuriously trip the stale check).
-        let ref_ts = now_ms.max(base_ts).max(quote_ts);
-        if (ref_ts - base_ts) > LEG_STALE_TTL_MS || (ref_ts - quote_ts) > LEG_STALE_TTL_MS {
-            self.stale_drop_count += 1;
-            return None;
-        }
-
-        // Sanity gates (also matches live).
-        if base.confidence == 0 || quote.confidence == 0 {
-            return None;
-        }
-        let b_bid = base.bid;
-        let b_ask = base.ask;
-        let q_bid = quote.bid;
-        let q_ask = quote.ask;
-        if !(b_bid > 0.0 && b_ask >= b_bid && q_bid > 0.0 && q_ask >= q_bid) {
-            return None;
-        }
-
-        // Conservative spread compounding (Tanaka rule).
-        //   synth.bid = base.bid / quote.ask
-        //   synth.ask = base.ask / quote.bid
-        let cross_bid = b_bid / q_ask;
-        let cross_ask = b_ask / q_bid;
-        if !(cross_bid > 0.0
-            && cross_ask >= cross_bid
-            && cross_bid.is_finite()
-            && cross_ask.is_finite())
-        {
-            return None;
-        }
-        let cross_mid = 0.5 * (cross_bid + cross_ask);
-        if !(cross_mid > 0.0 && cross_mid.is_finite()) {
-            return None;
-        }
-
-        // CI propagation: σ_z/z = √((σ_x/x)² + (σ_y/y)²) — same as live.
-        let ci_b_ubp = decode_ci_ubp(base.ci);
-        let ci_q_ubp = decode_ci_ubp(quote.ci);
-        let rel_ci_ubp = (ci_b_ubp.powi(2) + ci_q_ubp.powi(2)).sqrt();
-
-        let synth_idx = Index {
-            ticker: self.synth_id,
-            bid: cross_bid,
-            ask: cross_ask,
-            vbid: base.vbid.min(quote.vbid),
-            vask: base.vask.min(quote.vask),
-            ci: encode_ci_ubp(rel_ci_ubp),
-            tick_count: 1,
-            confidence: base.confidence.min(quote.confidence),
-            accepted: 2,
-            rejected: 0,
-            flags: 0,
+        // All math + gates live in `nxr_sdk::synth::replay::compute_synth_index`
+        // (single source for live kernel + offline replay — W4 consolidation).
+        // The compute helper folds TTL + sanity drops together; we count any
+        // None as a stale-drop here (matches the live kernel's semantics).
+        let synth_rec = match nxr_sdk::synth::compute_synth_index(
+            &base, &quote, base_ts, quote_ts, now_ms, self.synth_id, self.seq,
+        ) {
+            Some(r) => r,
+            None => {
+                self.stale_drop_count += 1;
+                return None;
+            }
         };
-
-        // Stamp the newer of the two leg timestamps onto the synth header so
-        // downstream bar logic groups by the latest information.
-        let stamp_ts_ms = base_ts.max(quote_ts);
-        let stamp_mts = timestamp::from_epoch_ms(stamp_ts_ms);
-        let mut header = MitchHeader::new(
-            mitch::common::message_type::INDEX,
-            SYNTH_KERNEL_PROVIDER_ID,
-            stamp_mts,
-            1,
-        );
-        header.set_sequence(self.seq);
         self.seq = self.seq.wrapping_add(1);
-
         self.emit_count += 1;
-        Some(IndexRecord::new(header, synth_idx))
+        Some(synth_rec)
     }
 }
 
