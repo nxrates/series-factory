@@ -42,7 +42,12 @@ use series_factory::sharding::{
 };
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+// Δ1.C: `ProviderEntry::last_update` is now `coarsetime::Instant` (u64,
+// `Copy`). The offline merger still wants a simulated clock anchored at the
+// earliest record, so we keep the `anchor + offset` pattern but switch the
+// underlying clock type. `coarsetime::Duration::from_millis` and
+// `Add<Duration>` for Instant are 1:1 with the std-time equivalents.
+use coarsetime::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Canonical default BTC/USDT weights for offline replay. Locked to these

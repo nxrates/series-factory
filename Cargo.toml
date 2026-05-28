@@ -124,6 +124,10 @@ mitch = { path = "../mitch/impl/rust", features = ["bytemuck"] }
 bytemuck = "1.0"
 # Shared SDK (aggregation primitives, Parkinson sigma, etc.)
 nxr-sdk = { path = "../sdk/rust" }
+# Δ1.C: coarsetime::Instant matches the SDK's `ProviderEntry::last_update`
+# clock so merge_idx can build a simulated anchor + offset and pass it
+# straight into `update_at` / `compute_vwap_at` without conversion.
+coarsetime = "0.1"
 
 [profile.dev]
 opt-level = 0
