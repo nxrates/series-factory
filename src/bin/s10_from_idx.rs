@@ -22,7 +22,7 @@ use mitch::timestamp;
 use nxr_sdk::shard::ShardStream;
 use nxr_sdk::{BarAccumulator, resolve_ticker_id};
 use series_factory::sharding::{
-    bars_dir_pair, composite_dir, list_shards, manifest_path, read_manifest, shard_path,
+    bars_dir, idx_dir, list_shards, manifest_path, read_manifest, shard_path,
     ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
 };
 use std::collections::BTreeMap;
@@ -40,11 +40,11 @@ struct Args {
     #[arg(long, default_value_t = 10_000)]
     bucket_ms: i64,
     /// Override the input composite shard dir.
-    /// Default: `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>/`.
+    /// Default: `$NXR_DATA_INDEXES/<MITCH_ID>/`.
     #[arg(long = "in-dir")]
     input_dir: Option<PathBuf>,
     /// Override the output shard dir.
-    /// Default: `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>/`.
+    /// Default: `$NXR_DATA_BARS/<MITCH_ID>/`.
     #[arg(long = "out-dir")]
     out_dir: Option<PathBuf>,
 }
@@ -75,14 +75,15 @@ fn main() -> Result<()> {
         .parent()
         .unwrap_or(Path::new("/data"))
         .to_path_buf();
+    let ticker_id = resolve_ticker_id(&format!("{}/{}", base, quote));
     let in_dir = args
         .input_dir
         .clone()
-        .unwrap_or_else(|| composite_dir(&data_root_idx, &base, &quote));
+        .unwrap_or_else(|| idx_dir(&data_root_idx, ticker_id));
     let out_dir = args
         .out_dir
         .clone()
-        .unwrap_or_else(|| bars_dir_pair(&data_root_bars, &base, &quote));
+        .unwrap_or_else(|| bars_dir(&data_root_bars, ticker_id));
 
     info!(
         in_dir = %in_dir.display(),

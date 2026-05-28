@@ -20,8 +20,8 @@
 //!     [--weight binance=40 --weight okx=20 --weight bybit=30 --weight bitget=10]
 //!
 //! Inputs:  `$NXR_DATA_INDEXES/<exchange>/<BASE>-<QUOTE>.idx` for each exchange
-//! Output:  `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>/<YYYY-MM-DD>.idx`
-//!         + `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>/manifest.json`
+//! Output:  `$NXR_DATA_INDEXES/<MITCH_ID>/<YYYY-MM-DD>.idx`
+//!         + `$NXR_DATA_INDEXES/<MITCH_ID>/manifest.json`
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -103,12 +103,11 @@ fn main() -> Result<()> {
     let ticker_str = format!("{}-{}", base_uc, quote_uc);
     let ticker_id = resolve_ticker_id(&format!("{}/{}", base_uc, quote_uc));
     let indexes_dir = PathBuf::from(&cfg.indexes_dir);
-    // shard root = <indexes_dir>/composite/<BASE>-<QUOTE>/
-    let out_dir = args.out_dir.clone().unwrap_or_else(|| {
-        indexes_dir
-            .join("composite")
-            .join(format!("{}-{}", base_uc, quote_uc))
-    });
+    // shard root = <indexes_dir>/<MITCH_ID>/  (canonical MITCH-keyed, U3/U4)
+    let out_dir = args
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| indexes_dir.join(ticker_id.to_string()));
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("create_dir_all {}", out_dir.display()))?;
 

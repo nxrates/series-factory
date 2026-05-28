@@ -479,15 +479,10 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     let mut steps_out: Vec<StepReport> = Vec::new();
     let cfg = ctx.args.config.to_string_lossy().to_string();
     let out_dir = &ctx.args.out_dir;
-    // Sharded paths (see `docs/sharding-spec.md`).
-    let composite_dir = out_dir
-        .join("indexes")
-        .join("composite")
-        .join(format!("{}-{}", base, quote));
-    let bars_dir = out_dir
-        .join("bars")
-        .join(&base)
-        .join(format!("{}{}", base, quote));
+    // Sharded paths — MITCH-ID keyed (canonical, U3/U4). See `docs/sharding-spec.md`.
+    let ticker_id = nxr_sdk::resolve_ticker_id(&format!("{}/{}", base, quote));
+    let composite_dir = nxr_sdk::shard::idx_dir(out_dir, ticker_id);
+    let bars_dir = nxr_sdk::shard::bars_dir(out_dir, ticker_id);
     let vol_path = out_dir.join("vol").join(format!("{}-{}.vol", base, quote));
 
     let want = |s: &str| ctx.steps.iter().any(|x| x == s);
