@@ -36,7 +36,6 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -877,14 +876,8 @@ fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    // tracing init — default INFO, env RUST_LOG override. Logs to stderr.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_writer(std::io::stderr)
-        .init();
+    // tracing init — default INFO, RUST_LOG override honoured via sdk's init.
+    nxr_sdk::logging::init("info");
 
     let args = Args::parse();
 

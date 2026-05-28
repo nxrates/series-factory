@@ -230,7 +230,7 @@ impl Clone for BoundaryReport {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    nxr_sdk::logging::init("info");
     let cli = Cli::parse();
     let bars_root = cli.data_root.join("bars");
     if !bars_root.exists() {
