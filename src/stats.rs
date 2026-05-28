@@ -335,7 +335,7 @@ fn compute_robust(stats: &[f64], iids: &[f64]) -> f64 {
 
 /// Bars per calendar day.
 pub fn compute_density_bars_per_day(n_bars: usize, duration_ms: i64) -> f64 {
-    let ms_per_day = 24.0 * 3_600_000.0;
+    let ms_per_day = nxr_sdk::shard::MS_PER_DAY as f64;
     let days = duration_ms as f64 / ms_per_day;
     if days < 0.1 {
         return 0.0;

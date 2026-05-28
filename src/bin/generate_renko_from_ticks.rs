@@ -249,7 +249,7 @@ fn run_pipeline(
             let mid = frame.mid_price();
 
             // Vol: 30-min HLC buckets (H/L from mid since raw ticks lack a bid/ask split here).
-            let key = (ts / 1_800_000) * 1_800_000;
+            let key = (ts / nxr_sdk::shard::MS_PER_30MIN) * nxr_sdk::shard::MS_PER_30MIN;
             let e = hlc.entry(key).or_insert((mid, mid));
             if mid > e.0 { e.0 = mid; }
             if mid < e.1 { e.1 = mid; }
@@ -288,7 +288,7 @@ fn run_pipeline(
     let n_valid = tick_prices.len() - n_zero;
     info!("  valid={}, zero/nan={}", n_valid, n_zero);
     if let (Some(first), Some(last)) = (tick_prices.first(), tick_prices.last()) {
-        let days = (last.0 - first.0) as f64 / 86_400_000.0;
+        let days = (last.0 - first.0) as f64 / (nxr_sdk::shard::MS_PER_DAY as f64);
         info!("  span: {:.1} days", days);
     }
 
@@ -327,7 +327,7 @@ fn run_pipeline(
     // emitted Renko bar to overlay the enrichment fields. Geometry (OHLC + ts)
     // comes from RenkoGenerator; enrichment (dispersion, drift, ...) from accum.
     let first_price_ts = tick_prices.first().map(|p| p.0).unwrap_or(0);
-    let bootstrap_end = first_price_ts + yml.pipeline.bootstrap_days * 86_400_000;
+    let bootstrap_end = first_price_ts + yml.pipeline.bootstrap_days * nxr_sdk::shard::MS_PER_DAY;
     let t1 = std::time::Instant::now();
     let mut bars: Vec<Bar> = Vec::new();
     let mut accum = BarAccumulator::new();

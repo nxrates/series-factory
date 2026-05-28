@@ -23,7 +23,7 @@ use nxr_sdk::parkinson::VolConfig;
 use crate::vol_bin::VolWriter;
 
 /// 30-min bucket width in milliseconds.
-pub const BUCKET_MS: i64 = 1_800_000;
+pub const BUCKET_MS: i64 = nxr_sdk::shard::MS_PER_30MIN;
 
 /// Build a `.vol` file from a stream of `IndexRecord`s.
 ///

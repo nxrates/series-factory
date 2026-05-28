@@ -54,8 +54,7 @@ pub struct CalibrationConfig {
     pub mult_bounds: [f64; 2],
 }
 
-/// Bucket size for "per UTC day" calibration scoring (M3 sprint).
-const MS_PER_DAY: i64 = 86_400_000;
+use nxr_sdk::shard::MS_PER_DAY;
 
 /// Per-day bar count + summary stats. Output of [`count_bars_per_day_from_prices`].
 #[derive(Debug, Clone)]
