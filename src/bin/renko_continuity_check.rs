@@ -30,9 +30,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser, Debug)]
 #[command(about = "Verify cross-shard continuity for .renko files (B03 + bricks/day stats).")]
 struct Cli {
-    /// Data root (parent of `bars/`).
-    #[arg(long, default_value = "/data")]
-    data_root: PathBuf,
+    #[clap(flatten)]
+    common: series_factory::cli::CommonArgs,
     /// Restrict to a single ticker_id (MITCH u64). Default: all tickers.
     #[arg(long)]
     ticker: Option<u64>,
@@ -232,7 +231,7 @@ impl Clone for BoundaryReport {
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
     let cli = Cli::parse();
-    let bars_root = cli.data_root.join("bars");
+    let bars_root = cli.common.data_root.join("bars");
     if !bars_root.exists() {
         anyhow::bail!("data root has no bars/ subdirectory: {}", bars_root.display());
     }
@@ -271,7 +270,7 @@ fn main() -> Result<()> {
     }
 
     let global = GlobalReport {
-        data_root: cli.data_root.display().to_string(),
+        data_root: cli.common.data_root.display().to_string(),
         tickers: per_ticker.len(),
         total_bricks,
         total_boundaries,

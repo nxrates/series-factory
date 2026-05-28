@@ -62,9 +62,8 @@ use nxr_sdk::Bar;
     about = "Certify bank/hedge-fund-grade data quality over the canonical sharded layout."
 )]
 struct Cli {
-    /// Root of the canonical store (contains `indexes/` and `bars/`).
-    #[arg(long, default_value = "/data")]
-    data_root: PathBuf,
+    #[clap(flatten)]
+    common: series_factory::cli::CommonArgs,
 
     /// Comma-separated ticker ids. Default: every id dir under `indexes/`.
     #[arg(long)]
@@ -811,13 +810,13 @@ fn main() -> Result<()> {
             .filter(|x| !x.is_empty())
             .filter_map(|x| x.parse::<u64>().ok())
             .collect(),
-        None => discover_tickers(&cli.data_root),
+        None => discover_tickers(&cli.common.data_root),
     };
 
     let mut reports: Vec<TickerReport> = Vec::with_capacity(tickers.len());
     for id in tickers {
         match audit_ticker(
-            &cli.data_root,
+            &cli.common.data_root,
             id,
             win_start,
             win_end,
@@ -866,7 +865,7 @@ fn main() -> Result<()> {
     let n_no_data = reports.iter().filter(|r| r.verdict == "NO_DATA").count() as u64;
 
     let report = AuditReport {
-        data_root: cli.data_root.display().to_string(),
+        data_root: cli.common.data_root.display().to_string(),
         window_days: cli.window_days,
         window_start: win_start.format("%Y-%m-%d").to_string(),
         window_end: win_end.format("%Y-%m-%d").to_string(),

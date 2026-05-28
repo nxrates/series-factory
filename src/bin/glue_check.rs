@@ -62,9 +62,8 @@ struct Args {
     #[arg(long)]
     ticker_id: Option<u64>,
 
-    /// Sharded mode: data root (contains `indexes/<id>/<YYYY-MM-DD>.idx`).
-    #[arg(long, default_value = "/data")]
-    data_root: PathBuf,
+    #[clap(flatten)]
+    common: series_factory::cli::CommonArgs,
 
     /// Legacy mode: `<BASE>-<QUOTE>` (e.g. `BTC-USDT`) or decimal ticker id.
     /// Required unless `--all` (and `--legacy-flat`).
@@ -195,7 +194,7 @@ fn run_sharded(args: &Args) -> Result<()> {
     let id = args.ticker_id.ok_or_else(|| {
         anyhow!("missing --ticker-id (or pass --all); use --legacy-flat for the old flat-file layout")
     })?;
-    let report = check_sharded_safe(id, &args.data_root);
+    let report = check_sharded_safe(id, &args.common.data_root);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -211,7 +210,7 @@ fn run_sharded(args: &Args) -> Result<()> {
 }
 
 fn run_sharded_all(args: &Args) -> Result<AggregateReport> {
-    let indexes_root = args.data_root.join("indexes");
+    let indexes_root = args.common.data_root.join("indexes");
     let mut ids: Vec<u64> = Vec::new();
     if indexes_root.exists() {
         for entry in std::fs::read_dir(&indexes_root)
@@ -241,7 +240,7 @@ fn run_sharded_all(args: &Args) -> Result<AggregateReport> {
     let mut errored = 0usize;
 
     for id in ids {
-        let r = check_sharded_safe(id, &args.data_root);
+        let r = check_sharded_safe(id, &args.common.data_root);
         match r.status.as_str() {
             "ok" => {
                 checked += 1;
