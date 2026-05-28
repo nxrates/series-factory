@@ -536,47 +536,52 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         }
     }
 
-    // 2) t2i (per exchange)
+    // 2) t2i (per exchange) — PARALLEL across exchanges (was serial; 3-exch
+    // ticker wall went from sum-of-per-exch to max-of-per-exch, typically ~2x
+    // speedup on liquid pairs where bitget/okx are smaller than binance).
     if want("t2i") {
-        for ex in &active_exchanges {
-            let per_idx = out_dir
-                .join("indexes")
-                .join(ex)
-                .join(format!("{}-{}.idx", base, quote));
-            if ctx.args.resume && integrity_clean(&per_idx, "idx") {
-                steps_out.push(StepReport {
-                    name: format!("ticks-to-idx[{}]", ex),
-                    duration_ms: 0,
-                    exit_code: 0,
-                    bytes: file_bytes(&per_idx),
-                    skipped: true,
-                    errors: Vec::new(),
-                });
-                continue;
-            }
-            let args = vec![
-                ex.clone(),
-                base.clone(),
-                quote.clone(),
-                "--cycle-ms".to_string(),
-                "100".to_string(),
-            ];
-            let mut rep = run_step(ticker, "ticks-to-idx", &args, Some(&per_idx));
-            rep.name = format!("ticks-to-idx[{}]", ex);
-            let failed = rep.exit_code != 0;
-            steps_out.push(rep);
-            if failed {
-                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-                write_marker(&ctx.args.out_dir, ticker, "failed");
-                return TickerReport {
-                    ticker: ticker.to_string(),
-                    status: "failed".to_string(),
-                    steps: steps_out,
-                    ticker_availability: availability,
-                    skip_reason: None,
-                };
-            }
+        let t2i_reports: Vec<StepReport> = active_exchanges
+            .par_iter()
+            .map(|ex| {
+                let per_idx = out_dir
+                    .join("indexes")
+                    .join(ex)
+                    .join(format!("{}-{}.idx", base, quote));
+                if ctx.args.resume && integrity_clean(&per_idx, "idx") {
+                    return StepReport {
+                        name: format!("ticks-to-idx[{}]", ex),
+                        duration_ms: 0,
+                        exit_code: 0,
+                        bytes: file_bytes(&per_idx),
+                        skipped: true,
+                        errors: Vec::new(),
+                    };
+                }
+                let args = vec![
+                    ex.clone(),
+                    base.clone(),
+                    quote.clone(),
+                    "--cycle-ms".to_string(),
+                    "100".to_string(),
+                ];
+                let mut rep = run_step(ticker, "ticks-to-idx", &args, Some(&per_idx));
+                rep.name = format!("ticks-to-idx[{}]", ex);
+                rep
+            })
+            .collect();
+        let any_failed = t2i_reports.iter().any(|r| r.exit_code != 0);
+        steps_out.extend(t2i_reports);
+        if any_failed {
+            ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+            write_marker(&ctx.args.out_dir, ticker, "failed");
+            return TickerReport {
+                ticker: ticker.to_string(),
+                status: "failed".to_string(),
+                steps: steps_out,
+                ticker_availability: availability,
+                skip_reason: None,
+            };
         }
     }
 
