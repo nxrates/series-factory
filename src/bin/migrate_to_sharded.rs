@@ -47,9 +47,8 @@ use nxr_sdk::{resolve_ticker_id, Bar, IndexRecord};
 #[derive(Parser, Debug)]
 #[command(about = "Unify market data into MITCH-ID daily-sharded layout")]
 struct Args {
-    /// Data root containing `indexes/` and `bars/`.
-    #[arg(long, default_value = "/data")]
-    data_root: PathBuf,
+    #[clap(flatten)]
+    common: series_factory::cli::CommonArgs,
     /// Retention cap in days; older data is not migrated (default 730 = 2y).
     #[arg(long, default_value_t = 730)]
     cutoff_days: i64,
@@ -96,7 +95,7 @@ fn parse_ticker_filter(s: &Option<String>) -> Option<Vec<u64>> {
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
     let args = Args::parse();
-    let root = &args.data_root;
+    let root = &args.common.data_root;
     let cutoff_ms = nxr_sdk::now_ms() as i64 - args.cutoff_days * MS_PER_DAY;
     let allow = parse_ticker_filter(&args.tickers);
     let allowed = |id: u64| allow.as_ref().map(|v| v.contains(&id)).unwrap_or(true);

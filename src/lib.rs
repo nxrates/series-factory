@@ -1,4 +1,5 @@
 pub mod bar_construction;
+pub mod cli;
 pub mod sampler;
 pub mod sharding;
 pub mod sources;
