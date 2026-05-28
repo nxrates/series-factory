@@ -907,7 +907,7 @@ mod tests {
     fn calibrator_window_excludes_day_d_data() {
         let d_start = day_start_ms(NaiveDate::from_ymd_opt(2024, 5, 21).unwrap());
         let prices: Vec<(i64, f64)> = vec![
-            (d_start - 86_400_000, 100.0), // D-1
+            (d_start - nxr_sdk::shard::MS_PER_DAY, 100.0), // D-1
             (d_start - 60_000, 101.0),     // 1 min before D
             (d_start - 1, 101.5),          // 1 ms before D
             (d_start, 102.0),              // D start — MUST be excluded

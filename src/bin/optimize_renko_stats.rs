@@ -507,7 +507,7 @@ fn build_vol_batched(
     // Canonical 30-min HLC buckets (matches VolMmap consumer + every other
     // pipeline). Previous code used 1h buckets + hardcoded ema=14 here, which
     // diverged silently from the rest of the stack.
-    const BUCKET_MS: i64 = 1_800_000;
+    const BUCKET_MS: i64 = nxr_sdk::shard::MS_PER_30MIN;
     let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
 
     for (chunk_idx, chunk) in tick_files.chunks(batch_size).enumerate() {

@@ -336,7 +336,7 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
     }
 
     if let (Some(a), Some(b)) = (stats.ts_first_ms, stats.ts_last_ms) {
-        stats.span_hours = Some((b - a) as f64 / 3_600_000.0);
+        stats.span_hours = Some((b - a) as f64 / (nxr_sdk::shard::MS_PER_HOUR as f64));
     }
 
     if n_finite > 0 {
@@ -554,7 +554,7 @@ fn check_bars(path: &Path, strict: bool) -> Result<FileReport> {
     }
 
     if let (Some(a), Some(b)) = (stats.ts_first_ms, stats.ts_last_ms) {
-        let span_h = (b - a) as f64 / 3_600_000.0;
+        let span_h = (b - a) as f64 / (nxr_sdk::shard::MS_PER_HOUR as f64);
         stats.span_hours = Some(span_h);
         if span_h > 0.0 {
             bars_stats.bars_per_day = n as f64 / (span_h / 24.0);
@@ -779,7 +779,7 @@ fn check_s10(path: &Path, strict: bool, bucket_ms: i64) -> Result<FileReport> {
     }
 
     if let (Some(a), Some(b)) = (stats.ts_first_ms, stats.ts_last_ms) {
-        let span_h = (b - a) as f64 / 3_600_000.0;
+        let span_h = (b - a) as f64 / (nxr_sdk::shard::MS_PER_HOUR as f64);
         stats.span_hours = Some(span_h);
         if span_h > 0.0 {
             bars_stats.bars_per_day = n as f64 / (span_h / 24.0);
@@ -788,7 +788,7 @@ fn check_s10(path: &Path, strict: bool, bucket_ms: i64) -> Result<FileReport> {
 
     // Expected ≈ 8640 bars/day for 10s buckets when no gaps.
     if strict && bars_stats.bars_per_day > 0.0 {
-        let expected = 86_400_000.0 / bucket_ms as f64;
+        let expected = nxr_sdk::shard::MS_PER_DAY as f64 / bucket_ms as f64;
         let frac = bars_stats.bars_per_day / expected;
         if !(0.5..=1.0 + 1e-6).contains(&frac) {
             errors.push(Finding {
@@ -921,7 +921,7 @@ fn check_vol(path: &Path, _strict: bool) -> Result<FileReport> {
     }
 
     if let (Some(a), Some(b)) = (stats.ts_first_ms, stats.ts_last_ms) {
-        stats.span_hours = Some((b - a) as f64 / 3_600_000.0);
+        stats.span_hours = Some((b - a) as f64 / (nxr_sdk::shard::MS_PER_HOUR as f64));
     }
 
     stats.vol_stats = Some(vol_stats);
