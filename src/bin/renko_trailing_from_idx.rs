@@ -182,21 +182,7 @@ fn day_start_ms(d: NaiveDate) -> i64 {
     Utc.from_utc_datetime(&ndt).timestamp_millis()
 }
 
-#[inline]
-fn parse_date(s: &str) -> Result<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").with_context(|| format!("parse date {}", s))
-}
-
-/// Inclusive set of UTC dates in `[from, to]`.
-fn day_range(from: NaiveDate, to: NaiveDate) -> Vec<NaiveDate> {
-    let mut out = Vec::new();
-    let mut d = from;
-    while d <= to {
-        out.push(d);
-        d = d.succ_opt().unwrap_or(d);
-    }
-    out
-}
+use nxr_sdk::shard::{parse_utc_date as parse_date, day_range_inclusive as day_range};
 
 // ── Future-dated junk wiper ─────────────────────────────────────────────────
 
