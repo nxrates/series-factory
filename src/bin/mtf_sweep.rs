@@ -146,10 +146,7 @@ fn day_start_ms(d: NaiveDate) -> i64 {
     Utc.from_utc_datetime(&ndt).timestamp_millis()
 }
 
-#[inline]
-fn parse_date(s: &str) -> Result<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").with_context(|| format!("parse date {}", s))
-}
+use nxr_sdk::shard::parse_utc_date as parse_date;
 
 /// NDJSON record on stdout — one per (pair, candidate, day) sample.
 #[derive(Serialize)]

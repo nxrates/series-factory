@@ -163,12 +163,7 @@ struct FinalReport {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn parse_date(s: &str) -> Result<NaiveDate> {
-    if s.eq_ignore_ascii_case("today") {
-        return Ok(Utc::now().date_naive());
-    }
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").with_context(|| format!("bad date `{}`", s))
-}
+use nxr_sdk::shard::parse_utc_date_or_today as parse_date;
 
 fn split_csv(s: &str) -> Vec<String> {
     s.split(',')
