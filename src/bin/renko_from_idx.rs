@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     nxr_sdk::memory::apply_safe_cap();
 
     let args = Args::parse();
-    let root: PipelineYml = serde_yaml::from_str(&fs::read_to_string(&args.config)?)?;
+    let root: PipelineYml = PipelineYml::load(&args.config)?;
     let yml = root.series;
 
     let cfg = nxr_sdk::NxrConfig::from_env();

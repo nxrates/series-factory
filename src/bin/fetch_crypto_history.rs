@@ -14,7 +14,7 @@
 //! FX has no public historical source, so calibration is crypto-only. Run this
 //! bin before any binary that depends on pre-populated `.ticks` archives.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use clap::Parser;
 use serde::Serialize;
@@ -22,7 +22,7 @@ use series_factory::{
     sources::{create_source, TickSource},
     types::{AggregationMode, Config, DataSource, TickFrame},
 };
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
@@ -223,10 +223,7 @@ async fn main() -> Result<()> {
     nxr_sdk::memory::apply_safe_cap();
 
     let args = Args::parse();
-    let root: YmlRoot = serde_yaml::from_str(
-        &fs::read_to_string(&args.config)
-            .with_context(|| format!("reading {}", args.config.display()))?,
-    )?;
+    let root: YmlRoot = YmlRoot::load(&args.config)?;
 
     let pairs = parse_csv(args.pairs.as_deref(), &root.series.pipeline.pairs);
     let exchanges = parse_csv(args.exchanges.as_deref(), &root.series.pipeline.exchanges);
