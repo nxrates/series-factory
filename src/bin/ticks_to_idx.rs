@@ -112,7 +112,17 @@ fn main() -> Result<()> {
     let files = discover_sorted_tick_files(&ticks_dir)
         .with_context(|| format!("discover tick files in {}", ticks_dir.display()))?;
     if files.is_empty() {
-        anyhow::bail!("no .ticks files under {}", ticks_dir.display());
+        // Soft-skip: this (sym, exchange) has no archive coverage. The merge
+        // step downstream will combine whatever other exchanges DID return
+        // data. A hard error here used to fail entire tickers (XMR-USDT,
+        // USDe-USDT, USDG-USDT) when 1 of 3 exchanges had no .ticks files.
+        tracing::warn!(
+            ticks_dir = %ticks_dir.display(),
+            exchange = %args.exchange,
+            ticker_id,
+            "no .ticks files — soft-skipping this (sym,exchange); merge will use other exchanges"
+        );
+        return Ok(());
     }
     info!(n_files = files.len(), "discovered tick files");
 
