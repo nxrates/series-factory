@@ -10,10 +10,7 @@ pub use mitch::bar::Bar;
 /// Round a float to 6 significant digits.
 #[inline]
 pub fn round_to_6_sig_digits(value: f64) -> f64 {
-    if value == 0.0 || !value.is_finite() { return value; }
-    let magnitude = value.abs().log10().floor();
-    let factor = 10.0_f64.powi(5 - magnitude as i32);
-    (value * factor).round() / factor
+    nxr_sdk::stats::round_to_sig_digits(value, 6)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
