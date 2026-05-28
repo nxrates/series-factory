@@ -48,7 +48,7 @@ use mitch::common::message_type;
 use mitch::timestamp;
 use nxr_sdk::ipc::record::IndexRecord;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use series_factory::vol_bin::VolRecord;
 use tracing::{info, warn};
 
@@ -176,13 +176,6 @@ impl FileReport {
 
 // ── Optional renko bounds from config.yml ──────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct CfgRoot { series: CfgSeries }
-#[derive(Debug, Deserialize)]
-struct CfgSeries { renko: CfgRenko }
-#[derive(Debug, Deserialize)]
-struct CfgRenko { min_pct: f64 }
-
 /// Load `min_pct` from `config.yml`, falling back to `0.0001`.
 /// Lookup order: `$NXR_CONFIG`, `./config.yml`, `series-factory/config.yml`.
 ///
@@ -190,7 +183,9 @@ struct CfgRenko { min_pct: f64 }
 /// loses its upper-bound enforcement. Aoife: "Replace with anomaly log only."
 /// Tomás: "Floor still matters — a brick < min_pct means generator math
 /// underflowed and the bar is invalid storage-wise." Consensus: keep floor
-/// check, drop ceiling.
+/// check, drop ceiling. Reads via the canonical
+/// [`nxr_sdk::pipeline_config::PipelineYml`] schema (the private CfgRoot
+/// duplicate that used to live here is removed per audit Wave 1.E).
 fn load_renko_bounds() -> f64 {
     let candidates: Vec<PathBuf> = std::env::var("NXR_CONFIG")
         .map(PathBuf::from)
@@ -198,10 +193,8 @@ fn load_renko_bounds() -> f64 {
         .chain(["config.yml", "series-factory/config.yml"].iter().map(PathBuf::from))
         .collect();
     for p in candidates {
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            if let Ok(cfg) = serde_yaml::from_str::<CfgRoot>(&s) {
-                return cfg.series.renko.min_pct;
-            }
+        if let Ok(yml) = nxr_sdk::pipeline_config::PipelineYml::load(&p) {
+            return yml.series.renko.min_pct as f64;
         }
     }
     0.0001

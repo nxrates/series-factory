@@ -569,10 +569,7 @@ fn resolve_synth_work() -> Vec<(u64, &'static str, u64, u64)> {
 
 fn run_once(args: &Args) -> Result<()> {
     let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "config.yml".to_string());
-    let root: PipelineYml = serde_yaml::from_str(
-        &std::fs::read_to_string(&cfg_path).with_context(|| format!("read {}", cfg_path))?,
-    )
-    .with_context(|| format!("parse {}", cfg_path))?;
+    let root: PipelineYml = PipelineYml::load(std::path::Path::new(&cfg_path))?;
     let series = &root.series;
     let stables = &root.cexs.stablecoins;
 

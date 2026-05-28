@@ -813,11 +813,7 @@ fn main() -> Result<()> {
     nxr_sdk::memory::apply_safe_cap();
 
     let args = Args::parse();
-    let root: PipelineYml = serde_yaml::from_str(
-        &std::fs::read_to_string(&args.config)
-            .with_context(|| format!("read {}", args.config.display()))?,
-    )
-    .with_context(|| format!("parse {}", args.config.display()))?;
+    let root: PipelineYml = PipelineYml::load(&args.config)?;
     let yml = root.series;
 
     let pairs: Vec<(String, String)> = if args.all {

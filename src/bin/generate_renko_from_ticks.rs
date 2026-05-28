@@ -185,7 +185,7 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let root: RootPipelineYml = serde_yaml::from_str(&fs::read_to_string(&args[1])?)?;
+    let root: RootPipelineYml = RootPipelineYml::load(std::path::Path::new(&args[1]))?;
     let yml = root.series;
 
     // Storage paths come from the unified NXR_DATA_* taxonomy:
