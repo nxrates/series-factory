@@ -266,10 +266,13 @@ fn integrity_clean(file: &Path, kind: &str) -> bool {
         return false;
     }
     let out = Command::new("integrity-check")
-        .args([kind, file.to_string_lossy().as_ref(), "--strict", "--json"])
+        .args([kind, file.to_string_lossy().as_ref(), "--json"])
         .output();
+    // exit 0 = clean, 1 = warnings only (e.g. sparse ticker w/ >60s gaps —
+    // legitimate for stablecoins like USDS/USDe/USDG/PYUSD; not a real error).
+    // exit 2 = errors. Treat 0+1 as clean, only 2 as broken.
     match out {
-        Ok(o) => o.status.success(),
+        Ok(o) => matches!(o.status.code(), Some(0) | Some(1)),
         Err(_) => false,
     }
 }
@@ -828,12 +831,13 @@ fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
         let args = vec![
             kind.to_string(),
             shard.to_string_lossy().to_string(),
-            "--strict".to_string(),
             "--json".to_string(),
         ];
+        // exit 0 = clean, 1 = warnings only (sparse stablecoin gaps, etc.),
+        // 2 = errors. Drop --strict so warnings ! tank tickers.
         let out = Command::new("integrity-check").args(&args).output();
         match out {
-            Ok(o) if o.status.success() => {}
+            Ok(o) if matches!(o.status.code(), Some(0) | Some(1)) => {}
             Ok(o) => {
                 any_fail = true;
                 let stderr = String::from_utf8_lossy(&o.stderr);
@@ -845,7 +849,7 @@ fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
                     kind,
                     shard = %shard.display(),
                     exit = ?o.status.code(),
-                    "shard integrity-check failed"
+                    "shard integrity-check failed (exit=2, errors)"
                 );
             }
             Err(e) => {
