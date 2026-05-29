@@ -7,9 +7,9 @@
 //! bucket. On bucket rollover, the previous accumulator is flushed → routed
 //! to the daily output shard keyed by `open_ts.date_utc()`.
 //!
-//! Inputs:  `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>/<YYYY-MM-DD>.idx`
-//! Output:  `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>/<YYYY-MM-DD>.s10`
-//!         + `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>/manifest.json` (kind merged)
+//! Inputs:  `$NXR_DATA_INDEXES/<MITCH_TICKER_ID>/<YYYY-MM-DD>.idx`
+//! Output:  `$NXR_DATA_BARS/<MITCH_TICKER_ID>/<YYYY-MM-DD>.s10`
+//!         + `$NXR_DATA_BARS/<MITCH_TICKER_ID>/manifest.json` (kind merged)
 //!
 //! Higher-TF series (1m, 5m, 1h, ...) are produced on the fly by API
 //! readers via the OHLC monoid rollup (`nxr_sdk::ohlc::rollup`).
