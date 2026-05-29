@@ -45,24 +45,8 @@ use tracing::{info, warn};
 /// branches in lock-step (audit point #5(i), 2026-05-26 — `feedback_no_k_fallback`).
 const EVAL_HOLDOUT_DAYS: usize = 7;
 
-// ── Synth pair registry (mirrors core/src/synth_registry.rs INITIAL_PAIRS) ──
-// Kept inline here because series-factory is a workspace-EXCLUDED crate and
-// cannot depend on the core crate; the 5-pair list is small + rarely
-// changes. Out-of-sync drift is caught manually until the registry moves to
-// nxr-sdk (a future refactor).
-struct SynthPairSpec {
-    synth_sym: &'static str,
-    base_sym: &'static str,
-    quote_sym: &'static str,
-}
-
-const SYNTH_PAIRS: &[SynthPairSpec] = &[
-    SynthPairSpec { synth_sym: "ETH/BTC", base_sym: "ETH/USDT", quote_sym: "BTC/USDT" },
-    SynthPairSpec { synth_sym: "SOL/BTC", base_sym: "SOL/USDT", quote_sym: "BTC/USDT" },
-    SynthPairSpec { synth_sym: "BNB/BTC", base_sym: "BNB/USDT", quote_sym: "BTC/USDT" },
-    SynthPairSpec { synth_sym: "BNB/ETH", base_sym: "BNB/USDT", quote_sym: "ETH/USDT" },
-    SynthPairSpec { synth_sym: "SOL/ETH", base_sym: "SOL/USDT", quote_sym: "ETH/USDT" },
-];
+// Synth pair registry — canonical source @ nxr_sdk::synth::pairs.
+use nxr_sdk::synth::pairs::INITIAL_SYNTH_PAIRS as SYNTH_PAIRS;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
