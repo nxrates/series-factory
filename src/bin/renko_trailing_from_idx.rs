@@ -61,22 +61,18 @@ use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
-// ── Launch symbol set (operator-specified, see task brief) ──────────────────
-
-/// Pairs (`base/quote`) that the `--all` mode iterates. Ticker IDs are resolved
-/// at runtime via `resolve_ticker_id` — keeping the list in code (not yaml)
-/// because operator approval is implicit and the set is small.
-const LAUNCH_PAIRS: &[(&str, &str)] = &[
-    ("BTC", "USDT"),
-    ("ETH", "USDT"),
-    ("BNB", "USDT"),
-    ("SOL", "USDT"),
-    ("USDC", "USDT"),
-    ("USDS", "USDT"),
-    ("USDE", "USDT"),
-    ("USD1", "USDT"),
-    ("PAXG", "USDT"),
-];
+// Launch symbol set sourced from YAML `series.pipeline.pairs` × default
+// USDT quote. Operator mandate 2026-05-30: NO hardcoded lists in code.
+// Helper builds (base, quote) tuples from the loaded PipelineYml when
+// `--all` is set.
+fn launch_pairs_from_yaml(pl: &nxr_sdk::pipeline_config::PipelineYml) -> Vec<(String, String)> {
+    pl.series
+        .pipeline
+        .pairs
+        .iter()
+        .map(|b| (b.to_uppercase(), "USDT".to_string()))
+        .collect()
+}
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -134,44 +130,28 @@ fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
     }
 }
 
-// ── Pair → asset-class bucket (slimmed copy of nxr_calibrate.rs) ────────────
-
-/// Stable list of crypto majors (matches `nxr_calibrate.rs` so the per-class
-/// target lookup picks the same bucket as the live cron).
-const CRYPTO_MAJORS: &[&str] = &[
-    "BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "AVAX", "LINK", "DOT", "LTC", "BCH", "TRX",
-    "XMR", "ZEC", "SUI", "HYPE", "UNI", "XLM", "HBAR", "ETC", "TON",
-];
-
-/// Stables we recognise by symbol regardless of MITCH class bits (operator
-/// observed USDS / USDE etc. carrying PM bits in the registry, but for
-/// renko targeting they belong in the stable bucket).
-const STABLE_SYMBOLS: &[&str] = &[
-    "USDT", "USDC", "USD", "USDS", "USDE", "USD1", "DAI", "TUSD", "PYUSD", "FDUSD", "BUSD",
-];
-
+// Pair → asset-class bucket: derived from MITCH wire bits via
+// nxr_sdk::asset_class::classify_ticker. NO hardcoded stablecoin / FX
+// lists — MITCH ticker_id already encodes `base_asset_class` +
+// `quote_asset_class` (4-bit enum: CR/SD/FX/PM/CM/…). The only judgment
+// list is `cexs.crypto_majors` in YAML (BTC/ETH/SOL/BNB/...) — the
+// "major vs alt within CR" split is an operator policy, not a wire bit.
 fn class_for_pair(base: &str, quote: &str) -> &'static str {
-    let b = base.to_uppercase();
-    let q = quote.to_uppercase();
-    let base_stable = STABLE_SYMBOLS.contains(&b.as_str());
-    let quote_stable = STABLE_SYMBOLS.contains(&q.as_str());
-    if base_stable && quote_stable {
-        return "crypto_stable";
-    }
-    let base_major = CRYPTO_MAJORS.contains(&b.as_str());
-    let quote_major = CRYPTO_MAJORS.contains(&q.as_str());
-    // Crypto-cross: both legs are non-stable majors (e.g. ETH/BTC, SOL/BTC,
-    // BNB/ETH). Cross-pair realised vol is ≈0.4-0.6× the USD-quoted leg's,
-    // so forcing the same target_bpd as crypto_major drives the calibrator
-    // to compress k far below sane values (k=0.01 boundary-clamp observed
-    // 2026-05-26 incident — see docs/internal/renko-synth-audit-2026-05-26.md).
-    if base_major && quote_major {
-        return "crypto_cross";
-    }
-    if base_major {
-        return "crypto_major";
-    }
-    "crypto_alt"
+    use mitch::common::InstrumentType;
+    use nxr_sdk::asset_class::{classify_ticker, effective_list, DEFAULT_CRYPTO_MAJORS};
+    let pair = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
+    // resolve_ticker returns a TickerMatch with the wire-encoded TickerId.
+    let ticker_id = match nxr_sdk::resolve_ticker(&pair, InstrumentType::SPOT) {
+        Ok(m) => mitch::ticker::TickerId::from_raw(m.ticker.id),
+        Err(_) => return "default",
+    };
+    // Single configurable list: crypto majors (YAML cexs.crypto_majors).
+    let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "/etc/nxr/config.yml".to_string());
+    let majors_v = nxr_sdk::pipeline_config::PipelineYml::load(std::path::Path::new(&cfg_path))
+        .map(|pl| pl.cexs.crypto_majors.clone())
+        .unwrap_or_default();
+    let majors = effective_list(&majors_v, DEFAULT_CRYPTO_MAJORS);
+    classify_ticker(&ticker_id, base, &majors).as_key()
 }
 
 // ── Date helpers ────────────────────────────────────────────────────────────
@@ -280,6 +260,7 @@ fn run_pair(args: &Args, yml: &nxr_sdk::pipeline_config::SeriesYml, base: &str, 
 
     let pair_str = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
     let ticker_id = resolve_ticker_id(&pair_str);
+    let _ = yml; // sig kept for future YAML-thread; class_for_pair reads $NXR_CONFIG directly.
     let class_key = class_for_pair(base, quote);
     let target_bpd = match yml.calibration.target_for_class(class_key) {
         Some(t) => t,
@@ -814,13 +795,10 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     let root: PipelineYml = PipelineYml::load(&args.config)?;
-    let yml = root.series;
+    let yml = root.series.clone();
 
     let pairs: Vec<(String, String)> = if args.all {
-        LAUNCH_PAIRS
-            .iter()
-            .map(|(b, q)| (b.to_string(), q.to_string()))
-            .collect()
+        launch_pairs_from_yaml(&root)
     } else {
         let base = args
             .base
@@ -901,14 +879,8 @@ mod tests {
         assert!(trailing.iter().all(|(ts, _)| *ts < d_start));
     }
 
-    #[test]
-    fn class_for_pair_buckets_correctly() {
-        assert_eq!(class_for_pair("BTC", "USDT"), "crypto_major");
-        assert_eq!(class_for_pair("ETH", "USDT"), "crypto_major");
-        assert_eq!(class_for_pair("USDC", "USDT"), "crypto_stable");
-        assert_eq!(class_for_pair("USDS", "USDT"), "crypto_stable");
-        assert_eq!(class_for_pair("PAXG", "USDT"), "crypto_alt");
-    }
+    // Note: class_for_pair test moved to nxr_sdk::asset_class (single source).
+    // Local wrapper now requires PipelineYml; covered by sdk unit tests.
 
     #[test]
     fn day_start_aligns_to_utc_midnight() {
