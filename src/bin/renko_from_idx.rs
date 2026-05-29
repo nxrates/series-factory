@@ -8,9 +8,9 @@
 //!           `RenkoGenerator`. The generator perpetually re-calibrates its
 //!           brick size every 30 min from the vol file.
 //!
-//! Inputs:  `$NXR_DATA_INDEXES/composite/<BASE>-<QUOTE>/<YYYY-MM-DD>.idx`
-//! Output:  `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>/<YYYY-MM-DD>.renko`
-//!         + merged into `$NXR_DATA_BARS/<BASE>/<BASE><QUOTE>/manifest.json`.
+//! Inputs:  `$NXR_DATA_INDEXES/<MITCH_TICKER_ID>/<YYYY-MM-DD>.idx`
+//! Output:  `$NXR_DATA_BARS/<MITCH_TICKER_ID>/<YYYY-MM-DD>.renko`
+//!         + merged into `$NXR_DATA_BARS/<MITCH_TICKER_ID>/manifest.json`.
 
 use anyhow::Result;
 use chrono::NaiveDate;
