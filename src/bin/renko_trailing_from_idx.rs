@@ -136,7 +136,7 @@ fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
 // and YAML `cexs.{crypto_majors,stablecoins,fx_majors}` carries the
 // within-class judgments (the wire deliberately does not — stablecoins
 // ARE crypto-assets on-chain). Empty YAML → audit-frozen sdk fallback.
-fn class_for_pair(base: &str, quote: &str) -> &'static str {
+fn class_for_pair(pl: &PipelineYml, base: &str, quote: &str) -> &'static str {
     use mitch::common::InstrumentType;
     use nxr_sdk::asset_class::{
         classify_ticker, effective_list,
@@ -148,13 +148,9 @@ fn class_for_pair(base: &str, quote: &str) -> &'static str {
         Ok(m) => mitch::ticker::TickerId::from_raw(m.ticker.id),
         Err(_) => return "default",
     };
-    let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "/etc/nxr/config.yml".to_string());
-    let (majors_v, stables_v, fx_v) = nxr_sdk::pipeline_config::PipelineYml::load(std::path::Path::new(&cfg_path))
-        .map(|pl| (pl.cexs.crypto_majors.clone(), pl.cexs.stablecoins.clone(), pl.cexs.fx_majors.clone()))
-        .unwrap_or_default();
-    let majors = effective_list(&majors_v, DEFAULT_CRYPTO_MAJORS);
-    let stables = effective_list(&stables_v, DEFAULT_STABLECOINS);
-    let fx_m = effective_list(&fx_v, DEFAULT_FX_MAJORS);
+    let majors = effective_list(&pl.cexs.crypto_majors, DEFAULT_CRYPTO_MAJORS);
+    let stables = effective_list(&pl.cexs.stablecoins, DEFAULT_STABLECOINS);
+    let fx_m = effective_list(&pl.cexs.fx_majors, DEFAULT_FX_MAJORS);
     classify_ticker(&ticker_id, base, quote, &majors, &stables, &fx_m).as_key()
 }
 
@@ -255,7 +251,7 @@ impl PairSummary {
 }
 
 /// One-shot walk-forward backfill for `(base, quote)`.
-fn run_pair(args: &Args, yml: &nxr_sdk::pipeline_config::SeriesYml, base: &str, quote: &str) -> Result<PairSummary> {
+fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<PairSummary> {
     let cfg = nxr_sdk::NxrConfig::from_env();
     let data_root = Path::new(&cfg.indexes_dir)
         .parent()
@@ -264,8 +260,8 @@ fn run_pair(args: &Args, yml: &nxr_sdk::pipeline_config::SeriesYml, base: &str, 
 
     let pair_str = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
     let ticker_id = resolve_ticker_id(&pair_str);
-    let _ = yml; // sig kept for future YAML-thread; class_for_pair reads $NXR_CONFIG directly.
-    let class_key = class_for_pair(base, quote);
+    let yml = &pl.series;
+    let class_key = class_for_pair(pl, base, quote);
     let target_bpd = match yml.calibration.target_for_class(class_key) {
         Some(t) => t,
         None => {
@@ -799,7 +795,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     let root: PipelineYml = PipelineYml::load(&args.config)?;
-    let yml = root.series.clone();
+    let yml = &root.series;
 
     let pairs: Vec<(String, String)> = if args.all {
         launch_pairs_from_yaml(&root)
@@ -823,7 +819,7 @@ fn main() -> Result<()> {
         if !seen.insert(key.clone()) {
             continue;
         }
-        match run_pair(&args, &yml, &b, &q) {
+        match run_pair(&args, &root, &b, &q) {
             Ok(s) => summaries.push(s),
             Err(e) => warn!(pair = key, err = %e, "pair run failed"),
         }
