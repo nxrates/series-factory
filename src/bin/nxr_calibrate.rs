@@ -27,6 +27,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use mitch::timestamp;
 use mitch::common::InstrumentType;
+use mitch::ticker::TickerId;
+use nxr_sdk::asset_class::{classify_ticker, effective_list, AssetClassBucket, DEFAULT_CRYPTO_MAJORS};
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::shard::{list_shards, ShardStream, MS_PER_30MIN};
 use nxr_sdk::weights_schema::WeightsFile;
@@ -82,113 +84,23 @@ fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
 /// Resolve `target_bpd` for an `AssetClassBucket` via the shared
 /// `target_bpd_by_class` map (with `default` fallback then flat target).
 fn target_for_class(c: &CalibrationYml, class: AssetClassBucket) -> Option<f64> {
-    c.target_for_class(class.as_str())
+    c.target_for_class(class.as_key())
 }
 
 // ── Asset-class bucket detection ─────────────────────────────────────────────
+//
+// Bucket detection is owned by `nxr_sdk::asset_class::classify_ticker`,
+// which reads the MITCH wire bits (`TickerId::base_asset_class()` /
+// `quote_asset_class()`) and applies the operator-defined `crypto_majors`
+// list for the major-vs-alt judgment within `AssetClass::CR`. No local
+// string lists or bit-shift duplication.
 
-#[derive(Debug, Clone, Copy)]
-enum AssetClassBucket {
-    CryptoMajor,
-    CryptoAlt,
-    CryptoCross,
-    CryptoStable,
-    FxMajor,
-    FxCross,
-    Unknown,
-}
-
-impl AssetClassBucket {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::CryptoMajor => "crypto_major",
-            Self::CryptoAlt => "crypto_alt",
-            Self::CryptoCross => "crypto_cross",
-            Self::CryptoStable => "crypto_stable",
-            Self::FxMajor => "fx_major",
-            Self::FxCross => "fx_cross",
-            Self::Unknown => "default",
-        }
-    }
-}
-
-/// MITCH AssetClass enum discriminants (mirrored to avoid pulling another dep).
-/// 3 = FX, 6 = CR.
-const ASSET_CLASS_FX: u8 = 3;
-const ASSET_CLASS_CR: u8 = 6;
-
-const FX_MAJORS: &[&str] = &[
-    "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD", "USD",
-];
-
-const CRYPTO_MAJORS: &[&str] = &[
-    "BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "AVAX", "LINK", "DOT",
-    "LTC", "BCH", "TRX", "XMR", "ZEC", "SUI", "HYPE", "UNI", "XLM", "HBAR",
-    "ETC", "TON",
-];
-
-fn classify_pair(pair: &str, ticker_id: u64, stables: &[String]) -> AssetClassBucket {
-    let parts: Vec<&str> = pair.split('/').collect();
-    let (base, quote) = match parts.as_slice() {
-        [b, q] => (b.to_uppercase(), q.to_uppercase()),
-        _ => return AssetClassBucket::Unknown,
-    };
-
-    // Decode base/quote MITCH class bits from the ticker_id. Bits [59:56] = base
-    // class, [39:36] = quote class. We use these as a hint and fall back to
-    // symbol-string heuristics; MITCH puts some stables under non-CR classes
-    // (e.g. USDS appears as PM=7 in the registry) so name-based detection is
-    // authoritative for the stable / non-stable split.
-    let base_class = ((ticker_id >> 56) & 0x0F) as u8;
-    let quote_class = ((ticker_id >> 36) & 0x0F) as u8;
-
-    let is_base_stable = stables.iter().any(|s| s.eq_ignore_ascii_case(&base));
-    let is_quote_stable = stables.iter().any(|s| s.eq_ignore_ascii_case(&quote))
-        || quote == "USD" || quote == "USDT" || quote == "USDC";
-
-    // Name-based stable detection is authoritative. USDS-style pairs were
-    // leaking through with k=0.075 because they didn't have both base_class
-    // and quote_class == CR, so the MITCH-bit gate above rejected them and
-    // they fell into Unknown → default target_bpd. Result: 6360 bpd bricks on
-    // stable-quoted stables. Catch them by name FIRST regardless of MITCH
-    // class bits.
-    if is_base_stable && is_quote_stable {
-        return AssetClassBucket::CryptoStable;
-    }
-
-    match (base_class, quote_class) {
-        (ASSET_CLASS_FX, ASSET_CLASS_FX) => {
-            let majors_only = FX_MAJORS.contains(&base.as_str()) && FX_MAJORS.contains(&quote.as_str());
-            if majors_only { AssetClassBucket::FxMajor } else { AssetClassBucket::FxCross }
-        }
-        (ASSET_CLASS_CR, _) | (_, ASSET_CLASS_CR) => {
-            let base_major = CRYPTO_MAJORS.contains(&base.as_str());
-            let quote_major = CRYPTO_MAJORS.contains(&quote.as_str());
-            // Crypto-cross: both legs non-stable majors (ETH/BTC, SOL/BTC,
-            // BNB/ETH, ...). Cross-pair realised vol ≈0.4-0.6× the
-            // USD-quoted leg's. Routing to crypto_major target_bpd=300
-            // drives the calibrator to compress k toward mult_bounds[0]
-            // (observed k=0.01 boundary-clamp 2026-05-26). Bucket
-            // separately so target_bpd can be tuned (~100 bpd).
-            if base_major && quote_major {
-                AssetClassBucket::CryptoCross
-            } else if base_major {
-                AssetClassBucket::CryptoMajor
-            } else {
-                AssetClassBucket::CryptoAlt
-            }
-        }
-        _ => {
-            // Final fallback: if the base looks like a known crypto major (or
-            // unknown alt) by symbol, classify accordingly so we don't lose
-            // tickers whose MITCH bits are quirky.
-            if CRYPTO_MAJORS.contains(&base.as_str()) {
-                AssetClassBucket::CryptoMajor
-            } else {
-                AssetClassBucket::Unknown
-            }
-        }
-    }
+/// Classify a pair via the SDK helper, extracting the base symbol from
+/// `<BASE>/<QUOTE>` for the major-vs-alt lookup within CR.
+fn classify_pair(pair: &str, ticker_id: u64, crypto_majors: &[&str]) -> AssetClassBucket {
+    let base = pair.split('/').next().unwrap_or("").to_uppercase();
+    let ticker = TickerId::from_raw(ticker_id);
+    classify_ticker(&ticker, &base, crypto_majors)
 }
 
 // ── Per-ticker calibration ───────────────────────────────────────────────────
@@ -300,7 +212,7 @@ fn calibrate_one(
         return CalOutcome::Failed { ticker_id, reason: format!("base renko cfg: {}", e) };
     }
 
-    info!(ticker_id, pair, class = class.as_str(), target_bpd, "calibrating (walk-forward)");
+    info!(ticker_id, pair, class = class.as_key(), target_bpd, "calibrating (walk-forward)");
     // Walk-forward calibration (7d holdout non-overlapping with the training
     // slice) per audit point #5(i) 2026-05-26. Eliminates the regime-leak
     // overfit that produced k≈0.01 boundary-clamps on cross-pairs (live
@@ -555,7 +467,9 @@ fn run_once(args: &Args) -> Result<()> {
     let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "config.yml".to_string());
     let root: PipelineYml = PipelineYml::load(std::path::Path::new(&cfg_path))?;
     let series = &root.series;
-    let stables = &root.cexs.stablecoins;
+    // Crypto-majors list (YAML override w/ audit-frozen sdk fallback). Used
+    // only for the major-vs-alt judgment inside `AssetClass::CR`.
+    let crypto_majors = effective_list(&root.cexs.crypto_majors, DEFAULT_CRYPTO_MAJORS);
 
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();
     let params_path = PathBuf::from(&nxr_cfg.ticker_params_path);
@@ -586,7 +500,7 @@ fn run_once(args: &Args) -> Result<()> {
     for pairs in weights_file.pair_volumes.values() {
         for pair in pairs.keys() {
             let ticker_id = resolve_ticker_id(pair);
-            let class = classify_pair(pair, ticker_id, stables);
+            let class = classify_pair(pair, ticker_id, &crypto_majors);
             seen.entry(ticker_id).or_insert_with(|| (pair.clone(), class));
         }
     }
@@ -615,7 +529,7 @@ fn run_once(args: &Args) -> Result<()> {
                 None => {
                     results.lock().unwrap().push(CalOutcome::Skipped {
                         ticker_id: *ticker_id,
-                        reason: format!("class {} marked skip", class.as_str()),
+                        reason: format!("class {} marked skip", class.as_key()),
                     });
                     return;
                 }
