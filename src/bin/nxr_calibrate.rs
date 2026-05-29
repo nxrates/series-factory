@@ -28,7 +28,10 @@ use clap::Parser;
 use mitch::timestamp;
 use mitch::common::InstrumentType;
 use mitch::ticker::TickerId;
-use nxr_sdk::asset_class::{classify_ticker, effective_list, AssetClassBucket, DEFAULT_CRYPTO_MAJORS};
+use nxr_sdk::asset_class::{
+    classify_ticker, effective_list, AssetClassBucket,
+    DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
+};
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::shard::{list_shards, ShardStream, MS_PER_30MIN};
 use nxr_sdk::weights_schema::WeightsFile;
@@ -95,12 +98,21 @@ fn target_for_class(c: &CalibrationYml, class: AssetClassBucket) -> Option<f64> 
 // list for the major-vs-alt judgment within `AssetClass::CR`. No local
 // string lists or bit-shift duplication.
 
-/// Classify a pair via the SDK helper, extracting the base symbol from
-/// `<BASE>/<QUOTE>` for the major-vs-alt lookup within CR.
-fn classify_pair(pair: &str, ticker_id: u64, crypto_majors: &[&str]) -> AssetClassBucket {
-    let base = pair.split('/').next().unwrap_or("").to_uppercase();
+/// Classify a pair via the SDK helper, extracting base + quote symbols
+/// from `<BASE>/<QUOTE>` for the within-class judgments (major-vs-alt
+/// within CR, stablecoin-pair within CR, major-vs-cross within FX).
+fn classify_pair(
+    pair: &str,
+    ticker_id: u64,
+    crypto_majors: &[&str],
+    stablecoins: &[&str],
+    fx_majors: &[&str],
+) -> AssetClassBucket {
+    let mut split = pair.split('/');
+    let base = split.next().unwrap_or("").to_uppercase();
+    let quote = split.next().unwrap_or("").to_uppercase();
     let ticker = TickerId::from_raw(ticker_id);
-    classify_ticker(&ticker, &base, crypto_majors)
+    classify_ticker(&ticker, &base, &quote, crypto_majors, stablecoins, fx_majors)
 }
 
 // ── Per-ticker calibration ───────────────────────────────────────────────────
@@ -467,9 +479,22 @@ fn run_once(args: &Args) -> Result<()> {
     let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "config.yml".to_string());
     let root: PipelineYml = PipelineYml::load(std::path::Path::new(&cfg_path))?;
     let series = &root.series;
-    // Crypto-majors list (YAML override w/ audit-frozen sdk fallback). Used
-    // only for the major-vs-alt judgment inside `AssetClass::CR`.
+    // Operator judgment lists (YAML override w/ audit-frozen sdk fallback).
+    // Used for within-MITCH-class buckets that the wire bits don't encode
+    // (major-vs-alt within CR, stablecoin pairs within CR, major-vs-cross
+    // within FX). Empty YAML → fallback + warn so cfg drift is visible.
+    if root.cexs.crypto_majors.is_empty() {
+        warn!("cexs.crypto_majors empty in YAML — falling back to DEFAULT_CRYPTO_MAJORS");
+    }
+    if root.cexs.stablecoins.is_empty() {
+        warn!("cexs.stablecoins empty in YAML — falling back to DEFAULT_STABLECOINS");
+    }
+    if root.cexs.fx_majors.is_empty() {
+        warn!("cexs.fx_majors empty in YAML — falling back to DEFAULT_FX_MAJORS");
+    }
     let crypto_majors = effective_list(&root.cexs.crypto_majors, DEFAULT_CRYPTO_MAJORS);
+    let stablecoins = effective_list(&root.cexs.stablecoins, DEFAULT_STABLECOINS);
+    let fx_majors = effective_list(&root.cexs.fx_majors, DEFAULT_FX_MAJORS);
 
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();
     let params_path = PathBuf::from(&nxr_cfg.ticker_params_path);
@@ -500,7 +525,7 @@ fn run_once(args: &Args) -> Result<()> {
     for pairs in weights_file.pair_volumes.values() {
         for pair in pairs.keys() {
             let ticker_id = resolve_ticker_id(pair);
-            let class = classify_pair(pair, ticker_id, &crypto_majors);
+            let class = classify_pair(pair, ticker_id, &crypto_majors, &stablecoins, &fx_majors);
             seen.entry(ticker_id).or_insert_with(|| (pair.clone(), class));
         }
     }

@@ -22,6 +22,10 @@ use anyhow::{Context, Result};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use clap::Parser;
 use mitch::timestamp;
+use nxr_sdk::asset_class::{
+    classify_ticker, effective_list,
+    DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
+};
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::resolve_ticker_id;
 use nxr_sdk::shard::{
@@ -117,27 +121,22 @@ struct Args {
 
 use nxr_sdk::pipeline_config::PipelineYml;
 
-// ── Asset-class bucketing (copy of renko-trailing logic) ────────────────────
-const CRYPTO_MAJORS: &[&str] = &[
-    "BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "AVAX", "LINK", "DOT", "LTC", "BCH", "TRX",
-    "XMR", "ZEC", "SUI", "HYPE", "UNI", "XLM", "HBAR", "ETC", "TON",
-];
-const STABLE_SYMBOLS: &[&str] = &[
-    "USDT", "USDC", "USD", "USDS", "USDE", "USD1", "DAI", "TUSD", "PYUSD", "FDUSD", "BUSD",
-];
-
-fn class_for_pair(base: &str, quote: &str) -> &'static str {
-    let b = base.to_uppercase();
-    let q = quote.to_uppercase();
-    let base_stable = STABLE_SYMBOLS.contains(&b.as_str());
-    let quote_stable = STABLE_SYMBOLS.contains(&q.as_str());
-    if base_stable && quote_stable {
-        return "crypto_stable";
-    }
-    if CRYPTO_MAJORS.contains(&b.as_str()) {
-        return "crypto_major";
-    }
-    "crypto_alt"
+// ── Asset-class bucketing — delegated to SDK ────────────────────────────────
+// Was: hardcoded CRYPTO_MAJORS (22) + STABLE_SYMBOLS (11) + class_for_pair
+// branching. Now reads `cexs.{crypto_majors,stablecoins,fx_majors}` from
+// YAML w/ audit-frozen sdk fallback. Matches `nxr_calibrate.rs` policy so
+// the sweep + the cron stay bit-for-bit aligned on bucket assignment.
+fn class_for_pair(yml_cexs: &nxr_sdk::pipeline_config::CexsYml, base: &str, quote: &str) -> &'static str {
+    use mitch::common::InstrumentType;
+    let pair = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
+    let ticker_id = match nxr_sdk::resolve_ticker(&pair, InstrumentType::SPOT) {
+        Ok(m) => mitch::ticker::TickerId::from_raw(m.ticker.id),
+        Err(_) => return "default",
+    };
+    let majors = effective_list(&yml_cexs.crypto_majors, DEFAULT_CRYPTO_MAJORS);
+    let stables = effective_list(&yml_cexs.stablecoins, DEFAULT_STABLECOINS);
+    let fx_m = effective_list(&yml_cexs.fx_majors, DEFAULT_FX_MAJORS);
+    classify_ticker(&ticker_id, base, quote, &majors, &stables, &fx_m).as_key()
 }
 
 #[inline]
@@ -227,6 +226,7 @@ fn parse_candidates(arg: Option<&str>) -> Vec<(&'static str, &'static [usize])> 
 fn run_pair(
     args: &Args,
     yml: &nxr_sdk::pipeline_config::SeriesYml,
+    cexs: &nxr_sdk::pipeline_config::CexsYml,
     base: &str,
     quote: &str,
     candidates: &[(&'static str, &'static [usize])],
@@ -239,7 +239,7 @@ fn run_pair(
 
     let pair_str = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
     let ticker_id = resolve_ticker_id(&pair_str);
-    let class_key = class_for_pair(base, quote);
+    let class_key = class_for_pair(cexs, base, quote);
     let target_bpd = match yml.calibration.target_for_class(class_key) {
         Some(t) => t,
         None => {
@@ -518,6 +518,17 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let root: PipelineYml = PipelineYml::load(&args.config)?;
     let yml = root.series;
+    let cexs = root.cexs;
+
+    if cexs.crypto_majors.is_empty() {
+        warn!("cexs.crypto_majors empty in YAML — falling back to DEFAULT_CRYPTO_MAJORS");
+    }
+    if cexs.stablecoins.is_empty() {
+        warn!("cexs.stablecoins empty in YAML — falling back to DEFAULT_STABLECOINS");
+    }
+    if cexs.fx_majors.is_empty() {
+        warn!("cexs.fx_majors empty in YAML — falling back to DEFAULT_FX_MAJORS");
+    }
 
     let pairs = parse_pairs(args.pairs.as_deref());
     let candidates = parse_candidates(args.candidates.as_deref());
@@ -539,7 +550,7 @@ fn main() -> Result<()> {
         if !seen.insert(pair_key.clone()) {
             continue;
         }
-        match run_pair(&args, &yml, &b, &q, &candidates) {
+        match run_pair(&args, &yml, &cexs, &b, &q, &candidates) {
             Ok(by_cand) => {
                 for (cand_key, sum) in by_cand {
                     combined

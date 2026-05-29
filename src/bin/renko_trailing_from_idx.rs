@@ -131,27 +131,31 @@ fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
 }
 
 // Pair → asset-class bucket: derived from MITCH wire bits via
-// nxr_sdk::asset_class::classify_ticker. NO hardcoded stablecoin / FX
-// lists — MITCH ticker_id already encodes `base_asset_class` +
-// `quote_asset_class` (4-bit enum: CR/SD/FX/PM/CM/…). The only judgment
-// list is `cexs.crypto_majors` in YAML (BTC/ETH/SOL/BNB/...) — the
-// "major vs alt within CR" split is an operator policy, not a wire bit.
+// nxr_sdk::asset_class::classify_ticker. NO hardcoded stablecoin / FX /
+// majors lists — MITCH wire encodes the COARSE class (CR/SD/FX/PM/CM/…)
+// and YAML `cexs.{crypto_majors,stablecoins,fx_majors}` carries the
+// within-class judgments (the wire deliberately does not — stablecoins
+// ARE crypto-assets on-chain). Empty YAML → audit-frozen sdk fallback.
 fn class_for_pair(base: &str, quote: &str) -> &'static str {
     use mitch::common::InstrumentType;
-    use nxr_sdk::asset_class::{classify_ticker, effective_list, DEFAULT_CRYPTO_MAJORS};
+    use nxr_sdk::asset_class::{
+        classify_ticker, effective_list,
+        DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
+    };
     let pair = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
     // resolve_ticker returns a TickerMatch with the wire-encoded TickerId.
     let ticker_id = match nxr_sdk::resolve_ticker(&pair, InstrumentType::SPOT) {
         Ok(m) => mitch::ticker::TickerId::from_raw(m.ticker.id),
         Err(_) => return "default",
     };
-    // Single configurable list: crypto majors (YAML cexs.crypto_majors).
     let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "/etc/nxr/config.yml".to_string());
-    let majors_v = nxr_sdk::pipeline_config::PipelineYml::load(std::path::Path::new(&cfg_path))
-        .map(|pl| pl.cexs.crypto_majors.clone())
+    let (majors_v, stables_v, fx_v) = nxr_sdk::pipeline_config::PipelineYml::load(std::path::Path::new(&cfg_path))
+        .map(|pl| (pl.cexs.crypto_majors.clone(), pl.cexs.stablecoins.clone(), pl.cexs.fx_majors.clone()))
         .unwrap_or_default();
     let majors = effective_list(&majors_v, DEFAULT_CRYPTO_MAJORS);
-    classify_ticker(&ticker_id, base, &majors).as_key()
+    let stables = effective_list(&stables_v, DEFAULT_STABLECOINS);
+    let fx_m = effective_list(&fx_v, DEFAULT_FX_MAJORS);
+    classify_ticker(&ticker_id, base, quote, &majors, &stables, &fx_m).as_key()
 }
 
 // ── Date helpers ────────────────────────────────────────────────────────────
