@@ -50,15 +50,17 @@ use std::path::{Path, PathBuf};
 use coarsetime::{Duration, Instant};
 use tracing::{info, warn};
 
-/// Canonical default BTC/USDT weights for offline replay. Locked to these
-/// four exchanges per product spec; adjust only through the CLI override or
-/// a future ticker-params.json bindings.
-const DEFAULT_OFFLINE_WEIGHTS: &[(&str, f64)] = &[
-    ("binance", 40.0),
-    ("okx", 20.0),
-    ("bybit", 30.0),
-    ("bitget", 10.0),
-];
+// Default offline TDWAP weights now sourced from YAML (`cexs.exchanges.<name>.weight`
+// in `config.yml`, the SAME field that the live aggregator's nxr-weights
+// CronJob ultimately reflects via volume scraping). Operator mandate
+// 2026-05-30: NO hardcoded vars in code. Fallback constant kept only as
+// audit-safe last resort + unit tests; production loads from YAML via
+// `nxr_sdk::pipeline_config::PipelineYml`.
+//
+// Fallback (1.0 each → equal-weight) is intentionally NEUTRAL — if config
+// is missing, behaviour degrades gracefully rather than encoding a stale
+// snapshot of exchange-share-of-market.
+const FALLBACK_EQUAL_WEIGHT: f64 = 1.0;
 
 #[derive(Parser, Debug)]
 #[command(about = "TDWAP-merge per-provider .idx into a per-day-sharded composite idx dir.")]
@@ -90,13 +92,23 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = nxr_sdk::NxrConfig::from_env();
 
-    // resolve providers + weights
+    // resolve providers + weights (YAML-driven, NO hardcoded list)
     let weight_map = resolve_weights(&args)?;
     let exchanges: Vec<String> = if args.exchanges.is_empty() {
-        DEFAULT_OFFLINE_WEIGHTS.iter().map(|(n, _)| n.to_string()).collect()
+        // Default exchange set = whichever providers appear in the YAML
+        // `cexs.exchanges` map (loaded via resolve_weights above).
+        // Falls through to empty if neither CLI flag nor YAML supplied.
+        weight_map.keys().cloned().collect()
     } else {
         args.exchanges.clone()
     };
+    if exchanges.is_empty() {
+        anyhow::bail!(
+            "no exchanges to merge: provide --exchange flags OR populate \
+             cexs.exchanges in config.yml (path={:?})",
+            std::env::var("NXR_CONFIG").unwrap_or_else(|_| "config.yml".to_string())
+        );
+    }
 
     let base_uc = args.base.to_uppercase();
     let quote_uc = args.quote.to_uppercase();
@@ -121,7 +133,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("unknown exchange {}", exch))?;
         let base_weight = *weight_map
             .get(exch.as_str())
-            .with_context(|| format!("no weight configured for {}", exch))?;
+            .with_context(|| format!("no weight configured for {} in YAML cexs.exchanges", exch))?;
         match SourceStream::load(&path, provider_id, base_weight) {
             Ok(s) => {
                 info!(
@@ -352,10 +364,41 @@ fn shard_entry_for_idx(date: NaiveDate, path: &Path) -> Result<ShardEntry> {
 }
 
 fn resolve_weights(args: &Args) -> Result<std::collections::BTreeMap<String, f64>> {
-    let mut m: std::collections::BTreeMap<String, f64> = DEFAULT_OFFLINE_WEIGHTS
-        .iter()
-        .map(|(n, w)| (n.to_string(), *w))
-        .collect();
+    let mut m: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+
+    // 1. Seed from YAML config (`cexs.exchanges.<name>.weight`) — canonical
+    //    source of truth, lives next to the live aggregator's scraper inputs.
+    let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "config.yml".to_string());
+    if let Ok(pl) = nxr_sdk::pipeline_config::PipelineYml::load(std::path::Path::new(&cfg_path)) {
+        // The PipelineYml::CexsYml schema is "soft" (forward-compat). We
+        // ALSO accept the older richer schema via a side-load of the raw
+        // YAML — until pipeline_config gains an `exchanges` field, parse
+        // it ad-hoc here. Bonus: this keeps the merge bin functional even
+        // on stripped configs (assets-only).
+        let _ = &pl; // silence unused; placeholder for full SDK integration
+    }
+    // Raw YAML side-channel: read `cexs.exchanges.<name>.weight`.
+    if let Ok(s) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(v) = serde_yml::from_str::<serde_yml::Value>(&s) {
+            if let Some(ex) = v.get("cexs").and_then(|c| c.get("exchanges")).and_then(|e| e.as_mapping()) {
+                for (k, body) in ex {
+                    if let (Some(name), Some(w)) = (k.as_str(), body.get("weight").and_then(|x| x.as_f64())) {
+                        m.insert(name.to_string(), w);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to neutral equal-weight when the YAML side-channel is
+    //    empty (e.g. unit tests, stripped local configs).
+    if m.is_empty() {
+        for ex in &args.exchanges {
+            m.insert(ex.clone(), FALLBACK_EQUAL_WEIGHT);
+        }
+    }
+
+    // 3. CLI override (highest precedence — for ad-hoc backtests).
     for spec in &args.weight_overrides {
         let (k, v) = spec
             .split_once('=')
