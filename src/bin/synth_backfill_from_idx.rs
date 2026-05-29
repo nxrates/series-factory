@@ -203,19 +203,7 @@ struct Args {
     force: bool,
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Default --all pair set (mirrors core::synth_registry::INITIAL_PAIRS)
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Symbol triples processed when `--all` is set. Order matches the live
-/// registry so backfill outputs collate cleanly with live continuation.
-const ALL_PAIRS: &[(&str, &str, &str)] = &[
-    ("ETH/BTC", "ETH/USDT", "BTC/USDT"),
-    ("SOL/BTC", "SOL/USDT", "BTC/USDT"),
-    ("BNB/BTC", "BNB/USDT", "BTC/USDT"),
-    ("BNB/ETH", "BNB/USDT", "ETH/USDT"),
-    ("SOL/ETH", "SOL/USDT", "ETH/USDT"),
-];
+// Default `--all` pair set sourced from canonical sdk registry.
 
 // ─────────────────────────────────────────────────────────────────────────
 // Sync replay state machines
@@ -1114,7 +1102,10 @@ fn main() -> Result<()> {
     }
 
     let pairs: Vec<(&str, &str, &str)> = if args.all {
-        ALL_PAIRS.to_vec()
+        nxr_sdk::synth::pairs::INITIAL_SYNTH_PAIRS
+            .iter()
+            .map(|p| (p.synth_sym, p.base_sym, p.quote_sym))
+            .collect()
     } else {
         let base = args
             .base_pair
