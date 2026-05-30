@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use nxr_sdk::shard::{list_shards, read_shard_aligned};
+use nxr_sdk::stats as sdk_stats;
 use nxr_sdk::Bar;
 use serde::{Deserialize, Serialize};
 
@@ -104,28 +105,6 @@ struct GlobalReport {
 
 // ── Core ────────────────────────────────────────────────────────────────────
 
-fn median_and_mad(xs: &[u64]) -> (f64, f64) {
-    if xs.is_empty() {
-        return (0.0, 0.0);
-    }
-    let mut v: Vec<f64> = xs.iter().map(|&n| n as f64).collect();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    let median = if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        0.5 * (v[n / 2 - 1] + v[n / 2])
-    };
-    let mut devs: Vec<f64> = v.iter().map(|x| (x - median).abs()).collect();
-    devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mad = if n % 2 == 1 {
-        devs[n / 2]
-    } else {
-        0.5 * (devs[n / 2 - 1] + devs[n / 2])
-    };
-    (median, mad)
-}
-
 fn check_ticker(ticker_dir: &Path, ticker_id: u64, warn_gap_ms: i64) -> Result<TickerReport> {
     let shards = list_shards(ticker_dir, "renko")
         .with_context(|| format!("list_shards {}", ticker_dir.display()))?;
@@ -176,7 +155,9 @@ fn check_ticker(ticker_dir: &Path, ticker_id: u64, warn_gap_ms: i64) -> Result<T
         last_bar_of_prev = Some((*date, *bars.last().unwrap()));
     }
 
-    let (median_bpd, mad_bpd) = median_and_mad(&bricks_per_day);
+    // Cast u64 → f64 once; sdk stats consume f64 slices.
+    let bpd_f64: Vec<f64> = bricks_per_day.iter().map(|&n| n as f64).collect();
+    let (median_bpd, mad_bpd) = sdk_stats::median_and_mad(&bpd_f64);
     let mean_bpd = if bricks_per_day.is_empty() {
         0.0
     } else {
