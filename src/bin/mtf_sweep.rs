@@ -40,30 +40,11 @@ use nxr_sdk::renko::RenkoConfig;
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
-// ── Launch symbol set (operator brief 2026-05-25 rev-3): universal config,
-//    cross-ticker mean-error minimization, no per-sym overfitting. 13 syms:
-//    5 volatile USDT-quoted + 5 crypto crosses + 3 stable/USDT.
-//    Class-tuned target (vol=300, stable=50) applied per sym; SAME
-//    k_fit_windows_days across all of them — that's the universality the
-//    sweep is testing.
-const SWEEP_PAIRS: &[(&str, &str)] = &[
-    // Volatile USDT-quoted
-    ("BTC", "USDT"),
-    ("ETH", "USDT"),
-    ("BNB", "USDT"),
-    ("SOL", "USDT"),
-    ("PAXG", "USDT"),
-    // Crypto crosses (operator priority)
-    ("ETH", "BTC"),
-    ("BNB", "ETH"),
-    ("BNB", "BTC"),
-    ("SOL", "BTC"),
-    ("SOL", "ETH"),
-    // Stable/USDT (target = 50)
-    ("USDC", "USDT"),
-    ("USDE", "USDT"),
-    ("USD1", "USDT"),
-];
+// Launch symbol set (operator brief 2026-05-25 rev-3): universal config,
+// cross-ticker mean-error minimization, no per-sym overfitting. 13 syms
+// (5 volatile USDT-quoted + 5 crypto crosses + 3 stable/USDT) — see
+// `config.yml::pipeline.sweep.pairs`. Audit-frozen fallback in
+// `nxr_sdk::synth::pairs::DEFAULT_SWEEP_PAIRS`.
 
 // ── Candidate k_fit_windows_days configs (7, chosen pre-sweep, no per-sym tuning) ─
 //
@@ -185,12 +166,28 @@ impl CandidateSummary {
     }
 }
 
-fn parse_pairs(arg: Option<&str>) -> Vec<(String, String)> {
+fn parse_pairs(
+    arg: Option<&str>,
+    yml_pairs: &[nxr_sdk::pipeline_config::PairSpec],
+) -> Vec<(String, String)> {
     match arg {
-        None => SWEEP_PAIRS
-            .iter()
-            .map(|(b, q)| (b.to_string(), q.to_string()))
-            .collect(),
+        None => {
+            if yml_pairs.is_empty() {
+                warn!(
+                    "pipeline.sweep.pairs empty in config.yml — falling back to \
+                     audit-frozen DEFAULT_SWEEP_PAIRS"
+                );
+                nxr_sdk::synth::pairs::DEFAULT_SWEEP_PAIRS
+                    .iter()
+                    .map(|(b, q)| (b.to_string(), q.to_string()))
+                    .collect()
+            } else {
+                yml_pairs
+                    .iter()
+                    .map(|p| (p.base.to_uppercase(), p.quote.to_uppercase()))
+                    .collect()
+            }
+        }
         Some(s) => s
             .split(',')
             .filter_map(|tok| {
@@ -517,6 +514,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     let root: PipelineYml = PipelineYml::load(&args.config)?;
+    let sweep_pairs = root.pipeline.sweep.pairs;
     let yml = root.series;
     let cexs = root.cexs;
 
@@ -530,7 +528,7 @@ fn main() -> Result<()> {
         warn!("cexs.fx_majors empty in YAML — falling back to DEFAULT_FX_MAJORS");
     }
 
-    let pairs = parse_pairs(args.pairs.as_deref());
+    let pairs = parse_pairs(args.pairs.as_deref(), &sweep_pairs);
     let candidates = parse_candidates(args.candidates.as_deref());
     info!(
         n_pairs = pairs.len(),

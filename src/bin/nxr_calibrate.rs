@@ -50,7 +50,8 @@ use tracing::{info, warn};
 const EVAL_HOLDOUT_DAYS: usize = 7;
 
 // Synth pair registry — canonical source @ nxr_sdk::synth::pairs.
-use nxr_sdk::synth::pairs::INITIAL_SYNTH_PAIRS as SYNTH_PAIRS;
+use nxr_sdk::pipeline_config::SynthPairYml;
+use nxr_sdk::synth::pairs::{SynthPairSpec, DEFAULT_INITIAL_SYNTH_PAIRS};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -433,11 +434,30 @@ fn calibrate_one_synth(
     CalOutcome::Ok { ticker_id: synth_id, k: mult as f64 }
 }
 
-/// Resolve all `SYNTH_PAIRS` entries to `(synth_id, sym, leg_a_id, leg_b_id)`.
-/// Entries that fail to resolve any leg are dropped with a warn.
-fn resolve_synth_work() -> Vec<(u64, &'static str, u64, u64)> {
-    let mut out = Vec::with_capacity(SYNTH_PAIRS.len());
-    for spec in SYNTH_PAIRS {
+/// Resolve all synth-pair entries (from YAML or audit-frozen fallback) to
+/// `(synth_id, sym, leg_a_id, leg_b_id)`. Entries that fail to resolve any
+/// leg are dropped with a warn.
+fn resolve_synth_work(yml_pairs: &[SynthPairYml]) -> Vec<(u64, &'static str, u64, u64)> {
+    // Build a `'static`-lifetime spec view: leaked owned strings from YAML,
+    // or direct reference to the sdk default array.
+    let owned: Vec<SynthPairSpec>;
+    let specs: &[SynthPairSpec] = if yml_pairs.is_empty() {
+        warn!("synths.initial_pairs empty in YAML — falling back to DEFAULT_INITIAL_SYNTH_PAIRS");
+        DEFAULT_INITIAL_SYNTH_PAIRS
+    } else {
+        owned = yml_pairs
+            .iter()
+            .map(|y| SynthPairSpec {
+                synth_sym: Box::leak(y.synth_sym.clone().into_boxed_str()),
+                base_sym: Box::leak(y.base_sym.clone().into_boxed_str()),
+                quote_sym: Box::leak(y.quote_sym.clone().into_boxed_str()),
+            })
+            .collect();
+        &owned
+    };
+
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
         let resolve = |sym: &str| -> Option<u64> {
             match resolve_ticker(sym, InstrumentType::SPOT) {
                 Ok(m) => Some(m.ticker.id),
@@ -616,7 +636,7 @@ fn run_once(args: &Args) -> Result<()> {
             warn!("crypto_cross target_bpd missing; falling back to default");
             cal_ext.target_bpd
         });
-    let synth_work = resolve_synth_work();
+    let synth_work = resolve_synth_work(&root.synths.initial_pairs);
     info!(n_synth = synth_work.len(), synth_target_bpd = synth_target, "synth calibration pass starting");
     let (mut s_passed, mut s_skipped, mut s_failed) = (0usize, 0usize, 0usize);
     for (synth_id, synth_sym, leg_a_id, leg_b_id) in synth_work {
