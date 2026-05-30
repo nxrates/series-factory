@@ -177,27 +177,20 @@ impl FileReport {
 // ── Optional renko bounds from config.yml ──────────────────────────────────
 
 /// Load `min_pct` from `config.yml`, falling back to `0.0001`.
-/// Lookup order: `$NXR_CONFIG`, `./config.yml`, `series-factory/config.yml`.
+/// Reads via the canonical [`nxr_sdk::pipeline_config::PipelineYml::load_default`]
+/// resolver (single source of truth for config discovery — was a divergent
+/// 3-candidate shim until phase 59.R3.C3.O7, 2026-05-30).
 ///
 /// Debate (Aoife ↔ Tomás): post-2026-05-24 max_pct is gone; integrity_check
 /// loses its upper-bound enforcement. Aoife: "Replace with anomaly log only."
 /// Tomás: "Floor still matters — a brick < min_pct means generator math
 /// underflowed and the bar is invalid storage-wise." Consensus: keep floor
-/// check, drop ceiling. Reads via the canonical
-/// [`nxr_sdk::pipeline_config::PipelineYml`] schema (the private CfgRoot
-/// duplicate that used to live here is removed per audit Wave 1.E).
+/// check, drop ceiling.
 fn load_renko_bounds() -> f64 {
-    let candidates: Vec<PathBuf> = std::env::var("NXR_CONFIG")
-        .map(PathBuf::from)
-        .into_iter()
-        .chain(["config.yml", "series-factory/config.yml"].iter().map(PathBuf::from))
-        .collect();
-    for p in candidates {
-        if let Ok(yml) = nxr_sdk::pipeline_config::PipelineYml::load(&p) {
-            return yml.series.renko.min_pct as f64;
-        }
-    }
-    0.0001
+    use nxr_sdk::pipeline_config::{ConfigHint, PipelineYml};
+    PipelineYml::load_default(ConfigHint::Bin)
+        .map(|yml| yml.series.renko.min_pct as f64)
+        .unwrap_or(0.0001)
 }
 
 // ── Mmap helper ─────────────────────────────────────────────────────────────
