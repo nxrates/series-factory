@@ -502,9 +502,12 @@ fn run_once(args: &Args) -> Result<()> {
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();
     let params_path = PathBuf::from(&nxr_cfg.ticker_params_path);
     let idx_dir = PathBuf::from(&nxr_cfg.indexes_dir);
+    let cfg_path = nxr_sdk::pipeline_config::PipelineYml::resolve_path(
+        nxr_sdk::pipeline_config::ConfigHint::Bin,
+    );
 
     info!(
-        cfg = cfg_path,
+        cfg = %cfg_path.display(),
         params = %params_path.display(),
         idx = %idx_dir.display(),
         parallel = args.parallel,
