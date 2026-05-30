@@ -45,15 +45,33 @@ impl TickSource for OKXSource {
         let tid = nxr_sdk::resolve_ticker_id(&sym);
         info!("Fetching OKX data for {}", sym);
         let parse: fn(&[u8], u64) -> Result<Vec<TickFrame>> = Self::parse_csv;
+        // Archive URL prefixes sourced from YAML
+        // `cexs.exchanges.okx.archive_url_template.{monthly,daily}`
+        // (phase 59.R3.C3.O1, 2026-05-30).
+        let urls = crate::sources::common::archive_urls("okx");
+        let monthly_prefix = urls.monthly.clone();
+        let daily_prefix = urls.daily.clone();
         let files = fetch_monthly_daily(
             &self.agent, config, "okx", &sym, &dir, tid, ".zip", Compression::Zip,
             |s, y, m| {
                 let f = format!("{}-trades-{:04}-{:02}.zip", s, y, m);
-                (format!("https://static.okx.com/cdn/okex/traderecords/trades/monthly/{:04}{:02}/{}", y, m, f), f)
+                let url = format!(
+                    "{}{}",
+                    monthly_prefix
+                        .replace("{y:04}", &format!("{:04}", y))
+                        .replace("{m:02}", &format!("{:02}", m)),
+                    f,
+                );
+                (url, f)
             },
             |s, d| {
                 let f = format!("{}-trades-{}.zip", s, d.format("%Y-%m-%d"));
-                (format!("https://static.okx.com/cdn/okex/traderecords/trades/daily/{}/{}", d.format("%Y%m%d"), f), f)
+                let url = format!(
+                    "{}{}",
+                    daily_prefix.replace("{ds}", &d.format("%Y%m%d").to_string()),
+                    f,
+                );
+                (url, f)
             },
             &parse,
         ).await?;

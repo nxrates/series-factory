@@ -49,6 +49,12 @@ impl TickSource for BitgetSource {
         let mut day = config.from.date_naive();
         let end = config.to.date_naive();
 
+        // Daily-only archive URL prefix sourced from YAML
+        // `cexs.exchanges.bitget.archive_url_template.daily`
+        // (phase 59.R3.C3.O1, 2026-05-30).
+        let urls = crate::sources::common::archive_urls("bitget");
+        let daily_prefix = urls.daily.replace("{sym}", &sym);
+
         while day <= end {
             let ds = day.format("%Y%m%d").to_string();
             let mut seq = 1;
@@ -58,7 +64,7 @@ impl TickSource for BitgetSource {
                 if cache_path.exists() {
                     files.push(cache_path); seq += 1; continue;
                 }
-                let url = format!("https://img.bitgetimg.com/online/trades/SPBL/{}/{}", sym, filename);
+                let url = format!("{}{}", daily_prefix, filename);
                 match download_and_convert(&self.agent, &url, &cache_path, tid, Compression::Zip, 1, &Self::parse_csv).await {
                     Ok(_) => { files.push(cache_path); seq += 1; }
                     Err(_) => { if seq == 1 { debug!("No Bitget data for {}", ds); } break; }
