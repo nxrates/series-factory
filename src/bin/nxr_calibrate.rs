@@ -476,8 +476,9 @@ fn resolve_synth_work() -> Vec<(u64, &'static str, u64, u64)> {
 // ── Main run ─────────────────────────────────────────────────────────────────
 
 fn run_once(args: &Args) -> Result<()> {
-    let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "config.yml".to_string());
-    let root: PipelineYml = PipelineYml::load(std::path::Path::new(&cfg_path))?;
+    let root: PipelineYml = PipelineYml::load_default(
+        nxr_sdk::pipeline_config::ConfigHint::Bin,
+    )?;
     let series = &root.series;
     // Operator judgment lists (YAML override w/ audit-frozen sdk fallback).
     // Used for within-MITCH-class buckets that the wire bits don't encode
