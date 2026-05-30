@@ -718,7 +718,7 @@ fn main() -> Result<()> {
         }
         if args.once { break; }
         info!("sleeping 24h until next calibration");
-        std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
+        std::thread::sleep(std::time::Duration::from_secs(nxr_sdk::shard::SECS_PER_DAY));
     }
     Ok(())
 }
