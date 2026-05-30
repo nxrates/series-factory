@@ -52,6 +52,7 @@ use nxr_sdk::shard::{
     FLAG_HEARTBEAT_SENTINEL,
 };
 use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::stats as sdk_stats;
 use nxr_sdk::Bar;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -168,48 +169,7 @@ struct AuditReport {
     n_no_data: u64,
 }
 
-// ── Inline stats (no new deps) ──────────────────────────────────────────────
-
-/// Median of a slice (sorts a copy). Returns NaN for empty input.
-fn median(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
-        return f64::NAN;
-    }
-    let mut v = xs.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
-
-/// Median absolute deviation about the median.
-fn mad(xs: &[f64], med: f64) -> f64 {
-    if xs.is_empty() {
-        return f64::NAN;
-    }
-    let dev: Vec<f64> = xs.iter().map(|x| (x - med).abs()).collect();
-    median(&dev)
-}
-
-/// Sample mean.
-fn mean(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
-        return f64::NAN;
-    }
-    xs.iter().sum::<f64>() / xs.len() as f64
-}
-
-/// Sample standard deviation (Bessel-corrected). Returns 0 for n<2.
-fn stddev(xs: &[f64], mu: f64) -> f64 {
-    if xs.len() < 2 {
-        return 0.0;
-    }
-    let ss: f64 = xs.iter().map(|x| (x - mu).powi(2)).sum();
-    (ss / (xs.len() as f64 - 1.0)).sqrt()
-}
+// ── Stats: median/mean/stddev/mad all sourced from `nxr_sdk::stats` ─────────
 
 /// Tabular (two-sided) CUSUM on standardized returns. Returns alarm count.
 /// k = allowance (slack), h = decision threshold (both in sigma units).
@@ -440,8 +400,7 @@ fn audit_ticker(
     }
 
     if !returns.is_empty() {
-        let med = median(&returns);
-        let m = mad(&returns, med);
+        let (med, m) = sdk_stats::median_and_mad(&returns);
         let denom = 1.4826 * m;
         if denom > 0.0 && denom.is_finite() {
             for &rt in &returns {
@@ -455,8 +414,8 @@ fn audit_ticker(
             }
         }
         // CUSUM on standardized returns (mean/std standardization).
-        let mu = mean(&returns);
-        let sd = stddev(&returns, mu);
+        let mu = sdk_stats::mean(&returns);
+        let sd = sdk_stats::std_dev(&returns);
         if sd > 0.0 {
             let z: Vec<f64> = returns.iter().map(|x| (x - mu) / sd).collect();
             r.cusum_alarms = cusum_alarms(&z, 0.5, 8.0);
@@ -526,7 +485,7 @@ fn audit_ticker(
     if !daily_hl_logsq.is_empty() {
         // sigma_daily = sqrt( (1/(4 ln2)) * mean( (ln(H/L))^2 ) )
         let factor = 1.0 / (4.0 * std::f64::consts::LN_2);
-        let sigma_daily = (factor * mean(&daily_hl_logsq)).sqrt();
+        let sigma_daily = (factor * sdk_stats::mean(&daily_hl_logsq)).sqrt();
         // Annualize: crypto trades ~365 days; FX ~252. Use 365 as conservative
         // upper bound for the 24/7 crypto-dominated store.
         r.sigma_park_ann = sigma_daily * (365.0_f64).sqrt();
