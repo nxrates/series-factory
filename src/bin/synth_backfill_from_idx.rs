@@ -1102,10 +1102,33 @@ fn main() -> Result<()> {
     }
 
     let pairs: Vec<(&str, &str, &str)> = if args.all {
-        nxr_sdk::synth::pairs::INITIAL_SYNTH_PAIRS
-            .iter()
-            .map(|p| (p.synth_sym, p.base_sym, p.quote_sym))
-            .collect()
+        // Load synth pair universe from operator YAML (`synths.initial_pairs`);
+        // fall back to audit-frozen sdk default if YAML missing / empty.
+        let yml_pairs: Vec<(&'static str, &'static str, &'static str)> =
+            match nxr_sdk::pipeline_config::PipelineYml::load_default(
+                nxr_sdk::pipeline_config::ConfigHint::Bin,
+            ) {
+                Ok(root) if !root.synths.initial_pairs.is_empty() => root
+                    .synths
+                    .initial_pairs
+                    .into_iter()
+                    .map(|p| {
+                        (
+                            Box::leak(p.synth_sym.into_boxed_str()) as &'static str,
+                            Box::leak(p.base_sym.into_boxed_str()) as &'static str,
+                            Box::leak(p.quote_sym.into_boxed_str()) as &'static str,
+                        )
+                    })
+                    .collect(),
+                _ => {
+                    warn!("synths.initial_pairs empty/missing — using DEFAULT_INITIAL_SYNTH_PAIRS");
+                    nxr_sdk::synth::pairs::DEFAULT_INITIAL_SYNTH_PAIRS
+                        .iter()
+                        .map(|p| (p.synth_sym, p.base_sym, p.quote_sym))
+                        .collect()
+                }
+            };
+        yml_pairs
     } else {
         let base = args
             .base_pair
