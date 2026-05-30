@@ -17,8 +17,7 @@
 //! Usage: `nxr-calibrate [--once] [--parallel N]`. `--once` exits after one run
 //! (default for k8s CronJob); without it the binary sleeps 24h between runs.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -269,35 +268,64 @@ fn calibrate_one(
 // clamp-detector drops every window), `Failed` is the honest outcome and
 // the caller carries the prior value rather than fabricating one.
 
-/// Stream one leg's `.idx` shards into a single ascending-ts iterator of
-/// `(ts, bid, ask)` triples. Returns Err if no shards or any read fails.
+/// Streaming reader over one leg's date-ordered `.idx` shards.
+///
+/// Yields `(ts, bid, ask)` triples in ascending order across shards. Memory
+/// footprint is bounded to **one ShardStream working buffer at a time** (~150 KB)
+/// instead of the full leg history (was: 24 B/tick × tens of millions × 2 legs
+/// → 16Gi pod OOM at ~7-9 min into the synth pass, 2026-05-30 incident).
 ///
 /// `idx_root` must point at the indexes directory itself (e.g. `/data/indexes`,
 /// NOT `/data` — `nxr-calibrate`'s NxrConfig::indexes_dir already includes
 /// the `indexes/` suffix). Per-ticker shards live at
 /// `<idx_root>/<ticker_id>/<YYYY-MM-DD>.idx`.
-fn load_leg_ticks_all_shards(idx_root: &Path, ticker_id: u64) -> Result<Vec<(i64, f64, f64)>> {
-    let dir = idx_root.join(ticker_id.to_string());
-    let shards = list_shards(&dir, "idx")
-        .with_context(|| format!("list shards {}", dir.display()))?;
-    if shards.is_empty() {
-        anyhow::bail!("no .idx shards under {}", dir.display());
+struct LegStream {
+    shards: std::vec::IntoIter<(chrono::NaiveDate, PathBuf)>,
+    cur: Option<ShardStream<IndexRecord>>,
+}
+
+impl LegStream {
+    fn open(idx_root: &Path, ticker_id: u64) -> Result<Self> {
+        let dir = idx_root.join(ticker_id.to_string());
+        let shards = list_shards(&dir, "idx")
+            .with_context(|| format!("list shards {}", dir.display()))?;
+        if shards.is_empty() {
+            anyhow::bail!("no .idx shards under {}", dir.display());
+        }
+        Ok(Self { shards: shards.into_iter(), cur: None })
     }
-    let mut out: Vec<(i64, f64, f64)> = Vec::new();
-    for (_d, path) in shards {
-        let mut stream = ShardStream::<IndexRecord>::open(&path)
-            .with_context(|| format!("open idx {}", path.display()))?;
-        while let Some(rec) = stream.next()? {
-            let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
-            let bid = rec.index.bid;
-            let ask = rec.index.ask;
-            if !(bid.is_finite() && ask.is_finite()) { continue; }
-            if bid <= 0.0 || ask <= 0.0 { continue; }
-            out.push((ts, bid, ask));
+
+    /// Next valid `(ts, bid, ask)` triple across all shards, or `Ok(None)` at end.
+    /// Skips records with non-finite/non-positive bid/ask (matches prior filter).
+    fn next_tick(&mut self) -> Result<Option<(i64, f64, f64)>> {
+        loop {
+            if self.cur.is_none() {
+                match self.shards.next() {
+                    Some((_d, path)) => {
+                        let s = ShardStream::<IndexRecord>::open(&path)
+                            .with_context(|| format!("open idx {}", path.display()))?;
+                        self.cur = Some(s);
+                    }
+                    None => return Ok(None),
+                }
+            }
+            let stream = self.cur.as_mut().unwrap();
+            match stream.next()? {
+                Some(rec) => {
+                    let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+                    let bid = rec.index.bid;
+                    let ask = rec.index.ask;
+                    if !(bid.is_finite() && ask.is_finite()) { continue; }
+                    if bid <= 0.0 || ask <= 0.0 { continue; }
+                    return Ok(Some((ts, bid, ask)));
+                }
+                None => {
+                    // End of current shard; advance to next.
+                    self.cur = None;
+                }
+            }
         }
     }
-    out.sort_by_key(|t| t.0);
-    Ok(out)
 }
 
 fn calibrate_one_synth(
@@ -311,16 +339,29 @@ fn calibrate_one_synth(
     vol_cfg: &VolConfig,
     renko_yml: &nxr_sdk::pipeline_config::RenkoYml,
 ) -> CalOutcome {
-    // ── 1. Load both legs ────────────────────────────────────────────────────
-    let leg_a = match load_leg_ticks_all_shards(idx_root, leg_a_id) {
-        Ok(v) => v,
+    // ── 1. Open both leg streams (no materialization) ───────────────────────
+    // Streams pull one tick at a time from on-disk shards. Memory bounded
+    // to two ShardStream buffers (~300 KB total) instead of full history
+    // (was 16Gi pod OOM, 2026-05-30 incident).
+    let mut leg_a_stream = match LegStream::open(idx_root, leg_a_id) {
+        Ok(s) => s,
         Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("leg_a={} {}", leg_a_id, e) },
     };
-    let leg_b = match load_leg_ticks_all_shards(idx_root, leg_b_id) {
-        Ok(v) => v,
+    let mut leg_b_stream = match LegStream::open(idx_root, leg_b_id) {
+        Ok(s) => s,
         Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("leg_b={} {}", leg_b_id, e) },
     };
-    if leg_a.is_empty() || leg_b.is_empty() {
+
+    // Prime both legs' look-ahead slot. If either leg has zero valid ticks → skip.
+    let mut a_next: Option<(i64, f64, f64)> = match leg_a_stream.next_tick() {
+        Ok(v) => v,
+        Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_a: {}", e) },
+    };
+    let mut b_next: Option<(i64, f64, f64)> = match leg_b_stream.next_tick() {
+        Ok(v) => v,
+        Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_b: {}", e) },
+    };
+    if a_next.is_none() || b_next.is_none() {
         return CalOutcome::Skipped { ticker_id: synth_id, reason: "empty leg".into() };
     }
 
@@ -330,36 +371,41 @@ fn calibrate_one_synth(
     //   synth.bid = leg_a.bid / leg_b.ask
     //   synth.ask = leg_a.ask / leg_b.bid
     // (mirrors core/src/synth_kernel.rs:185 + triangulator.rs:17).
-    let mut heap: BinaryHeap<Reverse<(i64, u8, usize)>> = BinaryHeap::new();
-    heap.push(Reverse((leg_a[0].0, 0u8, 0usize)));
-    heap.push(Reverse((leg_b[0].0, 1u8, 0usize)));
+    //
+    // Each leg stream is monotone-ascending (shards sorted by date,
+    // within-shard records are append-order from upstream), so the merge
+    // reduces to "pick whichever side has the earlier next-ts" — no heap.
     let mut a_last: Option<(f64, f64)> = None;
     let mut b_last: Option<(f64, f64)> = None;
-    // Two parallel maps (mirroring `calibrate_one`) — 30-min HLC for the
-    // vol input, 1-min last-mid downsample for the calibrator's tick
-    // replay. Sized at full leg total as an upper bound; over-allocation
-    // is preferable to reallocation on the hot path.
     let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
     let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
-    while let Some(Reverse((ts, which, idx))) = heap.pop() {
-        match which {
-            0 => {
-                let (_, b, a) = leg_a[idx];
-                a_last = Some((b, a));
-                let next = idx + 1;
-                if next < leg_a.len() {
-                    heap.push(Reverse((leg_a[next].0, 0, next)));
-                }
-            }
-            _ => {
-                let (_, b, a) = leg_b[idx];
-                b_last = Some((b, a));
-                let next = idx + 1;
-                if next < leg_b.len() {
-                    heap.push(Reverse((leg_b[next].0, 1, next)));
-                }
-            }
-        }
+    loop {
+        // Pick side with smaller ts (ties favor a → deterministic).
+        let take_a = match (&a_next, &b_next) {
+            (Some(a), Some(b)) => a.0 <= b.0,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        let (ts, b_px, a_px) = if take_a {
+            let cur = a_next.take().expect("a_next primed");
+            a_next = match leg_a_stream.next_tick() {
+                Ok(v) => v,
+                Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_a: {}", e) },
+            };
+            a_last = Some((cur.1, cur.2));
+            cur
+        } else {
+            let cur = b_next.take().expect("b_next primed");
+            b_next = match leg_b_stream.next_tick() {
+                Ok(v) => v,
+                Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_b: {}", e) },
+            };
+            b_last = Some((cur.1, cur.2));
+            cur
+        };
+        let _ = (b_px, a_px); // silence unused-binding lint; consumed via *_last
+
         // Both legs primed → emit synth tick.
         if let (Some((ab, aa)), Some((bb, ba))) = (a_last, b_last) {
             // Worst-case spread compounding (mirrors live kernel).
@@ -381,6 +427,10 @@ fn calibrate_one_synth(
             if ts >= pe.0 { *pe = (ts, mid); }
         }
     }
+    // Drop leg streams now — frees the two ShardStream buffers before the
+    // vol-write + sigma-cache + calibrator stage runs.
+    drop(leg_a_stream);
+    drop(leg_b_stream);
 
     if hlc.is_empty() {
         return CalOutcome::Skipped { ticker_id: synth_id, reason: "empty merged stream".into() };
