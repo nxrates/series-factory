@@ -48,6 +48,9 @@ fn archive_urls_for(exch: &str) -> ArchiveUrls {
         DEFAULT_ARCHIVE_URL_BINANCE_DAILY, DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY,
         DEFAULT_ARCHIVE_URL_BINANCE_PROBE, DEFAULT_ARCHIVE_URL_BYBIT_DAILY,
         DEFAULT_ARCHIVE_URL_BYBIT_MONTHLY, DEFAULT_ARCHIVE_URL_BYBIT_PROBE,
+        DEFAULT_ARCHIVE_URL_BITGET_DAILY, DEFAULT_ARCHIVE_URL_BITGET_MONTHLY,
+        DEFAULT_ARCHIVE_URL_BITGET_PROBE, DEFAULT_ARCHIVE_URL_OKX_DAILY,
+        DEFAULT_ARCHIVE_URL_OKX_MONTHLY, DEFAULT_ARCHIVE_URL_OKX_PROBE,
     };
     let (def_m, def_d, def_p) = match exch {
         "binance" => (
@@ -59,6 +62,16 @@ fn archive_urls_for(exch: &str) -> ArchiveUrls {
             DEFAULT_ARCHIVE_URL_BYBIT_MONTHLY,
             DEFAULT_ARCHIVE_URL_BYBIT_DAILY,
             DEFAULT_ARCHIVE_URL_BYBIT_PROBE,
+        ),
+        "bitget" => (
+            DEFAULT_ARCHIVE_URL_BITGET_MONTHLY,
+            DEFAULT_ARCHIVE_URL_BITGET_DAILY,
+            DEFAULT_ARCHIVE_URL_BITGET_PROBE,
+        ),
+        "okx" => (
+            DEFAULT_ARCHIVE_URL_OKX_MONTHLY,
+            DEFAULT_ARCHIVE_URL_OKX_DAILY,
+            DEFAULT_ARCHIVE_URL_OKX_PROBE,
         ),
         _ => ("", "", ""),
     };
