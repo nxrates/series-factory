@@ -27,9 +27,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use mitch::timestamp;
 use mitch::common::InstrumentType;
-use mitch::ticker::TickerId;
 use nxr_sdk::asset_class::{
-    classify_ticker, effective_list, AssetClassBucket,
+    bucket_for_pair, effective_list, AssetClassBucket,
     DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
 };
 use nxr_sdk::ipc::record::IndexRecord;
@@ -92,28 +91,11 @@ fn target_for_class(c: &CalibrationYml, class: AssetClassBucket) -> Option<f64> 
 
 // ── Asset-class bucket detection ─────────────────────────────────────────────
 //
-// Bucket detection is owned by `nxr_sdk::asset_class::classify_ticker`,
+// Bucket detection is owned by `nxr_sdk::asset_class::bucket_for_pair`,
 // which reads the MITCH wire bits (`TickerId::base_asset_class()` /
 // `quote_asset_class()`) and applies the operator-defined `crypto_majors`
 // list for the major-vs-alt judgment within `AssetClass::CR`. No local
 // string lists or bit-shift duplication.
-
-/// Classify a pair via the SDK helper, extracting base + quote symbols
-/// from `<BASE>/<QUOTE>` for the within-class judgments (major-vs-alt
-/// within CR, stablecoin-pair within CR, major-vs-cross within FX).
-fn classify_pair(
-    pair: &str,
-    ticker_id: u64,
-    crypto_majors: &[&str],
-    stablecoins: &[&str],
-    fx_majors: &[&str],
-) -> AssetClassBucket {
-    let mut split = pair.split('/');
-    let base = split.next().unwrap_or("").to_uppercase();
-    let quote = split.next().unwrap_or("").to_uppercase();
-    let ticker = TickerId::from_raw(ticker_id);
-    classify_ticker(&ticker, &base, &quote, crypto_majors, stablecoins, fx_majors)
-}
 
 // ── Per-ticker calibration ───────────────────────────────────────────────────
 
@@ -526,7 +508,7 @@ fn run_once(args: &Args) -> Result<()> {
     for pairs in weights_file.pair_volumes.values() {
         for pair in pairs.keys() {
             let ticker_id = resolve_ticker_id(pair);
-            let class = classify_pair(pair, ticker_id, &crypto_majors, &stablecoins, &fx_majors);
+            let class = bucket_for_pair(pair, ticker_id, &crypto_majors, &stablecoins, &fx_majors);
             seen.entry(ticker_id).or_insert_with(|| (pair.clone(), class));
         }
     }
