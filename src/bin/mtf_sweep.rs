@@ -192,12 +192,8 @@ fn parse_pairs(
             .split(',')
             .filter_map(|tok| {
                 let tok = tok.trim();
-                let parts: Vec<&str> = tok.split(['/', '-']).collect();
-                if parts.len() == 2 {
-                    Some((parts[0].to_uppercase(), parts[1].to_uppercase()))
-                } else {
-                    None
-                }
+                nxr_sdk::split_pair_multi(tok, &['/', '-'])
+                    .map(|(b, q)| (b.to_uppercase(), q.to_uppercase()))
             })
             .collect(),
     }

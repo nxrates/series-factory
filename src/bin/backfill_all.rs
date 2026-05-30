@@ -172,7 +172,7 @@ fn split_csv(s: &str) -> Vec<String> {
 }
 
 fn split_pair(t: &str) -> Result<(String, String)> {
-    series_factory::split_pair(t)
+    nxr_sdk::split_pair_multi(t, &['/', '-'])
         .map(|(b, q)| (b.to_string(), q.to_string()))
         .ok_or_else(|| anyhow!("bad ticker {}: expected BASE-QUOTE", t))
 }
