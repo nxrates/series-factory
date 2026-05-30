@@ -674,12 +674,7 @@ fn run_once(args: &Args) -> Result<()> {
     info!(s_passed, s_skipped, s_failed, "calibration summary (synth)");
 
     weights_file.renko_k_per_ticker = renko_k;
-    weights_file.calibrated_at = Some(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    );
+    weights_file.calibrated_at = Some(nxr_sdk::now_sec());
 
     let json = serde_json::to_string_pretty(&weights_file)?;
     // write_atomic requires Pod; we have a String → emit via a tiny helper
