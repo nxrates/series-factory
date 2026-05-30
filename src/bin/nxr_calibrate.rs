@@ -117,46 +117,62 @@ fn calibrate_one(
     vol_cfg: &VolConfig,
     renko_yml: &nxr_sdk::pipeline_config::RenkoYml,
 ) -> CalOutcome {
-    let idx_path = idx_dir.join(format!("{}.idx", ticker_id));
-    if !idx_path.exists() {
+    // Phase 55 sharded layout: shards live at `<idx_dir>/<ticker_id>/<YYYY-MM-DD>.idx`.
+    // Enumerate via `list_shards`, then stream each shard via `ShardStream` so
+    // memory stays bounded (one shard's working buffer, not the full history).
+    let ticker_dir = idx_dir.join(ticker_id.to_string());
+    let shards = match list_shards(&ticker_dir, "idx") {
+        Ok(v) => v,
+        Err(e) => return CalOutcome::Skipped {
+            ticker_id,
+            reason: format!("no shards under {}: {}", ticker_dir.display(), e),
+        },
+    };
+    if shards.is_empty() {
         return CalOutcome::Skipped {
             ticker_id,
-            reason: format!("no .idx at {}", idx_path.display()),
+            reason: format!("no .idx shards under {}", ticker_dir.display()),
         };
     }
 
-    // Pass 1: stream .idx → 30-min HLC + 1-min mid downsample for calibration.
-    let mut stream = match ShardStream::<IndexRecord>::open(&idx_path) {
-        Ok(s) => s,
-        Err(e) => return CalOutcome::Failed { ticker_id, reason: format!("open .idx: {}", e) },
-    };
-
-    // Stream the .idx once, populating both the 30-min HLC map (vol input)
-    // and the 1-min last-mid downsample (calibration input). Bucket H = ask,
-    // L = bid; matches `renko_from_idx.rs` semantics.
+    // Pass 1: stream every shard in date order → 30-min HLC + 1-min mid
+    // downsample for calibration. Bucket H = ask, L = bid; matches
+    // `renko_from_idx.rs` semantics.
     let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
     let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
-    loop {
-        let rec = match stream.next() {
-            Ok(Some(r)) => r,
-            Ok(None) => break,
-            Err(e) => return CalOutcome::Failed { ticker_id, reason: format!("read .idx: {}", e) },
+    for (_date, shard_path) in &shards {
+        let mut stream = match ShardStream::<IndexRecord>::open(shard_path) {
+            Ok(s) => s,
+            Err(e) => return CalOutcome::Failed {
+                ticker_id,
+                reason: format!("open shard {}: {}", shard_path.display(), e),
+            },
         };
-        let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
-        let bid = rec.index.bid;
-        let ask = rec.index.ask;
-        let mid = (bid + ask) * 0.5;
-        if !(mid.is_finite() && mid > 0.0) { continue; }
+        loop {
+            let rec = match stream.next() {
+                Ok(Some(r)) => r,
+                Ok(None) => break,
+                Err(e) => return CalOutcome::Failed {
+                    ticker_id,
+                    reason: format!("read shard {}: {}", shard_path.display(), e),
+                },
+            };
+            let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+            let bid = rec.index.bid;
+            let ask = rec.index.ask;
+            let mid = (bid + ask) * 0.5;
+            if !(mid.is_finite() && mid > 0.0) { continue; }
 
-        let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
-        let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
-        if ask > e.0 { e.0 = ask; }
-        if bid < e.1 && bid > 0.0 { e.1 = bid; }
+            let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
+            let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
+            if ask > e.0 { e.0 = ask; }
+            if bid < e.1 && bid > 0.0 { e.1 = bid; }
 
-        // 1-min last-mid bucket for in-memory calibration.
-        let bucket = (ts / MS_PER_MIN) * MS_PER_MIN;
-        let pe = price_buckets.entry(bucket).or_insert((ts, mid));
-        if ts >= pe.0 { *pe = (ts, mid); }
+            // 1-min last-mid bucket for in-memory calibration.
+            let bucket = (ts / MS_PER_MIN) * MS_PER_MIN;
+            let pe = price_buckets.entry(bucket).or_insert((ts, mid));
+            if ts >= pe.0 { *pe = (ts, mid); }
+        }
     }
 
     if hlc.is_empty() {
