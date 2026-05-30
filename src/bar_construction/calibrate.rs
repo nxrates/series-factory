@@ -369,8 +369,8 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
     let mut mults: Vec<f32> = Vec::new();
 
     for &window_days in &cal.k_fit_windows_days {
-        let from = (last - window_days as i64 * 86_400_000).max(first);
-        let days = (last - from) as f64 / 86_400_000.0;
+        let from = (last - window_days as i64 * MS_PER_DAY as i64).max(first);
+        let days = (last - from) as f64 / MS_PER_DAY as f64;
         if days < cal.min_window_days as f64 {
             info!(
                 "  {}d window: insufficient data ({:.0}d available), skipping",
