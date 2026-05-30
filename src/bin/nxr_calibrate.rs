@@ -694,6 +694,15 @@ fn run_once(args: &Args) -> Result<()> {
         "calibration summary (base)"
     );
 
+    // SLA-CRITICAL (phase60.η): write ticker-params.json AFTER base pass so
+    // renko emission unblocks for base tickers even if synth pass hangs/fails.
+    // Synth pass below re-writes with synth k's added.
+    weights_file.renko_k_per_ticker = renko_k.clone();
+    weights_file.calibrated_at = Some(nxr_sdk::now_sec());
+    let json_base = serde_json::to_string_pretty(&weights_file)?;
+    write_atomic_string(&params_path, &json_base)?;
+    info!(path = %params_path.display(), bytes = json_base.len(), base_k_count = renko_k.len(), "ticker-params.json updated (base pass)");
+
     // ── Synth-pair pass (5 crosses) ──────────────────────────────────────────
     // Runs unconditionally after the base pass. Cheap (5 pairs, mostly
     // bound by leg .idx I/O which the base pass already warmed in page
