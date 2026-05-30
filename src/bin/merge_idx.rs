@@ -381,6 +381,9 @@ fn resolve_weights(args: &Args) -> Result<std::collections::BTreeMap<String, f64
         let _ = &pl; // silence unused; placeholder for full SDK integration
     }
     // Raw YAML side-channel: read `cexs.exchanges.<name>.weight`.
+    let cfg_path = nxr_sdk::pipeline_config::PipelineYml::resolve_path(
+        nxr_sdk::pipeline_config::ConfigHint::Bin,
+    );
     if let Ok(s) = std::fs::read_to_string(&cfg_path) {
         if let Ok(v) = serde_yml::from_str::<serde_yml::Value>(&s) {
             if let Some(ex) = v.get("cexs").and_then(|c| c.get("exchanges")).and_then(|e| e.as_mapping()) {
