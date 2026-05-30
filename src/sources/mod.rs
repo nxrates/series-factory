@@ -42,6 +42,18 @@ pub fn next_synthetic_id() -> u16 {
     SYNTHETIC_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Construct a historical tick source by enum tag.
+///
+/// **Closed-set by design (phase 59.R3.C2.O6, 2026-05-30 — A2-LOW
+/// ACCEPTED):** each historical source has distinct API + parse logic
+/// (Binance aggTrades CSV vs Bybit per-trade CSV vs OKX zipped JSON vs
+/// Bitget per-symbol path conventions) that can't be YAML-driven without
+/// trait-object infrastructure that doesn't currently exist (a registry of
+/// `fn(&Config) -> Box<dyn TickSource>` constructors keyed by name). The
+/// match arm itself is a thin dispatcher; the per-source URL/template
+/// data has already been hoisted to YAML (phase 59.R3.C2.O4
+/// `archive_url_template`). Deferred to a future refactor if a 5th
+/// historical source is added.
 pub async fn create_source(source: &DataSource) -> Result<Box<dyn TickSource>> {
     match source {
         DataSource::Exchange(name) => match name.as_str() {
