@@ -32,7 +32,7 @@ use nxr_sdk::asset_class::{
     DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
 };
 use nxr_sdk::ipc::record::IndexRecord;
-use nxr_sdk::shard::{list_shards, ShardStream, MS_PER_30MIN};
+use nxr_sdk::shard::{list_shards, ShardStream, MS_PER_30MIN, MS_PER_MIN};
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
@@ -154,7 +154,7 @@ fn calibrate_one(
         if bid < e.1 && bid > 0.0 { e.1 = bid; }
 
         // 1-min last-mid bucket for in-memory calibration.
-        let bucket = (ts / 60_000) * 60_000;
+        let bucket = (ts / MS_PER_MIN) * MS_PER_MIN;
         let pe = price_buckets.entry(bucket).or_insert((ts, mid));
         if ts >= pe.0 { *pe = (ts, mid); }
     }
@@ -360,7 +360,7 @@ fn calibrate_one_synth(
             if synth_ask > e.0 { e.0 = synth_ask; }
             if synth_bid < e.1 && synth_bid > 0.0 { e.1 = synth_bid; }
             // 1-min last-mid downsample.
-            let bucket = (ts / 60_000) * 60_000;
+            let bucket = (ts / MS_PER_MIN) * MS_PER_MIN;
             let pe = price_buckets.entry(bucket).or_insert((ts, mid));
             if ts >= pe.0 { *pe = (ts, mid); }
         }
