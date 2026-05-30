@@ -44,15 +44,23 @@ impl TickSource for BinanceSource {
         let tid = nxr_sdk::resolve_ticker_id(&sym);
         info!("Fetching Binance data for {}", sym);
         let parse: fn(&[u8], u64) -> Result<Vec<TickFrame>> = Self::parse_csv;
+        // Archive URL prefixes sourced from YAML
+        // `cexs.exchanges.binance.archive_url_template.{monthly,daily}`
+        // (phase 59.R3.C2.O4, 2026-05-30).
+        let urls = crate::sources::common::archive_urls("binance");
+        let monthly_prefix = urls.monthly.clone();
+        let daily_prefix = urls.daily.clone();
         let files = fetch_monthly_daily(
             &self.agent, config, "binance", &sym, &sym, tid, ".zip", Compression::Zip,
             |s, y, m| {
                 let f = format!("{}-aggTrades-{:04}-{:02}.zip", s, y, m);
-                (format!("https://data.binance.vision/data/spot/monthly/aggTrades/{}/{}", s, f), f)
+                let url = format!("{}{}", monthly_prefix.replace("{sym}", s), f);
+                (url, f)
             },
             |s, d| {
                 let f = format!("{}-aggTrades-{}.zip", s, d.format("%Y-%m-%d"));
-                (format!("https://data.binance.vision/data/spot/daily/aggTrades/{}/{}", s, f), f)
+                let url = format!("{}{}", daily_prefix.replace("{sym}", s), f);
+                (url, f)
             },
             &parse,
         ).await?;
