@@ -29,6 +29,74 @@ pub fn http_agent() -> Arc<ureq::Agent> {
     )
 }
 
+// ─── Archive URL resolver (phase 59.R3.C2.O4) ──────────────────────────────
+//
+// Per-exchange `archive_url_template.{monthly,daily,probe}` is YAML-driven
+// (see `nxr_sdk::pipeline_config::ExchangeYml::archive_url_template`).
+// Cached at first read; PipelineYml resolution honours `NXR_CONFIG`.
+
+#[derive(Clone, Default)]
+pub struct ArchiveUrls {
+    pub monthly: String,
+    pub daily: String,
+    pub probe: String,
+}
+
+fn archive_urls_for(exch: &str) -> ArchiveUrls {
+    use nxr_sdk::pipeline_config::{
+        ConfigHint, PipelineYml,
+        DEFAULT_ARCHIVE_URL_BINANCE_DAILY, DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY,
+        DEFAULT_ARCHIVE_URL_BINANCE_PROBE, DEFAULT_ARCHIVE_URL_BYBIT_DAILY,
+        DEFAULT_ARCHIVE_URL_BYBIT_MONTHLY, DEFAULT_ARCHIVE_URL_BYBIT_PROBE,
+    };
+    let (def_m, def_d, def_p) = match exch {
+        "binance" => (
+            DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY,
+            DEFAULT_ARCHIVE_URL_BINANCE_DAILY,
+            DEFAULT_ARCHIVE_URL_BINANCE_PROBE,
+        ),
+        "bybit" => (
+            DEFAULT_ARCHIVE_URL_BYBIT_MONTHLY,
+            DEFAULT_ARCHIVE_URL_BYBIT_DAILY,
+            DEFAULT_ARCHIVE_URL_BYBIT_PROBE,
+        ),
+        _ => ("", "", ""),
+    };
+    let yaml = PipelineYml::load_default(ConfigHint::Bin)
+        .ok()
+        .and_then(|pl| pl.cexs.exchanges.get(exch).cloned());
+    let tpl = yaml.and_then(|ex| ex.archive_url_template);
+    let monthly = tpl
+        .as_ref()
+        .and_then(|t| t.monthly.clone())
+        .unwrap_or_else(|| def_m.to_string());
+    let daily = tpl
+        .as_ref()
+        .and_then(|t| t.daily.clone())
+        .unwrap_or_else(|| def_d.to_string());
+    let probe = tpl
+        .as_ref()
+        .and_then(|t| t.probe.clone())
+        .unwrap_or_else(|| def_p.to_string());
+    ArchiveUrls { monthly, daily, probe }
+}
+
+/// Resolve archive URLs for an exchange (cached per-exchange).
+pub fn archive_urls(exch: &'static str) -> &'static ArchiveUrls {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<&'static str, &'static ArchiveUrls>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().expect("archive_urls cache lock");
+    if let Some(v) = guard.get(exch).copied() {
+        return v;
+    }
+    let urls = Box::leak(Box::new(archive_urls_for(exch)));
+    guard.insert(exch, urls);
+    urls
+}
+
 /// Download URL to memory (blocking, runs on spawn_blocking).
 pub async fn download_bytes(agent: &Arc<ureq::Agent>, url: &str) -> Result<Vec<u8>> {
     let agent = agent.clone();

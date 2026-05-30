@@ -49,15 +49,23 @@ impl TickSource for BybitSource {
         let tid = nxr_sdk::resolve_ticker_id(&sym);
         info!("Fetching Bybit data for {}", sym);
         let parse: fn(&[u8], u64) -> Result<Vec<TickFrame>> = Self::parse_csv;
+        // Archive URL prefixes sourced from YAML
+        // `cexs.exchanges.bybit.archive_url_template.{monthly,daily}`
+        // (phase 59.R3.C2.O4, 2026-05-30).
+        let urls = crate::sources::common::archive_urls("bybit");
+        let monthly_prefix = urls.monthly.clone();
+        let daily_prefix = urls.daily.clone();
         let files = fetch_monthly_daily(
             &self.agent, config, "bybit", &sym, &sym, tid, ".csv.gz", Compression::Gzip,
             |s, y, m| {
                 let f = format!("{}-{:04}-{:02}.csv.gz", s, y, m);
-                (format!("https://public.bybit.com/spot/{}/{}", s, f), f)
+                let url = format!("{}{}", monthly_prefix.replace("{sym}", s), f);
+                (url, f)
             },
             |s, d| {
                 let f = format!("{}_{}.csv.gz", s, d.format("%Y-%m-%d"));
-                (format!("https://public.bybit.com/spot/{}/{}", s, f), f)
+                let url = format!("{}{}", daily_prefix.replace("{sym}", s), f);
+                (url, f)
             },
             &parse,
         ).await?;

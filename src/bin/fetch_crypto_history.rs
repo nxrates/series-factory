@@ -90,21 +90,31 @@ async fn probe_one(
             .build(),
     );
 
-    let url_for = |y: i32, m: u32| -> Option<String> {
-        match exchange {
-            "binance" => Some(format!(
-                "https://data.binance.vision/data/spot/monthly/aggTrades/{s}/{s}-aggTrades-{y:04}-{m:02}.zip",
-                s = sym
-            )),
-            "bybit" => Some(format!(
-                "https://public.bybit.com/trading/{s}/{s}{y:04}-{m:02}.csv.gz",
-                s = sym
-            )),
-            // bitget/okx have no easily-HEADable monthly archive convention
-            // (per-day only) — return None to skip probing; fetcher itself
-            // will discover coverage on attempt.
-            _ => None,
+    // Probe URL template sourced from YAML
+    // `cexs.exchanges.<exch>.archive_url_template.probe` (phase 59.R3.C2.O4,
+    // 2026-05-30). `{sym}` / `{y:04}` / `{m:02}` are filled at probe time.
+    let probe_tpl: Option<String> = match exchange {
+        "binance" | "bybit" => {
+            let t = series_factory::sources::common::archive_urls(if exchange == "binance" {
+                "binance"
+            } else {
+                "bybit"
+            })
+            .probe
+            .clone();
+            if t.is_empty() { None } else { Some(t) }
         }
+        // bitget/okx have no easily-HEADable monthly archive convention
+        // (per-day only) — return None to skip probing; fetcher itself
+        // will discover coverage on attempt.
+        _ => None,
+    };
+    let url_for = |y: i32, m: u32| -> Option<String> {
+        probe_tpl.as_ref().map(|t| {
+            t.replace("{sym}", &sym)
+                .replace("{y:04}", &format!("{:04}", y))
+                .replace("{m:02}", &format!("{:02}", m))
+        })
     };
 
     // walk forward to find first available month
