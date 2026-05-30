@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{NaiveDate, Utc};
 use clap::Parser;
 use mitch::timestamp;
 use nxr_sdk::asset_class::{
@@ -120,13 +120,7 @@ fn class_for_pair(yml_cexs: &nxr_sdk::pipeline_config::CexsYml, base: &str, quot
     classify_ticker(&ticker_id, base, quote, &majors, &stables, &fx_m).as_key()
 }
 
-#[inline]
-fn day_start_ms(d: NaiveDate) -> i64 {
-    let ndt = NaiveDateTime::new(d, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-    Utc.from_utc_datetime(&ndt).timestamp_millis()
-}
-
-use nxr_sdk::shard::parse_utc_date as parse_date;
+use nxr_sdk::shard::{day_start_ms, parse_utc_date as parse_date};
 
 /// NDJSON record on stdout — one per (pair, candidate, day) sample.
 #[derive(Serialize)]

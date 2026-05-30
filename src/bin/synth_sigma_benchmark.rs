@@ -49,7 +49,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::NaiveDate;
 use clap::Parser;
 use mitch::timestamp;
 use nxr_sdk::ipc::record::IndexRecord;
@@ -76,13 +76,7 @@ fn parkinson_var(high: f64, low: f64) -> f64 {
     (lhl * lhl) / (4.0 * LN2)
 }
 
-#[inline]
-fn day_start_ms(d: NaiveDate) -> i64 {
-    let ndt = NaiveDateTime::new(d, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-    Utc.from_utc_datetime(&ndt).timestamp_millis()
-}
-
-use nxr_sdk::shard::parse_utc_date as parse_date;
+use nxr_sdk::shard::{day_start_ms, parse_utc_date as parse_date};
 
 #[derive(Parser, Debug)]
 #[command(

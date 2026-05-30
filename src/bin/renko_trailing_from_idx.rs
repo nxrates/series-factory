@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate, Utc};
 use clap::Parser;
 use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
@@ -156,13 +156,7 @@ fn class_for_pair(pl: &PipelineYml, base: &str, quote: &str) -> &'static str {
 
 // ── Date helpers ────────────────────────────────────────────────────────────
 
-#[inline]
-fn day_start_ms(d: NaiveDate) -> i64 {
-    let ndt = NaiveDateTime::new(d, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-    Utc.from_utc_datetime(&ndt).timestamp_millis()
-}
-
-use nxr_sdk::shard::{parse_utc_date as parse_date, day_range_inclusive as day_range};
+use nxr_sdk::shard::{day_start_ms, day_range_inclusive as day_range, parse_utc_date as parse_date};
 
 // ── Future-dated junk wiper ─────────────────────────────────────────────────
 
