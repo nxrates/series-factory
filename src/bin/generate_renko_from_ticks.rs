@@ -255,7 +255,7 @@ fn run_pipeline(
             if mid < e.1 { e.1 = mid; }
 
             // Price: 1-min last-close for calibration (~25 MB for 3 years)
-            let bucket = (ts / 60_000) * 60_000;
+            let bucket = (ts / nxr_sdk::shard::MS_PER_MIN) * nxr_sdk::shard::MS_PER_MIN;
             let pe = price_buckets.entry(bucket).or_insert((ts, mid));
             if ts >= pe.0 { *pe = (ts, mid); }
         }
