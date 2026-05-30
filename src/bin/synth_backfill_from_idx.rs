@@ -1358,10 +1358,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "nxr_synth_backfill_test_{}_{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            nxr_sdk::now_ns()
         ));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
