@@ -151,7 +151,7 @@ fn main() -> Result<()> {
 
     let duration_ms = tick_prices.last().map(|t| t.0).unwrap_or(0)
         - tick_prices.first().map(|t| t.0).unwrap_or(0);
-    let days = duration_ms as f64 / (24.0 * 3_600_000.0);
+    let days = duration_ms as f64 / nxr_sdk::shard::MS_PER_DAY as f64;
     info!("Duration: {:.1} days ({:.1} years)", days, days / 365.25);
 
     // ── Gate spec (density gate removed - J_stats decides what's best) ────────
