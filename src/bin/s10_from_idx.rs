@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     nxr_sdk::memory::apply_safe_cap();
 
     let args = Args::parse();
-    let (base, quote) = series_factory::split_pair(&args.pair)
+    let (base, quote) = nxr_sdk::split_pair_multi(&args.pair, &['/', '-'])
         .map(|(b, q)| (b.to_uppercase(), q.to_uppercase()))
         .ok_or_else(|| anyhow::anyhow!("bad pair {}: expected BASE-QUOTE", args.pair))?;
     if !args.config.exists() {
