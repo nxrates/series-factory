@@ -105,8 +105,10 @@ fn main() -> Result<()> {
     if exchanges.is_empty() {
         anyhow::bail!(
             "no exchanges to merge: provide --exchange flags OR populate \
-             cexs.exchanges in config.yml (path={:?})",
-            std::env::var("NXR_CONFIG").unwrap_or_else(|_| "config.yml".to_string())
+             cexs.exchanges in config.yml (path={})",
+            nxr_sdk::pipeline_config::PipelineYml::resolve_path(
+                nxr_sdk::pipeline_config::ConfigHint::Bin
+            ).display()
         );
     }
 
@@ -368,8 +370,9 @@ fn resolve_weights(args: &Args) -> Result<std::collections::BTreeMap<String, f64
 
     // 1. Seed from YAML config (`cexs.exchanges.<name>.weight`) — canonical
     //    source of truth, lives next to the live aggregator's scraper inputs.
-    let cfg_path = std::env::var("NXR_CONFIG").unwrap_or_else(|_| "config.yml".to_string());
-    if let Ok(pl) = nxr_sdk::pipeline_config::PipelineYml::load(std::path::Path::new(&cfg_path)) {
+    if let Ok(pl) = nxr_sdk::pipeline_config::PipelineYml::load_default(
+        nxr_sdk::pipeline_config::ConfigHint::Bin,
+    ) {
         // The PipelineYml::CexsYml schema is "soft" (forward-compat). We
         // ALSO accept the older richer schema via a side-load of the raw
         // YAML — until pipeline_config gains an `exchanges` field, parse
