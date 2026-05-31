@@ -83,10 +83,10 @@ fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
     }
 }
 
-/// Resolve `target_bpd` for an `AssetClassBucket` via the shared
-/// `target_bpd_by_class` map (with `default` fallback then flat target).
-fn target_for_class(c: &CalibrationYml, class: AssetClassBucket) -> Option<f64> {
-    c.target_for_class(class.as_key())
+/// Resolve `target_bpd` for a given pair. Phase 60.π: per-pair overrides only,
+/// flat default for all unlisted pairs. Class arg retained for log context.
+fn target_for_pair(c: &CalibrationYml, pair: &str) -> f64 {
+    c.target_for_pair(pair)
 }
 
 // ── Asset-class bucket detection ─────────────────────────────────────────────
@@ -621,16 +621,9 @@ fn run_once(args: &Args) -> Result<()> {
 
     pool.install(|| {
         work.par_iter().for_each(|(ticker_id, pair, class)| {
-            let target_bpd = match target_for_class(cal_ext, *class) {
-                Some(t) => t,
-                None => {
-                    results.lock().unwrap().push(CalOutcome::Skipped {
-                        ticker_id: *ticker_id,
-                        reason: format!("class {} marked skip", class.as_key()),
-                    });
-                    return;
-                }
-            };
+            // Phase 60.π: per-pair override or flat default. No skip path —
+            // operator policy: never skip a day, calibrator always returns a target.
+            let target_bpd = target_for_pair(cal_ext, pair);
 
             // Panic-safe: one bad ticker (malformed .idx, OOM in sigma cache,
             // ...) must not abort the whole cron. AssertUnwindSafe is sound
@@ -704,20 +697,16 @@ fn run_once(args: &Args) -> Result<()> {
     info!(path = %params_path.display(), bytes = json_base.len(), base_k_count = renko_k.len(), "ticker-params.json updated (base pass)");
 
     // ── Synth-pair pass (5 crosses) ──────────────────────────────────────────
-    // Runs unconditionally after the base pass. Cheap (5 pairs, mostly
+    // Runs unconditionally after the base pass. Cheap (~10 pairs, mostly
     // bound by leg .idx I/O which the base pass already warmed in page
     // cache). The clamp-detector inside `calibrate_mtf_with_target` drops
     // degenerate windows; if all windows fail, k is NOT persisted (caller
-    // keeps prior). The crypto_cross target_bpd applies.
-    let synth_target = target_for_class(cal_ext, AssetClassBucket::CryptoCross)
-        .unwrap_or_else(|| {
-            warn!("crypto_cross target_bpd missing; falling back to default");
-            cal_ext.target_bpd
-        });
+    // keeps prior). Phase 60.π: per-pair override or flat default per synth.
     let synth_work = resolve_synth_work(&root.synths.initial_pairs);
-    info!(n_synth = synth_work.len(), synth_target_bpd = synth_target, "synth calibration pass starting");
+    info!(n_synth = synth_work.len(), "synth calibration pass starting");
     let (mut s_passed, mut s_skipped, mut s_failed) = (0usize, 0usize, 0usize);
     for (synth_id, synth_sym, leg_a_id, leg_b_id) in synth_work {
+        let synth_target = target_for_pair(cal_ext, synth_sym);
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             calibrate_one_synth(
                 synth_id, synth_sym, leg_a_id, leg_b_id,
