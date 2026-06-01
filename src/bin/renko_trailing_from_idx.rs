@@ -256,17 +256,9 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     let ticker_id = resolve_ticker_id(&pair_str);
     let yml = &pl.series;
     let class_key = class_for_pair(pl, base, quote);
-    let target_bpd = match yml.calibration.target_for_class(class_key) {
-        Some(t) => t,
-        None => {
-            info!(pair = pair_str, class = class_key, "class marked skip — no bricks emitted");
-            return Ok(PairSummary {
-                pair: pair_str,
-                ticker_id,
-                ..Default::default()
-            });
-        }
-    };
+    // Phase 60.π: per-class skip removed (operator policy "never skip a day").
+    // target_for_pair → per-pair override or flat default, always returns a value.
+    let target_bpd = yml.calibration.target_for_pair(&pair_str);
 
     let idx_directory = idx_dir(&data_root, ticker_id);
     let bars_directory = bars_dir(&data_root, ticker_id);
