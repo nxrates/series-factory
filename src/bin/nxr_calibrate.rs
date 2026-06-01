@@ -660,7 +660,15 @@ fn run_once(args: &Args) -> Result<()> {
     // Tally.
     let outcomes = results.into_inner().unwrap();
     let (mut passed, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-    let mut renko_k: BTreeMap<String, f64> = weights_file.renko_k_per_ticker.clone();
+    // EMERGENCY 2026-06-01 fix (per docs/EMERGENCY-2026-06-01.md P0.4 + memory
+    // feedback_no_k_fallback): start renko_k EMPTY. Only Ok outcomes populate.
+    // Failed/Skipped tickers are NOT carried over from the prior weights file.
+    // Operator policy is "skip day if calibrate fails; never bootstrap". Carrying
+    // forward stale k corrupts the live renko engine for tickers whose σ regime
+    // has shifted since last successful calibration (renko_k cohort 2026-06-01
+    // found 91 % of base tickers using prior-run k due to today's pass=17/188).
+    let prior_count = weights_file.renko_k_per_ticker.len();
+    let mut renko_k: BTreeMap<String, f64> = BTreeMap::new();
 
     for o in &outcomes {
         match o {
@@ -684,7 +692,10 @@ fn run_once(args: &Args) -> Result<()> {
         skipped,
         failed,
         total = outcomes.len(),
-        "calibration summary (base)"
+        prior_entries = prior_count,
+        kept_entries = renko_k.len(),
+        dropped_stale = prior_count.saturating_sub(renko_k.len()),
+        "calibration summary (base; stale entries dropped per feedback_no_k_fallback)"
     );
 
     // SLA-CRITICAL (phase60.η): write ticker-params.json AFTER base pass so
