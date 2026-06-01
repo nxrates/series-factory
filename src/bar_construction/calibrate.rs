@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, K_FLOOR};
 use nxr_sdk::parkinson::{VolConfig, VolSource};
 use nxr_sdk::mitch::timestamp;
 
@@ -246,13 +246,32 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             );
             continue;
         }
+        // EMERGENCY 2026-06-01 T0.1: sub-K_FLOOR reject (wf branch). See
+        // calibrate_mtf_with_target above for rationale.
+        if (best.0 as f64) < K_FLOOR {
+            warn!(
+                window_days,
+                mult = best.0,
+                k_floor = K_FLOOR,
+                "wf sub-K_FLOOR reject — window dropped (runtime would silently clamp)"
+            );
+            continue;
+        }
         mults.push(best.0);
     }
 
     if mults.is_empty() {
         return 0.0;
     }
-    (mults.iter().map(|m| (*m as f64).ln()).sum::<f64>() / mults.len() as f64).exp() as f32
+    let geo = (mults.iter().map(|m| (*m as f64).ln()).sum::<f64>() / mults.len() as f64).exp() as f32;
+    // EMERGENCY T0.1: final safety net — geo_mean below K_FLOOR is meaningless;
+    // signal calibrate-fail to caller (which per P0.4 drops the entry rather
+    // than carrying stale).
+    if (geo as f64) < K_FLOOR {
+        warn!(geo, k_floor = K_FLOOR, "wf geo_mean < K_FLOOR — returning 0.0 (caller drops entry)");
+        return 0.0;
+    }
+    geo
 }
 
 /// Replay `prices` through a fresh `RenkoGenerator(config)` and count bars
@@ -476,6 +495,38 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
             );
             continue;
         }
+        // EMERGENCY 2026-06-01 T0.1 (per docs/EMERGENCY-12-PRIORITY-2026-06-01.md +
+        // memory feedback_sol_renko_k_stablecoin_sentinel): bpd-target acceptance
+        // gate. The MAD/median scoring chooses a min-cost mult that may still be
+        // far off the target_bpd (e.g. SOL/USDT converging on k≈4 with 33 bpd vs
+        // 300 target — 9× undershoot). Reject windows where best.1 (the relative
+        // bpd error) exceeds 20%. This is the missing per-window invariant from
+        // feedback_target_bpd_simplified.
+        if best.1 > 0.20 {
+            warn!(
+                window_days,
+                mult = best.0,
+                err_pct = best.1 * 100.0,
+                target_bpd,
+                "bpd-target accept gate — dropping window from MTF blend (|measured-target|/target > 20%)"
+            );
+            continue;
+        }
+        // EMERGENCY T0.1: sub-K_FLOOR reject. If the per-window best mult lands
+        // below K_FLOOR (0.05), the runtime would silently clamp to K_FLOOR at
+        // 3 sites (renko.rs:188, bars_renko.rs:223, synth_backfill:402). Drop the
+        // window so geo_mean reflects only valid k values; if ALL windows fall
+        // below K_FLOOR, geo_mean returns 0.0 → calibrate fail → P0.4 logic drops
+        // the entry from ticker-params.json (no stale carry).
+        if (best.0 as f64) < K_FLOOR {
+            warn!(
+                window_days,
+                mult = best.0,
+                k_floor = K_FLOOR,
+                "sub-K_FLOOR reject — dropping window (runtime would silently clamp; violates feedback_no_k_fallback)"
+            );
+            continue;
+        }
         mults.push(best.0);
     }
 
@@ -504,5 +555,13 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
         t0.elapsed().as_secs_f64(),
         target_bpd
     );
+    // EMERGENCY 2026-06-01 T0.1: final safety net — if the geo_mean lands
+    // below K_FLOOR despite per-window gating, signal calibrate-fail rather
+    // than ship a clamped k. Per P0.4 the caller drops the entry on 0.0.
+    if (geo_mean as f64) < K_FLOOR {
+        warn!(geo_mean, k_floor = K_FLOOR, target_bpd,
+            "MTF geo_mean < K_FLOOR — returning 0.0 (caller drops entry per P0.4)");
+        return 0.0;
+    }
     geo_mean
 }
