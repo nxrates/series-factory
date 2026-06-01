@@ -227,13 +227,9 @@ fn run_pair(
     let pair_str = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
     let ticker_id = resolve_ticker_id(&pair_str);
     let class_key = class_for_pair(cexs, base, quote);
-    let target_bpd = match yml.calibration.target_for_class(class_key) {
-        Some(t) => t,
-        None => {
-            info!(pair = pair_str, class = class_key, "class marked skip");
-            return Ok(BTreeMap::new());
-        }
-    };
+    // Phase 60.π: per-class skip removed (operator policy "never skip a day").
+    // target_for_pair → per-pair override or flat default, always returns a value.
+    let target_bpd = yml.calibration.target_for_pair(&pair_str);
 
     let idx_directory = idx_dir(&data_root, ticker_id);
     let _bars_directory = bars_dir(&data_root, ticker_id);

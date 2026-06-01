@@ -168,7 +168,11 @@ fn idx_non_monotone_ts_errors() {
     recs.push(good_record(1_700_000_000_050, 100.0, 100.1)); // backwards
     let bytes: &[u8] = bytemuck::cast_slice(&recs);
     let path = write_file("nonmono.idx", bytes);
-    let (code, _stdout, stderr) = run(&["idx", path.to_str().unwrap()]);
+    // Non-monotone ts is a WARNING by default (2026-05-28 demotion: day-boundary
+    // rotation races emit benign backward ts). `--strict` promotes warnings to
+    // errors → exit 2. Run strict so the assertion exercises both detection +
+    // the strict-promotion path.
+    let (code, _stdout, stderr) = run(&["idx", path.to_str().unwrap(), "--strict"]);
     assert_eq!(code, 2);
     assert!(
         stderr.contains("non-monotone"),
