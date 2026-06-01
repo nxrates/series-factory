@@ -36,12 +36,21 @@
 //!   `close_ts[i-1] == open_ts[i]`. Strict → bars/day ∈ `[10, 2000]`.
 //! - `.vol` (`series_factory::vol_bin::VolRecord`, 14 B): length % 14 == 0;
 //!   `mts` strictly increasing; `sigma_pct` ∈ `[0, 0.5]`; no NaN/Inf.
+//!
+//! ## Internal structure
+//!
+//! The four file-type validators share an identical skeleton (open mmap →
+//! length-multiple guard → `cast_slice` → per-record loop → ts/stat fold →
+//! assemble `FileReport`). That skeleton lives once in [`validate_file`]; the
+//! genuinely-differing logic (record type, per-record field checks, ts-gap
+//! thresholds, stat accumulators, strict post-checks) is implemented per type
+//! via the [`RecordValidator`] trait. The `check_*` fns are thin wrappers.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bytemuck::cast_slice;
+use bytemuck::{cast_slice, Pod};
 use clap::{Parser, Subcommand};
 use memmap2::Mmap;
 use mitch::common::message_type;
@@ -201,378 +210,415 @@ fn open_mmap(path: &Path) -> Result<Mmap> {
     Ok(mmap)
 }
 
-// ── .idx check ──────────────────────────────────────────────────────────────
+// ── Generic validation skeleton ─────────────────────────────────────────────
 
-/// Max permitted gap between consecutive records before WARN (60 s).
-const IDX_MAX_GAP_MS: i64 = 60_000;
-
-fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
+/// Shared mmap+loop+report skeleton, parameterised over the record type `R` and
+/// a `body` closure carrying the per-type logic.
+///
+/// The driver owns everything identical across the four file types: open the
+/// mmap, reject truncated/empty files (with the matching `FileReport`), cast to
+/// `&[R]`, drive the per-record loop, fill `span_hours`, and assemble the final
+/// `FileReport`. `kind`/`label` are the file-type tag and the human record-type
+/// name used in the truncated-file message.
+///
+/// The per-type accumulator block (prev-ts, running sums, gap counters, …) is an
+/// opaque `state: S` owned and threaded by the driver: `body` gets `&mut state`
+/// each record, `finish` takes `state` by value once after the loop (after
+/// `span_hours` is set) to compute derived stats + strict-mode whole-file checks.
+/// Threading the state through the driver (rather than capturing it in the
+/// closures) sidesteps the double-`&mut`-borrow that two co-capturing closures
+/// would otherwise hit, while still avoiding any per-impl trait boilerplate.
+fn validate_file<R, S, Body, Finish>(
+    path: &Path,
+    kind: &'static str,
+    label: &str,
+    mut state: S,
+    mut body: Body,
+    finish: Finish,
+) -> Result<FileReport>
+where
+    R: Pod,
+    Body: FnMut(&mut S, usize, &R, &mut Vec<Finding>, &mut Vec<Finding>, &mut Stats),
+    Finish: FnOnce(S, usize, &mut Vec<Finding>, &mut Vec<Finding>, &mut Stats),
+{
     let mmap = open_mmap(path)?;
     let bytes = mmap.len() as u64;
-    let rec_size = std::mem::size_of::<IndexRecord>();
+    let rec_size = std::mem::size_of::<R>();
 
     let mut errors: Vec<Finding> = Vec::new();
     let mut warnings: Vec<Finding> = Vec::new();
     let mut stats = Stats::default();
-    let mut idx_stats = IdxStats::default();
+
+    let report = |records, errors, warnings, stats| FileReport {
+        path: path.display().to_string(),
+        kind,
+        bytes,
+        records,
+        errors,
+        warnings,
+        stats,
+    };
 
     if mmap.len() % rec_size != 0 {
         errors.push(Finding {
             record_ix: None,
             msg: format!(
-                "truncated: file size {} not a multiple of {} (IndexRecord)",
+                "truncated: file size {} not a multiple of {} ({})",
                 mmap.len(),
-                rec_size
+                rec_size,
+                label,
             ),
         });
-        return Ok(FileReport {
-            path: path.display().to_string(),
-            kind: "idx",
-            bytes,
-            records: mmap.len() / rec_size,
-            errors,
-            warnings,
-            stats,
-        });
+        return Ok(report(mmap.len() / rec_size, errors, warnings, stats));
     }
 
     if mmap.is_empty() {
-        return Ok(FileReport {
-            path: path.display().to_string(),
-            kind: "idx",
-            bytes,
-            records: 0,
-            errors,
-            warnings,
-            stats,
-        });
+        return Ok(report(0, errors, warnings, stats));
     }
 
-    let records: &[IndexRecord] = cast_slice(&mmap[..]);
+    let records: &[R] = cast_slice(&mmap[..]);
     let n = records.len();
 
-    let mut prev_ts_ms: Option<i64> = None;
-    let mut sum_ci_over_mid: f64 = 0.0;
-    let mut n_finite: usize = 0;
-    let mut n_wide: usize = 0;
-    let mut sum_spread_bps: f64 = 0.0;
-    let mut max_spread_bps: f64 = 0.0;
-
     for (i, rec) in records.iter().enumerate() {
-        let mt = rec.header.message_type();
-        if mt != message_type::INDEX {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("header.message_type=0x{:02x} != INDEX (0x{:02x})", mt, message_type::INDEX),
-            });
-        }
-
-        let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
-        if stats.ts_first_ms.is_none() {
-            stats.ts_first_ms = Some(ts);
-        }
-        stats.ts_last_ms = Some(ts);
-
-        if let Some(prev) = prev_ts_ms {
-            if ts < prev {
-                // Demoted err→warn (2026-05-28): merge-idx produces rare
-                // reverse-ts records from cross-provider stream skew (1 in
-                // ~300k = 0.0003% on LTC 2024-05-28). Data is salvageable;
-                // readers can sort. Only --strict promotes to error.
-                warnings.push(Finding {
-                    record_ix: Some(i),
-                    msg: format!("ts non-monotone: {} < prev {}", ts, prev),
-                });
-            } else {
-                let gap = ts - prev;
-                if gap > IDX_MAX_GAP_MS {
-                    warnings.push(Finding {
-                        record_ix: Some(i),
-                        msg: format!(
-                            "gap {} ms between rows {}..{} (>{} ms)",
-                            gap,
-                            i - 1,
-                            i,
-                            IDX_MAX_GAP_MS
-                        ),
-                    });
-                }
-            }
-        }
-        prev_ts_ms = Some(ts);
-
-        // Copy out of packed before validate().
-        let idx_body = rec.index;
-        if let Err(e) = idx_body.validate() {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("Index::validate failed: {}", e),
-            });
-            continue;
-        }
-        let mid = idx_body.mid();
-        if mid > 0.0 && mid.is_finite() {
-            let spread_bps = idx_body.spread_bps();
-            let ci_price = idx_body.ci_price();
-            let ratio = ci_price / mid;
-            if ratio.is_finite() {
-                sum_ci_over_mid += ratio;
-                n_finite += 1;
-            }
-            sum_spread_bps += spread_bps;
-            if spread_bps > max_spread_bps { max_spread_bps = spread_bps; }
-            if spread_bps > 500.0 { n_wide += 1; }
-        }
+        body(&mut state, i, rec, &mut errors, &mut warnings, &mut stats);
     }
 
     if let (Some(a), Some(b)) = (stats.ts_first_ms, stats.ts_last_ms) {
         stats.span_hours = Some((b - a) as f64 / (nxr_sdk::shard::MS_PER_HOUR as f64));
     }
 
-    if n_finite > 0 {
-        idx_stats.mean_ci_over_mid = sum_ci_over_mid / n_finite as f64;
-        idx_stats.mean_spread_bps = sum_spread_bps / n_finite as f64;
-        idx_stats.max_spread_bps = max_spread_bps;
-        idx_stats.frac_spread_gt_500_bps = n_wide as f64 / n_finite as f64;
+    finish(state, n, &mut errors, &mut warnings, &mut stats);
+
+    Ok(report(n, errors, warnings, stats))
+}
+
+// ── Shared `mitch::Bar` OHLC core ───────────────────────────────────────────
+
+/// Fields copied out of a packed `mitch::Bar`, shared by the `.bars` and `.s10`
+/// validators (both back onto `mitch::Bar`).
+struct BarFields {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    open_ts_ms: i64,
+    close_ts_ms: i64,
+}
+
+/// Run the OHLC sanity block common to `.bars` and `.s10`: copy packed fields,
+/// advance `ts_first_ms`/`ts_last_ms`, check `open_ts <= close_ts`, finiteness,
+/// `high >= max(o,c,l)`, `low <= min(o,c,h)`, and `realized_var/bipower_var >=
+/// 0`. Returns the copied fields plus `ohlc_finite`: when `false`, OHLC was
+/// non-finite, the "non-finite OHLC" error was already pushed, and the caller
+/// must skip its OHLC-dependent continuity checks (preserving the original
+/// early-`continue` behaviour while still letting each caller update its own
+/// prev-state).
+fn check_bar_ohlc(
+    i: usize,
+    bar: &mitch::bar::Bar,
+    errors: &mut Vec<Finding>,
+    stats: &mut Stats,
+) -> (BarFields, bool) {
+    // Copy fields out of packed struct.
+    let f = BarFields {
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        open_ts_ms: bar.open_time_ms(),
+        close_ts_ms: bar.close_time_ms(),
+    };
+
+    if stats.ts_first_ms.is_none() {
+        stats.ts_first_ms = Some(f.open_ts_ms);
+    }
+    stats.ts_last_ms = Some(f.close_ts_ms);
+
+    if f.open_ts_ms > f.close_ts_ms {
+        errors.push(Finding {
+            record_ix: Some(i),
+            msg: format!("open_ts {} > close_ts {}", f.open_ts_ms, f.close_ts_ms),
+        });
     }
 
-    if strict {
-        if idx_stats.mean_ci_over_mid >= 0.001 {
-            errors.push(Finding {
-                record_ix: None,
-                msg: format!(
-                    "strict: mean(ci/mid)={:.6} >= 0.001 (avg CI > 100 bps)",
-                    idx_stats.mean_ci_over_mid
-                ),
-            });
-        }
-        if idx_stats.frac_spread_gt_500_bps >= 0.005 {
-            errors.push(Finding {
-                record_ix: None,
-                msg: format!(
-                    "strict: frac(spread>500bps)={:.4} >= 0.005",
-                    idx_stats.frac_spread_gt_500_bps
-                ),
-            });
-        }
+    if !f.open.is_finite() || !f.high.is_finite() || !f.low.is_finite() || !f.close.is_finite() {
+        errors.push(Finding {
+            record_ix: Some(i),
+            msg: "non-finite OHLC".into(),
+        });
+        return (f, false);
     }
 
-    stats.idx_stats = Some(idx_stats);
-    Ok(FileReport {
-        path: path.display().to_string(),
-        kind: "idx",
-        bytes,
-        records: n,
-        errors,
-        warnings,
-        stats,
-    })
+    let max_ocl = f.open.max(f.close).max(f.low);
+    let min_och = f.open.min(f.close).min(f.high);
+    if f.high < max_ocl {
+        errors.push(Finding {
+            record_ix: Some(i),
+            msg: format!("high {} < max(o,c,l) {}", f.high, max_ocl),
+        });
+    }
+    if f.low > min_och {
+        errors.push(Finding {
+            record_ix: Some(i),
+            msg: format!("low {} > min(o,c,h) {}", f.low, min_och),
+        });
+    }
+
+    let realized_var = bar.realized_var;
+    let bipower_var = bar.bipower_var;
+    if realized_var < 0.0 {
+        errors.push(Finding {
+            record_ix: Some(i),
+            msg: format!("realized_var {} < 0", realized_var),
+        });
+    }
+    if bipower_var < 0.0 {
+        errors.push(Finding {
+            record_ix: Some(i),
+            msg: format!("bipower_var {} < 0", bipower_var),
+        });
+    }
+
+    (f, true)
+}
+
+// ── .idx check ──────────────────────────────────────────────────────────────
+
+/// Max permitted gap between consecutive records before WARN (60 s).
+const IDX_MAX_GAP_MS: i64 = 60_000;
+
+/// Per-file accumulators threaded through the `.idx` validator.
+#[derive(Default)]
+struct IdxState {
+    prev_ts_ms: Option<i64>,
+    sum_ci_over_mid: f64,
+    n_finite: usize,
+    n_wide: usize,
+    sum_spread_bps: f64,
+    max_spread_bps: f64,
+}
+
+fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
+    validate_file::<IndexRecord, _, _, _>(
+        path,
+        "idx",
+        "IndexRecord",
+        IdxState::default(),
+        |s: &mut IdxState, i, rec, errors, warnings, stats| {
+            let mt = rec.header.message_type();
+            if mt != message_type::INDEX {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("header.message_type=0x{:02x} != INDEX (0x{:02x})", mt, message_type::INDEX),
+                });
+            }
+
+            let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+            if stats.ts_first_ms.is_none() {
+                stats.ts_first_ms = Some(ts);
+            }
+            stats.ts_last_ms = Some(ts);
+
+            if let Some(prev) = s.prev_ts_ms {
+                if ts < prev {
+                    // Demoted err→warn (2026-05-28): merge-idx produces rare
+                    // reverse-ts records from cross-provider stream skew (1 in
+                    // ~300k = 0.0003% on LTC 2024-05-28). Data is salvageable;
+                    // readers can sort. Only --strict promotes to error.
+                    warnings.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!("ts non-monotone: {} < prev {}", ts, prev),
+                    });
+                } else {
+                    let gap = ts - prev;
+                    if gap > IDX_MAX_GAP_MS {
+                        warnings.push(Finding {
+                            record_ix: Some(i),
+                            msg: format!(
+                                "gap {} ms between rows {}..{} (>{} ms)",
+                                gap,
+                                i - 1,
+                                i,
+                                IDX_MAX_GAP_MS
+                            ),
+                        });
+                    }
+                }
+            }
+            s.prev_ts_ms = Some(ts);
+
+            // Copy out of packed before validate().
+            let idx_body = rec.index;
+            if let Err(e) = idx_body.validate() {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("Index::validate failed: {}", e),
+                });
+                return;
+            }
+            let mid = idx_body.mid();
+            if mid > 0.0 && mid.is_finite() {
+                let spread_bps = idx_body.spread_bps();
+                let ci_price = idx_body.ci_price();
+                let ratio = ci_price / mid;
+                if ratio.is_finite() {
+                    s.sum_ci_over_mid += ratio;
+                    s.n_finite += 1;
+                }
+                s.sum_spread_bps += spread_bps;
+                if spread_bps > s.max_spread_bps { s.max_spread_bps = spread_bps; }
+                if spread_bps > 500.0 { s.n_wide += 1; }
+            }
+        },
+        |s: IdxState, _n, errors, _warnings, stats| {
+            let mut idx_stats = IdxStats::default();
+            if s.n_finite > 0 {
+                idx_stats.mean_ci_over_mid = s.sum_ci_over_mid / s.n_finite as f64;
+                idx_stats.mean_spread_bps = s.sum_spread_bps / s.n_finite as f64;
+                idx_stats.max_spread_bps = s.max_spread_bps;
+                idx_stats.frac_spread_gt_500_bps = s.n_wide as f64 / s.n_finite as f64;
+            }
+
+            if strict {
+                if idx_stats.mean_ci_over_mid >= 0.001 {
+                    errors.push(Finding {
+                        record_ix: None,
+                        msg: format!(
+                            "strict: mean(ci/mid)={:.6} >= 0.001 (avg CI > 100 bps)",
+                            idx_stats.mean_ci_over_mid
+                        ),
+                    });
+                }
+                if idx_stats.frac_spread_gt_500_bps >= 0.005 {
+                    errors.push(Finding {
+                        record_ix: None,
+                        msg: format!(
+                            "strict: frac(spread>500bps)={:.4} >= 0.005",
+                            idx_stats.frac_spread_gt_500_bps
+                        ),
+                    });
+                }
+            }
+
+            stats.idx_stats = Some(idx_stats);
+        },
+    )
 }
 
 // ── .bars check ─────────────────────────────────────────────────────────────
 
+/// Per-file accumulators threaded through the `.bars` validator.
+#[derive(Default)]
+struct BarsState {
+    bars_stats: BarsStats,
+    prev_close_ts_ms: Option<i64>,
+    prev_close: Option<f64>,
+    prev_kind: Option<u8>,
+}
+
 fn check_bars(path: &Path, strict: bool) -> Result<FileReport> {
-    let mmap = open_mmap(path)?;
-    let bytes = mmap.len() as u64;
-    let rec_size = std::mem::size_of::<mitch::bar::Bar>();
-
-    let mut errors: Vec<Finding> = Vec::new();
-    let warnings: Vec<Finding> = Vec::new();
-    let mut stats = Stats::default();
-    let mut bars_stats = BarsStats::default();
-
-    if mmap.len() % rec_size != 0 {
-        errors.push(Finding {
-            record_ix: None,
-            msg: format!(
-                "truncated: file size {} not a multiple of {} (Bar)",
-                mmap.len(),
-                rec_size
-            ),
-        });
-        return Ok(FileReport {
-            path: path.display().to_string(),
-            kind: "bars",
-            bytes,
-            records: mmap.len() / rec_size,
-            errors,
-            warnings,
-            stats,
-        });
-    }
-
-    if mmap.is_empty() {
-        return Ok(FileReport {
-            path: path.display().to_string(),
-            kind: "bars",
-            bytes,
-            records: 0,
-            errors,
-            warnings,
-            stats,
-        });
-    }
-
-    let bars: &[mitch::bar::Bar] = cast_slice(&mmap[..]);
-    let n = bars.len();
-
     let renko_min_pct = load_renko_bounds();
 
-    let mut prev_close_ts_ms: Option<i64> = None;
-    let mut prev_close: Option<f64> = None;
-    let mut prev_kind: Option<u8> = None;
-
-    for (i, bar) in bars.iter().enumerate() {
-        // Copy fields out of packed struct.
-        let open = bar.open;
-        let high = bar.high;
-        let low = bar.low;
-        let close = bar.close;
-        let kind = bar.kind;
-        let realized_var = bar.realized_var;
-        let bipower_var = bar.bipower_var;
-        let open_ts_ms = bar.open_time_ms();
-        let close_ts_ms = bar.close_time_ms();
-
-        match kind {
-            0 => bars_stats.n_kline += 1,
-            1 => bars_stats.n_renko += 1,
-            2 | 3 => bars_stats.n_other += 1,
-            _ => {
-                errors.push(Finding {
-                    record_ix: Some(i),
-                    msg: format!("invalid kind={} (expected 0..=3)", kind),
-                });
+    validate_file::<mitch::bar::Bar, _, _, _>(
+        path,
+        "bars",
+        "Bar",
+        BarsState::default(),
+        |s: &mut BarsState, i, bar, errors, _warnings, stats| {
+            let kind = bar.kind;
+            match kind {
+                0 => s.bars_stats.n_kline += 1,
+                1 => s.bars_stats.n_renko += 1,
+                2 | 3 => s.bars_stats.n_other += 1,
+                _ => {
+                    errors.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!("invalid kind={} (expected 0..=3)", kind),
+                    });
+                }
             }
-        }
 
-        if stats.ts_first_ms.is_none() {
-            stats.ts_first_ms = Some(open_ts_ms);
-        }
-        stats.ts_last_ms = Some(close_ts_ms);
-
-        if open_ts_ms > close_ts_ms {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("open_ts {} > close_ts {}", open_ts_ms, close_ts_ms),
-            });
-        }
-
-        if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: "non-finite OHLC".into(),
-            });
-            prev_close = Some(close);
-            prev_close_ts_ms = Some(close_ts_ms);
-            prev_kind = Some(kind);
-            continue;
-        }
-
-        let max_ocl = open.max(close).max(low);
-        let min_och = open.min(close).min(high);
-        if high < max_ocl {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("high {} < max(o,c,l) {}", high, max_ocl),
-            });
-        }
-        if low > min_och {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("low {} > min(o,c,h) {}", low, min_och),
-            });
-        }
-        if realized_var < 0.0 {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("realized_var {} < 0", realized_var),
-            });
-        }
-        if bipower_var < 0.0 {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("bipower_var {} < 0", bipower_var),
-            });
-        }
-        // reject_rate is u16 by type, range [0,65535] is guaranteed; no check.
-
-        // Per-kind continuity invariants.
-        if let (Some(prev_ts), Some(prev_k)) = (prev_close_ts_ms, prev_kind) {
-            // Kline: close_ts[i-1] == open_ts[i].
-            if kind == 0 && prev_k == 0 && prev_ts != open_ts_ms {
-                errors.push(Finding {
-                    record_ix: Some(i),
-                    msg: format!(
-                        "kline gap: prev close_ts {} != this open_ts {}",
-                        prev_ts, open_ts_ms
-                    ),
-                });
+            // Shared OHLC core (ts span, open<=close, finiteness, high/low, vars).
+            let (f, ohlc_finite) = check_bar_ohlc(i, bar, errors, stats);
+            let open = f.open;
+            let close = f.close;
+            let open_ts_ms = f.open_ts_ms;
+            let close_ts_ms = f.close_ts_ms;
+            if !ohlc_finite {
+                s.prev_close = Some(close);
+                s.prev_close_ts_ms = Some(close_ts_ms);
+                s.prev_kind = Some(kind);
+                return;
             }
-        }
-        if let (Some(pc), Some(prev_k)) = (prev_close, prev_kind) {
-            // Renko: close[i-1] == open[i] (continuity).
-            if kind == 1 && prev_k == 1 && (pc - open).abs() > pc.abs() * 1e-12 + 1e-12 {
-                errors.push(Finding {
-                    record_ix: Some(i),
-                    msg: format!(
-                        "renko discontinuity: prev close {} != this open {}",
-                        pc, open
-                    ),
-                });
+            // reject_rate is u16 by type, range [0,65535] is guaranteed; no check.
+
+            // Per-kind continuity invariants.
+            if let (Some(prev_ts), Some(prev_k)) = (s.prev_close_ts_ms, s.prev_kind) {
+                // Kline: close_ts[i-1] == open_ts[i].
+                if kind == 0 && prev_k == 0 && prev_ts != open_ts_ms {
+                    errors.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!(
+                            "kline gap: prev close_ts {} != this open_ts {}",
+                            prev_ts, open_ts_ms
+                        ),
+                    });
+                }
             }
-        }
-
-        // Renko brick magnitude must be ≥ min_pct (floor only — no ceiling
-        // post 2026-05-24: adaptive renko has no max_pct cap).
-        if kind == 1 && open > 0.0 {
-            let brick = ((close - open) / open).abs();
-            if brick < renko_min_pct {
-                errors.push(Finding {
-                    record_ix: Some(i),
-                    msg: format!(
-                        "renko brick {:.6} below floor {}",
-                        brick, renko_min_pct
-                    ),
-                });
+            if let (Some(pc), Some(prev_k)) = (s.prev_close, s.prev_kind) {
+                // Renko: close[i-1] == open[i] (continuity).
+                if kind == 1 && prev_k == 1 && (pc - open).abs() > pc.abs() * 1e-12 + 1e-12 {
+                    errors.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!(
+                            "renko discontinuity: prev close {} != this open {}",
+                            pc, open
+                        ),
+                    });
+                }
             }
-        }
 
-        prev_close_ts_ms = Some(close_ts_ms);
-        prev_close = Some(close);
-        prev_kind = Some(kind);
-    }
+            // Renko brick magnitude must be ≥ min_pct (floor only — no ceiling
+            // post 2026-05-24: adaptive renko has no max_pct cap).
+            if kind == 1 && open > 0.0 {
+                let brick = ((close - open) / open).abs();
+                if brick < renko_min_pct {
+                    errors.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!(
+                            "renko brick {:.6} below floor {}",
+                            brick, renko_min_pct
+                        ),
+                    });
+                }
+            }
 
-    if let (Some(a), Some(b)) = (stats.ts_first_ms, stats.ts_last_ms) {
-        let span_h = (b - a) as f64 / (nxr_sdk::shard::MS_PER_HOUR as f64);
-        stats.span_hours = Some(span_h);
-        if span_h > 0.0 {
-            bars_stats.bars_per_day = n as f64 / (span_h / 24.0);
-        }
-    }
+            s.prev_close_ts_ms = Some(close_ts_ms);
+            s.prev_close = Some(close);
+            s.prev_kind = Some(kind);
+        },
+        |mut s: BarsState, n, errors, _warnings, stats| {
+            if let Some(span_h) = stats.span_hours {
+                if span_h > 0.0 {
+                    s.bars_stats.bars_per_day = n as f64 / (span_h / 24.0);
+                }
+            }
 
-    if strict && bars_stats.bars_per_day > 0.0 {
-        if bars_stats.bars_per_day < 10.0 || bars_stats.bars_per_day > 2000.0 {
-            errors.push(Finding {
-                record_ix: None,
-                msg: format!(
-                    "strict: bars/day {:.2} outside [10, 2000]",
-                    bars_stats.bars_per_day
-                ),
-            });
-        }
-    }
+            if strict && s.bars_stats.bars_per_day > 0.0 {
+                if s.bars_stats.bars_per_day < 10.0 || s.bars_stats.bars_per_day > 2000.0 {
+                    errors.push(Finding {
+                        record_ix: None,
+                        msg: format!(
+                            "strict: bars/day {:.2} outside [10, 2000]",
+                            s.bars_stats.bars_per_day
+                        ),
+                    });
+                }
+            }
 
-    stats.bars_stats = Some(bars_stats);
-    Ok(FileReport {
-        path: path.display().to_string(),
-        kind: "bars",
-        bytes,
-        records: n,
-        errors,
-        warnings,
-        stats,
-    })
+            stats.bars_stats = Some(s.bars_stats);
+        },
+    )
 }
 
 // ── .s10 check ──────────────────────────────────────────────────────────────
@@ -580,350 +626,221 @@ fn check_bars(path: &Path, strict: bool) -> Result<FileReport> {
 /// Validate a `.s10` file: 96 B `mitch::Bar` rows, all `kind == Kline`,
 /// close_ts monotone with `close_ts[i] - close_ts[i-1] == bucket_ms`
 /// modulo gap (gap = no-data bucket; reported as WARN, never ERROR).
+/// Per-file accumulators threaded through the `.s10` validator.
+#[derive(Default)]
+struct S10State {
+    bars_stats: BarsStats,
+    prev_close_ts_ms: Option<i64>,
+    n_gaps: usize,
+}
+
 fn check_s10(path: &Path, strict: bool, bucket_ms: i64) -> Result<FileReport> {
-    let mmap = open_mmap(path)?;
-    let bytes = mmap.len() as u64;
-    let rec_size = std::mem::size_of::<mitch::bar::Bar>();
-
-    let mut errors: Vec<Finding> = Vec::new();
-    let mut warnings: Vec<Finding> = Vec::new();
-    let mut stats = Stats::default();
-    let mut bars_stats = BarsStats::default();
-
-    if mmap.len() % rec_size != 0 {
-        errors.push(Finding {
-            record_ix: None,
-            msg: format!(
-                "truncated: file size {} not a multiple of {} (Bar)",
-                mmap.len(),
-                rec_size
-            ),
-        });
-        return Ok(FileReport {
-            path: path.display().to_string(),
-            kind: "s10",
-            bytes,
-            records: mmap.len() / rec_size,
-            errors,
-            warnings,
-            stats,
-        });
-    }
-
-    if mmap.is_empty() {
-        return Ok(FileReport {
-            path: path.display().to_string(),
-            kind: "s10",
-            bytes,
-            records: 0,
-            errors,
-            warnings,
-            stats,
-        });
-    }
-
-    let bars: &[mitch::bar::Bar] = cast_slice(&mmap[..]);
-    let n = bars.len();
-
-    let mut prev_close_ts_ms: Option<i64> = None;
-    let mut n_gaps: usize = 0;
-
-    for (i, bar) in bars.iter().enumerate() {
-        let open = bar.open;
-        let high = bar.high;
-        let low = bar.low;
-        let close = bar.close;
-        let kind = bar.kind;
-        let realized_var = bar.realized_var;
-        let bipower_var = bar.bipower_var;
-        let open_ts_ms = bar.open_time_ms();
-        let close_ts_ms = bar.close_time_ms();
-
-        if kind != mitch::bar::BarKind::Kline as u8 {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!(
-                    "s10: kind={} != Kline ({})",
-                    kind,
-                    mitch::bar::BarKind::Kline as u8
-                ),
-            });
-        } else {
-            bars_stats.n_kline += 1;
-        }
-
-        if stats.ts_first_ms.is_none() {
-            stats.ts_first_ms = Some(open_ts_ms);
-        }
-        stats.ts_last_ms = Some(close_ts_ms);
-
-        if open_ts_ms > close_ts_ms {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("open_ts {} > close_ts {}", open_ts_ms, close_ts_ms),
-            });
-        }
-
-        if !open.is_finite() || !high.is_finite() || !low.is_finite() || !close.is_finite() {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: "non-finite OHLC".into(),
-            });
-            prev_close_ts_ms = Some(close_ts_ms);
-            continue;
-        }
-
-        let max_ocl = open.max(close).max(low);
-        let min_och = open.min(close).min(high);
-        if high < max_ocl {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("high {} < max(o,c,l) {}", high, max_ocl),
-            });
-        }
-        if low > min_och {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("low {} > min(o,c,h) {}", low, min_och),
-            });
-        }
-
-        if realized_var < 0.0 {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("realized_var {} < 0", realized_var),
-            });
-        }
-        if bipower_var < 0.0 {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("bipower_var {} < 0", bipower_var),
-            });
-        }
-
-        // Sanity bounds on microstructure (warn — not enough to fail).
-        let drift = bar.drift;
-        let vol_imb = bar.vol_imbalance;
-        let spread = bar.avg_spread_bps;
-        let max_ret = bar.max_abs_return;
-        if drift.is_finite() && drift.abs() > 1.0 {
-            warnings.push(Finding {
-                record_ix: Some(i),
-                msg: format!("drift {:.4} |x|>1 (suspicious)", drift),
-            });
-        }
-        if vol_imb.is_finite() && vol_imb.abs() > 1.0 + 1e-3 {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("vol_imbalance {:.4} outside [-1,1]", vol_imb),
-            });
-        }
-        if spread.is_finite() && spread < 0.0 {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("avg_spread_bps {} < 0", spread),
-            });
-        }
-        if max_ret.is_finite() && max_ret < 0.0 {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("max_abs_return {} < 0", max_ret),
-            });
-        }
-
-        if let Some(prev) = prev_close_ts_ms {
-            if close_ts_ms < prev {
+    validate_file::<mitch::bar::Bar, _, _, _>(
+        path,
+        "s10",
+        "Bar",
+        S10State::default(),
+        |s: &mut S10State, i, bar, errors, warnings, stats| {
+            let kind = bar.kind;
+            if kind != mitch::bar::BarKind::Kline as u8 {
                 errors.push(Finding {
                     record_ix: Some(i),
-                    msg: format!("s10 ts non-monotone: {} < prev {}", close_ts_ms, prev),
+                    msg: format!(
+                        "s10: kind={} != Kline ({})",
+                        kind,
+                        mitch::bar::BarKind::Kline as u8
+                    ),
                 });
             } else {
-                let delta = close_ts_ms - prev;
-                if delta != bucket_ms {
-                    // Allow only integer-multiples of bucket_ms (= gap = no-data).
-                    if bucket_ms > 0 && delta > 0 && delta % bucket_ms == 0 {
-                        n_gaps += (delta / bucket_ms - 1) as usize;
-                        warnings.push(Finding {
-                            record_ix: Some(i),
-                            msg: format!(
-                                "s10 gap: {} ms between rows {}..{} ({} missing buckets)",
-                                delta,
-                                i - 1,
-                                i,
-                                delta / bucket_ms - 1,
-                            ),
-                        });
-                    } else {
-                        errors.push(Finding {
-                            record_ix: Some(i),
-                            msg: format!(
-                                "s10 spacing {} ms not a multiple of bucket {} ms",
-                                delta, bucket_ms
-                            ),
-                        });
+                s.bars_stats.n_kline += 1;
+            }
+
+            // Shared OHLC core (ts span, open<=close, finiteness, high/low, vars).
+            let (f, ohlc_finite) = check_bar_ohlc(i, bar, errors, stats);
+            let close_ts_ms = f.close_ts_ms;
+            if !ohlc_finite {
+                s.prev_close_ts_ms = Some(close_ts_ms);
+                return;
+            }
+
+            // Sanity bounds on microstructure (warn — not enough to fail).
+            let drift = bar.drift;
+            let vol_imb = bar.vol_imbalance;
+            let spread = bar.avg_spread_bps;
+            let max_ret = bar.max_abs_return;
+            if drift.is_finite() && drift.abs() > 1.0 {
+                warnings.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("drift {:.4} |x|>1 (suspicious)", drift),
+                });
+            }
+            if vol_imb.is_finite() && vol_imb.abs() > 1.0 + 1e-3 {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("vol_imbalance {:.4} outside [-1,1]", vol_imb),
+                });
+            }
+            if spread.is_finite() && spread < 0.0 {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("avg_spread_bps {} < 0", spread),
+                });
+            }
+            if max_ret.is_finite() && max_ret < 0.0 {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("max_abs_return {} < 0", max_ret),
+                });
+            }
+
+            if let Some(prev) = s.prev_close_ts_ms {
+                if close_ts_ms < prev {
+                    errors.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!("s10 ts non-monotone: {} < prev {}", close_ts_ms, prev),
+                    });
+                } else {
+                    let delta = close_ts_ms - prev;
+                    if delta != bucket_ms {
+                        // Allow only integer-multiples of bucket_ms (= gap = no-data).
+                        if bucket_ms > 0 && delta > 0 && delta % bucket_ms == 0 {
+                            s.n_gaps += (delta / bucket_ms - 1) as usize;
+                            warnings.push(Finding {
+                                record_ix: Some(i),
+                                msg: format!(
+                                    "s10 gap: {} ms between rows {}..{} ({} missing buckets)",
+                                    delta,
+                                    i - 1,
+                                    i,
+                                    delta / bucket_ms - 1,
+                                ),
+                            });
+                        } else {
+                            errors.push(Finding {
+                                record_ix: Some(i),
+                                msg: format!(
+                                    "s10 spacing {} ms not a multiple of bucket {} ms",
+                                    delta, bucket_ms
+                                ),
+                            });
+                        }
                     }
                 }
             }
-        }
-        prev_close_ts_ms = Some(close_ts_ms);
-    }
+            s.prev_close_ts_ms = Some(close_ts_ms);
+        },
+        |mut s: S10State, n, errors, warnings, stats| {
+            if let Some(span_h) = stats.span_hours {
+                if span_h > 0.0 {
+                    s.bars_stats.bars_per_day = n as f64 / (span_h / 24.0);
+                }
+            }
 
-    if let (Some(a), Some(b)) = (stats.ts_first_ms, stats.ts_last_ms) {
-        let span_h = (b - a) as f64 / (nxr_sdk::shard::MS_PER_HOUR as f64);
-        stats.span_hours = Some(span_h);
-        if span_h > 0.0 {
-            bars_stats.bars_per_day = n as f64 / (span_h / 24.0);
-        }
-    }
+            // Expected ≈ 8640 bars/day for 10s buckets when no gaps.
+            if strict && s.bars_stats.bars_per_day > 0.0 {
+                let expected = nxr_sdk::shard::MS_PER_DAY as f64 / bucket_ms as f64;
+                let frac = s.bars_stats.bars_per_day / expected;
+                if !(0.5..=1.0 + 1e-6).contains(&frac) {
+                    errors.push(Finding {
+                        record_ix: None,
+                        msg: format!(
+                            "strict: bars/day {:.1} = {:.1}% of expected {:.1} (gap fraction high)",
+                            s.bars_stats.bars_per_day,
+                            frac * 100.0,
+                            expected
+                        ),
+                    });
+                }
+            }
+            if s.n_gaps > 0 {
+                warnings.push(Finding {
+                    record_ix: None,
+                    msg: format!("total missing buckets: {}", s.n_gaps),
+                });
+            }
 
-    // Expected ≈ 8640 bars/day for 10s buckets when no gaps.
-    if strict && bars_stats.bars_per_day > 0.0 {
-        let expected = nxr_sdk::shard::MS_PER_DAY as f64 / bucket_ms as f64;
-        let frac = bars_stats.bars_per_day / expected;
-        if !(0.5..=1.0 + 1e-6).contains(&frac) {
-            errors.push(Finding {
-                record_ix: None,
-                msg: format!(
-                    "strict: bars/day {:.1} = {:.1}% of expected {:.1} (gap fraction high)",
-                    bars_stats.bars_per_day,
-                    frac * 100.0,
-                    expected
-                ),
-            });
-        }
-    }
-    if n_gaps > 0 {
-        warnings.push(Finding {
-            record_ix: None,
-            msg: format!("total missing buckets: {}", n_gaps),
-        });
-    }
-
-    stats.bars_stats = Some(bars_stats);
-    Ok(FileReport {
-        path: path.display().to_string(),
-        kind: "s10",
-        bytes,
-        records: n,
-        errors,
-        warnings,
-        stats,
-    })
+            stats.bars_stats = Some(s.bars_stats);
+        },
+    )
 }
 
 // ── .vol check ──────────────────────────────────────────────────────────────
 
-fn check_vol(path: &Path, _strict: bool) -> Result<FileReport> {
-    let mmap = open_mmap(path)?;
-    let bytes = mmap.len() as u64;
-    let rec_size = std::mem::size_of::<VolRecord>();
+/// Per-file accumulators threaded through the `.vol` validator.
+struct VolState {
+    vol_stats: VolStats,
+    prev_mts: Option<u64>,
+    sum_sigma: f64,
+}
 
-    let mut errors: Vec<Finding> = Vec::new();
-    let warnings: Vec<Finding> = Vec::new();
-    let mut stats = Stats::default();
-    let mut vol_stats = VolStats {
-        min_sigma_pct: f64::INFINITY,
-        max_sigma_pct: f64::NEG_INFINITY,
-        mean_sigma_pct: 0.0,
-    };
-
-    if mmap.len() % rec_size != 0 {
-        errors.push(Finding {
-            record_ix: None,
-            msg: format!(
-                "truncated: file size {} not a multiple of {} (VolRecord)",
-                mmap.len(),
-                rec_size
-            ),
-        });
-        return Ok(FileReport {
-            path: path.display().to_string(),
-            kind: "vol",
-            bytes,
-            records: mmap.len() / rec_size,
-            errors,
-            warnings,
-            stats,
-        });
-    }
-
-    if mmap.is_empty() {
-        return Ok(FileReport {
-            path: path.display().to_string(),
-            kind: "vol",
-            bytes,
-            records: 0,
-            errors,
-            warnings,
-            stats,
-        });
-    }
-
-    let recs: &[VolRecord] = cast_slice(&mmap[..]);
-    let n = recs.len();
-
-    let mut prev_mts: Option<u64> = None;
-    let mut sum_sigma = 0.0;
-
-    for (i, r) in recs.iter().enumerate() {
-        let mts_bytes = r.mts;
-        let mts = timestamp::decode_u48(&mts_bytes);
-        let sigma = r.sigma_pct;
-
-        if i == 0 {
-            stats.ts_first_ms = Some(timestamp::to_epoch_ms(mts));
+impl Default for VolState {
+    fn default() -> Self {
+        Self {
+            vol_stats: VolStats {
+                min_sigma_pct: f64::INFINITY,
+                max_sigma_pct: f64::NEG_INFINITY,
+                mean_sigma_pct: 0.0,
+            },
+            prev_mts: None,
+            sum_sigma: 0.0,
         }
-        stats.ts_last_ms = Some(timestamp::to_epoch_ms(mts));
+    }
+}
 
-        if let Some(prev) = prev_mts {
-            if mts <= prev {
+fn check_vol(path: &Path, _strict: bool) -> Result<FileReport> {
+    validate_file::<VolRecord, _, _, _>(
+        path,
+        "vol",
+        "VolRecord",
+        VolState::default(),
+        |s: &mut VolState, i, r, errors, _warnings, stats| {
+            let mts_bytes = r.mts;
+            let mts = timestamp::decode_u48(&mts_bytes);
+            let sigma = r.sigma_pct;
+
+            if i == 0 {
+                stats.ts_first_ms = Some(timestamp::to_epoch_ms(mts));
+            }
+            stats.ts_last_ms = Some(timestamp::to_epoch_ms(mts));
+
+            if let Some(prev) = s.prev_mts {
+                if mts <= prev {
+                    errors.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!("mts not strictly increasing: {} <= prev {}", mts, prev),
+                    });
+                }
+            }
+            s.prev_mts = Some(mts);
+
+            if !sigma.is_finite() {
                 errors.push(Finding {
                     record_ix: Some(i),
-                    msg: format!("mts not strictly increasing: {} <= prev {}", mts, prev),
+                    msg: format!("sigma_pct non-finite ({})", sigma),
+                });
+                return;
+            }
+            if !(0.0..=0.5).contains(&sigma) {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("sigma_pct {} outside [0, 0.5]", sigma),
                 });
             }
-        }
-        prev_mts = Some(mts);
 
-        if !sigma.is_finite() {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("sigma_pct non-finite ({})", sigma),
-            });
-            continue;
-        }
-        if !(0.0..=0.5).contains(&sigma) {
-            errors.push(Finding {
-                record_ix: Some(i),
-                msg: format!("sigma_pct {} outside [0, 0.5]", sigma),
-            });
-        }
+            s.sum_sigma += sigma;
+            if sigma < s.vol_stats.min_sigma_pct { s.vol_stats.min_sigma_pct = sigma; }
+            if sigma > s.vol_stats.max_sigma_pct { s.vol_stats.max_sigma_pct = sigma; }
+        },
+        |mut s: VolState, n, _errors, _warnings, stats| {
+            if n > 0 {
+                s.vol_stats.mean_sigma_pct = s.sum_sigma / n as f64;
+                if !s.vol_stats.min_sigma_pct.is_finite() { s.vol_stats.min_sigma_pct = 0.0; }
+                if !s.vol_stats.max_sigma_pct.is_finite() { s.vol_stats.max_sigma_pct = 0.0; }
+            }
 
-        sum_sigma += sigma;
-        if sigma < vol_stats.min_sigma_pct { vol_stats.min_sigma_pct = sigma; }
-        if sigma > vol_stats.max_sigma_pct { vol_stats.max_sigma_pct = sigma; }
-    }
-
-    if n > 0 {
-        vol_stats.mean_sigma_pct = sum_sigma / n as f64;
-        if !vol_stats.min_sigma_pct.is_finite() { vol_stats.min_sigma_pct = 0.0; }
-        if !vol_stats.max_sigma_pct.is_finite() { vol_stats.max_sigma_pct = 0.0; }
-    }
-
-    if let (Some(a), Some(b)) = (stats.ts_first_ms, stats.ts_last_ms) {
-        stats.span_hours = Some((b - a) as f64 / (nxr_sdk::shard::MS_PER_HOUR as f64));
-    }
-
-    stats.vol_stats = Some(vol_stats);
-    Ok(FileReport {
-        path: path.display().to_string(),
-        kind: "vol",
-        bytes,
-        records: n,
-        errors,
-        warnings,
-        stats,
-    })
+            stats.vol_stats = Some(s.vol_stats);
+        },
+    )
 }
 
 // ── Output ──────────────────────────────────────────────────────────────────
