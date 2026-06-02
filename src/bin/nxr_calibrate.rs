@@ -617,6 +617,13 @@ fn run_once(args: &Args) -> Result<()> {
     let vol_cfg = &series.vol;
     let renko_yml = &series.renko;
 
+    // Fail fast if config's mult_bounds disagree with the SDK's single-source
+    // renko ceiling/floor (RCA ROOT2a). A mismatch makes the clamp-detector
+    // watch the wrong wall and the search park at a lattice artifact.
+    cal_ext
+        .assert_bounds_consistent()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let results: Mutex<Vec<CalOutcome>> = Mutex::new(Vec::with_capacity(work.len()));
 
     pool.install(|| {

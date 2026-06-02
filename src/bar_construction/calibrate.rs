@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, K_FLOOR};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, K_FLOOR, SIGMA_FALLBACK};
 use nxr_sdk::parkinson::{VolConfig, VolSource};
 use nxr_sdk::mitch::timestamp;
 
@@ -29,7 +29,7 @@ fn sigma_for_ts<S: VolSource + ?Sized>(
 ) -> f64 {
     let mts = timestamp::from_epoch_ms(ts_ms);
     let i = vol_source.find_index_for_mts(mts);
-    sigma_cache.get(i).copied().unwrap_or(0.01)
+    sigma_cache.get(i).copied().unwrap_or(SIGMA_FALLBACK)
 }
 
 /// Calibration knobs. Maps to `series.calibration` in `config.yml`.
@@ -55,6 +55,37 @@ pub struct CalibrationConfig {
 }
 
 use nxr_sdk::shard::MS_PER_DAY;
+
+/// Spike/gap quarantine for a per-day brick-count vector (RCA ROOT2c).
+///
+/// Drops gap days (zero counts) and spike days (outside `[median/3, median*3]`
+/// of the non-zero median), then returns the surviving "clean" days. Returns
+/// `None` when too few clean days remain (the slice is too gappy/spiky to
+/// trust) — the caller then marks the window dead (`days=0`) so it is dropped
+/// rather than fitting noise.
+///
+/// `min_clean = max(3, n_days/2)` capped at `n_days`: require at least 3 clean
+/// days, ideally half the observed window.
+fn quarantine_clean_days(per_day: &[u64], n_days: usize) -> Option<Vec<u64>> {
+    let nonzero: Vec<u64> = per_day.iter().copied().filter(|&b| b > 0).collect();
+    if nonzero.is_empty() {
+        return None;
+    }
+    let mut nz_sorted = nonzero.clone();
+    nz_sorted.sort_unstable();
+    let prov_median = median_sorted(&nz_sorted);
+    let (lo, hi) = (prov_median / 3.0, prov_median * 3.0);
+    let clean: Vec<u64> = nonzero
+        .into_iter()
+        .filter(|&b| (b as f64) >= lo && (b as f64) <= hi)
+        .collect();
+    let min_clean = 3usize.max(n_days / 2).min(n_days);
+    if clean.len() < min_clean {
+        None
+    } else {
+        Some(clean)
+    }
+}
 
 /// Per-day bar count + summary stats. Output of [`count_bars_per_day_from_prices`].
 #[derive(Debug, Clone)]
@@ -147,19 +178,35 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
         .ok();
     }
 
-    let total: u64 = per_day.iter().sum();
-    let mean = total as f64 / n_days as f64;
-    let mut sorted = per_day.clone();
+    // Spike/gap quarantine (RCA ROOT2c, 2026-06-01). The raw eval slice was
+    // contaminated by spike days (regime bursts) and gap days (zero-record /
+    // .idx.stub.bak / 56B-truncated shards surface as 0-count days). Pure logic
+    // is in `quarantine_clean_days` so it can be unit-tested.
+    let clean_stats = quarantine_clean_days(&per_day, n_days);
+
+    let Some(clean) = clean_stats else {
+        // Dead window — insufficient clean eval days. days=0 → score()=INFINITY
+        // → window dropped by the calibrator (no fit on contaminated data).
+        return DailyBpdStats {
+            bricks_per_day: per_day, median: 0.0, mean: 0.0, mad: 0.0, days: 0,
+        };
+    };
+
+    let clean_total: u64 = clean.iter().sum();
+    let mean = clean_total as f64 / clean.len() as f64;
+    let mut sorted = clean.clone();
     sorted.sort_unstable();
     let median = median_sorted(&sorted);
-    let mut devs: Vec<u64> = per_day
+    let mut devs: Vec<u64> = clean
         .iter()
         .map(|&b| (b as f64 - median).abs().round() as u64)
         .collect();
     devs.sort_unstable();
     let mad = median_sorted(&devs);
 
-    DailyBpdStats { bricks_per_day: per_day, median, mean, mad, days: n_days }
+    // `days` reflects the count of CLEAN days actually scored, so score()
+    // returns INFINITY when the clean set degenerated above.
+    DailyBpdStats { bricks_per_day: per_day, median, mean, mad, days: clean.len() }
 }
 
 /// Walk-forward calibration with non-overlapping cal/eval windows
@@ -193,28 +240,45 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
     if last <= first || eval_holdout_days == 0 {
         return 0.0;
     }
-    let eval_ms = (eval_holdout_days as i64) * MS_PER_DAY;
-    let eval_from = last - eval_ms;
-    if eval_from <= first {
-        return 0.0;
-    }
-
     let mut mults: Vec<f32> = Vec::new();
     for &window_days in &cal.k_fit_windows_days {
         let cal_from = (last - (window_days as i64) * MS_PER_DAY).max(first);
+
+        // PER-WINDOW eval slice (RCA ROOT2c, 2026-06-01). Previously `eval_from`
+        // was hoisted out of this loop, so all 3 MTF windows scored the SAME
+        // trailing 7d slice — `k_fit_windows_days` was a no-op (every window
+        // returned the same k) AND that one slice was the contaminated one.
+        // Scale the holdout with the window (≥ eval_holdout_days, ≤ a third of
+        // the window) so a 7d / 14d / 30d window each scores a DIFFERENT eval
+        // slice and yields a genuinely different k.
+        let window_span_days = (last - cal_from) as f64 / MS_PER_DAY as f64;
+        let eval_days_w = (eval_holdout_days as f64)
+            .max(window_span_days / 3.0)
+            .min(window_span_days)
+            .floor() as i64;
+        if eval_days_w <= 0 {
+            continue;
+        }
+        let eval_from = last - eval_days_w * MS_PER_DAY;
         let cal_days = (eval_from - cal_from) as f64 / MS_PER_DAY as f64;
-        if cal_days < cal.min_window_days as f64 {
+        if cal_days < cal.min_window_days as f64 || eval_from <= first {
             continue;
         }
         let (mut log_lo, mut log_hi) = (cal.mult_bounds[0].ln(), cal.mult_bounds[1].ln());
         let mut best = (base.multiplier, f64::INFINITY);
+        // Track the chosen mult's clean-eval median so the bpd-accept gate can
+        // recompute a pure relative-bpd error (independent of the MAD-weighted
+        // score used for the search).
+        let mut best_eval_median = 0.0f64;
+        let mut best_eval_days = 0usize;
 
         for _round in 0..cal.max_rounds {
             let log_mid = (log_lo + log_hi) / 2.0;
             let mult = log_mid.exp() as f32;
             let trial = RenkoConfig { multiplier: mult, min_pct: base.min_pct };
 
-            // Score on EVAL slice (walk-forward).
+            // Score on this window's EVAL slice (walk-forward). The slice is
+            // spike/gap-quarantined inside count_bars_per_day_from_prices.
             let eval_stats = count_bars_per_day_from_prices(
                 prices, &trial, vol_source, vol_config, sigma_cache,
                 eval_from, last,
@@ -222,6 +286,8 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             let score = eval_stats.score(target_bpd);
             if score < best.1 {
                 best = (mult, score);
+                best_eval_median = eval_stats.median;
+                best_eval_days = eval_stats.days;
             }
             if score < cal.tolerance {
                 break;
@@ -232,6 +298,16 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             } else {
                 log_hi = log_mid;
             }
+        }
+
+        // If every round degenerated (clean-eval days == 0 each time), best.1
+        // stays INFINITY → drop the window (the quarantine killed the slice).
+        if best.1 == f64::INFINITY || best_eval_days == 0 {
+            warn!(
+                window_days,
+                "wf window had no scorable clean-eval round — dropped (spike/gap quarantine)"
+            );
+            continue;
         }
 
         // Clamp detector — same policy as calibrate_mtf.
@@ -254,6 +330,27 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
                 mult = best.0,
                 k_floor = K_FLOOR,
                 "wf sub-K_FLOOR reject — window dropped (runtime would silently clamp)"
+            );
+            continue;
+        }
+        // bpd-target accept gate (RCA ROOT2b, 2026-06-01). Ported from the
+        // sibling `calibrate_mtf_with_target` (duplication drift left it out of
+        // the production walk-forward path). The MAD-weighted score may pick a
+        // min-cost mult that is still far off target_bpd (e.g. SOL/USDT parking
+        // at k≈4 / 33 bpd vs 300 target). Recompute a PURE relative-bpd error on
+        // the chosen mult's clean-eval median and DROP the window when it
+        // exceeds 20%. All windows dropped → return 0.0 → nxr_calibrate emits
+        // Failed → entry DROPPED from ticker-params.json (correct outcome — no
+        // midpoint/stale carry).
+        let rel_bpd_err = (best_eval_median / target_bpd - 1.0).abs();
+        if rel_bpd_err > 0.20 {
+            warn!(
+                window_days,
+                mult = best.0,
+                eval_median = best_eval_median,
+                target_bpd,
+                rel_bpd_err_pct = rel_bpd_err * 100.0,
+                "wf bpd-target accept gate — dropping window (|measured-target|/target > 20%)"
             );
             continue;
         }
@@ -564,4 +661,57 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
         return 0.0;
     }
     geo_mean
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quarantine_drops_gaps_and_spikes() {
+        // 10 days: 8 "normal" ~100/day, one gap (0), one spike (1000).
+        // n_days=10 → min_clean = max(3, 5) = 5. 8 normals survive.
+        let per_day = vec![100, 98, 102, 0, 101, 99, 1000, 100, 103, 97];
+        let clean = quarantine_clean_days(&per_day, per_day.len())
+            .expect("8 clean days >= min_clean(5)");
+        assert_eq!(clean.len(), 8, "gap(0) and spike(1000) excluded");
+        assert!(clean.iter().all(|&b| b > 0 && b < 1000));
+    }
+
+    #[test]
+    fn quarantine_dead_window_when_too_gappy() {
+        // 10 days, only 2 non-zero → below min_clean(5) → None (dead window).
+        let per_day = vec![0, 0, 0, 100, 0, 0, 102, 0, 0, 0];
+        assert!(
+            quarantine_clean_days(&per_day, per_day.len()).is_none(),
+            "2 clean days < min_clean(5) → dead window"
+        );
+    }
+
+    #[test]
+    fn quarantine_all_zero_is_dead() {
+        assert!(quarantine_clean_days(&vec![0u64; 7], 7).is_none());
+    }
+
+    #[test]
+    fn dead_window_scores_infinity() {
+        // A dead (days=0) DailyBpdStats must score INFINITY so the bpd-accept
+        // gate / search never selects it.
+        let dead = DailyBpdStats {
+            bricks_per_day: vec![], median: 0.0, mean: 0.0, mad: 0.0, days: 0,
+        };
+        assert_eq!(dead.score(300.0), f64::INFINITY);
+    }
+
+    #[test]
+    fn bpd_accept_gate_threshold_math() {
+        // The gate drops a window when |median/target - 1| > 0.20.
+        let target = 300.0;
+        // 33 bpd vs 300 target → rel-err ≈ 0.89 → dropped (the SOL/USDT k≈4 case).
+        let rel_err_bad = (33.0_f64 / target - 1.0).abs();
+        assert!(rel_err_bad > 0.20);
+        // 280 bpd vs 300 → rel-err ≈ 0.067 → accepted.
+        let rel_err_ok = (280.0_f64 / target - 1.0).abs();
+        assert!(rel_err_ok <= 0.20);
+    }
 }

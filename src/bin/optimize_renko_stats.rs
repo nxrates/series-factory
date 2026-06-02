@@ -36,7 +36,7 @@ use series_factory::{
     stats::{aggregate_fold_scores, compute_returns, score_fold, GateSpec, StatAggregateScore},
 };
 use nxr_sdk::parkinson::{VolConfig, VolSource};
-use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use std::{
     collections::BTreeMap,
     fs,
@@ -480,7 +480,7 @@ fn generate_bars(
     let iter = tick_prices.iter().map(|&(ts, mid)| {
         let mts = nxr_sdk::mitch::timestamp::from_epoch_ms(ts);
         let i = vol_mmap.find_index_for_mts(mts);
-        let sigma = sigma_cache.get(i).copied().unwrap_or(0.01);
+        let sigma = sigma_cache.get(i).copied().unwrap_or(SIGMA_FALLBACK);
         (ts, mid, sigma)
     });
     let _ = generator.generate(iter, |bar: &Bar| {

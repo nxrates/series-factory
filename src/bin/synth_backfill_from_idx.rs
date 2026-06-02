@@ -131,7 +131,7 @@ use mitch::index::Index;
 use mitch::timestamp;
 use nxr_sdk::bar_builder::BarAccumulator;
 use nxr_sdk::ipc::record::IndexRecord;
-use nxr_sdk::renko::{K_FLOOR, MAX_BRICKS_PER_TICK, MIN_BRICK_PCT};
+use nxr_sdk::renko::{K_FLOOR, MAX_BRICKS_PER_TICK, MIN_BRICK_PCT, MULT_UPPER_BOUND};
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, shard_path, BarShardWriter, ShardStream,
     BAR_MS_S10 as BAR_MS, MS_PER_DAY,
@@ -1026,13 +1026,16 @@ fn write_benchmark_sidecars(
         // floor (the live producer's clamp) — gives a usable lower-bound
         // estimate. Real production calibration runs on the s10 +
         // calibrate_mtf_with_target pipeline; this is a side-channel hint.
+        // Ceiling is the single-source renko::MULT_UPPER_BOUND (== config
+        // mult_bounds[1], enforced by CalibrationYml::assert_bounds_consistent),
+        // not a bare 4.0 literal (RCA ROOT2a single-source cleanup 2026-06-01).
         let k_a = if sigma_a > 0.0 {
-            (MIN_BRICK_PCT / sigma_a).clamp(K_FLOOR, 4.0)
+            (MIN_BRICK_PCT / sigma_a).clamp(K_FLOOR, MULT_UPPER_BOUND)
         } else {
             0.0
         };
         let k_b = if sigma_b > 0.0 {
-            (MIN_BRICK_PCT / sigma_b).clamp(K_FLOOR, 4.0)
+            (MIN_BRICK_PCT / sigma_b).clamp(K_FLOOR, MULT_UPPER_BOUND)
         } else {
             0.0
         };
