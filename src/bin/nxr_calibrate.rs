@@ -36,8 +36,7 @@ use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
 use series_factory::bar_construction::{
-    build_vol_from_s10, calibrate_mtf_walkforward, write_vol_records_from_ohlc, CalibrationConfig,
-    S10ShardIter,
+    build_vol_from_s10, calibrate_mtf_walkforward, CalibrationConfig, S10ShardIter,
 };
 use nxr_sdk::vol::{MtfVolCalculator, VolConfig};
 use nxr_sdk::renko::RenkoConfig;
@@ -340,6 +339,7 @@ fn calibrate_one_synth(
     leg_a_id: u64,
     leg_b_id: u64,
     idx_root: &Path,
+    bars_root: &Path,
     cal_ext: &CalibrationYml,
     target_bpd: f64,
     vol_cfg: &VolConfig,
@@ -383,10 +383,14 @@ fn calibrate_one_synth(
     // reduces to "pick whichever side has the earlier next-ts" — no heap.
     let mut a_last: Option<(f64, f64)> = None;
     let mut b_last: Option<(f64, f64)> = None;
-    // Synth has no persisted `.s10`; reconstruct the gapless 10s-OHLC mid series
-    // in-memory from the merged synth ticks, then roll up to 30-min RS σ — the
-    // SAME basis the native path reads off disk (offline == live contract).
-    let mut s10: BTreeMap<i64, nxr_sdk::ohlc::Ohlc> = BTreeMap::new();
+    // SEAM PARITY (R3): the synth `.vol` is built from the SAME persisted `.s10`
+    // shards the live `bars_renko_synth` ring consumes (written by the synth s10
+    // producer — live `bars_s10::spawn(Synth)` / offline `synth-backfill-from-idx`),
+    // NOT an in-memory mid reconstruction. The old reconstruction min/max/last on
+    // raw mids ≠ the real s10 producer's `BarAccumulator` microstructure-weighted
+    // OHLC + flat-fill timing → train/serve skew on synths. The leg merge below
+    // is now ONLY for the 1-min last-mid `price_buckets` (the calibration tick
+    // stream), exactly as the native path uses its `.idx` mids.
     let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
     loop {
         // Pick side with smaller ts (ties favor a → deterministic).
@@ -425,27 +429,7 @@ fn calibrate_one_synth(
                 continue;
             }
             let mid = (synth_bid + synth_ask) * 0.5;
-            // 10s OHLC bucket on synth mid (matches s10 producer's mid basis).
-            let s10_key = (ts / nxr_sdk::shard::BAR_MS_S10) * nxr_sdk::shard::BAR_MS_S10;
-            s10.entry(s10_key)
-                .and_modify(|o| {
-                    if mid > o.high { o.high = mid; }
-                    if mid < o.low { o.low = mid; }
-                    o.close = mid;
-                    o.tick_count = o.tick_count.saturating_add(1);
-                })
-                .or_insert(nxr_sdk::ohlc::Ohlc {
-                    ts: s10_key,
-                    open: mid,
-                    high: mid,
-                    low: mid,
-                    close: mid,
-                    vbid: 0,
-                    vask: 0,
-                    tick_count: 1,
-                    avg_ci_ubp: 0,
-                });
-            // 1-min last-mid downsample.
+            // 1-min last-mid downsample (the calibration tick stream).
             let bucket = (ts / MS_PER_MIN) * MS_PER_MIN;
             let pe = price_buckets.entry(bucket).or_insert((ts, mid));
             if ts >= pe.0 { *pe = (ts, mid); }
@@ -456,41 +440,12 @@ fn calibrate_one_synth(
     drop(leg_a_stream);
     drop(leg_b_stream);
 
-    if s10.is_empty() {
+    if price_buckets.is_empty() {
         return CalOutcome::Skipped { ticker_id: synth_id, reason: "empty merged stream".into() };
     }
 
-    // Gapless-fill the 10s OHLC series with flat bars (last close) so quiet
-    // windows match the live producer, then roll up to 30-min RS σ.
-    let s10_series: Vec<nxr_sdk::ohlc::Ohlc> = {
-        let mut out: Vec<nxr_sdk::ohlc::Ohlc> = Vec::with_capacity(s10.len());
-        let mut prev_ts: Option<i64> = None;
-        let mut last_close = 0.0;
-        for (&ts, &o) in &s10 {
-            if let Some(pt) = prev_ts {
-                let mut b = pt + nxr_sdk::shard::BAR_MS_S10;
-                while b < ts {
-                    out.push(nxr_sdk::ohlc::Ohlc {
-                        ts: b, open: last_close, high: last_close,
-                        low: last_close, close: last_close,
-                        vbid: 0, vask: 0, tick_count: 0, avg_ci_ubp: 0,
-                    });
-                    b += nxr_sdk::shard::BAR_MS_S10;
-                }
-            }
-            out.push(o);
-            last_close = o.close;
-            prev_ts = Some(ts);
-        }
-        out
-    };
-    let bins = nxr_sdk::ohlc::rollup(
-        &s10_series,
-        nxr_sdk::shard::BAR_MS_S10,
-        nxr_sdk::shard::MS_PER_30MIN,
-    );
-
-    // ── 3. VolWriter / VolMmap / sigma cache (identical to base path) ────────
+    // ── 3. Build .vol from the persisted synth `.s10` shards (identical to the
+    // native base path) → offline σ == live σ on the SAME real s10 artifact.
     let vol_path = std::env::temp_dir()
         .join(format!("nxr-calibrate-synth-{}-{}.vol", synth_id, std::process::id()));
     {
@@ -498,7 +453,17 @@ fn calibrate_one_synth(
             Ok(w) => w,
             Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol writer: {}", e) },
         };
-        if let Err(e) = write_vol_records_from_ohlc(&bins, vol_cfg, &mut writer) {
+        let s10_dir = nxr_sdk::shard::bars_dir(bars_root, synth_id);
+        let s10_shards = list_shards(&s10_dir, "s10").unwrap_or_default();
+        if s10_shards.is_empty() {
+            let _ = std::fs::remove_file(&vol_path);
+            return CalOutcome::Skipped {
+                ticker_id: synth_id,
+                reason: format!("no synth .s10 shards under {} (run synth-backfill-from-idx first)", s10_dir.display()),
+            };
+        }
+        let mut s10_iter = S10ShardIter::new(s10_shards);
+        if let Err(e) = build_vol_from_s10(|| s10_iter.next_bar(), vol_cfg, &mut writer) {
             return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol build: {}", e) };
         }
         if let Err(e) = writer.finish() {
@@ -790,7 +755,7 @@ fn run_once(args: &Args) -> Result<()> {
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             calibrate_one_synth(
                 synth_id, synth_sym, leg_a_id, leg_b_id,
-                &idx_dir, cal_ext, synth_target, vol_cfg, renko_yml,
+                &idx_dir, &bars_root, cal_ext, synth_target, vol_cfg, renko_yml,
             )
         }))
         .unwrap_or_else(|p| {
