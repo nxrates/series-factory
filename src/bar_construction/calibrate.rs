@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, K_FLOOR, SIGMA_FALLBACK};
-use nxr_sdk::parkinson::{VolConfig, VolSource};
+use nxr_sdk::vol::{VolConfig, VolSource};
 use nxr_sdk::mitch::timestamp;
 
 /// Resolve σ_pct for a given epoch-ms timestamp via the precomputed cache.

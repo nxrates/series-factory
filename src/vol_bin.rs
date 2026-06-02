@@ -13,7 +13,7 @@
 //! Offset | Field     | Size | Type    | Description
 //! -------|-----------|------|---------|--------------------------------------
 //! 0      | mts       | 6    | u48 LE  | Record mts (16 us ticks since 2010)
-//! 6      | sigma_pct | 8    | f64 LE  | Parkinson sigma as fraction (0.015 = 1.5%)
+//! 6      | sigma_pct | 8    | f64 LE  | Rogers-Satchell sigma over s10 OHLC, fraction (0.015 = 1.5%)
 //! ```
 //!
 //! Matches the `#[repr(C, packed)]` convention used by `mitch::Index` and
@@ -91,7 +91,7 @@ pub struct VolMmap {
 unsafe impl Send for VolMmap {}
 unsafe impl Sync for VolMmap {}
 
-impl nxr_sdk::parkinson::VolSource for VolMmap {
+impl nxr_sdk::vol::VolSource for VolMmap {
     #[inline]
     fn len(&self) -> usize { self.records.len() }
 

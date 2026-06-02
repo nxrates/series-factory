@@ -51,12 +51,12 @@ use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::resolve_ticker_id;
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, read_shard_aligned, shard_path, BarShardWriter, ShardStream,
-    MS_PER_30MIN, MS_PER_DAY,
+    MS_PER_DAY,
 };
 use series_factory::bar_construction::{
-    build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig,
+    build_vol_from_mid_ticks, calibrate_mtf_with_target, CalibrationConfig,
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolSource};
+use nxr_sdk::vol::{MtfVolCalculator, VolSource};
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
@@ -328,7 +328,8 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     //        max(k_fit_windows_days) days back from `to`). 120-180d × 10 Hz ≈
     //        130-200 MB, acceptable on 8 GiB pods. Symbols above 10 Hz are
     //        ignored — aggregator caps records at delta-gate cadence.
-    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    // Full-history mid stream → RS-over-s10 vol (vol bins are tiny + causal).
+    let mut vol_mids: Vec<(i64, f64)> = Vec::new();
     let mut tick_stream: Vec<(i64, f64)> = Vec::new();
     let mut total_records: u64 = 0;
 
@@ -370,16 +371,9 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
             }
             total_records += 1;
 
-            // (a) 30-min HLC for vol blender (full history — vol bins are
-            // tiny and the blender is causal on its own).
-            let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
-            let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
-            if ask > e.0 {
-                e.0 = ask;
-            }
-            if bid < e.1 && bid > 0.0 {
-                e.1 = bid;
-            }
+            // (a) Full-history mid stream for the vol blender (RS over gapless
+            // s10 OHLC; causal — compute_sigma reads only bins ≤ t).
+            vol_mids.push((ts, mid));
 
             // (b) Full-tick stream, sliding window. Skip records older than
             // the longest calibration window — they wouldn't be used anyway.
@@ -392,13 +386,13 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     info!(
         pair = pair_str,
         idx_records = total_records,
-        hlc_buckets = hlc.len(),
+        vol_mids = vol_mids.len(),
         tick_stream_len = tick_stream.len(),
         tick_retain_window_days = max_window_days,
-        "pass 1 (vol HLC + full-tick stream) done"
+        "pass 1 (vol mid stream + full-tick stream) done"
     );
 
-    if hlc.is_empty() || tick_stream.is_empty() {
+    if vol_mids.is_empty() || tick_stream.is_empty() {
         warn!(pair = pair_str, "no usable mid quotes after scan");
         return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
     }
@@ -415,7 +409,7 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     ));
     {
         let mut writer = VolWriter::new(&vol_path)?;
-        build_vol_from_hlc(&hlc, &yml.vol, &mut writer)?;
+        build_vol_from_mid_ticks(vol_mids.iter().copied(), &yml.vol, &mut writer)?;
         writer.finish()?;
     }
 
@@ -448,7 +442,7 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
 
     let vol_mmap = VolMmap::open(&vol_path)?;
     let sigma_cache = {
-        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
+        let mut calc = MtfVolCalculator::new(&vol_mmap, yml.vol.clone());
         calc.precompute_sigma_cache()
     };
     info!(

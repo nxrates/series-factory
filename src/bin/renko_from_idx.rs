@@ -25,12 +25,12 @@ use series_factory::sharding::{
     ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
 };
 use series_factory::{
-    bar_construction::build_vol_from_hlc,
+    bar_construction::build_vol_from_mid_ticks,
     vol_bin::{VolMmap, VolWriter},
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolSource};
+use nxr_sdk::vol::{MtfVolCalculator, VolSource};
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -91,9 +91,9 @@ fn main() -> Result<()> {
     }
     info!(input_shards = shards.len(), "input shard scan done");
 
-    // ═══ PASS 1: 30-min HLC from composite mid ═══
+    // ═══ PASS 1: collect (ts, mid) from composite idx → RS-over-s10 vol ═══
     let t0 = std::time::Instant::now();
-    let mut hlc: HashMap<i64, (f64, f64, f64)> = HashMap::new();
+    let mut mids: Vec<(i64, f64)> = Vec::new();
     let mut pass1_count: u64 = 0;
     for (_, path) in &shards {
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
@@ -103,37 +103,23 @@ fn main() -> Result<()> {
             if !(mid.is_finite() && mid > 0.0) {
                 continue;
             }
-            let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
-            let e = hlc.entry(key).or_insert((mid, mid, mid));
-            if mid > e.0 {
-                e.0 = mid;
-            }
-            if mid < e.1 {
-                e.1 = mid;
-            }
-            e.2 = mid;
+            mids.push((ts, mid));
             pass1_count += 1;
         }
     }
+    let first_ts = mids.first().map(|&(ts, _)| (ts / MS_PER_30MIN) * MS_PER_30MIN).unwrap_or(0);
     info!(
         pass1_records = pass1_count,
-        buckets = hlc.len(),
-        "pass 1: 30-min HLC built in {}ms",
+        "pass 1: mid stream collected in {}ms",
         t0.elapsed().as_millis()
     );
 
-    // ═══ Build vol (.vol) file ═══
+    // ═══ Build vol (.vol) file (RS over gapless s10 OHLC) ═══
     std::fs::create_dir_all(&out_dir)?;
     // vol file lives alongside the shard dir; transient (deleted post-write).
     let vol_path = out_dir.join("_renko.vol");
-    // Drop the close component → canonical (ts, H, L) BTreeMap for the shared
-    // EMA-Parkinson builder. BTreeMap sorts by ts so output is monotone.
-    let hlc_sorted: BTreeMap<i64, (f64, f64)> =
-        hlc.iter().map(|(&ts, &(h, l, _))| (ts, (h, l))).collect();
-    let first_ts = hlc_sorted.keys().next().copied().unwrap_or(0);
-    let n_vol = hlc_sorted.len();
     let mut vol_writer = VolWriter::new(&vol_path)?;
-    build_vol_from_hlc(&hlc_sorted, &yml.vol, &mut vol_writer)?;
+    let n_vol = build_vol_from_mid_ticks(mids.iter().copied(), &yml.vol, &mut vol_writer)?;
     vol_writer.finish()?;
     let vol_mmap = VolMmap::open(&vol_path)?;
     info!(vol_records = n_vol, "vol file written");
@@ -180,7 +166,7 @@ fn main() -> Result<()> {
     renko_config.validate()?;
 
     let sigma_cache = {
-        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
+        let mut calc = MtfVolCalculator::new(&vol_mmap, yml.vol.clone());
         calc.precompute_sigma_cache()
     };
     let sigma_at = |ts: i64| -> f64 {

@@ -57,9 +57,9 @@ use nxr_sdk::shard::{
     idx_dir, list_shards, ShardStream, MS_PER_30MIN, MS_PER_DAY,
 };
 use series_factory::bar_construction::{
-    build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig,
+    build_vol_from_mid_ticks, calibrate_mtf_with_target, CalibrationConfig,
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::vol::{MtfVolCalculator, VolConfig};
 use nxr_sdk::renko::RenkoConfig;
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
@@ -473,13 +473,16 @@ fn simulate_calibrator(
     ));
     let _ = std::fs::remove_file(&vol_path);
     {
+        // RS over gapless s10 OHLC, built from the same mid stream the
+        // calibrator consumes (the legacy Parkinson-HLC `hlc` arg is retained
+        // only for the empty-input guard above — the vol basis is now s10-RS).
         let mut writer = VolWriter::new(&vol_path)?;
-        build_vol_from_hlc(hlc, vol_cfg, &mut writer)?;
+        build_vol_from_mid_ticks(prices.iter().copied(), vol_cfg, &mut writer)?;
         writer.finish()?;
     }
     let vol_mmap = VolMmap::open(&vol_path)?;
     let sigma_cache = {
-        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, vol_cfg.clone());
+        let mut calc = MtfVolCalculator::new(&vol_mmap, vol_cfg.clone());
         calc.precompute_sigma_cache()
     };
 

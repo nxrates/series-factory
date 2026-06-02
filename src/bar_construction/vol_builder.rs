@@ -1,104 +1,190 @@
-//! Canonical 30-min Parkinson sigma builder.
+//! Canonical 30-min Rogers-Satchell sigma builder over s10 OHLC.
 //!
 //! Single source of truth for the `.vol` file construction shared by every
 //! offline pipeline (`nxr-calibrate`, `generate-renko-from-ticks`,
-//! `optimize-renko-stats`). Previously each call site re-implemented the same
-//! 30-min HLC bucketing + EMA-smoothed Parkinson sigma loop, which caused at
-//! least one bug (`optimize_renko_stats` used 1h buckets + hardcoded ema=14).
+//! `optimize-renko-stats`, the renko-from-idx bins). The ratified vol basis
+//! (2026-06): the canonical per-bin σ is the Rogers-Satchell range estimator
+//! over s10-resampled 30-min OHLC, with `offline == live` byte-for-byte.
 //!
-//! Canonical parameters:
-//!   - Bucket width: 30 minutes (1_800_000 ms). Matches `VolMmap` consumer.
-//!   - EMA period:   `vol_cfg.ema_period` (default 28, see `VolConfig`).
+//! Pipeline (ONE function, [`build_vol_from_s10`]):
+//!   1. Stream the gapless `.s10` bars (96B `mitch::Bar`, `kind = Kline`).
+//!   2. Convert each to [`nxr_sdk::ohlc::Ohlc`] and roll up
+//!      `ohlc::rollup(10_000, 1_800_000)` into 30-min OHLC bins (O=first
+//!      s10.open, H=max s10.high, L=min s10.low, C=last s10.close).
+//!   3. Per bin: σ = `vol_estimator::rs_sigma_from_ohlc(o,h,l,c)`.
+//!   4. EMA(`vol_cfg.ema_period`, default 28) smoothing — first `ema_period`
+//!      bins use an expanding-mean seed (identical to the live `LiveVolRing`).
+//!   5. Write one EMA-smoothed σ row per bin to the `.vol` `VolWriter`.
 //!
-//! The bucket H/L are derived from raw mid prices supplied by the caller.
-//! Sigma is computed via `parkinson_sigma(high, low)` then EMA-smoothed.
-//! The first `ema_period` samples use a simple expanding mean to seed the EMA.
+//! The s10 input MUST be gapless (flat-fill on quiet windows, matching the live
+//! `bars_s10` producer) so offline σ == live σ on quiet windows.
 
 use anyhow::Result;
 use mitch::timestamp;
-use nxr_sdk::{ipc::record::IndexRecord, parkinson_sigma};
-use std::collections::BTreeMap;
+use nxr_sdk::ohlc::{bar_to_ohlc, rollup, Ohlc};
+use nxr_sdk::shard::{ShardStream, BAR_MS_S10, MS_PER_30MIN};
+use nxr_sdk::vol::VolConfig;
+use nxr_sdk::vol_estimator::rs_sigma_from_ohlc;
+use nxr_sdk::Bar;
+use std::path::PathBuf;
 
-use nxr_sdk::parkinson::VolConfig;
 use crate::vol_bin::VolWriter;
 
-/// 30-min bucket width in milliseconds.
-pub const BUCKET_MS: i64 = nxr_sdk::shard::MS_PER_30MIN;
+/// Streaming reader over a ticker's date-ordered `.s10` shards.
+///
+/// Bounded memory: one `ShardStream<Bar>` working buffer at a time. Feeds
+/// [`build_vol_from_s10`] via [`Self::next_bar`]. Malformed shards are skipped
+/// (best-effort: a single corrupt day must not abort the whole vol build).
+pub struct S10ShardIter {
+    shards: std::collections::VecDeque<PathBuf>,
+    cur: Option<ShardStream<Bar>>,
+}
 
-/// Build a `.vol` file from a stream of `IndexRecord`s.
+impl S10ShardIter {
+    /// `shards` = `(date, path)` pairs from `list_shards(dir, "s10")`, ascending.
+    pub fn new<I>(shards: I) -> Self
+    where
+        I: IntoIterator<Item = (chrono::NaiveDate, PathBuf)>,
+    {
+        Self {
+            shards: shards.into_iter().map(|(_, p)| p).collect(),
+            cur: None,
+        }
+    }
+
+    /// Next s10 `Bar` in chronological order, or `None` at end of all shards.
+    pub fn next_bar(&mut self) -> Option<Bar> {
+        loop {
+            if let Some(stream) = self.cur.as_mut() {
+                match stream.next() {
+                    Ok(Some(bar)) => return Some(bar),
+                    Ok(None) | Err(_) => {
+                        self.cur = None;
+                    }
+                }
+            }
+            let path = self.shards.pop_front()?;
+            self.cur = ShardStream::<Bar>::open(&path).ok();
+        }
+    }
+}
+
+/// 30-min bin width in milliseconds (the canonical vol-bin width).
+pub const BUCKET_MS: i64 = MS_PER_30MIN;
+
+/// Build a `.vol` file from a sequence of s10 `Bar`s.
 ///
-/// Streams records from `next_record` (returns `None` at EOF), aggregates
-/// them into 30-minute HLC buckets using `mid = (bid + ask) / 2` (with H/L
-/// taken from `ask` / `bid` respectively, matching `nxr_calibrate.rs`
-/// semantics), then writes EMA-smoothed Parkinson sigma rows to `writer`.
-///
-/// Returns the number of records written.
-pub fn build_vol_from_records<F>(
-    mut next_record: F,
+/// `next_bar` yields s10 bars in chronological order (returns `None` at EOF) —
+/// e.g. draining a `ShardStream<Bar>` over the daily `.s10` shards. Returns the
+/// number of `.vol` rows written (one per 30-min bin).
+pub fn build_vol_from_s10<F>(
+    mut next_bar: F,
     vol_cfg: &VolConfig,
     writer: &mut VolWriter,
 ) -> Result<usize>
 where
-    F: FnMut() -> Option<IndexRecord>,
+    F: FnMut() -> Option<Bar>,
 {
-    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    // Collect s10 candles, then roll up to 30-min OHLC bins. The rollup monoid
+    // (first/max/min/last) is byte-identical to the live ring's intra-bin OHLC.
+    let mut s10: Vec<Ohlc> = Vec::new();
+    while let Some(bar) = next_bar() {
+        let o = bar_to_ohlc(&bar);
+        if !(o.open > 0.0 && o.high > 0.0 && o.low > 0.0 && o.close > 0.0) {
+            continue;
+        }
+        s10.push(o);
+    }
+    let bins = rollup(&s10, BAR_MS_S10, BUCKET_MS);
+    write_vol_records_from_ohlc(&bins, vol_cfg, writer)
+}
 
-    while let Some(rec) = next_record() {
-        let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
-        let bid = rec.index.bid;
-        let ask = rec.index.ask;
-        let mid = (bid + ask) * 0.5;
+/// Build a `.vol` file from a stream of `(epoch_ms, mid)` price observations.
+///
+/// Reconstructs the gapless 10s-OHLC mid series in-memory (flat-fill on quiet
+/// 10s buckets, matching the live `bars_s10` producer), rolls it up to 30-min
+/// OHLC, then writes EMA-smoothed RS σ rows. Use this from offline bins that
+/// have a mid/tick stream but no persisted `.s10` (research/sweep tools, synth
+/// reconstruction). Returns the number of `.vol` rows written.
+pub fn build_vol_from_mid_ticks<I>(
+    mids: I,
+    vol_cfg: &VolConfig,
+    writer: &mut VolWriter,
+) -> Result<usize>
+where
+    I: IntoIterator<Item = (i64, f64)>,
+{
+    use std::collections::BTreeMap;
+    let mut s10: BTreeMap<i64, Ohlc> = BTreeMap::new();
+    for (ts, mid) in mids {
         if !(mid.is_finite() && mid > 0.0) {
             continue;
         }
-
-        let key = (ts / BUCKET_MS) * BUCKET_MS;
-        let entry = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
-        if ask > entry.0 {
-            entry.0 = ask;
-        }
-        if bid < entry.1 && bid > 0.0 {
-            entry.1 = bid;
-        }
+        let key = (ts / BAR_MS_S10) * BAR_MS_S10;
+        s10.entry(key)
+            .and_modify(|o| {
+                if mid > o.high { o.high = mid; }
+                if mid < o.low { o.low = mid; }
+                o.close = mid;
+                o.tick_count = o.tick_count.saturating_add(1);
+            })
+            .or_insert(Ohlc {
+                ts: key, open: mid, high: mid, low: mid, close: mid,
+                vbid: 0, vask: 0, tick_count: 1, avg_ci_ubp: 0,
+            });
     }
-
-    write_vol_records_from_hlc(&hlc, vol_cfg, writer)
+    // Gapless flat-fill across empty 10s buckets.
+    let mut series: Vec<Ohlc> = Vec::with_capacity(s10.len());
+    let mut prev_ts: Option<i64> = None;
+    let mut last_close = 0.0;
+    for (&ts, &o) in &s10 {
+        if let Some(pt) = prev_ts {
+            let mut b = pt + BAR_MS_S10;
+            while b < ts {
+                series.push(Ohlc {
+                    ts: b, open: last_close, high: last_close,
+                    low: last_close, close: last_close,
+                    vbid: 0, vask: 0, tick_count: 0, avg_ci_ubp: 0,
+                });
+                b += BAR_MS_S10;
+            }
+        }
+        series.push(o);
+        last_close = o.close;
+        prev_ts = Some(ts);
+    }
+    let bins = rollup(&series, BAR_MS_S10, BUCKET_MS);
+    write_vol_records_from_ohlc(&bins, vol_cfg, writer)
 }
 
-/// Build a `.vol` file from prebuilt 30-min HLC buckets.
+/// Write EMA-smoothed RS σ rows from a slice of 30-min OHLC bins (ts-ascending).
 ///
-/// Use when the caller has already aggregated raw ticks into HLC buckets
-/// (e.g. `generate_renko_from_ticks.rs`, `optimize_renko_stats.rs`).
-/// Buckets must be keyed by 30-min-aligned epoch_ms.
-pub fn build_vol_from_hlc(
-    hlc: &BTreeMap<i64, (f64, f64)>,
+/// Shared finalize path: σ = RS(o,h,l,c) per bin, then expanding-mean-seeded
+/// EMA(`ema_period`). Exposed so callers that already hold rolled-up 30-min
+/// OHLC bins can write `.vol` without re-streaming s10.
+pub fn write_vol_records_from_ohlc(
+    bins: &[Ohlc],
     vol_cfg: &VolConfig,
     writer: &mut VolWriter,
 ) -> Result<usize> {
-    write_vol_records_from_hlc(hlc, vol_cfg, writer)
-}
-
-fn write_vol_records_from_hlc(
-    hlc: &BTreeMap<i64, (f64, f64)>,
-    vol_cfg: &VolConfig,
-    writer: &mut VolWriter,
-) -> Result<usize> {
-    let hours: Vec<(i64, f64, f64)> = hlc.iter().map(|(&ts, &(h, l))| (ts, h, l)).collect();
     let ema_period = vol_cfg.ema_period.max(1);
     let alpha = 2.0 / (ema_period as f64 + 1.0);
     let mut prev_ema: Option<f64> = None;
     let mut count = 0usize;
 
-    for (i, &(ts, high, low)) in hours.iter().enumerate() {
-        let sigma = parkinson_sigma(high, low);
+    for (i, bin) in bins.iter().enumerate() {
+        let sigma = rs_sigma_from_ohlc(bin.open, bin.high, bin.low, bin.close);
         let ema = if i < ema_period {
-            hours[..=i].iter().map(|&(_, h, l)| parkinson_sigma(h, l)).sum::<f64>()
+            bins[..=i]
+                .iter()
+                .map(|b| rs_sigma_from_ohlc(b.open, b.high, b.low, b.close))
+                .sum::<f64>()
                 / (i + 1) as f64
         } else {
             alpha * sigma + (1.0 - alpha) * prev_ema.unwrap_or(sigma)
         };
         prev_ema = Some(ema);
-        writer.write_record(timestamp::from_epoch_ms(ts), ema)?;
+        writer.write_record(timestamp::from_epoch_ms(bin.ts), ema)?;
         count += 1;
     }
 
