@@ -7,12 +7,6 @@ use std::path::PathBuf;
 pub use mitch::TickFrame;
 pub use mitch::bar::Bar;
 
-/// Round a float to 6 significant digits.
-#[inline]
-pub fn round_to_6_sig_digits(value: f64) -> f64 {
-    nxr_sdk::stats::round_to_sig_digits(value, 6)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggregationMode {
     Tick,

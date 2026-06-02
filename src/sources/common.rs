@@ -4,7 +4,7 @@
 //! ZIP/GZIP decompression, bid/ask inference from trade data, batch sending,
 //! and date iteration helpers.
 
-use crate::types::{round_to_6_sig_digits, Config, TickFrame};
+use crate::types::{Config, TickFrame};
 use anyhow::Result;
 use chrono::{Datelike, Duration, NaiveDate};
 use memmap2::Mmap;
@@ -173,16 +173,17 @@ pub fn infer_tick(ticker_id: u64, price: f64, volume: u32, is_buyer: bool) -> Ti
     if is_buyer {
         Tick {
             ticker: ticker_id,
-            bid: round_to_6_sig_digits(price * 0.9999),
-            ask: round_to_6_sig_digits(price),
+            // 6 sig digits — matches prod forwarder tick rounding
+            bid: nxr_sdk::stats::round_to_sig_digits(price * 0.9999, 6),
+            ask: nxr_sdk::stats::round_to_sig_digits(price, 6),
             vbid: 0,
             vask: volume,
         }
     } else {
         Tick {
             ticker: ticker_id,
-            bid: round_to_6_sig_digits(price),
-            ask: round_to_6_sig_digits(price * 1.0001),
+            bid: nxr_sdk::stats::round_to_sig_digits(price, 6),
+            ask: nxr_sdk::stats::round_to_sig_digits(price * 1.0001, 6),
             vbid: volume,
             vask: 0,
         }

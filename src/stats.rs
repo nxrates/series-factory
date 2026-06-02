@@ -205,7 +205,7 @@ pub fn compute_returns(bars: &[Bar], horizon: usize) -> Vec<f64> {
 // ── Statistical tests ─────────────────────────────────────────────────────────
 
 /// STAT = 0.6*(1 - ADF_p) + 0.4*KPSS_p
-pub fn compute_stat(returns: &[f64]) -> f64 {
+fn compute_stat(returns: &[f64]) -> f64 {
     if returns.len() < 50 {
         return 0.5;
     }
@@ -267,7 +267,7 @@ fn kpss_test(returns: &[f64]) -> f64 {
 /// IID = 1 − mean(|ACF_1..5|) − 0.5·mean(|ACF²_1..5|)
 ///
 /// Penalises autocorrelation in both returns and squared returns.
-pub fn compute_iid(returns: &[f64]) -> f64 {
+fn compute_iid(returns: &[f64]) -> f64 {
     if returns.len() < 20 {
         return 0.5;
     }
@@ -296,7 +296,7 @@ pub fn compute_iid(returns: &[f64]) -> f64 {
 ///
 /// Must be called with fold_variances from at least 2 folds.
 /// CV of a single-element slice is undefined - this is an aggregate metric.
-pub fn compute_homo(fold_variances: &[f64]) -> f64 {
+fn compute_homo(fold_variances: &[f64]) -> f64 {
     if fold_variances.len() < 2 {
         return 0.5;
     }
@@ -305,7 +305,7 @@ pub fn compute_homo(fold_variances: &[f64]) -> f64 {
 }
 
 /// NORM = 1 − 0.1·|skew| − 0.05·|excess_kurtosis| (capped)
-pub fn compute_norm(returns: &[f64]) -> f64 {
+fn compute_norm(returns: &[f64]) -> f64 {
     if returns.len() < 10 {
         return 0.5;
     }
@@ -334,7 +334,7 @@ fn compute_robust(stats: &[f64], iids: &[f64]) -> f64 {
 // ── Hard gate helpers ─────────────────────────────────────────────────────────
 
 /// Bars per calendar day.
-pub fn compute_density_bars_per_day(n_bars: usize, duration_ms: i64) -> f64 {
+fn compute_density_bars_per_day(n_bars: usize, duration_ms: i64) -> f64 {
     let ms_per_day = nxr_sdk::shard::MS_PER_DAY as f64;
     let days = duration_ms as f64 / ms_per_day;
     if days < 0.1 {
@@ -347,7 +347,7 @@ pub fn compute_density_bars_per_day(n_bars: usize, duration_ms: i64) -> f64 {
 ///
 /// 0 = Renko reverses immediately at turning points.
 /// 1 = Renko takes 50+ bars to confirm a reversal.
-pub fn compute_reversal_delay_lag(bars: &[Bar], window: usize) -> f64 {
+fn compute_reversal_delay_lag(bars: &[Bar], window: usize) -> f64 {
     if bars.len() < window * 2 {
         return 0.5;
     }
