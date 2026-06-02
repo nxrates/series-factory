@@ -418,6 +418,34 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
         build_vol_from_hlc(&hlc, &yml.vol, &mut writer)?;
         writer.finish()?;
     }
+
+    // Persist an id-keyed copy at `<data_root>/vol/<id>.vol` so the LIVE renko
+    // producer can prime its in-process Parkinson ring from the SAME EMA-σ bins
+    // this backfill used — the history↔live seam-glue prime. The bins are
+    // EMA-smoothed Parkinson σ (causal); the live ring re-derives byte-identical
+    // bins from live ticks, so priming only tightens the FIRST live brick at
+    // the seam. Atomic write (tmp + rename) so a concurrent live prime never
+    // reads a torn file.
+    {
+        let persist_path = nxr_sdk::shard::vol_path_for_id(&data_root, ticker_id);
+        if let Some(parent) = persist_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = persist_path.with_extension("vol.tmp");
+        match std::fs::copy(&vol_path, &tmp).and_then(|_| std::fs::rename(&tmp, &persist_path)) {
+            Ok(_) => info!(
+                pair = pair_str,
+                vol = %persist_path.display(),
+                "persistent id-keyed .vol written (live-prime source)"
+            ),
+            Err(e) => warn!(
+                err = %e,
+                vol = %persist_path.display(),
+                "persistent .vol write failed (live prime will warm from ticks)"
+            ),
+        }
+    }
+
     let vol_mmap = VolMmap::open(&vol_path)?;
     let sigma_cache = {
         let mut calc = MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
@@ -435,7 +463,16 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     // monotonic; cross-shard order is shard-date-monotonic ⇒ stream is
     // globally monotonic. We rely on that for the leak gate's
     // `partition_point` below.
-    let prices: Vec<(i64, f64)> = tick_stream;
+    // Per-day sliding-window tick buffer (OOM fix). Previously this held the
+    // ENTIRE [from - max_window_days .. to] tick range in RAM for the whole
+    // run — on a multi-year --all backfill that grew past the apply_safe_cap
+    // RSS watchdog (the observed 8->16GiB abort). The walk-forward calibrator
+    // for day D only ever reaches back `max_window_days` from D (see
+    // calibrate_mtf_with_target: `from = last - window_days*MS_PER_DAY`), so as
+    // the walk advances we drop ticks older than `D_start - max_window_days`
+    // from the FRONT each day. Peak RAM = one trailing window, freed per day —
+    // not the full range. Bars already stream per-day via BarShardWriter below.
+    let mut prices: Vec<(i64, f64)> = tick_stream;
 
     // ── Per-day walk-forward calibration + brick emission ───────────────
     let day_list = day_range(from, to);
@@ -503,6 +540,22 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
             if let Err(e) = std::fs::remove_file(&out_path) {
                 warn!(path = %out_path.display(), err = %e, "force-delete failed");
             }
+        }
+
+        // ── OOM fix: drop trailing ticks no future day needs ─────────────
+        // Day D (and every later day) calibrates over the last
+        // `max_window_days` anchored on `last` (the last tick with ts <
+        // d_start), NOT on d_start itself — and `last` can be up to ~1 day
+        // before d_start when the market is quiet. So we keep a +1-day margin:
+        // drop only ticks older than `d_start - (max_window_days + 1)`. This
+        // guarantees we never remove a tick any current/future calibration
+        // window could read, while still bounding the buffer to ~one window.
+        // Drain from the front each day → peak RAM = one trailing window, freed
+        // per day (the 8->16GiB OOM was this Vec held for the whole run).
+        let prune_before = d_start - ((max_window_days as i64) + 1) * MS_PER_DAY;
+        let drop_n = prices.partition_point(|(ts, _)| *ts < prune_before);
+        if drop_n > 0 {
+            prices.drain(0..drop_n);
         }
 
         // ── Calibrate k(D) on prices with ts STRICTLY < d_start ─────────
@@ -863,6 +916,52 @@ mod tests {
         let trailing = &prices[..cutoff];
         assert_eq!(trailing.len(), 3);
         assert!(trailing.iter().all(|(ts, _)| *ts < d_start));
+    }
+
+    /// OOM-fix prune correctness: dropping ticks older than
+    /// `d_start - max_window_days` must NOT change the trailing slice the
+    /// calibrator sees for day D (which only reaches back max_window_days from
+    /// `last < d_start`), while bounding the retained buffer to one window.
+    #[test]
+    fn front_prune_preserves_trailing_window() {
+        let day = MS_PER_DAY;
+        let d_start = day_start_ms(NaiveDate::from_ymd_opt(2024, 5, 21).unwrap());
+        let max_window_days: i64 = 30;
+        // Ticks spanning 60 days before D, one per day.
+        let mut prices: Vec<(i64, f64)> = (1..=60)
+            .map(|i| (d_start - i * day, 100.0 + i as f64))
+            .collect();
+        prices.sort_by_key(|(ts, _)| *ts);
+
+        // Trailing slice (ts < d_start) over the FULL buffer — reference.
+        let cutoff_full = prices.partition_point(|(ts, _)| *ts < d_start);
+        let last_ts = prices[cutoff_full - 1].0;
+        // The calibrator window reaches back max_window_days from `last`.
+        let window_lo = last_ts - max_window_days * day;
+        let ref_window: Vec<(i64, f64)> = prices[..cutoff_full]
+            .iter()
+            .copied()
+            .filter(|(ts, _)| *ts >= window_lo)
+            .collect();
+
+        // Apply the front prune as the loop would for day D (+1-day margin so
+        // the `last`-anchored window is never truncated).
+        let prune_before = d_start - (max_window_days + 1) * day;
+        let drop_n = prices.partition_point(|(ts, _)| *ts < prune_before);
+        prices.drain(0..drop_n);
+
+        // Buffer is now bounded to ~one window (≤ max_window_days+2 entries here).
+        assert!(prices.len() <= (max_window_days as usize) + 3);
+        // The calibrator window over the pruned buffer is byte-identical to the
+        // reference window over the full buffer — no data the window needs was
+        // dropped.
+        let cutoff_pruned = prices.partition_point(|(ts, _)| *ts < d_start);
+        let pruned_window: Vec<(i64, f64)> = prices[..cutoff_pruned]
+            .iter()
+            .copied()
+            .filter(|(ts, _)| *ts >= window_lo)
+            .collect();
+        assert_eq!(ref_window, pruned_window);
     }
 
     // Note: class_for_pair test moved to nxr_sdk::asset_class (single source).
