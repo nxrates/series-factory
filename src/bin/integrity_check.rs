@@ -107,6 +107,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Check a single `.renko` file (alias for `.bars`; 96B renko bricks).
+    Renko {
+        path: PathBuf,
+        #[arg(long)]
+        strict: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Recursively check all `.idx`, `.bars`, `.vol` files under a directory.
     Dir {
         path: PathBuf,
@@ -911,7 +919,7 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
             if p.is_dir() {
                 walk(&p, out);
             } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                if matches!(ext, "idx" | "bars" | "s10" | "vol") {
+                if matches!(ext, "idx" | "bars" | "s10" | "vol" | "renko") {
                     out.push(p);
                 }
             }
@@ -957,6 +965,7 @@ fn check_dir(root: &Path, parallel: usize, strict: bool) -> Result<AggregateRepo
                     "idx" => check_idx(p, strict),
                     "bars" => check_bars(p, strict),
                     "s10" => check_s10(p, strict, 10_000),
+                    "renko" => check_bars(p, strict),
                     "vol" => check_vol(p, strict),
                     other => Err(anyhow::anyhow!("unhandled extension: {}", other)),
                 };
@@ -1019,6 +1028,11 @@ fn main() -> Result<()> {
         }
         Cmd::S10 { path, strict, json, bucket_ms } => {
             let r = check_s10(&path, strict, bucket_ms)?;
+            emit_report(&r, json);
+            std::process::exit(exit_code(std::slice::from_ref(&r), strict));
+        }
+        Cmd::Renko { path, strict, json } => {
+            let r = check_bars(&path, strict)?;
             emit_report(&r, json);
             std::process::exit(exit_code(std::slice::from_ref(&r), strict));
         }
