@@ -57,7 +57,7 @@ use series_factory::bar_construction::{
     build_vol_from_hlc, calibrate_mtf_with_target, CalibrationConfig,
 };
 use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolSource};
-use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
@@ -617,7 +617,7 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
         let sigma_at = |ts: i64| -> f64 {
             let mts = timestamp::from_epoch_ms(ts);
             let i = vol_mmap.find_index_for_mts(mts);
-            sigma_cache.get(i).copied().unwrap_or(0.01)
+            sigma_cache.get(i).copied().unwrap_or(SIGMA_FALLBACK)
         };
 
         // Optionally seed from the prior generator's last_close so the

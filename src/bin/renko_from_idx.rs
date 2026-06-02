@@ -29,7 +29,7 @@ use series_factory::{
     vol_bin::{VolMmap, VolWriter},
 };
 use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolSource};
-use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -186,7 +186,7 @@ fn main() -> Result<()> {
     let sigma_at = |ts: i64| -> f64 {
         let mts = timestamp::from_epoch_ms(ts);
         let i = vol_mmap.find_index_for_mts(mts);
-        sigma_cache.get(i).copied().unwrap_or(0.01)
+        sigma_cache.get(i).copied().unwrap_or(SIGMA_FALLBACK)
     };
 
     let t1 = std::time::Instant::now();

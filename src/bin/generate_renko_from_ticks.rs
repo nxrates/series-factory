@@ -20,7 +20,7 @@ use series_factory::{
 };
 use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolSource};
 use nxr_sdk::mitch::timestamp;
-use nxr_sdk::renko::{RenkoConfig, RenkoGenerator};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
@@ -336,7 +336,7 @@ fn run_pipeline(
     let sigma_at = |ts: i64| -> f64 {
         let mts = timestamp::from_epoch_ms(ts);
         let i = vol_mmap.find_index_for_mts(mts);
-        sigma_cache.get(i).copied().unwrap_or(0.01)
+        sigma_cache.get(i).copied().unwrap_or(SIGMA_FALLBACK)
     };
     let mut pass2_tick_count = 0u64;
     let mut pass2_post_bootstrap = 0u64;
