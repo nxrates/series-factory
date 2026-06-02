@@ -14,5 +14,4 @@ pub use calibrate::{
 };
 pub use vol_builder::{
     build_vol_from_mid_ticks, build_vol_from_s10, write_vol_records_from_ohlc, S10ShardIter,
-    BUCKET_MS as VOL_BUCKET_MS,
 };

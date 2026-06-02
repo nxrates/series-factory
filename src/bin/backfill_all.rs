@@ -171,12 +171,6 @@ fn split_csv(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn split_pair(t: &str) -> Result<(String, String)> {
-    nxr_sdk::split_pair_multi(t, &['/', '-'])
-        .map(|(b, q)| (b.to_string(), q.to_string()))
-        .ok_or_else(|| anyhow!("bad ticker {}: expected BASE-QUOTE", t))
-}
-
 fn file_bytes(p: &Path) -> u64 {
     fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
@@ -442,7 +436,10 @@ fn cleanup_ticker_staging(
 }
 
 fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
-    let (base, quote) = match split_pair(ticker) {
+    let (base, quote) = match nxr_sdk::split_pair_multi(ticker, &['/', '-'])
+        .map(|(b, q)| (b.to_string(), q.to_string()))
+        .ok_or_else(|| anyhow!("bad ticker {}: expected BASE-QUOTE", ticker))
+    {
         // R1 H10: uppercase both halves the moment we parse the pair so a
         // lowercased CLI arg (`btc-usdt`) cannot silently shadow the
         // uppercase fetcher output. Per-exchange `ticks/<exch>/<BASE><QUOTE>`
@@ -833,12 +830,8 @@ fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
     let mut any_fail = false;
     for shard in &shards {
         total_bytes += file_bytes(shard);
-        let ic_kind = match kind {
-            "renko" => "renko",
-            other => other,
-        };
         let args = vec![
-            ic_kind.to_string(),
+            kind.to_string(),
             shard.to_string_lossy().to_string(),
             "--json".to_string(),
         ];

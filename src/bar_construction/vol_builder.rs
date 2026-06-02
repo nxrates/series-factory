@@ -69,9 +69,6 @@ impl S10ShardIter {
     }
 }
 
-/// 30-min bin width in milliseconds (the canonical vol-bin width).
-pub const BUCKET_MS: i64 = MS_PER_30MIN;
-
 /// Build a `.vol` file from a sequence of s10 `Bar`s.
 ///
 /// `next_bar` yields s10 bars in chronological order (returns `None` at EOF) —
@@ -95,7 +92,7 @@ where
         }
         s10.push(o);
     }
-    let bins = rollup(&s10, BAR_MS_S10, BUCKET_MS);
+    let bins = rollup(&s10, BAR_MS_S10, MS_PER_30MIN);
     write_vol_records_from_ohlc(&bins, vol_cfg, writer)
 }
 
@@ -131,8 +128,14 @@ where
             .or_insert(Ohlc {
                 ts: key,
                 close_ts: key + BAR_MS_S10 - 1,
-                open: mid, high: mid, low: mid, close: mid,
-                vbid: 0, vask: 0, tick_count: 1, avg_ci_ubp: 0,
+                open: mid,
+                high: mid,
+                low: mid,
+                close: mid,
+                vbid: 0,
+                vask: 0,
+                tick_count: 1,
+                avg_ci_ubp: 0,
             });
     }
     // Gapless flat-fill across empty 10s buckets.
@@ -146,9 +149,14 @@ where
                 series.push(Ohlc {
                     ts: b,
                     close_ts: b + BAR_MS_S10 - 1,
-                    open: last_close, high: last_close,
-                    low: last_close, close: last_close,
-                    vbid: 0, vask: 0, tick_count: 0, avg_ci_ubp: 0,
+                    open: last_close,
+                    high: last_close,
+                    low: last_close,
+                    close: last_close,
+                    vbid: 0,
+                    vask: 0,
+                    tick_count: 0,
+                    avg_ci_ubp: 0,
                 });
                 b += BAR_MS_S10;
             }
@@ -157,7 +165,7 @@ where
         last_close = o.close;
         prev_ts = Some(ts);
     }
-    let bins = rollup(&series, BAR_MS_S10, BUCKET_MS);
+    let bins = rollup(&series, BAR_MS_S10, MS_PER_30MIN);
     write_vol_records_from_ohlc(&bins, vol_cfg, writer)
 }
 

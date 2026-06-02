@@ -85,8 +85,8 @@ fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
 
 /// Resolve `target_bpd` for a given pair. Phase 60.π: per-pair overrides only,
 /// flat default for all unlisted pairs. Class arg retained for log context.
-fn target_for_pair(c: &CalibrationYml, pair: &str) -> f64 {
-    c.target_for_pair(pair)
+fn target_for_pair(c: &CalibrationYml, pair: &str, class: AssetClassBucket) -> f64 {
+    c.target_for_pair_classed(pair, class.as_key())
 }
 
 // ── Asset-class bucket detection ─────────────────────────────────────────────
@@ -654,9 +654,10 @@ fn run_once(args: &Args) -> Result<()> {
 
     pool.install(|| {
         work.par_iter().for_each(|(ticker_id, pair, class)| {
-            // Phase 60.π: per-pair override or flat default. No skip path —
-            // operator policy: never skip a day, calibrator always returns a target.
-            let target_bpd = target_for_pair(cal_ext, pair);
+            // Per-pair override → per-class default (e.g. crypto_stable → 50,
+            // detected from the already-computed bucket) → flat default. No skip
+            // path — operator policy: never skip a day, always return a target.
+            let target_bpd = target_for_pair(cal_ext, pair, *class);
 
             // Panic-safe: one bad ticker (malformed .idx, OOM in sigma cache,
             // ...) must not abort the whole cron. AssertUnwindSafe is sound
@@ -751,7 +752,11 @@ fn run_once(args: &Args) -> Result<()> {
     info!(n_synth = synth_work.len(), "synth calibration pass starting");
     let (mut s_passed, mut s_skipped, mut s_failed) = (0usize, 0usize, 0usize);
     for (synth_id, synth_sym, leg_a_id, leg_b_id) in synth_work {
-        let synth_target = target_for_pair(cal_ext, synth_sym);
+        // Class-detect the synth pair too (stable/stable crosses like USD1/USDC
+        // → crypto_stable → 50) instead of relying on a manual override entry.
+        let synth_class =
+            bucket_for_pair(synth_sym, synth_id, &crypto_majors, &stablecoins, &fx_majors);
+        let synth_target = target_for_pair(cal_ext, synth_sym, synth_class);
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             calibrate_one_synth(
                 synth_id, synth_sym, leg_a_id, leg_b_id,
