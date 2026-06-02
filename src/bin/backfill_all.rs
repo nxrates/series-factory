@@ -833,8 +833,12 @@ fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
     let mut any_fail = false;
     for shard in &shards {
         total_bytes += file_bytes(shard);
+        let ic_kind = match kind {
+            "renko" => "renko",
+            other => other,
+        };
         let args = vec![
-            kind.to_string(),
+            ic_kind.to_string(),
             shard.to_string_lossy().to_string(),
             "--json".to_string(),
         ];

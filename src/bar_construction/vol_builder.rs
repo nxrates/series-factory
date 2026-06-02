@@ -129,7 +129,9 @@ where
                 o.tick_count = o.tick_count.saturating_add(1);
             })
             .or_insert(Ohlc {
-                ts: key, open: mid, high: mid, low: mid, close: mid,
+                ts: key,
+                close_ts: key + BAR_MS_S10 - 1,
+                open: mid, high: mid, low: mid, close: mid,
                 vbid: 0, vask: 0, tick_count: 1, avg_ci_ubp: 0,
             });
     }
@@ -142,7 +144,9 @@ where
             let mut b = pt + BAR_MS_S10;
             while b < ts {
                 series.push(Ohlc {
-                    ts: b, open: last_close, high: last_close,
+                    ts: b,
+                    close_ts: b + BAR_MS_S10 - 1,
+                    open: last_close, high: last_close,
                     low: last_close, close: last_close,
                     vbid: 0, vask: 0, tick_count: 0, avg_ci_ubp: 0,
                 });
