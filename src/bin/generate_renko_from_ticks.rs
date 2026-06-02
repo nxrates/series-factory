@@ -14,11 +14,11 @@ use bytemuck::bytes_of;
 use mitch::bar::{Bar, BarKind};
 use nxr_sdk::BarAccumulator;
 use series_factory::{
-    bar_construction::{build_vol_from_hlc, calibrate_mtf, CalibrationConfig},
+    bar_construction::{build_vol_from_mid_ticks, calibrate_mtf, CalibrationConfig},
     vol_bin::{VolMmap, VolWriter},
     TickFrame,
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolSource};
+use nxr_sdk::vol::{MtfVolCalculator, VolSource};
 use nxr_sdk::mitch::timestamp;
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use std::{
@@ -238,7 +238,7 @@ fn run_pipeline(
     // (needed for RenkoGenerator) and 1-min downsampled prices (used for
     // in-memory calibration, eliminating ~15 redundant tick file re-reads).
     let t0 = std::time::Instant::now();
-    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    let mut vol_mids: Vec<(i64, f64)> = Vec::new();
     let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
 
     for (fi, path) in tick_files.iter().enumerate() {
@@ -248,11 +248,8 @@ fn run_pipeline(
             let ts = frame.timestamp_ms();
             let mid = frame.mid_price();
 
-            // Vol: 30-min HLC buckets (H/L from mid since raw ticks lack a bid/ask split here).
-            let key = (ts / nxr_sdk::shard::MS_PER_30MIN) * nxr_sdk::shard::MS_PER_30MIN;
-            let e = hlc.entry(key).or_insert((mid, mid));
-            if mid > e.0 { e.0 = mid; }
-            if mid < e.1 { e.1 = mid; }
+            // Vol: full-history mid stream → RS over gapless s10 OHLC.
+            vol_mids.push((ts, mid));
 
             // Price: 1-min last-close for calibration (~25 MB for 3 years)
             let bucket = (ts / nxr_sdk::shard::MS_PER_MIN) * nxr_sdk::shard::MS_PER_MIN;
@@ -264,7 +261,7 @@ fn run_pipeline(
 
     let vol_path = output_path.with_extension("vol");
     let mut vol_writer = VolWriter::new(&vol_path)?;
-    let n_vol_records = build_vol_from_hlc(&hlc, &yml.vol, &mut vol_writer)?;
+    let n_vol_records = build_vol_from_mid_ticks(vol_mids.iter().copied(), &yml.vol, &mut vol_writer)?;
     vol_writer.finish()?;
     let vol_mmap = VolMmap::open(&vol_path)?;
 
@@ -294,7 +291,7 @@ fn run_pipeline(
 
     // ═══ CALIBRATION (in-memory from downsampled prices) ═══
     let sigma_cache = {
-        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
+        let mut calc = MtfVolCalculator::new(&vol_mmap, yml.vol.clone());
         let t = std::time::Instant::now();
         let c = calc.precompute_sigma_cache();
         let min_s = c.iter().cloned().fold(f64::MAX, f64::min);

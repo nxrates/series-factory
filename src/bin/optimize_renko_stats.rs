@@ -29,13 +29,13 @@ use rayon::prelude::*;
 use mitch::bar::{Bar, BarKind};
 use nxr_sdk::BarAccumulator;
 use series_factory::{
-    bar_construction::build_vol_from_hlc,
+    bar_construction::build_vol_from_mid_ticks,
     vol_bin::{VolMmap, VolWriter},
     sampler::{SearchConfig, SearchState},
     read_tick_file,
     stats::{aggregate_fold_scores, compute_returns, score_fold, GateSpec, StatAggregateScore},
 };
-use nxr_sdk::parkinson::{VolConfig, VolSource};
+use nxr_sdk::vol::{VolConfig, VolSource};
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use std::{
     collections::BTreeMap,
@@ -474,7 +474,7 @@ fn generate_bars(
     };
     // Resolve σ per tick via the vol mmap directly (this binary's hot path
     // is single-pass over already-decoded tick prices, no cache).
-    let mut calc = nxr_sdk::parkinson::MtfParkinsonCalculator::new(vol_mmap, VolConfig::default());
+    let mut calc = nxr_sdk::vol::MtfVolCalculator::new(vol_mmap, VolConfig::default());
     let sigma_cache = calc.precompute_sigma_cache();
     let mut bars = Vec::new();
     let iter = tick_prices.iter().map(|&(ts, mid)| {
@@ -499,16 +499,15 @@ fn build_vol_batched(
     vol_cfg: &VolConfig,
 ) -> Result<()> {
     info!(
-        "Building Parkinson vol from {} files (batch_size={})...",
+        "Building Rogers-Satchell vol (over gapless s10 OHLC) from {} files (batch_size={})...",
         tick_files.len(),
         batch_size
     );
 
-    // Canonical 30-min HLC buckets (matches VolMmap consumer + every other
-    // pipeline). Previous code used 1h buckets + hardcoded ema=14 here, which
-    // diverged silently from the rest of the stack.
-    const BUCKET_MS: i64 = nxr_sdk::shard::MS_PER_30MIN;
-    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    // Collect the full (ts, mid) stream (parallel per-file read), then build the
+    // vol via the canonical RS-over-s10-OHLC builder (matches every other
+    // pipeline + the live ring). Previous code built 30-min HLC here.
+    let mut mids: Vec<(i64, f64)> = Vec::new();
 
     for (chunk_idx, chunk) in tick_files.chunks(batch_size).enumerate() {
         if chunk_idx % 5 == 0 {
@@ -519,33 +518,28 @@ fn build_vol_batched(
             );
         }
 
-        let partial_maps: Vec<BTreeMap<i64, (f64, f64)>> = chunk
+        let partials: Vec<Vec<(i64, f64)>> = chunk
             .par_iter()
             .filter_map(|tick_file| {
                 let ticks = read_tick_file(tick_file).ok()?;
-                let mut h: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+                let mut v: Vec<(i64, f64)> = Vec::with_capacity(ticks.len());
                 for t in &ticks {
-                    let h_key = (t.timestamp_ms() / BUCKET_MS) * BUCKET_MS;
-                    let mid = t.mid_price();
-                    let entry = h.entry(h_key).or_insert((mid, mid));
-                    entry.0 = entry.0.max(mid);
-                    entry.1 = entry.1.min(mid);
+                    v.push((t.timestamp_ms(), t.mid_price()));
                 }
-                Some(h)
+                Some(v)
             })
             .collect();
 
-        for partial in partial_maps {
-            for (ts, (h, l)) in partial {
-                let entry = hlc.entry(ts).or_insert((h, l));
-                entry.0 = entry.0.max(h);
-                entry.1 = entry.1.min(l);
-            }
+        for partial in partials {
+            mids.extend(partial);
         }
     }
 
+    // Ensure chronological order before the gapless 10s-bucket fill.
+    mids.sort_unstable_by_key(|&(ts, _)| ts);
+
     let mut writer = VolWriter::new(path)?;
-    let n = build_vol_from_hlc(&hlc, vol_cfg, &mut writer)?;
+    let n = build_vol_from_mid_ticks(mids.iter().copied(), vol_cfg, &mut writer)?;
     writer.finish()?;
     info!("Vol built: {} 30-min records", n);
     Ok(())

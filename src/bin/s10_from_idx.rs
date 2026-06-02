@@ -19,6 +19,7 @@ use chrono::NaiveDate;
 use clap::Parser;
 use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
+use nxr_sdk::bar_builder::flat_bar;
 use nxr_sdk::shard::ShardStream;
 use nxr_sdk::{BarAccumulator, resolve_ticker_id};
 use series_factory::sharding::{
@@ -102,13 +103,38 @@ fn main() -> Result<()> {
     let mut accum = BarAccumulator::new();
     let mut bars_by_date: BTreeMap<NaiveDate, Vec<Bar>> = BTreeMap::new();
     let mut cur_bucket: Option<i64> = None;
+    // Last emitted close — seeds `flat_bar` for empty (zero-tick) buckets so the
+    // offline series is GAPLESS, byte-identical to the live `bars_s10` producer
+    // (core/src/bars_s10.rs flush_all). Without this, quiet windows drop buckets
+    // and offline-s10-resampled vol diverges from live on those windows.
+    let mut last_close: f64 = 0.0;
     let mut n_input: u64 = 0;
     let mut n_skipped: u64 = 0;
+    let mut n_flat: u64 = 0;
 
     let flush_bar = |bars_by_date: &mut BTreeMap<NaiveDate, Vec<Bar>>, bar: Bar| {
         // route by open_ts.utc_date()
         let date = ts_ms_to_utc_date(bar.open_time_ms());
         bars_by_date.entry(date).or_default().push(bar);
+    };
+
+    // Emit flat bars for every empty 10s bucket in `(from, to)` (exclusive both
+    // ends), each seeded with `last_close`. Mirrors the live producer, which
+    // fires one `flat_bar` per ticker per 10s boundary that received no ticks.
+    let fill_gap = |bars_by_date: &mut BTreeMap<NaiveDate, Vec<Bar>>,
+                    from: i64,
+                    to: i64,
+                    last_close: f64,
+                    n_flat: &mut u64| {
+        if last_close <= 0.0 {
+            return;
+        }
+        let mut b = from + args.bucket_ms;
+        while b < to {
+            flush_bar(bars_by_date, flat_bar(b, last_close));
+            *n_flat += 1;
+            b += args.bucket_ms;
+        }
     };
 
     for (date, path) in &shards {
@@ -134,8 +160,14 @@ fn main() -> Result<()> {
                 Some(cb) if bucket > cb => {
                     if let Some(mut bar) = accum.flush() {
                         bar.kind = BarKind::Kline as u8;
+                        if bar.close > 0.0 && bar.close.is_finite() {
+                            last_close = bar.close;
+                        }
                         flush_bar(&mut bars_by_date, bar);
                     }
+                    // GAPLESS fill: emit a flat bar for each empty bucket strictly
+                    // between the just-closed bucket and the new one.
+                    fill_gap(&mut bars_by_date, cb, bucket, last_close, &mut n_flat);
                     cur_bucket = Some(bucket);
                 }
                 Some(cb) if bucket < cb => {
@@ -158,7 +190,8 @@ fn main() -> Result<()> {
             );
         }
     }
-    // flush final open bucket
+    // flush final open bucket (no trailing gap-fill: gapless only spans
+    // first..last observed, matching live which fills only past boundaries).
     if let Some(mut bar) = accum.flush() {
         bar.kind = BarKind::Kline as u8;
         flush_bar(&mut bars_by_date, bar);
@@ -168,9 +201,10 @@ fn main() -> Result<()> {
     info!(
         input_records = n_input,
         skipped = n_skipped,
+        flat_filled = n_flat,
         bars = total_bars,
         out_shards = bars_by_date.len(),
-        "s10 pass done in {}ms",
+        "s10 pass done (gapless) in {}ms",
         t0.elapsed().as_millis()
     );
 

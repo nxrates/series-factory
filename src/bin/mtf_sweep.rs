@@ -29,13 +29,13 @@ use nxr_sdk::asset_class::{
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::resolve_ticker_id;
 use nxr_sdk::shard::{
-    bars_dir, idx_dir, list_shards, ShardStream, MS_PER_30MIN, MS_PER_DAY,
+    bars_dir, idx_dir, list_shards, ShardStream, MS_PER_DAY,
 };
 use serde::Serialize;
 use series_factory::bar_construction::{
-    build_vol_from_hlc, calibrate_mtf_with_target, count_bars_from_prices, CalibrationConfig,
+    build_vol_from_mid_ticks, calibrate_mtf_with_target, count_bars_from_prices, CalibrationConfig,
 };
-use nxr_sdk::parkinson::MtfParkinsonCalculator;
+use nxr_sdk::vol::MtfVolCalculator;
 use nxr_sdk::renko::RenkoConfig;
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
@@ -279,8 +279,8 @@ fn run_pair(
     let from_d_start = day_start_ms(from_date);
     let tick_retain_from = from_d_start - (max_window_days_in_sweep as i64) * MS_PER_DAY;
 
-    // ── Pass 1: HLC + tick stream ───────────────────────────────────────────
-    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    // ── Pass 1: full-history mid stream (vol) + windowed tick stream ────────
+    let mut vol_mids: Vec<(i64, f64)> = Vec::new();
     let mut tick_stream: Vec<(i64, f64)> = Vec::new();
     let mut total_records: u64 = 0;
 
@@ -297,14 +297,7 @@ fn run_pair(
             }
             total_records += 1;
 
-            let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
-            let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
-            if ask > e.0 {
-                e.0 = ask;
-            }
-            if bid < e.1 && bid > 0.0 {
-                e.1 = bid;
-            }
+            vol_mids.push((ts, mid));
 
             if ts >= tick_retain_from {
                 tick_stream.push((ts, mid));
@@ -315,13 +308,13 @@ fn run_pair(
     info!(
         pair = pair_str,
         idx_records = total_records,
-        hlc_buckets = hlc.len(),
+        vol_mids = vol_mids.len(),
         tick_stream_len = tick_stream.len(),
         retain_days = max_window_days_in_sweep,
         "pass 1 done"
     );
 
-    if hlc.is_empty() || tick_stream.is_empty() {
+    if vol_mids.is_empty() || tick_stream.is_empty() {
         warn!(pair = pair_str, "no usable mid quotes after scan");
         return Ok(BTreeMap::new());
     }
@@ -334,12 +327,12 @@ fn run_pair(
     ));
     {
         let mut writer = VolWriter::new(&vol_path)?;
-        build_vol_from_hlc(&hlc, &yml.vol, &mut writer)?;
+        build_vol_from_mid_ticks(vol_mids.iter().copied(), &yml.vol, &mut writer)?;
         writer.finish()?;
     }
     let vol_mmap = VolMmap::open(&vol_path)?;
     let sigma_cache = {
-        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, yml.vol.clone());
+        let mut calc = MtfVolCalculator::new(&vol_mmap, yml.vol.clone());
         calc.precompute_sigma_cache()
     };
     info!(

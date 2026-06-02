@@ -31,14 +31,15 @@ use nxr_sdk::asset_class::{
     DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
 };
 use nxr_sdk::ipc::record::IndexRecord;
-use nxr_sdk::shard::{list_shards, ShardStream, MS_PER_30MIN, MS_PER_MIN};
+use nxr_sdk::shard::{list_shards, ShardStream, MS_PER_MIN};
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
 use series_factory::bar_construction::{
-    build_vol_from_hlc, calibrate_mtf_walkforward, CalibrationConfig,
+    build_vol_from_s10, calibrate_mtf_walkforward, write_vol_records_from_ohlc, CalibrationConfig,
+    S10ShardIter,
 };
-use nxr_sdk::parkinson::{MtfParkinsonCalculator, VolConfig};
+use nxr_sdk::vol::{MtfVolCalculator, VolConfig};
 use nxr_sdk::renko::RenkoConfig;
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
@@ -111,6 +112,7 @@ fn calibrate_one(
     pair: &str,
     class: AssetClassBucket,
     idx_dir: &Path,
+    bars_root: &Path,
     cal_ext: &CalibrationYml,
     target_bpd: f64,
     vol_cfg: &VolConfig,
@@ -134,10 +136,10 @@ fn calibrate_one(
         };
     }
 
-    // Pass 1: stream every shard in date order → 30-min HLC + 1-min mid
-    // downsample for calibration. Bucket H = ask, L = bid; matches
-    // `renko_from_idx.rs` semantics.
-    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    // Pass 1: stream every .idx shard in date order → 1-min last-mid downsample
+    // for the in-memory calibration walk-forward. The vol basis is built
+    // separately from the gapless `.s10` shards (RS over s10 OHLC), NOT from
+    // idx-HLC — see the s10 vol build below.
     let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
     for (_date, shard_path) in &shards {
         let mut stream = match ShardStream::<IndexRecord>::open(shard_path) {
@@ -162,11 +164,6 @@ fn calibrate_one(
             let mid = (bid + ask) * 0.5;
             if !(mid.is_finite() && mid > 0.0) { continue; }
 
-            let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
-            let e = hlc.entry(key).or_insert((ask.max(mid), bid.min(mid)));
-            if ask > e.0 { e.0 = ask; }
-            if bid < e.1 && bid > 0.0 { e.1 = bid; }
-
             // 1-min last-mid bucket for in-memory calibration.
             let bucket = (ts / MS_PER_MIN) * MS_PER_MIN;
             let pe = price_buckets.entry(bucket).or_insert((ts, mid));
@@ -174,20 +171,29 @@ fn calibrate_one(
         }
     }
 
-    if hlc.is_empty() {
+    if price_buckets.is_empty() {
         return CalOutcome::Skipped { ticker_id, reason: "empty .idx".into() };
     }
 
-    // Build the .vol file (tmp, deleted at end of fn). VolMmap is the de-facto
-    // VolSource; reusing the canonical builder keeps calibration bit-for-bit
-    // identical to the prod pipeline and the other offline pipelines.
+    // Build the .vol file (tmp, deleted at end of fn) from the gapless `.s10`
+    // shards via the canonical RS-over-s10-OHLC builder. offline == live.
     let vol_path = std::env::temp_dir().join(format!("nxr-calibrate-{}-{}.vol", ticker_id, std::process::id()));
     {
         let mut writer = match VolWriter::new(&vol_path) {
             Ok(w) => w,
             Err(e) => return CalOutcome::Failed { ticker_id, reason: format!("vol writer: {}", e) },
         };
-        if let Err(e) = build_vol_from_hlc(&hlc, vol_cfg, &mut writer) {
+        let s10_dir = nxr_sdk::shard::bars_dir(bars_root, ticker_id);
+        let s10_shards = list_shards(&s10_dir, "s10").unwrap_or_default();
+        if s10_shards.is_empty() {
+            let _ = std::fs::remove_file(&vol_path);
+            return CalOutcome::Skipped {
+                ticker_id,
+                reason: format!("no .s10 shards under {}", s10_dir.display()),
+            };
+        }
+        let mut s10_iter = S10ShardIter::new(s10_shards);
+        if let Err(e) = build_vol_from_s10(|| s10_iter.next_bar(), vol_cfg, &mut writer) {
             return CalOutcome::Failed { ticker_id, reason: format!("vol build: {}", e) };
         }
         if let Err(e) = writer.finish() {
@@ -204,7 +210,7 @@ fn calibrate_one(
     };
 
     let sigma_cache = {
-        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, vol_cfg.clone());
+        let mut calc = MtfVolCalculator::new(&vol_mmap, vol_cfg.clone());
         calc.precompute_sigma_cache()
     };
 
@@ -377,7 +383,10 @@ fn calibrate_one_synth(
     // reduces to "pick whichever side has the earlier next-ts" — no heap.
     let mut a_last: Option<(f64, f64)> = None;
     let mut b_last: Option<(f64, f64)> = None;
-    let mut hlc: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    // Synth has no persisted `.s10`; reconstruct the gapless 10s-OHLC mid series
+    // in-memory from the merged synth ticks, then roll up to 30-min RS σ — the
+    // SAME basis the native path reads off disk (offline == live contract).
+    let mut s10: BTreeMap<i64, nxr_sdk::ohlc::Ohlc> = BTreeMap::new();
     let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
     loop {
         // Pick side with smaller ts (ties favor a → deterministic).
@@ -416,11 +425,26 @@ fn calibrate_one_synth(
                 continue;
             }
             let mid = (synth_bid + synth_ask) * 0.5;
-            // 30-min H/L bucket (H = ask, L = bid).
-            let key = (ts / MS_PER_30MIN) * MS_PER_30MIN;
-            let e = hlc.entry(key).or_insert((synth_ask.max(mid), synth_bid.min(mid)));
-            if synth_ask > e.0 { e.0 = synth_ask; }
-            if synth_bid < e.1 && synth_bid > 0.0 { e.1 = synth_bid; }
+            // 10s OHLC bucket on synth mid (matches s10 producer's mid basis).
+            let s10_key = (ts / nxr_sdk::shard::BAR_MS_S10) * nxr_sdk::shard::BAR_MS_S10;
+            s10.entry(s10_key)
+                .and_modify(|o| {
+                    if mid > o.high { o.high = mid; }
+                    if mid < o.low { o.low = mid; }
+                    o.close = mid;
+                    o.tick_count = o.tick_count.saturating_add(1);
+                })
+                .or_insert(nxr_sdk::ohlc::Ohlc {
+                    ts: s10_key,
+                    open: mid,
+                    high: mid,
+                    low: mid,
+                    close: mid,
+                    vbid: 0,
+                    vask: 0,
+                    tick_count: 1,
+                    avg_ci_ubp: 0,
+                });
             // 1-min last-mid downsample.
             let bucket = (ts / MS_PER_MIN) * MS_PER_MIN;
             let pe = price_buckets.entry(bucket).or_insert((ts, mid));
@@ -432,9 +456,39 @@ fn calibrate_one_synth(
     drop(leg_a_stream);
     drop(leg_b_stream);
 
-    if hlc.is_empty() {
+    if s10.is_empty() {
         return CalOutcome::Skipped { ticker_id: synth_id, reason: "empty merged stream".into() };
     }
+
+    // Gapless-fill the 10s OHLC series with flat bars (last close) so quiet
+    // windows match the live producer, then roll up to 30-min RS σ.
+    let s10_series: Vec<nxr_sdk::ohlc::Ohlc> = {
+        let mut out: Vec<nxr_sdk::ohlc::Ohlc> = Vec::with_capacity(s10.len());
+        let mut prev_ts: Option<i64> = None;
+        let mut last_close = 0.0;
+        for (&ts, &o) in &s10 {
+            if let Some(pt) = prev_ts {
+                let mut b = pt + nxr_sdk::shard::BAR_MS_S10;
+                while b < ts {
+                    out.push(nxr_sdk::ohlc::Ohlc {
+                        ts: b, open: last_close, high: last_close,
+                        low: last_close, close: last_close,
+                        vbid: 0, vask: 0, tick_count: 0, avg_ci_ubp: 0,
+                    });
+                    b += nxr_sdk::shard::BAR_MS_S10;
+                }
+            }
+            out.push(o);
+            last_close = o.close;
+            prev_ts = Some(ts);
+        }
+        out
+    };
+    let bins = nxr_sdk::ohlc::rollup(
+        &s10_series,
+        nxr_sdk::shard::BAR_MS_S10,
+        nxr_sdk::shard::MS_PER_30MIN,
+    );
 
     // ── 3. VolWriter / VolMmap / sigma cache (identical to base path) ────────
     let vol_path = std::env::temp_dir()
@@ -444,7 +498,7 @@ fn calibrate_one_synth(
             Ok(w) => w,
             Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol writer: {}", e) },
         };
-        if let Err(e) = build_vol_from_hlc(&hlc, vol_cfg, &mut writer) {
+        if let Err(e) = write_vol_records_from_ohlc(&bins, vol_cfg, &mut writer) {
             return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol build: {}", e) };
         }
         if let Err(e) = writer.finish() {
@@ -459,7 +513,7 @@ fn calibrate_one_synth(
         }
     };
     let sigma_cache = {
-        let mut calc = MtfParkinsonCalculator::new(&vol_mmap, vol_cfg.clone());
+        let mut calc = MtfVolCalculator::new(&vol_mmap, vol_cfg.clone());
         calc.precompute_sigma_cache()
     };
 
@@ -568,6 +622,13 @@ fn run_once(args: &Args) -> Result<()> {
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();
     let params_path = PathBuf::from(&nxr_cfg.ticker_params_path);
     let idx_dir = PathBuf::from(&nxr_cfg.indexes_dir);
+    // Bars root holds the per-ticker `.s10` shards (the canonical vol basis).
+    // `bars_dir` = `<root>/bars`; sharding helpers want the data root, so use
+    // the parent (mirrors s10_from_idx.rs derivation).
+    let bars_root = Path::new(&nxr_cfg.bars_dir)
+        .parent()
+        .unwrap_or(Path::new("/data"))
+        .to_path_buf();
     let cfg_path = nxr_sdk::pipeline_config::PipelineYml::resolve_path(
         nxr_sdk::pipeline_config::ConfigHint::Bin,
     );
@@ -643,6 +704,7 @@ fn run_once(args: &Args) -> Result<()> {
                     &pair_clone,
                     class_clone,
                     &idx_dir,
+                    &bars_root,
                     cal_ext,
                     target_bpd,
                     vol_cfg,
