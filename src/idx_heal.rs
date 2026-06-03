@@ -11,7 +11,8 @@ use mitch::index::Index;
 use mitch::timestamp::{from_epoch_ms, to_epoch_ms};
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::shard::{
-    idx_dir, list_shards, read_shard_aligned, shard_path, write_shard_atomic, ShardRecord,
+    idx_dir, list_shards, read_shard_aligned, shard_path, ts_ms_to_utc_date, write_shard_atomic,
+    FLAG_IDX_HEALED, FLAG_RENKO_SYNTHETIC_BRICK, ShardRecord,
 };
 use nxr_sdk::tdwap::{decode_ci_ubp, encode_ci_ubp};
 use std::collections::BTreeMap;
@@ -19,7 +20,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-const RESAMPLE_FLAG: u8 = 0x04;
+/// Sentinel sequence written to every healed record's MitchHeader.
+///
+/// The wire `sequence` field is a `u16` (gap-detection counter, 0..=65535).
+/// At 100 ms cadence a single UTC day holds ~864k records — far beyond u16 —
+/// so any per-day positional index would wrap and collide. Healed shards are
+/// ts-ordered on disk, so the live gap-detection sequence is meaningless
+/// post-heal; we set it to 0 to mark "non-monotonic / not a live stream"
+/// rather than silently truncating a large index into a wrapped value.
+const HEALED_SEQUENCE: u16 = 0;
 
 #[derive(Debug, Clone)]
 pub struct HealReport {
@@ -54,14 +63,10 @@ pub fn heal_ticker_shards(
         bail!("no idx shards under {}", dir.display());
     }
 
-    let source_ms_detected = shards
-        .iter()
-        .find_map(|(_, path)| {
-            read_shard_aligned::<IndexRecord>(path)
-                .ok()
-                .and_then(|r| detect_median_delta_ms(&r))
-        })
-        .unwrap_or(target_ms);
+    // Sample source cadence across first/middle/last shards (median of the
+    // per-shard medians) rather than the first readable shard alone — a single
+    // shard can be unrepresentative (sparse early day, gap day, etc.).
+    let source_ms_detected = detect_source_ms(&shards).unwrap_or(target_ms);
     let resampled = source_ms_detected < target_ms - 10;
 
     let staging = staging_dir(&dir, ticker_id);
@@ -76,9 +81,16 @@ pub fn heal_ticker_shards(
     let mut records_in = 0usize;
     let mut records_out = 0usize;
     let mut misrouted_dropped = 0usize;
-    let mut shards_out = 0usize;
+    // Destination day-shards we have written to, so the records_out / shards_out
+    // tallies and progress logging reflect *output* days, not source days.
+    let mut touched_dates: std::collections::BTreeSet<NaiveDate> = Default::default();
 
-    for (date, path) in &shards {
+    // Per-shard streaming pass (preserves the OOM fix: only one source shard's
+    // records are resident at a time). The merge/resample is applied within the
+    // source shard; each resulting record is then routed to *its own* ts-correct
+    // UTC day-shard (a single source file can straddle a day boundary), merging
+    // into — never overwriting — the destination staging shard.
+    for (src_date, path) in &shards {
         let mut recs = read_shard_aligned::<IndexRecord>(path)
             .with_context(|| format!("read {}", path.display()))?;
         records_in += recs.len();
@@ -95,14 +107,17 @@ pub fn heal_ticker_shards(
             dedupe_bins(&recs, target_ms)?
         };
         records_out += out.len();
-        shards_out += 1;
 
         if dry_run {
             continue;
         }
 
-        let mut numbered = out;
-        for (i, rec) in numbered.iter_mut().enumerate() {
+        // Fan this source shard's output records out by their ts-correct UTC day.
+        // Bin-merge keys on the bin start, so a 50→100 ms merge cannot move a
+        // record across a day boundary; the fan-out is normally {src_date} and
+        // at most two adjacent days when the source file itself straddled a day.
+        let mut by_date: BTreeMap<NaiveDate, Vec<IndexRecord>> = BTreeMap::new();
+        for mut rec in out {
             let ts = rec.shard_ts_ms();
             let mts = from_epoch_ms(ts);
             let mut header = MitchHeader::new(
@@ -111,18 +126,22 @@ pub fn heal_ticker_shards(
                 mts,
                 rec.header.count.max(1),
             );
-            header.set_sequence(i as u16);
+            header.set_sequence(HEALED_SEQUENCE);
             rec.header = header;
+            by_date.entry(ts_ms_to_utc_date(ts)).or_default().push(rec);
         }
-        let bytes: Vec<u8> = numbered
-            .iter()
-            .flat_map(|r| bytemuck::bytes_of(r).iter().copied())
-            .collect();
-        write_shard_atomic(&shard_path(&staging, *date, "idx"), &bytes)?;
-        if (shards_out % 50) == 0 {
-            info!(date = %date, shards_done = shards_out, "heal-idx progress");
+
+        for (date, new_recs) in by_date {
+            merge_into_staging_shard(&staging, date, new_recs)?;
+            touched_dates.insert(date);
+            if (touched_dates.len() % 50) == 0 {
+                info!(date = %date, shards_done = touched_dates.len(), "heal-idx progress");
+            }
         }
+        let _ = src_date;
     }
+
+    let shards_out = touched_dates.len();
 
     if misrouted_dropped > 0 {
         warn!(ticker_id, dropped = misrouted_dropped, "removed mis-routed records");
@@ -178,6 +197,58 @@ fn staging_dir(ticker_dir: &Path, ticker_id: u64) -> PathBuf {
         .join(format!("{ticker_id}.heal-staging"))
 }
 
+/// Merge `new_recs` into the staging day-shard for `date`, preserving any
+/// records already written there by an earlier source shard (a source file that
+/// straddled the day boundary, or out-of-order source shards). Reads the
+/// existing staging shard (bounded: one day ≤ ~30MB), appends, re-sorts by ts,
+/// and rewrites atomically. KEEP-not-overwrite is the whole point of the
+/// per-record routing restore.
+fn merge_into_staging_shard(
+    staging: &Path,
+    date: NaiveDate,
+    mut new_recs: Vec<IndexRecord>,
+) -> Result<()> {
+    let dst = shard_path(staging, date, "idx");
+    if dst.exists() {
+        let mut existing = read_shard_aligned::<IndexRecord>(&dst)
+            .with_context(|| format!("read staging {}", dst.display()))?;
+        existing.append(&mut new_recs);
+        new_recs = existing;
+    }
+    new_recs.sort_by_key(|r| r.shard_ts_ms());
+    let bytes: Vec<u8> = new_recs
+        .iter()
+        .flat_map(|r| bytemuck::bytes_of(r).iter().copied())
+        .collect();
+    write_shard_atomic(&dst, &bytes)
+}
+
+/// Detect the source cadence by sampling the first, middle, and last shards and
+/// taking the median of their per-shard median deltas. More robust than reading
+/// only the first readable shard (which can be a sparse/gap day).
+fn detect_source_ms(shards: &[(NaiveDate, PathBuf)]) -> Option<i64> {
+    if shards.is_empty() {
+        return None;
+    }
+    let idxs = [0, shards.len() / 2, shards.len() - 1];
+    let mut samples: Vec<i64> = idxs
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|i| {
+            read_shard_aligned::<IndexRecord>(&shards[i].1)
+                .ok()
+                .and_then(|r| detect_median_delta_ms(&r))
+        })
+        .collect();
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    Some(samples[samples.len() / 2])
+}
+
 fn detect_median_delta_ms(recs: &[IndexRecord]) -> Option<i64> {
     if recs.len() < 2 {
         return None;
@@ -209,8 +280,8 @@ fn resample_bins(recs: &[IndexRecord], target_ms: i64) -> Result<Vec<IndexRecord
             .push(*rec);
     }
     let mut out = Vec::with_capacity(bins.len());
-    for (i, (_bin, chunk)) in bins.into_iter().enumerate() {
-        out.push(merge_chunk(&chunk, target_ms, i as u16)?);
+    for (_bin, chunk) in bins.into_iter() {
+        out.push(merge_chunk(&chunk, target_ms)?);
     }
     Ok(out)
 }
@@ -226,17 +297,17 @@ fn dedupe_bins(recs: &[IndexRecord], target_ms: i64) -> Result<Vec<IndexRecord>>
             .push(*rec);
     }
     let mut out = Vec::with_capacity(bins.len());
-    for (i, (_bin, chunk)) in bins.into_iter().enumerate() {
+    for (_bin, chunk) in bins.into_iter() {
         if chunk.len() == 1 {
             out.push(chunk[0]);
         } else {
-            out.push(merge_chunk(&chunk, target_ms, i as u16)?);
+            out.push(merge_chunk(&chunk, target_ms)?);
         }
     }
     Ok(out)
 }
 
-fn merge_chunk(chunk: &[IndexRecord], target_ms: i64, out_seq: u16) -> Result<IndexRecord> {
+fn merge_chunk(chunk: &[IndexRecord], target_ms: i64) -> Result<IndexRecord> {
     if chunk.is_empty() {
         bail!("empty chunk");
     }
@@ -319,7 +390,9 @@ fn merge_chunk(chunk: &[IndexRecord], target_ms: i64, out_seq: u16) -> Result<In
     };
 
     let mut header = MitchHeader::new(message_type::INDEX, provider_id, bin_mts, input_count.max(1));
-    header.set_sequence(out_seq);
+    // Sequence is re-stamped to HEALED_SEQUENCE (0) by the caller after ts-routing;
+    // value here is irrelevant. See HEALED_SEQUENCE for why healed seq is sentinel.
+    header.set_sequence(HEALED_SEQUENCE);
     let body = Index {
         ticker,
         bid: bid_out,
@@ -331,7 +404,9 @@ fn merge_chunk(chunk: &[IndexRecord], target_ms: i64, out_seq: u16) -> Result<In
         confidence: confidence_max,
         accepted: accepted_max,
         rejected: rejected_max,
-        flags: flags_or | RESAMPLE_FLAG,
+        // FLAG_IDX_HEALED (0x10) — distinct from FLAG_RENKO_SYNTHETIC_BRICK
+        // (0x04) which the old local RESAMPLE_FLAG collided with.
+        flags: flags_or | FLAG_IDX_HEALED,
     };
     Ok(IndexRecord::new(header, body))
 }
@@ -381,10 +456,53 @@ mod tests {
 
         let rep = heal_ticker_shards(&root, id, 100, false, true).unwrap();
         assert_eq!(rep.records_in, 2);
-        assert!(rep.records_out >= 1);
+        // base and base+200 fall in different 100 ms bins (dedupe path, not
+        // resampled since 200 >= target-10) → exactly 2 records out.
+        assert_eq!(rep.records_out, 2);
         let shards = list_shards(&idx_dir(&root, id), "idx").unwrap();
         let healed = read_shard_aligned::<IndexRecord>(&shards[0].1).unwrap();
         assert!(healed[0].shard_ts_ms() <= healed[1].shard_ts_ms());
+        // Healed records carry FLAG_IDX_HEALED, NOT FLAG_RENKO_SYNTHETIC_BRICK.
+        for h in &healed {
+            assert_eq!(h.index.flags & FLAG_RENKO_SYNTHETIC_BRICK, 0);
+        }
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn heal_routes_records_across_day_boundary() {
+        // A source shard straddling a UTC day boundary must fan its records out
+        // to the correct day-shards (the per-record routing restore, BUG 3).
+        let root = std::env::temp_dir().join("heal_idx_route_test");
+        let _ = fs::remove_dir_all(&root);
+        let id = nxr_sdk::resolve_ticker_id("BTC/USDT");
+        let dir = idx_dir(&root, id);
+        fs::create_dir_all(&dir).unwrap();
+        // Pick a UTC midnight well after the MITCH 2010 epoch (from_epoch_ms
+        // clamps anything <= 2010 to 0). Records at boundary-100 and +100 belong
+        // to two different UTC days but are both written under the earlier day's
+        // file — heal must re-route the second to the next day's shard.
+        let boundary = ts_ms_to_utc_date(1_700_000_000_000) // some 2023 day
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis()
+            + MS_PER_DAY_LOCAL; // next UTC midnight
+        let day0 = ts_ms_to_utc_date(boundary - 100);
+        let r0 = rec(boundary - 100, 100.0);
+        let r1 = rec(boundary + 100, 101.0);
+        let bytes: Vec<u8> = [r0, r1]
+            .iter()
+            .flat_map(|r| bytemuck::bytes_of(r).iter().copied())
+            .collect();
+        write_shard_atomic(&shard_path(&dir, day0, "idx"), &bytes).unwrap();
+
+        heal_ticker_shards(&root, id, 100, false, true).unwrap();
+        let shards = list_shards(&idx_dir(&root, id), "idx").unwrap();
+        // Two distinct day-shards expected.
+        assert_eq!(shards.len(), 2, "record past midnight must land in next day's shard");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    const MS_PER_DAY_LOCAL: i64 = 86_400_000;
 }
