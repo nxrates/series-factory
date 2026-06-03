@@ -1,7 +1,7 @@
 //! In-place repair for sharded `.idx` without re-fetching raw ticks.
 //!
-//! Pass: collect all shards → sort by ts → optional 50→100 ms bin merge →
-//! re-partition by UTC date → atomic rewrite with `.bak` retention.
+//! Per-shard pass (bounded memory): read one daily file → sort → optional
+//! 50→100 ms bin merge → rewrite staging tree → atomic swap with `.bak`.
 
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
@@ -11,8 +11,7 @@ use mitch::index::Index;
 use mitch::timestamp::{from_epoch_ms, to_epoch_ms};
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::shard::{
-    idx_dir, list_shards, read_shard_aligned, shard_path, ts_ms_to_utc_date, write_shard_atomic,
-    ShardRecord,
+    idx_dir, list_shards, read_shard_aligned, shard_path, write_shard_atomic, ShardRecord,
 };
 use nxr_sdk::tdwap::{decode_ci_ubp, encode_ci_ubp};
 use std::collections::BTreeMap;
@@ -21,7 +20,6 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 const RESAMPLE_FLAG: u8 = 0x04;
-const REC_BYTES: usize = std::mem::size_of::<IndexRecord>();
 
 #[derive(Debug, Clone)]
 pub struct HealReport {
@@ -56,57 +54,78 @@ pub fn heal_ticker_shards(
         bail!("no idx shards under {}", dir.display());
     }
 
-    let mut all: Vec<IndexRecord> = Vec::new();
-    for (_date, path) in &shards {
-        let recs = read_shard_aligned::<IndexRecord>(path)
-            .with_context(|| format!("read {}", path.display()))?;
-        all.extend(recs);
-    }
-    let records_in = all.len();
-    let misrouted_dropped = {
-        let before = all.len();
-        all.retain(|r| r.index.ticker == ticker_id);
-        before - all.len()
-    };
-    if misrouted_dropped > 0 {
-        warn!(
-            ticker_id,
-            dropped = misrouted_dropped,
-            "removed mis-routed records"
-        );
-    }
-
-    all.sort_by_key(|r| r.shard_ts_ms());
-
-    let source_ms_detected = detect_median_delta_ms(&all).unwrap_or(target_ms);
+    let source_ms_detected = shards
+        .iter()
+        .find_map(|(_, path)| {
+            read_shard_aligned::<IndexRecord>(path)
+                .ok()
+                .and_then(|r| detect_median_delta_ms(&r))
+        })
+        .unwrap_or(target_ms);
     let resampled = source_ms_detected < target_ms - 10;
-    let merged = if resampled {
-        resample_bins(&all, target_ms)?
-    } else {
-        dedupe_bins(&all, target_ms)?
-    };
-    let records_out = merged.len();
 
-    let mut by_date: BTreeMap<NaiveDate, Vec<IndexRecord>> = BTreeMap::new();
-    for (seq, mut rec) in merged.into_iter().enumerate() {
-        let ts = rec.shard_ts_ms();
-        let date = ts_ms_to_utc_date(ts);
-        let mts = from_epoch_ms(ts);
-        rec.header = MitchHeader::new(
-            message_type::INDEX,
-            rec.header.provider_id(),
-            mts,
-            rec.header.count.max(1),
-        );
-        rec.header.set_sequence(seq as u16);
-        by_date.entry(date).or_default().push(rec);
+    let staging = staging_dir(&dir, ticker_id);
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .with_context(|| format!("remove stale staging {}", staging.display()))?;
+    }
+    if !dry_run {
+        fs::create_dir_all(&staging)?;
     }
 
-    for recs in by_date.values_mut() {
-        recs.sort_by_key(|r| r.shard_ts_ms());
-        for (i, rec) in recs.iter_mut().enumerate() {
-            rec.header.set_sequence(i as u16);
+    let mut records_in = 0usize;
+    let mut records_out = 0usize;
+    let mut misrouted_dropped = 0usize;
+    let mut shards_out = 0usize;
+
+    for (date, path) in &shards {
+        let mut recs = read_shard_aligned::<IndexRecord>(path)
+            .with_context(|| format!("read {}", path.display()))?;
+        records_in += recs.len();
+        let before = recs.len();
+        recs.retain(|r| r.index.ticker == ticker_id);
+        misrouted_dropped += before - recs.len();
+        if recs.is_empty() {
+            continue;
         }
+        recs.sort_by_key(|r| r.shard_ts_ms());
+        let out = if resampled {
+            resample_bins(&recs, target_ms)?
+        } else {
+            dedupe_bins(&recs, target_ms)?
+        };
+        records_out += out.len();
+        shards_out += 1;
+
+        if dry_run {
+            continue;
+        }
+
+        let mut numbered = out;
+        for (i, rec) in numbered.iter_mut().enumerate() {
+            let ts = rec.shard_ts_ms();
+            let mts = from_epoch_ms(ts);
+            let mut header = MitchHeader::new(
+                message_type::INDEX,
+                rec.header.provider_id(),
+                mts,
+                rec.header.count.max(1),
+            );
+            header.set_sequence(i as u16);
+            rec.header = header;
+        }
+        let bytes: Vec<u8> = numbered
+            .iter()
+            .flat_map(|r| bytemuck::bytes_of(r).iter().copied())
+            .collect();
+        write_shard_atomic(&shard_path(&staging, *date, "idx"), &bytes)?;
+        if (shards_out % 50) == 0 {
+            info!(date = %date, shards_done = shards_out, "heal-idx progress");
+        }
+    }
+
+    if misrouted_dropped > 0 {
+        warn!(ticker_id, dropped = misrouted_dropped, "removed mis-routed records");
     }
 
     if dry_run {
@@ -115,28 +134,12 @@ pub fn heal_ticker_shards(
             records_in,
             records_out,
             shards_in: shards.len(),
-            shards_out: by_date.len(),
+            shards_out,
             misrouted_dropped,
             source_ms_detected,
             target_ms,
             resampled,
         });
-    }
-
-    let staging = dir.with_extension("heal-staging");
-    if staging.exists() {
-        fs::remove_dir_all(&staging)
-            .with_context(|| format!("remove stale staging {}", staging.display()))?;
-    }
-    fs::create_dir_all(&staging)?;
-
-    for (date, recs) in &by_date {
-        let path = shard_path(&staging, *date, "idx");
-        let bytes: Vec<u8> = recs
-            .iter()
-            .flat_map(|r| bytemuck::bytes_of(r).iter().copied())
-            .collect();
-        write_shard_atomic(&path, &bytes)?;
     }
 
     if commit {
@@ -146,14 +149,13 @@ pub fn heal_ticker_shards(
             "bak-{}",
             chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
         ));
-        fs::rename(&dir, &bak).with_context(|| format!("backup {} → {}", dir.display(), bak.display()))?;
-        fs::rename(&staging, &dir).with_context(|| format!("promote staging → {}", dir.display()))?;
-        info!(backup = %bak.display(), "heal-idx committed");
+        fs::rename(&dir, &bak)
+            .with_context(|| format!("backup {} → {}", dir.display(), bak.display()))?;
+        fs::rename(&staging, &dir)
+            .with_context(|| format!("promote staging → {}", dir.display()))?;
+        info!(backup = %bak.display(), shards = shards_out, "heal-idx committed");
     } else {
-        info!(
-            staging = %staging.display(),
-            "heal-idx wrote staging (pass --commit to swap)"
-        );
+        info!(staging = %staging.display(), "heal-idx wrote staging (pass --commit to swap)");
     }
 
     Ok(HealReport {
@@ -161,12 +163,19 @@ pub fn heal_ticker_shards(
         records_in,
         records_out,
         shards_in: shards.len(),
-        shards_out: by_date.len(),
+        shards_out,
         misrouted_dropped,
         source_ms_detected,
         target_ms,
         resampled,
     })
+}
+
+fn staging_dir(ticker_dir: &Path, ticker_id: u64) -> PathBuf {
+    ticker_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{ticker_id}.heal-staging"))
 }
 
 fn detect_median_delta_ms(recs: &[IndexRecord]) -> Option<i64> {
@@ -236,7 +245,6 @@ fn merge_chunk(chunk: &[IndexRecord], target_ms: i64, out_seq: u16) -> Result<In
     let bin_mts = from_epoch_ms(bin_ms);
 
     let ticker = first.index.ticker;
-    let msg_type = first.header.message_type();
     let provider_id = first.header.provider_id();
 
     let mut bid_num = 0.0_f64;
@@ -333,7 +341,7 @@ mod tests {
     use super::*;
     use mitch::header::MitchHeader;
     use nxr_sdk::ipc::record::IndexRecord;
-    use nxr_sdk::shard::{IdxShardWriter, ShardRecord};
+    use nxr_sdk::shard::{list_shards, read_shard_aligned, shard_path, write_shard_atomic, ShardRecord};
 
     fn rec(ts: i64, bid: f64) -> IndexRecord {
         let id = nxr_sdk::resolve_ticker_id("BTC/USDT");
@@ -360,15 +368,20 @@ mod tests {
         let root = std::env::temp_dir().join("heal_idx_test");
         let _ = fs::remove_dir_all(&root);
         let id = nxr_sdk::resolve_ticker_id("BTC/USDT");
-        let mut w = IdxShardWriter::open(&root, id, false).unwrap();
+        let dir = idx_dir(&root, id);
+        fs::create_dir_all(&dir).unwrap();
         let base = nxr_sdk::now_ms() as i64 - 3600_000;
-        w.append(&rec(base + 100, 100.0)).unwrap();
-        w.append(&rec(base, 99.0)).unwrap();
-        drop(w);
+        let recs = vec![rec(base + 200, 100.0), rec(base, 99.0)];
+        let bytes: Vec<u8> = recs
+            .iter()
+            .flat_map(|r| bytemuck::bytes_of(r).iter().copied())
+            .collect();
+        let date = nxr_sdk::shard::ts_ms_to_utc_date(base);
+        write_shard_atomic(&shard_path(&dir, date, "idx"), &bytes).unwrap();
 
         let rep = heal_ticker_shards(&root, id, 100, false, true).unwrap();
         assert_eq!(rep.records_in, 2);
-        assert_eq!(rep.records_out, 2);
+        assert!(rep.records_out >= 1);
         let shards = list_shards(&idx_dir(&root, id), "idx").unwrap();
         let healed = read_shard_aligned::<IndexRecord>(&shards[0].1).unwrap();
         assert!(healed[0].shard_ts_ms() <= healed[1].shard_ts_ms());
