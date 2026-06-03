@@ -299,7 +299,7 @@ async fn main() -> Result<()> {
                 to,
                 agg_mode: AggregationMode::Time,
                 agg_step: 60_000.0,
-                cycle_ms: 50,
+                cycle_ms: 100,
                 stale_secs: 30.0,
                 z_threshold: 6.0,
                 ticks_dir: ticks_dir.clone(),

@@ -429,11 +429,7 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
 
             if let Some(prev) = s.prev_ts_ms {
                 if ts < prev {
-                    // Demoted err→warn (2026-05-28): merge-idx produces rare
-                    // reverse-ts records from cross-provider stream skew (1 in
-                    // ~300k = 0.0003% on LTC 2024-05-28). Data is salvageable;
-                    // readers can sort. Only --strict promotes to error.
-                    warnings.push(Finding {
+                    errors.push(Finding {
                         record_ix: Some(i),
                         msg: format!("ts non-monotone: {} < prev {}", ts, prev),
                     });
