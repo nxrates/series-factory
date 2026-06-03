@@ -1,96 +1,135 @@
-//! Resample 20Hz (50ms-cadence) `.idx` AppendLogs to a lower output cadence
-//! (default 10Hz / 100ms bins).
+//! Down-sample sharded `.idx` AppendLogs from one cadence to a coarser one
+//! (default 100ms / 10Hz → 200ms / 5Hz) using **last-in-bucket** selection.
 //!
-//! Why: NXR is moving from a 50ms aggregator cycle to 100ms. Existing `.idx`
-//! history is 20Hz; future writes are 10Hz. To keep consumers seeing a
-//! time-consistent series across the cutover, we down-sample the historical
-//! 50ms records into 100ms bins using a volume-weighted merge that preserves
-//! VWAP semantics + variance pooling on the encoded confidence interval.
-//! Atomic rename + `.bak` retention so rollback is trivial.
+//! # Why (5Hz migration)
 //!
-//! ## Merge formula
+//! NXR shipped a 5Hz (200ms) aggregator. Existing `.idx` history was written
+//! at 10Hz (100ms; `idx_aggregation_ms: 100` confirmed live). To keep the
+//! series time-consistent across the cutover seam, historical 100ms shards are
+//! re-bucketed to 200ms windows. Deploy order is load-bearing: **deploy the
+//! 5Hz aggregator first** (so new realtime is 200ms), *then* resample history,
+//! so the join seam is a single cadence on both sides.
 //!
-//! For two consecutive 50ms `IndexRecord`s A and B collapsed into one 100ms
-//! bin (general N-into-1 case for arbitrary `factor = target_ms / source_ms`):
+//! # Method: last-in-200ms-bucket (NOT VWAP-merge)
 //!
-//! - `bid` = `Σ(bid_i · vbid_i) / Σ vbid_i` (volume-weighted; fallback to
-//!   simple mean if both vbid==0). Same for `ask` w/ `vask_i`.
-//! - `vbid` = `saturating_sum(vbid_i)`; `vask` = `saturating_sum(vask_i)`.
-//! - `ci`  = `encode_ci_ubp( sqrt( Σ(decode_ci_ubp(ci_i))² · w_i / Σ w_i ) )`
-//!   where `w_i = vbid_i + vask_i` (fallback `tick_count_i` if vols zero).
-//!   Variance pooling — independent estimator combination.
-//! - `tick_count` = `saturating_sum(tick_count_i)`.
-//! - `confidence` / `accepted` / `rejected` = `max_i` (peak in window; these
-//!   are per-cycle counters not flows).
-//! - `flags` = `OR_i flags_i | RESAMPLE_FLAG (0x04)`.
-//! - `header.timestamp` = `floor(to_epoch_ms(A.ts) / target_ms) * target_ms`
-//!   re-encoded via `from_epoch_ms`. Bin-aligned.
-//! - `header.sequence` = renumbered 0..N in output order.
-//! - `header.count` = number of input records merged into this bin.
+//! Each output record is the **last (latest-ts) whole input record** whose
+//! observation ts falls in its 200ms bin (`floor(ts/target_ms)*target_ms`).
+//! We keep that record **verbatim** (header re-stamped to the bin start; body
+//! copied byte-for-byte) rather than VWAP-merging the bin's members.
 //!
-//! Trailing odd input (no partner) is emitted as-is with bin-aligned ts.
+//! Rationale:
+//! - A 5Hz aggregator's delta-gate would have emitted the *latest composite
+//!   state* at each 200ms boundary, not a volume-weighted blend of the two
+//!   10Hz sub-cycles. Last-in-bucket reproduces that emission exactly.
+//! - It is the only choice that is **confidence-safe**. The `confidence` byte
+//!   is flag-gated (`FLAG_CONF_FRESHNESS`): clear = legacy active-provider
+//!   COUNT, set = Q0.8 freshness (`byte/255`). A VWAP-style `max`/pool of two
+//!   confidence bytes is meaningless across that flag boundary and could
+//!   silently produce a value whose flag no longer matches. Copying one whole
+//!   record keeps `confidence` and its `FLAG_CONF_FRESHNESS` bit traveling
+//!   together, untouched. See the confidence note below.
+//! - Volumes/ticks are per-cycle counters on the wire, not flows to be summed:
+//!   the live 5Hz writer reports the counters of *its* cycle, so preserving the
+//!   representative record's counters is correct, not summing across sub-cycles.
 //!
-//! ## Usage
+//! # Confidence handling (deliberately a NO-OP)
 //!
-//! ```sh
-//! resample-idx --input-dir /data/indexes --source-ms 50 --target-ms 100 \
-//!              [--ticker <id>] [--parallel 4] [--dry-run] [--commit] \
-//!              [--keep-bak-days 14]
+//! Historical `.idx` records carry the OLD confidence semantics: an integer
+//! active-provider COUNT (0..~22), with `FLAG_CONF_FRESHNESS` **clear**. The
+//! new wire semantics is Q0.8 freshness (`byte/255`) gated by that flag, and
+//! it is computed from per-provider decay state that is **not** persisted in
+//! `.idx`. The raw decay inputs are gone ⇒ historical freshness is **not
+//! recomputable**. The honest, correct handling is therefore to **preserve the
+//! existing confidence byte and leave `FLAG_CONF_FRESHNESS` clear**, so readers
+//! interpret historical rows as legacy counts. The flag-gated reader design
+//! (`mitch::index` doc, `nxr_sdk::shard::FLAG_CONF_FRESHNESS`) is *built* to
+//! span mixed old/new records exactly this way: only new realtime data carries
+//! Q0.8. This tool does NOT touch `confidence` or that flag — no fabricated
+//! freshness. Last-in-bucket copy guarantees this automatically.
+//!
+//! # Layout (sharded, per-MITCH-ticker)
+//!
+//! ```text
+//! <input_dir>/<ticker_id>/<YYYY-MM-DD>.idx     56B IndexRecord, ts-ascending
 //! ```
 //!
-//! Two-phase lifecycle:
-//! 1. Bulk pass (online): aggregator keeps running at source_ms cadence;
-//!    resampler reads up to `floor(N/factor) * factor` records and writes
-//!    `<id>.idx.new`. Tail records (partial last group) are skipped.
-//! 2. Delta pass (offline, during pod stop window): aggregator paused;
-//!    resampler reads any newly-appended records and appends merged bins to
-//!    `<id>.idx.new`. Then atomic rename `<id>.idx → <id>.idx.bak`
-//!    and `<id>.idx.new → <id>.idx`. Aggregator restarts at target_ms.
+//! `--input-dir` is the `indexes/` root. We iterate ticker subdirectories (each
+//! named by its decimal `u64` MITCH id), and within each, every `*.idx` daily
+//! shard. The ticker id comes from the **directory name** — never from the
+//! date-stem filename. (The previous flat-layout version parsed `file_stem` as
+//! `u64`, which on sharded `YYYY-MM-DD.idx` filenames always failed → the
+//! misroute filter silently disabled. Fixed: id from dir, body-ticker filter
+//! re-enabled.)
 //!
-//! Verification (always): per-file invariants checked before rename. Failures
-//! leave `<id>.idx` untouched and emit a diff report.
+//! # Idempotency
+//!
+//! Each resampled output row is tagged `FLAG_IDX_HEALED` (0x10, the dedicated
+//! offline-rewrite bit for INDEX rows). On a re-run we **skip any shard already
+//! fully at target cadence** (median inter-record spacing ≈ target_ms AND every
+//! record carries `FLAG_IDX_HEALED`) so a second pass is a no-op. Re-bucketing
+//! an already-200ms shard is also internally stable (one record per bin → same
+//! output), so idempotency holds even if the skip heuristic is bypassed.
+//!
+//! # Marker flag
+//!
+//! Output rows OR in `FLAG_IDX_HEALED` (0x10). We deliberately do **not** use
+//! the old `RESAMPLE_FLAG = 0x04`: 0x04 is `FLAG_RENKO_SYNTHETIC_BRICK` in the
+//! Bar flag space and reusing it on INDEX rows is the exact collision the
+//! `heal-idx` migration fixed (healed rows misclassified as synthetic bricks by
+//! the calibration/vol exclusion). `FLAG_IDX_HEALED` is free in both spaces and
+//! already means "offline-rewritten INDEX row", which is precisely what this is.
+//!
+//! # Usage
+//!
+//! ```sh
+//! resample-idx --input-dir /data/indexes --source-ms 100 --target-ms 200 \
+//!              [--ticker <id>] [--parallel 2] [--dry-run] [--commit]
+//! ```
+//!
+//! Two phases per shard:
+//! - Without `--commit`: writes `<shard>.idx.new` beside the original; original
+//!   untouched (inspect before committing).
+//! - With `--commit`: after invariants pass, atomic `<shard>.idx → .idx.bak`
+//!   then `.idx.new → .idx`. `.bak` retained for trivial rollback.
+//!
+//! Per-shard invariants are verified before any rename; failures leave the
+//! original `.idx` untouched and are reported in `resample-report.csv`.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use mitch::common::message_type;
-use mitch::header::MitchHeader;
-use mitch::index::Index;
 use mitch::timestamp::{from_epoch_ms, to_epoch_ms};
-use nxr_sdk::{
-    ipc::record::IndexRecord,
-    tdwap::{decode_ci_ubp, encode_ci_ubp},
-};
+use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::shard::{self, FLAG_IDX_HEALED};
 use rayon::prelude::*;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
-/// Flag bit set on merged records so consumers can detect resampled history.
-const RESAMPLE_FLAG: u8 = 0x04;
-
 #[derive(Parser, Debug)]
-#[command(about = "Down-sample MITCH .idx AppendLogs to a coarser cadence (VWAP-preserving).")]
+#[command(about = "Down-sample sharded MITCH .idx AppendLogs to a coarser cadence (last-in-bucket).")]
 struct Args {
-    /// Directory containing `<ticker_id>.idx` files (e.g. /data/indexes).
+    /// `indexes/` root containing `<ticker_id>/<YYYY-MM-DD>.idx` shards.
     #[arg(long)]
     input_dir: PathBuf,
 
     /// Source cadence in milliseconds (existing aggregator emit period).
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "100")]
     source_ms: u64,
 
-    /// Target cadence in milliseconds (new aggregator emit period). Must be
-    /// an integer multiple of `--source-ms`.
-    #[arg(long, default_value = "100")]
+    /// Target cadence in milliseconds (new aggregator emit period). Must be an
+    /// integer multiple of `--source-ms`.
+    #[arg(long, default_value = "200")]
     target_ms: u64,
 
-    /// Single-ticker mode: only resample this filename stem (decimal id).
+    /// Single-ticker mode: only resample this ticker subdirectory (decimal id).
     #[arg(long)]
     ticker: Option<String>,
 
-    /// Worker thread pool size for rayon. Cap respects the 16GB-box rule.
-    #[arg(long, default_value = "4")]
+    /// Worker thread pool size for rayon. Keep small on the cluster (the node
+    /// just recovered from I/O thrash — the runbook runs serial, parallel=1).
+    #[arg(long, default_value = "2")]
     parallel: usize,
 
     /// Don't write `.idx.new`, only print the would-be report.
@@ -102,26 +141,21 @@ struct Args {
     /// originals stay in place (lets you inspect before committing).
     #[arg(long)]
     commit: bool,
-
-    /// How long to keep the `.bak` files (informational only — caller must
-    /// schedule the cleanup separately, eg via a cron find -mtime).
-    #[arg(long, default_value = "14")]
-    keep_bak_days: u32,
 }
 
-/// Per-file outcome (one row in the final CSV report).
+/// Per-shard outcome (one row in the final CSV report).
 #[derive(Debug, Clone)]
-struct FileReport {
-    id: String,
+struct ShardReport {
+    ticker: String,
+    date: String,
     bytes_old: u64,
     count_old: u64,
     count_new: u64,
     bytes_new: u64,
-    ts_first_ms_old: i64,
-    ts_last_ms_old: i64,
-    ts_first_ms_new: i64,
-    ts_last_ms_new: i64,
-    partial_tail_dropped: usize,
+    median_spacing_old_ms: i64,
+    median_spacing_new_ms: i64,
+    dropped_misrouted: usize,
+    skipped_already_target: bool,
     invariants_passed: bool,
     invariants_failed: Vec<String>,
     duration_ms: u128,
@@ -131,18 +165,22 @@ fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
 
     let args = Args::parse();
+    if args.commit && args.dry_run {
+        bail!("--commit and --dry-run are mutually exclusive");
+    }
     if args.target_ms == 0 || args.source_ms == 0 {
         bail!("source_ms and target_ms must be > 0");
     }
     if args.target_ms % args.source_ms != 0 {
         bail!(
             "target_ms ({}) must be an integer multiple of source_ms ({})",
-            args.target_ms, args.source_ms
+            args.target_ms,
+            args.source_ms
         );
     }
     let factor = (args.target_ms / args.source_ms) as usize;
     if factor < 2 {
-        bail!("factor (target/source) must be ≥ 2; got {}", factor);
+        bail!("factor (target/source) must be >= 2; got {}", factor);
     }
     info!(
         input_dir = %args.input_dir.display(),
@@ -151,74 +189,42 @@ fn main() -> Result<()> {
         factor,
         commit = args.commit,
         dry_run = args.dry_run,
-        "resample-idx starting"
+        "resample-idx starting (sharded, last-in-bucket)"
     );
 
     rayon::ThreadPoolBuilder::new()
-        .num_threads(args.parallel)
+        .num_threads(args.parallel.max(1))
         .build_global()
         .ok(); // ignore if already set
 
-    let files = collect_idx_files(&args.input_dir, args.ticker.as_deref())?;
-    if files.is_empty() {
-        bail!("no .idx files found under {}", args.input_dir.display());
+    let shards = collect_shards(&args.input_dir, args.ticker.as_deref())?;
+    if shards.is_empty() {
+        bail!(
+            "no <ticker>/<date>.idx shards found under {}",
+            args.input_dir.display()
+        );
     }
-    info!(file_count = files.len(), "scanned input directory");
+    info!(shard_count = shards.len(), "scanned input directory");
 
-    // Panic-safe: each file goes through catch_unwind so a single bad file
-    // does NOT abort the rayon collect (which would lose results for ALL
-    // already-completed files). Earlier production run lost ~290/351 results
-    // because of an unrecoverable panic inside resample_one for one file.
-    let reports: Vec<FileReport> = files
+    // Panic-safe: each shard goes through catch_unwind so one bad file does NOT
+    // abort the rayon collect (which would discard every already-completed
+    // result). A prior prod run lost ~290/351 results to a single panic.
+    let reports: Vec<ShardReport> = shards
         .par_iter()
-        .map(|path| {
+        .map(|sh| {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                resample_one(path, &args, factor)
+                resample_shard(sh, &args)
             }));
             match result {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    error!(path = %path.display(), error = %e, "resample failed");
-                    FileReport {
-                        id: filename_stem(path),
-                        bytes_old: 0,
-                        count_old: 0,
-                        count_new: 0,
-                        bytes_new: 0,
-                        ts_first_ms_old: 0,
-                        ts_last_ms_old: 0,
-                        ts_first_ms_new: 0,
-                        ts_last_ms_new: 0,
-                        partial_tail_dropped: 0,
-                        invariants_passed: false,
-                        invariants_failed: vec![format!("error: {}", e)],
-                        duration_ms: 0,
-                    }
+                    error!(ticker = %sh.ticker, date = %sh.date, error = %e, "resample failed");
+                    err_report(sh, format!("error: {e}"))
                 }
                 Err(panic_box) => {
-                    let msg = if let Some(s) = panic_box.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_box.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "unknown panic".to_string()
-                    };
-                    error!(path = %path.display(), panic = %msg, "resample PANICKED");
-                    FileReport {
-                        id: filename_stem(path),
-                        bytes_old: 0,
-                        count_old: 0,
-                        count_new: 0,
-                        bytes_new: 0,
-                        ts_first_ms_old: 0,
-                        ts_last_ms_old: 0,
-                        ts_first_ms_new: 0,
-                        ts_last_ms_new: 0,
-                        partial_tail_dropped: 0,
-                        invariants_passed: false,
-                        invariants_failed: vec![format!("panic: {}", msg)],
-                        duration_ms: 0,
-                    }
+                    let msg = panic_msg(&panic_box);
+                    error!(ticker = %sh.ticker, date = %sh.date, panic = %msg, "resample PANICKED");
+                    err_report(sh, format!("panic: {msg}"))
                 }
             }
         })
@@ -227,448 +233,337 @@ fn main() -> Result<()> {
     write_csv_report(&args.input_dir, &reports)?;
 
     let passed = reports.iter().filter(|r| r.invariants_passed).count();
+    let skipped = reports.iter().filter(|r| r.skipped_already_target).count();
     let failed = reports.len() - passed;
-    info!(passed, failed, "resample complete");
+    info!(passed, skipped, failed, "resample complete");
     if failed > 0 {
-        warn!("{} file(s) failed invariants — see resample-report.csv", failed);
+        warn!("{failed} shard(s) failed invariants — see resample-report.csv");
         std::process::exit(2);
     }
     Ok(())
 }
 
-fn collect_idx_files(dir: &Path, only: Option<&str>) -> Result<Vec<PathBuf>> {
+/// A discovered shard: (ticker dir name, date stem, path).
+struct ShardRef {
+    ticker: String,
+    date: String,
+    path: PathBuf,
+}
+
+/// Walk `<input_dir>/<ticker_id>/<YYYY-MM-DD>.idx`. Ticker id is the SUBDIR
+/// name (decimal u64); date is the file stem. `only` filters by ticker dir.
+fn collect_shards(root: &Path, only: Option<&str>) -> Result<Vec<ShardRef>> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+    for entry in fs::read_dir(root).with_context(|| format!("read_dir {}", root.display()))? {
         let entry = entry?;
         let path = entry.path();
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if ext != "idx" {
+        if !path.is_dir() {
             continue;
         }
-        let stem = filename_stem(&path);
+        let ticker = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Ticker subdirs are decimal u64 ids; skip anything else (.bak roots etc.).
+        if ticker.parse::<u64>().is_err() {
+            continue;
+        }
         if let Some(filter) = only {
-            if stem != filter {
+            if ticker != filter {
                 continue;
             }
         }
-        out.push(path);
+        // `list_shards` only matches `<YYYY-MM-DD>.idx` (date-parseable stem).
+        for (date, shard_path) in shard::list_shards(&path, "idx")? {
+            out.push(ShardRef {
+                ticker: ticker.clone(),
+                date: shard::date_stem(date),
+                path: shard_path,
+            });
+        }
     }
-    out.sort();
+    out.sort_by(|a, b| (a.ticker.as_str(), a.date.as_str()).cmp(&(b.ticker.as_str(), b.date.as_str())));
     Ok(out)
 }
 
-fn filename_stem(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn resample_one(path: &Path, args: &Args, factor: usize) -> Result<FileReport> {
+fn resample_shard(sh: &ShardRef, args: &Args) -> Result<ShardReport> {
     let started = std::time::Instant::now();
-    let id = filename_stem(path);
-    // Filter records to the filename-ticker. Some prod .idx files contain
-    // mis-routed records (aggregator wrote some records under wrong filename
-    // — historical bug). Filtering to filename keeps the output semantically
-    // correct (this ticker's data only) while .bak retains ALL records for
-    // forensic recovery if needed.
-    let expected_ticker: Option<u64> = id.parse::<u64>().ok();
+    let expected_ticker: u64 = sh
+        .ticker
+        .parse::<u64>()
+        .with_context(|| format!("ticker dir name not a u64: {}", sh.ticker))?;
 
-    // --- Read whole file into a byte buffer ---
-    let bytes_old = fs::metadata(path)?.len();
-    let mut bytes_buf = Vec::with_capacity(bytes_old as usize);
-    File::open(path)
-        .with_context(|| format!("open {}", path.display()))?
-        .read_to_end(&mut bytes_buf)?;
-    let rec_size = std::mem::size_of::<IndexRecord>(); // 56
-    let count_old_raw = bytes_buf.len() / rec_size;
-    let trailing_partial = bytes_buf.len() % rec_size;
-    if trailing_partial != 0 {
-        bytes_buf.truncate(count_old_raw * rec_size);
-        warn!(path = %path.display(), trailing = trailing_partial, "trimmed partial-record tail");
+    let bytes_old = fs::metadata(&sh.path)?.len();
+    let mut records: Vec<IndexRecord> = shard::read_shard_aligned(&sh.path)
+        .with_context(|| format!("read {}", sh.path.display()))?;
+    let raw_count = records.len();
+
+    // Filter to the directory's ticker. Some prod shards contain mis-routed
+    // records (aggregator wrote rows under the wrong ticker dir — historical
+    // bug). The dir name is authoritative; keep only body-ticker matches so the
+    // output is semantically clean for this ticker. `.bak` retains everything
+    // for forensic recovery. (This filter was dead in the flat-layout version
+    // because the id was parsed from the date-stem filename and never matched.)
+    let before = records.len();
+    records.retain(|r| r.index.ticker == expected_ticker);
+    let dropped_misrouted = before - records.len();
+    if dropped_misrouted > 0 {
+        warn!(
+            ticker = %sh.ticker,
+            date = %sh.date,
+            dropped = dropped_misrouted,
+            kept = records.len(),
+            "filtered misrouted records (aggregator bug)"
+        );
     }
 
-    // bytemuck::cast_slice requires alignment. IndexRecord is `repr(C, packed)`
-    // align=1, so any byte buffer aligns. Read records via copy_from_slice.
-    let mut records: Vec<IndexRecord> = vec![unsafe { std::mem::zeroed() }; count_old_raw];
-    {
-        let dst_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut records);
-        dst_bytes.copy_from_slice(&bytes_buf[..count_old_raw * rec_size]);
+    if records.is_empty() {
+        return Ok(empty_report(sh, bytes_old, dropped_misrouted, started));
     }
-    drop(bytes_buf);
-    let raw_record_count = records.len();
 
-    // Filter to filename-ticker. Aggregator mis-routed some records
-    // (historical bug — non-canonical ticker_ids in body for ~15-19% of
-    // records in some files). Keep only records whose body ticker matches
-    // the filename → output file is semantically clean for this ticker.
-    // .bak retains all raw records for forensic recovery.
-    let mut dropped_misrouted: usize = 0;
-    if let Some(expected) = expected_ticker {
-        let before = records.len();
-        records.retain(|r| {
-            let t = r.index.ticker;
-            t == expected
-        });
-        dropped_misrouted = before - records.len();
-        if dropped_misrouted > 0 {
-            warn!(
-                path = %path.display(),
-                dropped = dropped_misrouted,
-                kept = records.len(),
-                expected_ticker = expected,
-                "filtered misrouted records (aggregator bug)"
-            );
-        }
-    }
-    let count_old_raw = records.len();
+    let median_spacing_old_ms = median_spacing(&records);
 
-    if count_old_raw == 0 {
-        warn!(path = %path.display(), "empty file — skipped");
-        return Ok(FileReport {
-            id,
+    // Idempotency skip: already at target cadence AND every row already healed.
+    let already_target = is_already_target(&records, args.target_ms as i64);
+    if already_target {
+        info!(ticker = %sh.ticker, date = %sh.date, "already at target cadence — skipped");
+        return Ok(ShardReport {
+            ticker: sh.ticker.clone(),
+            date: sh.date.clone(),
             bytes_old,
-            count_old: 0,
-            count_new: 0,
-            bytes_new: 0,
-            ts_first_ms_old: 0,
-            ts_last_ms_old: 0,
-            ts_first_ms_new: 0,
-            ts_last_ms_new: 0,
-            partial_tail_dropped: if trailing_partial > 0 { 1 } else { 0 },
+            count_old: raw_count as u64,
+            count_new: records.len() as u64,
+            bytes_new: bytes_old,
+            median_spacing_old_ms,
+            median_spacing_new_ms: median_spacing_old_ms,
+            dropped_misrouted,
+            skipped_already_target: true,
             invariants_passed: true,
             invariants_failed: vec![],
             duration_ms: started.elapsed().as_millis(),
         });
     }
 
-    let ts_first_ms_old = to_epoch_ms(records.first().unwrap().header.get_timestamp());
-    let ts_last_ms_old = to_epoch_ms(records.last().unwrap().header.get_timestamp());
-
-    // --- Merge: chunk into groups of `factor` consecutive records ---
-    let mut merged: Vec<IndexRecord> = Vec::with_capacity(records.len() / factor + 1);
-    let mut seq: u16 = 0;
-    for chunk in records.chunks(factor) {
-        let merged_rec = merge_chunk(chunk, args.target_ms, seq)?;
-        merged.push(merged_rec);
-        seq = seq.wrapping_add(1);
-    }
-    let count_new = merged.len() as u64;
-    let bytes_new = count_new * rec_size as u64;
-    let ts_first_ms_new = to_epoch_ms(merged.first().unwrap().header.get_timestamp());
-    let ts_last_ms_new = to_epoch_ms(merged.last().unwrap().header.get_timestamp());
+    // --- Down-sample: last-in-bucket per 200ms window ---
+    let resampled = resample_last_in_bucket(&records, args.target_ms as i64);
+    let count_new = resampled.len() as u64;
+    let rec_size = std::mem::size_of::<IndexRecord>() as u64;
+    let bytes_new = count_new * rec_size;
+    let median_spacing_new_ms = median_spacing(&resampled);
 
     // --- Verify invariants ---
     let mut failures = Vec::new();
-    verify_invariants(
-        &records,
-        &merged,
-        args.target_ms,
-        ts_first_ms_old,
-        ts_last_ms_old,
-        ts_first_ms_new,
-        ts_last_ms_new,
-        &mut failures,
-    );
+    verify_invariants(&records, &resampled, args.target_ms as i64, &mut failures);
     let invariants_passed = failures.is_empty();
 
-    // --- Write .new file (unless dry-run) ---
+    // --- Write .new (unless dry-run) ---
     if !args.dry_run && invariants_passed {
-        let new_path = path.with_extension("idx.new");
-        nxr_sdk::ipc::write_atomic::<IndexRecord>(&new_path, &merged)
+        let new_path = with_suffix(&sh.path, "idx.new");
+        nxr_sdk::ipc::write_atomic::<IndexRecord>(&new_path, &resampled)
             .with_context(|| format!("write {}", new_path.display()))?;
 
         if args.commit {
-            let bak_path = path.with_extension("idx.bak");
-            // .idx → .bak
-            fs::rename(path, &bak_path)
-                .with_context(|| format!("rename {} → {}", path.display(), bak_path.display()))?;
-            // .new → .idx
-            fs::rename(&new_path, path)
-                .with_context(|| format!("rename {} → {}", new_path.display(), path.display()))?;
-            info!(id = %id, count_old = count_old_raw, count_new, "committed");
+            let bak_path = with_suffix(&sh.path, "idx.bak");
+            fs::rename(&sh.path, &bak_path).with_context(|| {
+                format!("rename {} -> {}", sh.path.display(), bak_path.display())
+            })?;
+            fs::rename(&new_path, &sh.path).with_context(|| {
+                format!("rename {} -> {}", new_path.display(), sh.path.display())
+            })?;
+            info!(ticker = %sh.ticker, date = %sh.date, count_old = records.len(), count_new, "committed");
         } else {
-            info!(id = %id, count_old = count_old_raw, count_new, "wrote .new (not committed)");
+            info!(ticker = %sh.ticker, date = %sh.date, count_old = records.len(), count_new, "wrote .new (not committed)");
         }
     }
 
-    Ok(FileReport {
-        id,
+    Ok(ShardReport {
+        ticker: sh.ticker.clone(),
+        date: sh.date.clone(),
         bytes_old,
-        count_old: count_old_raw as u64,
+        count_old: records.len() as u64,
         count_new,
         bytes_new,
-        ts_first_ms_old,
-        ts_last_ms_old,
-        ts_first_ms_new,
-        ts_last_ms_new,
-        partial_tail_dropped: if trailing_partial > 0 { 1 } else { 0 },
+        median_spacing_old_ms,
+        median_spacing_new_ms,
+        dropped_misrouted,
+        skipped_already_target: false,
         invariants_passed,
         invariants_failed: failures,
         duration_ms: started.elapsed().as_millis(),
     })
 }
 
-/// Merge N consecutive 50ms-cadence records into one 100ms-cadence record
-/// (or generally `factor` records → 1, for any factor ≥ 1).
-fn merge_chunk(chunk: &[IndexRecord], target_ms: u64, out_seq: u16) -> Result<IndexRecord> {
-    if chunk.is_empty() {
-        bail!("empty chunk");
-    }
-
-    // Bin-aligned timestamp: floor(first_ms / target_ms) * target_ms.
-    let first = &chunk[0];
-    let first_ms = to_epoch_ms(first.header.get_timestamp());
-    let bin_ms = (first_ms / target_ms as i64) * target_ms as i64;
-    let bin_mts = from_epoch_ms(bin_ms);
-
-    // Read packed fields into locals via copies — UB-safe access pattern.
-    let ticker = first.index.ticker;
-    let msg_type = first.header.message_type();
-    let provider_id = first.header.provider_id();
-
-    // Volume-weighted price merge. Numerators in u128 to avoid f64 catastrophic
-    // cancellation across hundreds of records (sum runs to ~9.4G total bytes).
-    let mut bid_num: f64 = 0.0;
-    let mut bid_den: f64 = 0.0;
-    let mut ask_num: f64 = 0.0;
-    let mut ask_den: f64 = 0.0;
-    // Volumes sum saturating.
-    let mut vbid_sum: u32 = 0;
-    let mut vask_sum: u32 = 0;
-    // Variance pooling for CI.
-    let mut ci_num: f64 = 0.0;
-    let mut ci_den: f64 = 0.0;
-    // Counters / peaks.
-    let mut tick_count_sum: u16 = 0;
-    let mut confidence_max: u8 = 0;
-    let mut accepted_max: u8 = 0;
-    let mut rejected_max: u8 = 0;
-    let mut flags_or: u8 = 0;
-    let mut input_count: u8 = 0;
-
-    for r in chunk {
-        // Copy packed fields out — taking refs to packed struct fields is UB
-        // since they may be unaligned.
-        let bid = r.index.bid;
-        let ask = r.index.ask;
-        let vbid = r.index.vbid;
-        let vask = r.index.vask;
-        let ci_u16 = r.index.ci;
-        let tick_count = r.index.tick_count;
-        let confidence = r.index.confidence;
-        let accepted = r.index.accepted;
-        let rejected = r.index.rejected;
-        let flags = r.index.flags;
-        let rec_ticker = r.index.ticker;
-
-        // Sanity: ticker_id must be invariant within a file.
-        if rec_ticker != ticker {
-            bail!(
-                "ticker mismatch within file: {} vs {}",
-                rec_ticker, ticker
-            );
-        }
-
-        let w_bid = vbid as f64;
-        let w_ask = vask as f64;
-        if w_bid > 0.0 {
-            bid_num += bid * w_bid;
-            bid_den += w_bid;
-        }
-        if w_ask > 0.0 {
-            ask_num += ask * w_ask;
-            ask_den += w_ask;
-        }
-
-        vbid_sum = vbid_sum.saturating_add(vbid);
-        vask_sum = vask_sum.saturating_add(vask);
-
-        // CI variance pool weighted by total volume; fallback to tick_count if
-        // both sides have zero volume (eg synthetic / injected records).
-        let w_ci = if (vbid + vask) > 0 {
-            (vbid + vask) as f64
-        } else {
-            tick_count as f64
-        };
-        if w_ci > 0.0 {
-            let ci_ubp = decode_ci_ubp(ci_u16);
-            ci_num += ci_ubp * ci_ubp * w_ci;
-            ci_den += w_ci;
-        }
-
-        tick_count_sum = tick_count_sum.saturating_add(tick_count);
-        confidence_max = confidence_max.max(confidence);
-        accepted_max = accepted_max.max(accepted);
-        rejected_max = rejected_max.max(rejected);
-        flags_or |= flags;
-        input_count = input_count.saturating_add(1);
-    }
-
-    // Fallback to simple mean if no volume weight was available (degenerate
-    // case: all records had vbid==0 || vask==0).
-    let bid_out = if bid_den > 0.0 {
-        bid_num / bid_den
-    } else {
-        chunk.iter().map(|r| r.index.bid).sum::<f64>() / chunk.len() as f64
-    };
-    let ask_out = if ask_den > 0.0 {
-        ask_num / ask_den
-    } else {
-        chunk.iter().map(|r| r.index.ask).sum::<f64>() / chunk.len() as f64
-    };
-    let ci_out_u16 = if ci_den > 0.0 {
-        encode_ci_ubp((ci_num / ci_den).sqrt())
-    } else {
-        // No volume context — take the max input CI as a conservative bound.
-        chunk
-            .iter()
-            .map(|r| {
-                let ci_u = r.index.ci;
-                ci_u
-            })
-            .max()
-            .unwrap_or(0)
-    };
-
-    let header = build_header(msg_type, provider_id, bin_mts, input_count, out_seq);
-    let body = Index {
-        ticker,
-        bid: bid_out,
-        ask: ask_out,
-        vbid: vbid_sum,
-        vask: vask_sum,
-        ci: ci_out_u16,
-        tick_count: tick_count_sum,
-        confidence: confidence_max,
-        accepted: accepted_max,
-        rejected: rejected_max,
-        flags: flags_or | RESAMPLE_FLAG,
-    };
-    Ok(IndexRecord::new(header, body))
+/// Bin start (floor to target_ms grid).
+#[inline]
+fn bin_start(ts_ms: i64, target_ms: i64) -> i64 {
+    (ts_ms / target_ms) * target_ms
 }
 
-/// Construct a MitchHeader matching prod's `emit_full` semantics with
-/// a bin-aligned timestamp + a sequence renumbered for the resampled output.
-fn build_header(msg_type: u8, provider_id: u16, bin_mts: u64, count: u8, seq: u16) -> MitchHeader {
-    let mut h = MitchHeader::new(msg_type, provider_id, bin_mts, count.max(1));
-    // Re-number sequences from 0..N in output order (original sequences carry
-    // gap-detection semantics that are meaningless after resampling).
-    let _ = seq; // sequence is private to MitchHeader; new() doesn't take it.
-                 // We rely on the default-init behavior of MitchHeader::new which
-                 // sets sequence per its own counter or leaves zero — both are
-                 // acceptable for resampled history. If a setter exists upstream
-                 // we'd call it here.
-    h.set_timestamp(bin_mts);
-    h
+/// Down-sample by keeping the **last (latest-ts) record in each target_ms
+/// bin**, re-stamped to the bin start. Body (incl. `confidence` + flags) copied
+/// verbatim; `FLAG_IDX_HEALED` OR'd in. `records` must be ts-ascending (shard
+/// invariant); we do not re-sort here. One output row per occupied bin.
+fn resample_last_in_bucket(records: &[IndexRecord], target_ms: i64) -> Vec<IndexRecord> {
+    let mut out: Vec<IndexRecord> = Vec::with_capacity(records.len() / 2 + 1);
+    let mut cur_bin: Option<i64> = None;
+    for r in records {
+        let bin = bin_start(to_epoch_ms(r.header.get_timestamp()), target_ms);
+        match cur_bin {
+            Some(b) if b == bin => {
+                // Same bin: replace the in-progress representative with this
+                // later record (last-in-bucket wins).
+                *out.last_mut().unwrap() = stamp(r, bin);
+            }
+            _ => {
+                out.push(stamp(r, bin));
+                cur_bin = Some(bin);
+            }
+        }
+    }
+    out
+}
+
+/// Copy a record verbatim, re-stamp header ts to `bin_ms`, OR in FLAG_IDX_HEALED.
+/// Body (confidence, FLAG_CONF_FRESHNESS, ci, vols, counters) untouched.
+#[inline]
+fn stamp(r: &IndexRecord, bin_ms: i64) -> IndexRecord {
+    let mut out = *r;
+    let mut header = out.header;
+    header.set_timestamp(from_epoch_ms(bin_ms));
+    out.header = header;
+    // Read packed field via copy, OR the marker, write back.
+    let flags = out.index.flags | FLAG_IDX_HEALED;
+    out.index.flags = flags;
+    out
+}
+
+/// True if the shard is already at target cadence (median spacing == target_ms)
+/// AND every record already carries FLAG_IDX_HEALED. Used to skip on re-run.
+fn is_already_target(records: &[IndexRecord], target_ms: i64) -> bool {
+    if records.len() < 2 {
+        return false;
+    }
+    let all_healed = records.iter().all(|r| (r.index.flags & FLAG_IDX_HEALED) != 0);
+    all_healed && median_spacing(records) == target_ms
+}
+
+/// Median inter-record spacing in ms (0 if < 2 records). Robust to gaps.
+fn median_spacing(records: &[IndexRecord]) -> i64 {
+    if records.len() < 2 {
+        return 0;
+    }
+    let mut deltas: Vec<i64> = records
+        .windows(2)
+        .map(|w| {
+            to_epoch_ms(w[1].header.get_timestamp()) - to_epoch_ms(w[0].header.get_timestamp())
+        })
+        .filter(|d| *d > 0)
+        .collect();
+    if deltas.is_empty() {
+        return 0;
+    }
+    deltas.sort_unstable();
+    deltas[deltas.len() / 2]
 }
 
 fn verify_invariants(
     old: &[IndexRecord],
     new: &[IndexRecord],
-    target_ms: u64,
-    ts_first_old: i64,
-    ts_last_old: i64,
-    ts_first_new: i64,
-    ts_last_new: i64,
+    target_ms: i64,
     failures: &mut Vec<String>,
 ) {
-    let factor = 2; // any factor; we use it as a min bound below
-
-    // (1) count_new ∈ [ floor(count_old/factor), ceil(count_old/factor) ]
-    let expected_low = old.len() / factor;
-    let expected_high = (old.len() + factor - 1) / factor;
-    if !(new.len() >= expected_low && new.len() <= expected_high + 1) {
-        failures.push(format!(
-            "count_new={} not in [{}, {}]",
-            new.len(),
-            expected_low,
-            expected_high + 1
-        ));
+    // (1) count_new must be ≤ count_old and roughly half (one row per occupied
+    //     200ms bin; clusters/gaps allow a range). Upper bound = #old bins.
+    if new.len() > old.len() {
+        failures.push(format!("count grew: {} -> {}", old.len(), new.len()));
     }
 
-    // (2) ts_first_new in bin-aligned window
-    let bin_first = (ts_first_old / target_ms as i64) * target_ms as i64;
-    if ts_first_new < bin_first || ts_first_new > ts_first_old + target_ms as i64 {
-        failures.push(format!(
-            "ts_first_new={} outside [bin_first={}, ts_first_old+target={}]",
-            ts_first_new,
-            bin_first,
-            ts_first_old + target_ms as i64
-        ));
+    // (2) Every new ts is bin-aligned to the target grid.
+    if let Some(bad) = new
+        .iter()
+        .find(|r| to_epoch_ms(r.header.get_timestamp()) % target_ms != 0)
+    {
+        let ts = to_epoch_ms(bad.header.get_timestamp());
+        failures.push(format!("ts {ts} not aligned to {target_ms}ms grid"));
     }
 
-    // (3) ts_last_new ≤ ts_last_old (no fabricated future data)
-    if ts_last_new > ts_last_old {
-        failures.push(format!(
-            "ts_last_new={} > ts_last_old={}",
-            ts_last_new, ts_last_old
-        ));
-    }
-
-    // (4) Monotonic timestamps in new sequence
+    // (3) Strictly increasing bin timestamps (one row per bin → strict).
     for w in new.windows(2) {
         let a = to_epoch_ms(w[0].header.get_timestamp());
         let b = to_epoch_ms(w[1].header.get_timestamp());
-        if b < a {
-            failures.push(format!("non-monotonic ts: {} → {}", a, b));
+        if b <= a {
+            failures.push(format!("non-increasing bin ts: {a} -> {b}"));
             break;
         }
     }
 
-    // (5) Volume conservation (within saturating-u32 caveat: only check that
-    //     new total is ≤ old total since we saturate; clamp events would
-    //     break exact equality but never produce a higher total).
-    let vbid_old: u64 = old.iter().map(|r| r.index.vbid as u64).sum();
-    let vbid_new: u64 = new.iter().map(|r| r.index.vbid as u64).sum();
-    let vask_old: u64 = old.iter().map(|r| r.index.vask as u64).sum();
-    let vask_new: u64 = new.iter().map(|r| r.index.vask as u64).sum();
-    if vbid_new > vbid_old {
-        failures.push(format!("vbid grew: {} → {}", vbid_old, vbid_new));
-    }
-    if vask_new > vask_old {
-        failures.push(format!("vask grew: {} → {}", vask_old, vask_new));
+    // (4) No fabricated future data: last new ts ≤ last old ts (bin-floored).
+    if let (Some(no), Some(oo)) = (new.last(), old.last()) {
+        let last_new = to_epoch_ms(no.header.get_timestamp());
+        let last_old = to_epoch_ms(oo.header.get_timestamp());
+        if last_new > last_old {
+            failures.push(format!("last_new ts {last_new} > last_old {last_old}"));
+        }
     }
 
-    // (6) Every new record carries the resample flag
-    if let Some(bad) = new.iter().find(|r| (r.index.flags & RESAMPLE_FLAG) == 0) {
+    // (5) Every new record carries FLAG_IDX_HEALED.
+    if let Some(bad) = new.iter().find(|r| (r.index.flags & FLAG_IDX_HEALED) == 0) {
         let f = bad.index.flags;
-        failures.push(format!("record missing RESAMPLE_FLAG (flags={:#x})", f));
+        failures.push(format!("record missing FLAG_IDX_HEALED (flags={f:#x})"));
     }
 
-    // (7) Index msg type preserved
-    if !new.is_empty() {
-        let old_t = old[0].header.message_type();
-        let new_t = new[0].header.message_type();
-        if old_t != new_t {
-            failures.push(format!("msg_type changed: {} → {}", old_t, new_t));
+    // (6) Confidence is NOT fabricated: FLAG_CONF_FRESHNESS distribution is
+    //     preserved (we never set or clear it). Every new row's flag bit must
+    //     have come from some old row (last-in-bucket copies verbatim) — i.e.
+    //     if NO old row had it set, no new row may have it set.
+    let old_any_fresh = old.iter().any(|r| {
+        (r.index.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0
+    });
+    if !old_any_fresh {
+        if let Some(bad) = new
+            .iter()
+            .find(|r| (r.index.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0)
+        {
+            let f = bad.index.flags;
+            failures.push(format!(
+                "fabricated FLAG_CONF_FRESHNESS (flags={f:#x}) — none in source"
+            ));
+        }
+    }
+
+    // (7) Msg type preserved.
+    if let (Some(o), Some(n)) = (old.first(), new.first()) {
+        let ot = o.header.message_type();
+        let nt = n.header.message_type();
+        if ot != nt {
+            failures.push(format!("msg_type changed: {ot} -> {nt}"));
         }
     }
 }
 
-fn write_csv_report(input_dir: &Path, reports: &[FileReport]) -> Result<()> {
+fn write_csv_report(input_dir: &Path, reports: &[ShardReport]) -> Result<()> {
     let path = input_dir.join("resample-report.csv");
-    let mut f = File::create(&path)?;
+    let mut f = fs::File::create(&path)?;
     writeln!(
         f,
-        "id,bytes_old,count_old,count_new,bytes_new,ts_first_ms_old,ts_last_ms_old,\
-         ts_first_ms_new,ts_last_ms_new,partial_tail_dropped,invariants_passed,\
-         duration_ms,failures"
+        "ticker,date,bytes_old,count_old,count_new,bytes_new,median_spacing_old_ms,\
+         median_spacing_new_ms,dropped_misrouted,skipped_already_target,\
+         invariants_passed,duration_ms,failures"
     )?;
     for r in reports {
         writeln!(
             f,
             "{},{},{},{},{},{},{},{},{},{},{},{},{}",
-            r.id,
+            r.ticker,
+            r.date,
             r.bytes_old,
             r.count_old,
             r.count_new,
             r.bytes_new,
-            r.ts_first_ms_old,
-            r.ts_last_ms_old,
-            r.ts_first_ms_new,
-            r.ts_last_ms_new,
-            r.partial_tail_dropped,
+            r.median_spacing_old_ms,
+            r.median_spacing_new_ms,
+            r.dropped_misrouted,
+            r.skipped_already_target,
             r.invariants_passed,
             r.duration_ms,
             r.invariants_failed.join("|")
@@ -678,9 +573,188 @@ fn write_csv_report(input_dir: &Path, reports: &[FileReport]) -> Result<()> {
     Ok(())
 }
 
-// Silence unused warning for message_type module — keeps the import as a
-// future-proofing reminder that index records carry MITCH msg type code 4
-// (`message_type::INDEX` per `mitch::common`). Asserted at runtime via the
-// invariant check above.
+// ── helpers ──────────────────────────────────────────────────────────────
+
+/// Append a dotted suffix to a path's filename: `2026-06-01.idx` + `idx.new`
+/// → `2026-06-01.idx.new`. (`Path::with_extension` would clobber `.idx`.)
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    // file_stem strips the final `.idx`; re-add via the requested suffix which
+    // itself starts with `idx`.
+    name.push('.');
+    name.push_str(suffix);
+    path.with_file_name(name)
+}
+
+fn empty_report(
+    sh: &ShardRef,
+    bytes_old: u64,
+    dropped_misrouted: usize,
+    started: std::time::Instant,
+) -> ShardReport {
+    ShardReport {
+        ticker: sh.ticker.clone(),
+        date: sh.date.clone(),
+        bytes_old,
+        count_old: 0,
+        count_new: 0,
+        bytes_new: 0,
+        median_spacing_old_ms: 0,
+        median_spacing_new_ms: 0,
+        dropped_misrouted,
+        skipped_already_target: false,
+        invariants_passed: true,
+        invariants_failed: vec![],
+        duration_ms: started.elapsed().as_millis(),
+    }
+}
+
+fn err_report(sh: &ShardRef, msg: String) -> ShardReport {
+    ShardReport {
+        ticker: sh.ticker.clone(),
+        date: sh.date.clone(),
+        bytes_old: 0,
+        count_old: 0,
+        count_new: 0,
+        bytes_new: 0,
+        median_spacing_old_ms: 0,
+        median_spacing_new_ms: 0,
+        dropped_misrouted: 0,
+        skipped_already_target: false,
+        invariants_passed: false,
+        invariants_failed: vec![msg],
+        duration_ms: 0,
+    }
+}
+
+fn panic_msg(panic_box: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic_box.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = panic_box.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+// Keep the INDEX msg-type import live as a documentation anchor: index records
+// carry MITCH msg type code 4 (`message_type::INDEX`). Asserted via invariant 7.
 #[allow(dead_code)]
 const _MSG_TYPE_INDEX_REMINDER: u8 = message_type::INDEX;
+
+// ── tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mitch::common::message_type;
+    use mitch::header::MitchHeader;
+    use mitch::index::Index;
+
+    fn rec(ticker: u64, ts_ms: i64, bid: f64, confidence: u8, flags: u8) -> IndexRecord {
+        let header = MitchHeader::new(message_type::INDEX, 1, from_epoch_ms(ts_ms), 1);
+        let body = Index {
+            ticker,
+            bid,
+            ask: bid + 1.0,
+            vbid: 10,
+            vask: 10,
+            ci: 0,
+            tick_count: 1,
+            confidence,
+            accepted: confidence,
+            rejected: 0,
+            flags,
+        };
+        IndexRecord::new(header, body)
+    }
+
+    fn ts_of(r: &IndexRecord) -> i64 {
+        to_epoch_ms(r.header.get_timestamp())
+    }
+
+    /// 100→200ms last-in-bucket: 10 records at 100ms → 5 records at 200ms,
+    /// each carrying the LATER sub-cycle's body (bid/confidence) verbatim, ts
+    /// bin-aligned to the 200ms grid, FLAG_IDX_HEALED set, FLAG_CONF_FRESHNESS
+    /// untouched (clear → stays clear).
+    #[test]
+    fn downsample_100_to_200_last_in_bucket() {
+        let t0 = 1_700_000_000_000_i64; // already 200ms-aligned
+        let ticker = 42;
+        // ts: t0, +100, +200, +300, ... +900 → bins [t0, t0+200, t0+400, t0+600, t0+800]
+        let recs: Vec<IndexRecord> = (0..10)
+            .map(|i| rec(ticker, t0 + i * 100, 100.0 + i as f64, (i + 1) as u8, 0))
+            .collect();
+
+        let out = resample_last_in_bucket(&recs, 200);
+
+        assert_eq!(out.len(), 5, "10 @100ms → 5 @200ms");
+        // Each bin keeps the LATER (odd-index) record: confidence 2,4,6,8,10.
+        let confs: Vec<u8> = out.iter().map(|r| r.index.confidence).collect();
+        assert_eq!(confs, vec![2, 4, 6, 8, 10], "last-in-bucket body preserved");
+        // ts bin-aligned + 200ms spacing.
+        for (i, r) in out.iter().enumerate() {
+            let ts = ts_of(r);
+            assert_eq!(ts % 200, 0, "bin-aligned");
+            assert_eq!(ts, t0 + i as i64 * 200, "200ms grid");
+        }
+        assert_eq!(median_spacing(&out), 200, "spacing ≈ 200ms");
+        // Marker set, freshness flag NOT fabricated.
+        assert!(out.iter().all(|r| (r.index.flags & FLAG_IDX_HEALED) != 0));
+        assert!(out
+            .iter()
+            .all(|r| (r.index.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) == 0));
+
+        let mut failures = Vec::new();
+        verify_invariants(&recs, &out, 200, &mut failures);
+        assert!(failures.is_empty(), "invariants: {failures:?}");
+    }
+
+    /// Idempotency: re-running on an already-200ms, already-healed series is a
+    /// no-op (one record per bin → same count + same timestamps).
+    #[test]
+    fn idempotent_on_target_cadence() {
+        let t0 = 1_700_000_000_000_i64;
+        let ticker = 7;
+        let first: Vec<IndexRecord> = (0..6)
+            .map(|i| rec(ticker, t0 + i * 100, 50.0 + i as f64, 3, 0))
+            .collect();
+        let once = resample_last_in_bucket(&first, 200);
+        assert!(is_already_target(&once, 200), "post-pass shard is at target");
+        let twice = resample_last_in_bucket(&once, 200);
+        assert_eq!(once.len(), twice.len(), "re-run count stable");
+        for (a, b) in once.iter().zip(&twice) {
+            assert_eq!(ts_of(a), ts_of(b), "re-run ts stable");
+            assert_eq!(a.index.confidence, b.index.confidence, "body stable");
+        }
+    }
+
+    /// Confidence is NEVER converted: a legacy-count record (flag clear) stays a
+    /// legacy count with the flag clear; a freshness record (flag set) keeps its
+    /// flag — neither is fabricated nor stripped.
+    #[test]
+    fn confidence_flag_preserved_verbatim() {
+        let t0 = 1_700_000_000_000_i64;
+        let ticker = 9;
+        let fresh = nxr_sdk::shard::FLAG_CONF_FRESHNESS;
+        // bin 1: two legacy-count rows (flag clear); bin 2: two freshness rows.
+        let recs = vec![
+            rec(ticker, t0, 1.0, 12, 0),
+            rec(ticker, t0 + 100, 1.0, 15, 0),
+            rec(ticker, t0 + 200, 1.0, 200, fresh),
+            rec(ticker, t0 + 300, 1.0, 210, fresh),
+        ];
+        let out = resample_last_in_bucket(&recs, 200);
+        assert_eq!(out.len(), 2);
+        // bin1 → later legacy row: conf 15, freshness flag clear.
+        assert_eq!(out[0].index.confidence, 15);
+        assert_eq!(out[0].index.flags & fresh, 0, "legacy flag stays clear");
+        // bin2 → later freshness row: conf 210, freshness flag still set.
+        assert_eq!(out[1].index.confidence, 210);
+        assert_ne!(out[1].index.flags & fresh, 0, "freshness flag preserved");
+    }
+}
