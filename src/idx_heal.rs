@@ -140,6 +140,8 @@ pub fn heal_ticker_shards(
     }
 
     if commit {
+        let _lock = nxr_sdk::shard::acquire_idx_writer_lock(&dir)
+            .context("cannot commit heal while live idx writer holds lock — scale nxr to 0 first")?;
         let bak = dir.with_extension(format!(
             "bak-{}",
             chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
