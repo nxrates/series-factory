@@ -71,7 +71,7 @@ struct Args {
     exchanges: Vec<String>,
     /// Composite cycle in ms. Each cycle reruns the TDWAP over whichever
     /// providers have delivered data in [last_cycle, this_cycle].
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "100")]
     cycle_ms: u64,
     /// Half-life clamp feed for the TDWAP decay (prod default = 30 s).
     #[arg(long, default_value = "30")]

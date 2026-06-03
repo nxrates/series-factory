@@ -1,3 +1,4 @@
+pub mod idx_heal;
 pub mod bar_construction;
 pub mod cli;
 pub mod sampler;

@@ -31,7 +31,7 @@ pub struct Config {
     pub to: DateTime<Utc>,
     pub agg_mode: AggregationMode,
     pub agg_step: f64,
-    /// Per-provider index cycle in ms (default 50 = 20 Hz, matching prod forwarders).
+    /// Per-provider index cycle in ms (default 100 = 10 Hz, matching prod forwarders).
     pub cycle_ms: u64,
     /// Stale-provider threshold in seconds (TDWAP half-life clamp upper bound).
     pub stale_secs: f64,
