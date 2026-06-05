@@ -395,10 +395,63 @@ fn check_bar_ohlc(
 /// Max permitted gap between consecutive records before WARN (60 s).
 const IDX_MAX_GAP_MS: i64 = 60_000;
 
+// ── Institutional-grade data-quality constants (G1/G3/G5/G6/G7/G8) ───────────
+//
+// Design rule (see module head): HARD structural corruption → ERROR always.
+// Statistical/heuristic anomalies (jumps, per-record CI) → WARN by default,
+// ERROR only under `--strict`, so the cert does NOT false-FAIL on legitimate
+// volatile-but-real crypto data.
+
+/// G1 — absolute price floor. Any finite, technically-positive bid/ask below
+/// this is treated as structural corruption (e.g. a price that underflowed to a
+/// denormal). `Index::validate()` only rejects `<= 0.0`; a value like `1e-15`
+/// passes it yet cannot be a real quote. ERROR always.
+const MIN_PX: f64 = 1e-9;
+
+/// G6 — lower timestamp bound: 2000-01-01T00:00:00Z in epoch ms. Any record ts
+/// below this is a corrupt/garbage clock. Defensive guard: a valid u48 mts
+/// decodes to ≥ 2010-01-01 (`mitch::timestamp::from_epoch_ms` floors pre-epoch
+/// inputs to 0 → `EPOCH_MS`), so this bound is unreachable through normal
+/// encoding — it backstops a non-mts-encoded garbage clock. ERROR.
+const EPOCH_2000_MS: i64 = 946_684_800_000;
+
+/// G6 — small future slack (ms) added to "now" before flagging a ts as being
+/// from the future. Absorbs benign clock skew between the writer host and this
+/// checker (5 min). Beyond this → corrupt clock → ERROR.
+const FUTURE_SLACK_MS: i64 = 300_000;
+
+/// G8 — sane upper bound on `Index::accepted` (distinct providers contributing
+/// to the composite). `accepted` is a `u8` so it is non-negative and ≤ 255 by
+/// type; a value this large is metadata corruption, not a real provider count.
+/// ERROR on overrun. (`confidence` is now an independent Q0.8 freshness byte —
+/// see `mitch::index` — so no `confidence <= accepted` cross-constraint here.)
+const MAX_ACCEPTED_PROVIDERS: u8 = 64;
+
+/// G5 — price-jump heuristic ceiling: `|mid - prev_mid| / prev_mid`. A move of
+/// more than this between consecutive records is *flagged* — but real crypto
+/// prints genuinely jump this much on thin books, so this is a WARN by default
+/// and only an ERROR under `--strict`. 10 %.
+const JUMP_PCT: f64 = 0.10;
+
+/// G3 — per-record confidence-interval ceiling as a fraction of mid: a record
+/// whose `ci_price > mid * CI_MAX_FRAC` has a degenerate (~useless) interval.
+/// Heuristic → WARN by default, ERROR under `--strict`. 1 % of mid.
+const CI_MAX_FRAC: f64 = 0.01;
+
+/// G7 — spread-consistency tolerance (bps). `spread_bps()` is derived from
+/// `(ask-bid)/mid`, so the cross-check is on the *reconstruction*: recompute
+/// `(ask-bid)/mid*1e4` independently and require it match the reported value.
+/// A gross mismatch (or a non-finite / negative reconstructed spread that the
+/// MITCH `validate()` happened not to catch) signals bid/ask encoding
+/// corruption. ERROR on gross mismatch. 0.5 bps absolute slack.
+const SPREAD_CONSISTENCY_BPS: f64 = 0.5;
+
 /// Per-file accumulators threaded through the `.idx` validator.
 #[derive(Default)]
 struct IdxState {
     prev_ts_ms: Option<i64>,
+    /// G5 — previous record mid for the price-jump heuristic.
+    prev_mid: Option<f64>,
     sum_ci_over_mid: f64,
     n_finite: usize,
     n_wide: usize,
@@ -427,6 +480,19 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
             }
             stats.ts_last_ms = Some(ts);
 
+            // G6 — timestamp epoch sanity: must be within [2000-01-01, now+slack].
+            // Out-of-range = corrupt clock = structural corruption → ERROR always.
+            let now_ms = nxr_sdk::agg::now_ms() as i64;
+            if ts < EPOCH_2000_MS || ts > now_ms + FUTURE_SLACK_MS {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!(
+                        "ts {} ms outside sane epoch [{}, now+{}]",
+                        ts, EPOCH_2000_MS, FUTURE_SLACK_MS
+                    ),
+                });
+            }
+
             if let Some(prev) = s.prev_ts_ms {
                 if ts < prev {
                     errors.push(Finding {
@@ -451,8 +517,43 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
             }
             s.prev_ts_ms = Some(ts);
 
-            // Copy out of packed before validate().
+            // Copy out of packed before any field access.
             let idx_body = rec.index;
+            let bid = idx_body.bid;
+            let ask = idx_body.ask;
+
+            // G1 — absolute price floor (structural corruption → ERROR always).
+            // Runs before validate(): validate() only rejects non-finite / <=0,
+            // so a finite, technically-positive sub-floor px would slip through.
+            let mut floor_bad = false;
+            if !bid.is_finite() || bid < MIN_PX {
+                floor_bad = true;
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("bid {} below price floor {:e} (or non-finite)", bid, MIN_PX),
+                });
+            }
+            if !ask.is_finite() || ask < MIN_PX {
+                floor_bad = true;
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("ask {} below price floor {:e} (or non-finite)", ask, MIN_PX),
+                });
+            }
+
+            // G8 — metadata sanity: `accepted` must be a real provider count.
+            // u8 ⇒ non-negative by type; an absurdly large value is corruption.
+            let accepted = idx_body.accepted;
+            if accepted > MAX_ACCEPTED_PROVIDERS {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!(
+                        "accepted={} exceeds sane max {} (metadata corruption)",
+                        accepted, MAX_ACCEPTED_PROVIDERS
+                    ),
+                });
+            }
+
             if let Err(e) = idx_body.validate() {
                 errors.push(Finding {
                     record_ix: Some(i),
@@ -460,10 +561,69 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                 });
                 return;
             }
+            // If the floor was breached the body is structurally corrupt; the
+            // ERROR is already recorded — skip the derived/heuristic math.
+            if floor_bad {
+                return;
+            }
             let mid = idx_body.mid();
             if mid > 0.0 && mid.is_finite() {
                 let spread_bps = idx_body.spread_bps();
                 let ci_price = idx_body.ci_price();
+
+                // G7 — spread realness: recompute (ask-bid)/mid*1e4 independently
+                // and require it match the reported spread_bps. A gross mismatch,
+                // or a non-finite / negative reconstructed spread that validate()
+                // missed, indicates bid/ask encoding corruption → ERROR.
+                let recomputed_spread_bps = (ask - bid) / mid * 10_000.0;
+                if !recomputed_spread_bps.is_finite()
+                    || recomputed_spread_bps < 0.0
+                    || (recomputed_spread_bps - spread_bps).abs() > SPREAD_CONSISTENCY_BPS
+                {
+                    errors.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!(
+                            "spread inconsistent: (ask-bid)/mid={:.4} bps vs reported {:.4} bps (bid/ask corruption)",
+                            recomputed_spread_bps, spread_bps
+                        ),
+                    });
+                }
+
+                // G3 — per-record CI ceiling. Heuristic → WARN, strict → ERROR.
+                if ci_price.is_finite() && ci_price > mid * CI_MAX_FRAC {
+                    let msg = format!(
+                        "ci_price {:.6} > mid*{} = {:.6} (degenerate interval)",
+                        ci_price, CI_MAX_FRAC, mid * CI_MAX_FRAC
+                    );
+                    if strict {
+                        errors.push(Finding { record_ix: Some(i), msg });
+                    } else {
+                        warnings.push(Finding { record_ix: Some(i), msg });
+                    }
+                }
+
+                // G5 — price-jump guard. Heuristic → WARN, strict → ERROR.
+                if let Some(prev_mid) = s.prev_mid {
+                    if prev_mid > 0.0 {
+                        let jump = (mid - prev_mid).abs() / prev_mid;
+                        if jump > JUMP_PCT {
+                            let msg = format!(
+                                "mid jump {:.2}% between rows {}..{} (>{:.0}%)",
+                                jump * 100.0,
+                                i.saturating_sub(1),
+                                i,
+                                JUMP_PCT * 100.0
+                            );
+                            if strict {
+                                errors.push(Finding { record_ix: Some(i), msg });
+                            } else {
+                                warnings.push(Finding { record_ix: Some(i), msg });
+                            }
+                        }
+                    }
+                }
+                s.prev_mid = Some(mid);
+
                 let ratio = ci_price / mid;
                 if ratio.is_finite() {
                     s.sum_ci_over_mid += ratio;
@@ -770,6 +930,13 @@ fn check_s10(path: &Path, strict: bool, bucket_ms: i64) -> Result<FileReport> {
 
 // ── .vol check ──────────────────────────────────────────────────────────────
 
+/// Absurd-volatility ceiling: a per-bar `sigma_pct` (fraction) at or above this
+/// is physically impossible (500 %/bar) and signals structural corruption, not
+/// a real-but-extreme print → ERROR always. The tight `[0, 0.5]` band below is
+/// the *expected* operating range; this is the hard backstop that must never be
+/// crossed even for the most volatile legitimate crypto bar.
+const VOL_MAX: f64 = 5.0;
+
 /// Per-file accumulators threaded through the `.vol` validator.
 struct VolState {
     vol_stats: VolStats,
@@ -802,10 +969,23 @@ fn check_vol(path: &Path, _strict: bool) -> Result<FileReport> {
             let mts = timestamp::decode_u48(&mts_bytes);
             let sigma = r.sigma_pct;
 
+            let ts_ms = timestamp::to_epoch_ms(mts);
             if i == 0 {
-                stats.ts_first_ms = Some(timestamp::to_epoch_ms(mts));
+                stats.ts_first_ms = Some(ts_ms);
             }
-            stats.ts_last_ms = Some(timestamp::to_epoch_ms(mts));
+            stats.ts_last_ms = Some(ts_ms);
+
+            // G6 — timestamp epoch sanity (mirrors `.idx`): corrupt clock → ERROR.
+            let now_ms = nxr_sdk::agg::now_ms() as i64;
+            if ts_ms < EPOCH_2000_MS || ts_ms > now_ms + FUTURE_SLACK_MS {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!(
+                        "mts {} ms outside sane epoch [{}, now+{}]",
+                        ts_ms, EPOCH_2000_MS, FUTURE_SLACK_MS
+                    ),
+                });
+            }
 
             if let Some(prev) = s.prev_mts {
                 if mts <= prev {
@@ -824,6 +1004,19 @@ fn check_vol(path: &Path, _strict: bool) -> Result<FileReport> {
                 });
                 return;
             }
+            // Hard structural band: negative or absurdly large (>= VOL_MAX =
+            // 500 %/bar) is impossible even for the most volatile real crypto
+            // bar → structural corruption → ERROR always.
+            if sigma < 0.0 || sigma >= VOL_MAX {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("sigma_pct {} outside sane band [0, {})", sigma, VOL_MAX),
+                });
+                return;
+            }
+            // Expected operating range. A value here is finite, non-negative and
+            // sub-VOL_MAX but still outside the normal regime → ERROR (kept as
+            // the historical tight gate; structural, not heuristic).
             if !(0.0..=0.5).contains(&sigma) {
                 errors.push(Finding {
                     record_ix: Some(i),
@@ -1070,3 +1263,219 @@ fn main() -> Result<()> {
 // The smoke test binary (`tests/integrity_smoke.rs`) invokes this binary as a
 // subprocess via the `CARGO_BIN_EXE_integrity-check` env var. No public Rust
 // API is needed.
+
+// ── Unit tests for the institutional-grade ERROR-class checks ────────────────
+//
+// These craft in-memory `IndexRecord` / `VolRecord` rows, write them to a temp
+// file, and call `check_idx` / `check_vol` directly (mirroring the fixture
+// style in `tests/integrity_smoke.rs`). They assert ERROR presence/absence for
+// the new HARD checks (price floor, ts epoch, accepted bound, spread realness,
+// vol band) and WARN-vs-ERROR-vs-strict behaviour for the heuristic checks
+// (price jump, per-record CI).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::bytes_of;
+    use mitch::header::MitchHeader;
+    use mitch::index::Index;
+
+    /// Build a valid `IndexRecord` at `epoch_ms` with the given bid/ask.
+    fn good_record(epoch_ms: i64, bid: f64, ask: f64) -> IndexRecord {
+        let mts = timestamp::from_epoch_ms(epoch_ms);
+        let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
+        let index = Index::new(
+            0xDEAD_BEEF_u64,
+            bid, ask, 100, /*ci*/ 1_000, /*vbid*/ 1_000, /*vask*/ 10, /*tick_count*/
+            1, /*confidence*/ 1, /*accepted*/ 0, /*rejected*/
+        );
+        IndexRecord::new(header, index)
+    }
+
+    /// Build a `VolRecord` at `epoch_ms` with the given sigma fraction.
+    fn vol_record(epoch_ms: i64, sigma_pct: f64) -> VolRecord {
+        VolRecord {
+            mts: timestamp::encode_u48(timestamp::from_epoch_ms(epoch_ms)),
+            sigma_pct,
+        }
+    }
+
+    fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "nxr-integrity-unit-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            name,
+        ));
+        std::fs::write(&p, bytes).expect("write tmp fixture");
+        p
+    }
+
+    fn write_idx(name: &str, recs: &[IndexRecord]) -> PathBuf {
+        let mut buf = Vec::with_capacity(recs.len() * std::mem::size_of::<IndexRecord>());
+        for r in recs { buf.extend_from_slice(bytes_of(r)); }
+        write_tmp(name, &buf)
+    }
+
+    fn write_vol(name: &str, recs: &[VolRecord]) -> PathBuf {
+        let mut buf = Vec::with_capacity(recs.len() * std::mem::size_of::<VolRecord>());
+        for r in recs { buf.extend_from_slice(bytes_of(r)); }
+        write_tmp(name, &buf)
+    }
+
+    fn has_err(r: &FileReport, needle: &str) -> bool {
+        r.errors.iter().any(|f| f.msg.contains(needle))
+    }
+    fn has_warn(r: &FileReport, needle: &str) -> bool {
+        r.warnings.iter().any(|f| f.msg.contains(needle))
+    }
+
+    // A safely-past, in-range epoch for baseline rows (2022-01-01).
+    const T0: i64 = 1_640_995_200_000;
+
+    // ── G1 price floor ──────────────────────────────────────────────────────
+
+    #[test]
+    fn g1_subfloor_price_is_error() {
+        // Finite, technically-positive but below MIN_PX → ERROR (and validate()
+        // alone would NOT catch it).
+        let rec = good_record(T0, 5e-10, 6e-10);
+        let p = write_idx("g1-subfloor.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(has_err(&r, "price floor"), "sub-floor px must ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g1_normal_price_no_floor_error() {
+        let rec = good_record(T0, 100.0, 100.1);
+        let p = write_idx("g1-ok.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(!has_err(&r, "price floor"), "normal px must not ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── G6 timestamp epoch sanity ────────────────────────────────────────────
+
+    #[test]
+    fn g6_min_mts_does_not_false_fail() {
+        // mts=0 decodes to exactly EPOCH_MS (2010-01-01), the smallest ts a u48
+        // mts can represent — and it is ABOVE EPOCH_2000_MS, so the lower bound
+        // must never false-fail legitimate min-ts data. (The lower bound is a
+        // defensive guard against a non-mts-encoded garbage clock; it is
+        // unreachable via valid u48 mts, which floors at 2010 — see
+        // `mitch::timestamp::from_epoch_ms`.)
+        let header = MitchHeader::new(message_type::INDEX, 1, 0, 1);
+        let index = Index::new(0xDEAD_BEEF, 100.0, 100.1, 100, 1, 1, 1, 1, 1, 0);
+        let rec = IndexRecord::new(header, index);
+        let p = write_idx("g6-minmts.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(!has_err(&r, "outside sane epoch"), "min mts must not ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g6_future_ts_is_error() {
+        // now + 1 day → beyond FUTURE_SLACK_MS → ERROR.
+        let future_ms = nxr_sdk::agg::now_ms() as i64 + nxr_sdk::shard::MS_PER_DAY;
+        let rec = good_record(future_ms, 100.0, 100.1);
+        let p = write_idx("g6-future.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(has_err(&r, "outside sane epoch"), "future ts must ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── G8 accepted bound ────────────────────────────────────────────────────
+
+    #[test]
+    fn g8_absurd_accepted_is_error() {
+        let mts = timestamp::from_epoch_ms(T0);
+        let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
+        // accepted = MAX+1 → metadata corruption.
+        let index = Index::new(
+            0xDEAD_BEEF, 100.0, 100.1, 100, 1, 1, 1, 1, MAX_ACCEPTED_PROVIDERS + 1, 0,
+        );
+        let rec = IndexRecord::new(header, index);
+        let p = write_idx("g8-accepted.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(has_err(&r, "exceeds sane max"), "absurd accepted must ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── G5 price-jump guard (heuristic: WARN default, ERROR strict) ───────────
+
+    #[test]
+    fn g5_jump_warns_default_errors_strict() {
+        // mid 100 → mid 120 = 20% jump (> JUMP_PCT 10%).
+        let recs = [
+            good_record(T0, 99.95, 100.05),
+            good_record(T0 + 1_000, 119.95, 120.05),
+        ];
+        let p = write_idx("g5-jump.idx", &recs);
+
+        let r = check_idx(&p, false).unwrap();
+        assert!(has_warn(&r, "mid jump"), "jump must WARN (non-strict): {:?}", r.warnings);
+        assert!(!has_err(&r, "mid jump"), "jump must NOT ERROR (non-strict): {:?}", r.errors);
+
+        let r2 = check_idx(&p, true).unwrap();
+        assert!(has_err(&r2, "mid jump"), "jump must ERROR (strict): {:?}", r2.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g5_small_move_no_jump() {
+        let recs = [
+            good_record(T0, 100.0, 100.1),
+            good_record(T0 + 1_000, 100.5, 100.6), // ~0.5% move < 10%
+        ];
+        let p = write_idx("g5-nojump.idx", &recs);
+        let r = check_idx(&p, false).unwrap();
+        assert!(!has_warn(&r, "mid jump"), "small move must not WARN: {:?}", r.warnings);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── G3 per-record CI ceiling (heuristic: WARN default, ERROR strict) ──────
+
+    #[test]
+    fn g3_wide_ci_warns_default_errors_strict() {
+        // ci wire value chosen large so ci_price > mid * CI_MAX_FRAC (1%).
+        let mts = timestamp::from_epoch_ms(T0);
+        let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
+        let index = Index::new(
+            0xDEAD_BEEF, 100.0, 100.1, 60_000, /*ci near u16 sat → very wide*/
+            1, 1, 1, 1, 1, 0,
+        );
+        let rec = IndexRecord::new(header, index);
+        let p = write_idx("g3-ci.idx", &[rec]);
+
+        let r = check_idx(&p, false).unwrap();
+        assert!(has_warn(&r, "degenerate interval"), "wide CI must WARN: {:?}", r.warnings);
+
+        let r2 = check_idx(&p, true).unwrap();
+        assert!(has_err(&r2, "degenerate interval"), "wide CI must ERROR (strict): {:?}", r2.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── .vol band ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn vol_absurd_sigma_is_error() {
+        // sigma >= VOL_MAX (5.0) → structural ERROR.
+        let recs = [vol_record(T0, VOL_MAX + 1.0)];
+        let p = write_vol("vol-absurd.vol", &recs);
+        let r = check_vol(&p, false).unwrap();
+        assert!(has_err(&r, "sane band"), "absurd sigma must ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn vol_normal_sigma_ok() {
+        let recs = [vol_record(T0, 0.02), vol_record(T0 + 1_000, 0.03)];
+        let p = write_vol("vol-ok.vol", &recs);
+        let r = check_vol(&p, false).unwrap();
+        assert!(r.errors.is_empty(), "normal vol must be clean: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+}

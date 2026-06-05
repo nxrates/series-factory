@@ -2,6 +2,7 @@ pub mod idx_heal;
 pub mod bar_construction;
 pub mod cli;
 pub mod sampler;
+pub mod seam;
 pub mod sharding;
 pub mod sources;
 pub mod stats;

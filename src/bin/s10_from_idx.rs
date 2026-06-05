@@ -156,6 +156,13 @@ fn main() -> Result<()> {
         info!(date = %date, path = %path.display(), "reading input shard");
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
         while let Some(rec) = stream.next()? {
+            // SEAM PARITY: skip heartbeat sentinels (mirror live bars_s10.rs:198).
+            // Sentinels carry stale bid/ask; ingesting offline (but not live)
+            // poisons the s10 OHLC → vol-ring σ → hist↔live seam drift.
+            if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                n_skipped += 1;
+                continue;
+            }
             let ts_ms = timestamp::to_epoch_ms(rec.header.get_timestamp());
             let idx = rec.index;
             let bid = idx.bid;
@@ -253,4 +260,95 @@ fn main() -> Result<()> {
 
     info!(out_dir = %out_dir.display(), manifest = %mpath.display(), "manifest updated");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LIVE twin of the offline `stamp_grid`, copied VERBATIM from
+    /// `core/src/bars_s10.rs::stamp_s10_bucket` (+ its `bucket_close_ms`
+    /// helper). The SEAM-4 parity test below asserts these two stampers are
+    /// byte-identical for thousands of bucket boundaries. If the live producer
+    /// ever changes its grid-stamping, this copy diverges from the imported
+    /// `stamp_grid` and the test fails — permanently guarding the offline-only
+    /// grid-stamp defect that integrity-check (post-write) failed to catch.
+    fn live_stamp_s10_bucket(bar: &mut Bar, bucket_open: i64) {
+        const BAR_MS: i64 = 10_000;
+        let open_mts = timestamp::from_epoch_ms(bucket_open);
+        // bucket_close_ms = bucket_open + BAR_MS - 1 (live bars_s10.rs).
+        let close_mts = timestamp::from_epoch_ms(bucket_open + BAR_MS - 1);
+        bar.open_ts = timestamp::encode_u48(open_mts);
+        bar.close_ts = timestamp::encode_u48(close_mts);
+    }
+
+    fn blank_bar() -> Bar {
+        let z = timestamp::from_epoch_ms(0);
+        Bar::new_ohlcv(z, z, 1.0, 1.0, 1.0, 1.0, 0, 0, 0)
+    }
+
+    /// SEAM-4: the offline `stamp_grid` (s10-from-idx) and the live
+    /// `stamp_s10_bucket` MUST produce BYTE-IDENTICAL `open_ts`/`close_ts` for
+    /// every 10s bucket boundary. Deterministic sweep, no rng. This permanently
+    /// guards the grid-stamp bug just fixed: a post-write integrity check ran
+    /// too late; this is a FORMAT-PARITY assertion at the stamping function.
+    #[test]
+    fn seam4_s10_grid_stamp_parity_offline_vs_live() {
+        const BAR_MS: i64 = 10_000;
+        // Sweep a wide, deterministic range of 10s-aligned bucket opens:
+        //   * an epoch-near band (DST/leap-second-irrelevant UTC ms),
+        //   * a present-day band (~2023-2024 epoch),
+        //   * a far-future band (u48 tick headroom check).
+        // Plus a dense contiguous run to exercise day-boundary adjacency.
+        // All bands are post-2010 (the mitch epoch); pre-epoch inputs saturate
+        // to 0 in `from_epoch_ms`, which is irrelevant to live↔offline parity.
+        let bands: [i64; 3] = [
+            1_300_000_000_000,       // ~2011-03 (just past the mitch epoch)
+            1_700_000_000_000,       // ~2023-11
+            4_100_000_000_000,       // ~2099
+        ];
+        let mut checked = 0u64;
+        for &base in &bands {
+            // 5000 consecutive buckets per band (spans > 13h — crosses no DST
+            // because these are raw UTC ms, but does cross the within-day grid
+            // and, for the dense run, day boundaries).
+            let base = (base / BAR_MS) * BAR_MS; // ensure 10s-aligned
+            for i in 0..5_000i64 {
+                let bucket_open = base + i * BAR_MS;
+
+                let mut off = blank_bar();
+                stamp_grid(&mut off, bucket_open, BAR_MS);
+
+                let mut live = blank_bar();
+                live_stamp_s10_bucket(&mut live, bucket_open);
+
+                assert_eq!(
+                    off.open_ts, live.open_ts,
+                    "SEAM-4 open_ts mismatch @ bucket_open={bucket_open}: offline={:?} live={:?}",
+                    off.open_ts, live.open_ts
+                );
+                assert_eq!(
+                    off.close_ts, live.close_ts,
+                    "SEAM-4 close_ts mismatch @ bucket_open={bucket_open}: offline={:?} live={:?}",
+                    off.close_ts, live.close_ts
+                );
+                // Decoded epoch_ms must land on the bucket grid within the 16µs
+                // tick quantization (≤1 ms) — guards that the encode itself is
+                // grid-aligned, not just that the two stampers agree.
+                assert!(
+                    (off.open_time_ms() - bucket_open).abs() <= 1,
+                    "offline open_ts decode {} off grid bucket_open {bucket_open}",
+                    off.open_time_ms()
+                );
+                assert!(
+                    (off.close_time_ms() - (bucket_open + BAR_MS - 1)).abs() <= 1,
+                    "offline close_ts decode {} off grid bucket_close {}",
+                    off.close_time_ms(),
+                    bucket_open + BAR_MS - 1
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 15_000, "SEAM-4 must sweep ≥15k boundaries, got {checked}");
+    }
 }

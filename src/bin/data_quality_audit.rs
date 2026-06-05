@@ -32,8 +32,20 @@
 //!    annualized Parkinson volatility from daily high/low.
 //! 4. **Renko bars/day vs calibration**: mean bricks/UTC-day vs `--target-bpd`.
 //!    Stable/stable crypto pairs (inferred by near-zero vol / all-zero returns)
-//!    are flagged `crypto_stable=skip` and excluded from the bpd verdict.
+//!    are flagged `crypto_stable=skip` and excluded from the bpd verdict. Parity
+//!    extensions (mirroring `.idx` rigor): **R1** cross-shard brick continuity
+//!    (last close[D] == first open[D+1], 1e-9 rel; FAIL), **R3** brick magnitude
+//!    floor (`|Δ|/open >= renko.min_pct`; FAIL), **R4** calibration correctness
+//!    (realized bpd within the calibrator's ±20% accept band AND a `renko_k`
+//!    entry exists in `ticker-params.json`; missing k while shards exist =
+//!    CRIT `renko_uncalibrated`), **R2** per-day brick distribution drift
+//!    (median/MAD/min-day; WARN).
 //! 5. **s10 kline sanity**: ts-sorted, non-overlapping buckets, OHLC consistency.
+//!    Parity extensions: **K1** cross-shard boundary continuity (delta = positive
+//!    multiple of 10_000 ms; off-grid = FAIL, multi-bucket gap = WARN), **K2**
+//!    UTC-grid bucket alignment (`open_ts % 10_000 == 0`; FAIL — guards the
+//!    s10-from-idx alignment regression), **K3** coverage vs 8640 bars/day
+//!    (WARN 0.5–0.8, FAIL < 0.5; mirrors integrity-check strict coverage gate).
 //!
 //! Exit non-zero if any audited ticker FAILS, so the binary can gate CI /
 //! cutover. Empty or missing directories are reported as "no data", never a
@@ -49,11 +61,50 @@ use serde::Serialize;
 
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, read_shard_aligned, ts_ms_to_utc_date, ShardRecord,
-    FLAG_HEARTBEAT_SENTINEL,
+    FLAG_HEARTBEAT_SENTINEL, MS_PER_DAY,
 };
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::stats as sdk_stats;
+use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::Bar;
+
+// ── Calibration / renko config (single source of truth = config.yml) ─────────
+
+/// s10 bucket width: UTC-grid alignment + per-day coverage are computed against
+/// this. Matches `integrity-check s10 --bucket-ms` default and the live producer.
+const S10_BUCKET_MS: i64 = 10_000;
+
+/// Renko brick floor (`series.renko.min_pct`) from `config.yml`, falling back to
+/// `0.0001`. Mirrors `integrity_check::load_renko_bounds` (single canonical
+/// resolver). R3 brick-magnitude floor check uses this.
+fn load_renko_min_pct() -> f64 {
+    use nxr_sdk::pipeline_config::{ConfigHint, PipelineYml};
+    PipelineYml::load_default(ConfigHint::Bin)
+        .map(|yml| yml.series.renko.min_pct as f64)
+        .unwrap_or(0.0001)
+}
+
+/// Relative-bpd accept-band the calibrator's walk-forward accept-gate uses to
+/// drop a window (`bar_construction::calibrate.rs`: `rel_bpd_err > 0.20`). R4
+/// asserts realized bricks/day lands inside the same band around target_bpd, so
+/// the cert mirrors exactly what the calibrator accepted at fit time.
+const RENKO_BPD_ACCEPT_TOL: f64 = 0.20;
+
+/// Look up the calibrated Renko k for `ticker_id` in
+/// `$NXR_TICKER_PARAMS_PATH` (default `/data/config/ticker-params.json`).
+/// Returns `None` if the file is missing/malformed or has no positive-finite
+/// entry. Mirrors `renko_from_idx::load_calibrated_k` (same schema + filter).
+/// R4 CRIT `renko_uncalibrated` fires when renko shards exist but this is None.
+fn load_calibrated_k(ticker_id: u64) -> Option<f64> {
+    let cfg = nxr_sdk::NxrConfig::from_env();
+    let raw = std::fs::read_to_string(&cfg.ticker_params_path).ok()?;
+    let weights: WeightsFile = serde_json::from_str(&raw).ok()?;
+    weights
+        .renko_k_per_ticker
+        .get(&ticker_id.to_string())
+        .copied()
+        .filter(|k| *k > 0.0 && k.is_finite())
+}
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -145,10 +196,29 @@ struct TickerReport {
     renko_days: u64,
     renko_ratio: f64,
     renko_skipped_stable: bool,
+    // Renko parity checks (vs .idx 6.5/10 target)
+    renko_b03_violations: u64,          // R1 cross-shard continuity breaks
+    renko_brick_floor_violations: u64,  // R3 |Δ|/open < min_pct
+    renko_k_present: bool,              // R4 calibrated k exists in ticker-params
+    renko_uncalibrated: bool,           // R4 CRIT: shards but no k
+    renko_inferred_bpd: f64,            // R4 realized bricks/day
+    renko_bpd_off_band: bool,           // R4 |inferred/target-1| > accept tol
+    renko_bpd_median: f64,              // R2 per-day distribution
+    renko_bpd_mad: f64,
+    renko_bpd_min_day: u64,
+    renko_dist_drift: bool,             // R2 WARN: MAD > 0.5*median or min < 0.33*median
+    renko_samples: Vec<String>,         // dated violation provenance
     // s10 kline
     s10_bars: u64,
     s10_violations: u64,
     s10_samples: Vec<String>,
+    // s10 parity checks
+    s10_b03_violations: u64,            // K1 cross-shard off-grid boundary
+    s10_b03_gaps: u64,                  // K1 multi-bucket gap at boundary (WARN)
+    s10_misaligned: u64,                // K2 open_time_ms % 10_000 != 0
+    s10_coverage_pct: f64,              // K3 bars/day vs 8640
+    s10_coverage_fail: bool,            // K3 < 0.5
+    s10_coverage_warn: bool,            // K3 0.5..0.8
     // Verdict
     verdict: String, // "PASS" | "FAIL" | "NO_DATA"
     fail_reasons: Vec<String>,
@@ -246,9 +316,26 @@ fn audit_ticker(
         renko_days: 0,
         renko_ratio: f64::NAN,
         renko_skipped_stable: false,
+        renko_b03_violations: 0,
+        renko_brick_floor_violations: 0,
+        renko_k_present: false,
+        renko_uncalibrated: false,
+        renko_inferred_bpd: f64::NAN,
+        renko_bpd_off_band: false,
+        renko_bpd_median: f64::NAN,
+        renko_bpd_mad: f64::NAN,
+        renko_bpd_min_day: 0,
+        renko_dist_drift: false,
+        renko_samples: Vec::new(),
         s10_bars: 0,
         s10_violations: 0,
         s10_samples: Vec::new(),
+        s10_b03_violations: 0,
+        s10_b03_gaps: 0,
+        s10_misaligned: 0,
+        s10_coverage_pct: f64::NAN,
+        s10_coverage_fail: false,
+        s10_coverage_warn: false,
         verdict: "NO_DATA".to_string(),
         fail_reasons: Vec::new(),
     };
@@ -510,23 +597,85 @@ fn audit_ticker(
 
     if !renko_shards.is_empty() {
         use std::collections::BTreeMap;
+        let renko_min_pct = load_renko_min_pct();
         let mut per_day: BTreeMap<NaiveDate, u64> = BTreeMap::new();
-        for (_, path) in &renko_shards {
+        // R1 cross-shard continuity: last bar.close of day D == first bar.open of
+        // D+1. Tracked across shard boundaries (shards are date-sorted).
+        let mut prev_shard_close: Option<(NaiveDate, f64)> = None;
+        for (date, path) in &renko_shards {
             let bars = match read_shard_aligned::<Bar>(path) {
                 Ok(b) => b,
                 Err(_) => continue,
             };
+            let mut day_count = 0u64;
+            let first_open = bars.first().map(|b| b.open);
+            // R1: boundary continuity vs previous shard's last close.
+            if let (Some((pd, pc)), Some(fo)) = (prev_shard_close, first_open) {
+                if (pc - fo).abs() > pc.abs() * 1e-9 {
+                    r.renko_b03_violations += 1;
+                    if r.renko_samples.len() < 10 {
+                        r.renko_samples.push(format!(
+                            "[{}→{}] R1 cross-shard discontinuity: prev close {} != open {}",
+                            pd, date, pc, fo
+                        ));
+                    }
+                }
+            }
             for bar in &bars {
                 let d = ts_ms_to_utc_date(bar.ts_ms());
                 *per_day.entry(d).or_insert(0) += 1;
+                day_count += 1;
+                // R3 brick magnitude floor: |close-open|/open >= min_pct.
+                let open = bar.open;
+                let close = bar.close;
+                if open > 0.0 && open.is_finite() && close.is_finite() {
+                    let brick = ((close - open) / open).abs();
+                    if brick < renko_min_pct {
+                        r.renko_brick_floor_violations += 1;
+                        if r.renko_samples.len() < 10 {
+                            r.renko_samples.push(format!(
+                                "[{}] R3 brick {:.6} < floor {} (open={}, close={})",
+                                date, brick, renko_min_pct, open, close
+                            ));
+                        }
+                    }
+                }
+            }
+            let _ = day_count;
+            if let Some(last) = bars.last() {
+                prev_shard_close = Some((*date, last.close));
             }
         }
         r.renko_days = per_day.len() as u64;
         if r.renko_days > 0 {
             let total: u64 = per_day.values().sum();
             r.renko_bpd = total as f64 / r.renko_days as f64;
+            r.renko_inferred_bpd = r.renko_bpd;
             if target_bpd > 0.0 {
                 r.renko_ratio = r.renko_bpd / target_bpd;
+            }
+            // R2 per-day distribution: median + MAD of bricks/day.
+            let counts: Vec<f64> = per_day.values().map(|&c| c as f64).collect();
+            let (med, mad) = sdk_stats::median_and_mad(&counts);
+            r.renko_bpd_median = med;
+            r.renko_bpd_mad = mad;
+            r.renko_bpd_min_day = per_day.values().copied().min().unwrap_or(0);
+            if med > 0.0
+                && (mad > 0.5 * med || (r.renko_bpd_min_day as f64) < 0.33 * med)
+            {
+                r.renko_dist_drift = true;
+            }
+        }
+        // R4 calibration correctness: realized bpd must land in the calibrator's
+        // accept band around target_bpd, AND a calibrated k must exist.
+        r.renko_k_present = load_calibrated_k(id).is_some();
+        if !r.renko_k_present && r.renko_days > 0 {
+            r.renko_uncalibrated = true; // CRIT: shards built w/ stale/bootstrap k
+        }
+        if !r.crypto_stable && r.renko_days > 0 && target_bpd > 0.0 {
+            let rel_err = (r.renko_inferred_bpd / target_bpd - 1.0).abs();
+            if rel_err > RENKO_BPD_ACCEPT_TOL {
+                r.renko_bpd_off_band = true;
             }
         }
         if r.crypto_stable {
@@ -534,44 +683,101 @@ fn audit_ticker(
         }
     }
 
-    // ── Check 5: s10 kline sanity ─────────────────────────────────────────
-    for (_, path) in &s10_shards {
-        let bars = match read_shard_aligned::<Bar>(path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let mut prev_close_ms: Option<i64> = None;
-        for bar in &bars {
-            r.s10_bars += 1;
-            let o = bar.open;
-            let h = bar.high;
-            let l = bar.low;
-            let c = bar.close;
-            let open_ms = bar.open_time_ms();
-            let close_ms = bar.close_time_ms();
-            let mut why: Option<String> = None;
-            if !(o.is_finite() && h.is_finite() && l.is_finite() && c.is_finite()) {
-                why = Some("non-finite OHLC".to_string());
-            } else if l > h {
-                why = Some("low > high".to_string());
-            } else if o < l || o > h {
-                why = Some("open outside [low,high]".to_string());
-            } else if c < l || c > h {
-                why = Some("close outside [low,high]".to_string());
-            } else if open_ms > close_ms {
-                why = Some("open_ts > close_ts".to_string());
-            } else if let Some(pc) = prev_close_ms {
-                if open_ms < pc {
-                    why = Some("overlapping bucket (open_ts < prev close_ts)".to_string());
+    // ── Check 5: s10 kline sanity (+ K1 continuity, K2 alignment, K3 coverage)
+    {
+        use std::collections::BTreeMap;
+        let mut prev_close_ms: Option<i64> = None; // across shards (date-sorted)
+        let mut buckets_per_day: BTreeMap<NaiveDate, u64> = BTreeMap::new();
+        for (date, path) in &s10_shards {
+            let bars = match read_shard_aligned::<Bar>(path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            for bar in &bars {
+                r.s10_bars += 1;
+                let o = bar.open;
+                let h = bar.high;
+                let l = bar.low;
+                let c = bar.close;
+                let open_ms = bar.open_time_ms();
+                let close_ms = bar.close_time_ms();
+                *buckets_per_day
+                    .entry(ts_ms_to_utc_date(open_ms))
+                    .or_insert(0) += 1;
+
+                let mut why: Option<String> = None;
+                if !(o.is_finite() && h.is_finite() && l.is_finite() && c.is_finite()) {
+                    why = Some("non-finite OHLC".to_string());
+                } else if l > h {
+                    why = Some("low > high".to_string());
+                } else if o < l || o > h {
+                    why = Some("open outside [low,high]".to_string());
+                } else if c < l || c > h {
+                    why = Some("close outside [low,high]".to_string());
+                } else if open_ms > close_ms {
+                    why = Some("open_ts > close_ts".to_string());
+                } else if let Some(pc) = prev_close_ms {
+                    if open_ms < pc {
+                        why = Some("overlapping bucket (open_ts < prev close_ts)".to_string());
+                    }
                 }
-            }
-            if let Some(w) = why {
-                r.s10_violations += 1;
-                if r.s10_samples.len() < 10 {
-                    r.s10_samples.push(format!("ts={} {}", open_ms, w));
+                if let Some(w) = why {
+                    r.s10_violations += 1;
+                    if r.s10_samples.len() < 10 {
+                        r.s10_samples.push(format!("[{}] ts={} {}", date, open_ms, w));
+                    }
                 }
+
+                // K2 bucket alignment: open_time_ms on the UTC 10s grid.
+                if open_ms % S10_BUCKET_MS != 0 {
+                    r.s10_misaligned += 1;
+                    if r.s10_samples.len() < 10 {
+                        r.s10_samples.push(format!(
+                            "[{}] K2 off-grid open_ts={} (% {} = {})",
+                            date,
+                            open_ms,
+                            S10_BUCKET_MS,
+                            open_ms % S10_BUCKET_MS
+                        ));
+                    }
+                }
+
+                // K1 boundary continuity: first bucket of D+1 must be exactly one
+                // bucket after the last close of D. Off-grid delta (non-multiple)
+                // = FAIL; multiple>1 = gap (WARN). Same-shard consecutive bars are
+                // already covered by the overlap check above; this gate fires on
+                // the cross-shard boundary too via the shared prev_close_ms.
+                if let Some(pc) = prev_close_ms {
+                    let delta = open_ms - pc;
+                    if delta > 0 {
+                        if delta % S10_BUCKET_MS != 0 {
+                            r.s10_b03_violations += 1;
+                            if r.s10_samples.len() < 10 {
+                                r.s10_samples.push(format!(
+                                    "[{}] K1 off-grid boundary: open_ts {} - prev_close {} = {} ms (not mult of {})",
+                                    date, open_ms, pc, delta, S10_BUCKET_MS
+                                ));
+                            }
+                        } else if delta / S10_BUCKET_MS > 1 {
+                            r.s10_b03_gaps += 1;
+                        }
+                    }
+                }
+                prev_close_ms = Some(close_ms);
             }
-            prev_close_ms = Some(close_ms);
+        }
+
+        // K3 coverage: mean bars/day vs expected (MS_PER_DAY / bucket = 8640).
+        if !buckets_per_day.is_empty() {
+            let expected = MS_PER_DAY as f64 / S10_BUCKET_MS as f64;
+            let total: u64 = buckets_per_day.values().sum();
+            let mean_per_day = total as f64 / buckets_per_day.len() as f64;
+            r.s10_coverage_pct = mean_per_day / expected;
+            if r.s10_coverage_pct < 0.5 {
+                r.s10_coverage_fail = true;
+            } else if r.s10_coverage_pct < 0.8 {
+                r.s10_coverage_warn = true;
+            }
         }
     }
 
@@ -601,6 +807,51 @@ fn audit_ticker(
                 r.renko_ratio
             ));
         }
+    }
+    // R1 (CRIT): cross-shard renko continuity breaks.
+    if r.renko_b03_violations > 0 {
+        reasons.push(format!(
+            "{} renko cross-shard discontinuity (R1)",
+            r.renko_b03_violations
+        ));
+    }
+    // R3 (HIGH): renko brick magnitude below floor.
+    if r.renko_brick_floor_violations > 0 {
+        reasons.push(format!(
+            "{} renko brick(s) below min_pct floor (R3)",
+            r.renko_brick_floor_violations
+        ));
+    }
+    // R4 (CRIT): renko shards present but no calibrated k → stale/bootstrap k.
+    if r.renko_uncalibrated {
+        reasons.push("renko uncalibrated: shards exist but no k in ticker-params (R4)".to_string());
+    }
+    // R4 (HIGH): realized bpd outside calibrator accept band (skip stable pairs).
+    if r.renko_bpd_off_band {
+        reasons.push(format!(
+            "renko inferred_bpd {:.1} off target {:.1} by >{:.0}% (R4)",
+            r.renko_inferred_bpd,
+            target_bpd,
+            RENKO_BPD_ACCEPT_TOL * 100.0
+        ));
+    }
+    // K1 (CRIT): s10 off-grid boundary (non-multiple delta).
+    if r.s10_b03_violations > 0 {
+        reasons.push(format!(
+            "{} s10 off-grid boundary (K1)",
+            r.s10_b03_violations
+        ));
+    }
+    // K2 (HIGH): s10 bucket misalignment to UTC grid (the s10-from-idx regression).
+    if r.s10_misaligned > 0 {
+        reasons.push(format!("{} s10 misaligned bucket(s) (K2)", r.s10_misaligned));
+    }
+    // K3 (HIGH): s10 coverage < 50% of expected 8640 bars/day.
+    if r.s10_coverage_fail {
+        reasons.push(format!(
+            "s10 coverage {:.1}% < 50% of expected (K3)",
+            r.s10_coverage_pct * 100.0
+        ));
     }
     // Anomalies are advisory (reported) but MAD outliers + CUSUM are warnings,
     // not hard fails — a single jump should not red-flag a feed for cutover.
@@ -687,12 +938,52 @@ fn print_human(report: &AuditReport) {
                 t.renko_ratio,
                 if t.renko_skipped_stable { " [skipped: stable]" } else { "" }
             );
+            println!(
+                "   renko calib (R4)     : inferred_bpd={:.1} target={:.1} k_present={}{}{}",
+                t.renko_inferred_bpd,
+                report.target_bpd,
+                t.renko_k_present,
+                if t.renko_uncalibrated { " [UNCALIBRATED]" } else { "" },
+                if t.renko_bpd_off_band { " [OFF-BAND]" } else { "" }
+            );
+            println!(
+                "   renko cont/floor     : R1_disc={} R3_floor_viol={}",
+                t.renko_b03_violations, t.renko_brick_floor_violations
+            );
+            println!(
+                "   renko dist (R2)      : median={} MAD={} min_day={}{}",
+                fmt_sigma(t.renko_bpd_median),
+                fmt_sigma(t.renko_bpd_mad),
+                t.renko_bpd_min_day,
+                if t.renko_dist_drift { " [WARN: drift]" } else { "" }
+            );
+            for s in &t.renko_samples {
+                println!("     {}", s);
+            }
         } else {
             println!("   renko                : no .renko shards in window");
         }
         println!(
-            "   s10 kline            : {} bars, {} violations",
+            "   s10 kline            : {} bars, {} OHLC violations",
             t.s10_bars, t.s10_violations
+        );
+        println!(
+            "   s10 parity           : K1_offgrid={} K1_gaps={} K2_misaligned={} coverage={}{}",
+            t.s10_b03_violations,
+            t.s10_b03_gaps,
+            t.s10_misaligned,
+            if t.s10_coverage_pct.is_finite() {
+                format!("{:.1}%", t.s10_coverage_pct * 100.0)
+            } else {
+                "n/a".to_string()
+            },
+            if t.s10_coverage_fail {
+                " [FAIL]"
+            } else if t.s10_coverage_warn {
+                " [WARN]"
+            } else {
+                ""
+            }
         );
         for s in &t.s10_samples {
             println!("     {}", s);
@@ -807,9 +1098,26 @@ fn main() -> Result<()> {
                     renko_days: 0,
                     renko_ratio: f64::NAN,
                     renko_skipped_stable: false,
+                    renko_b03_violations: 0,
+                    renko_brick_floor_violations: 0,
+                    renko_k_present: false,
+                    renko_uncalibrated: false,
+                    renko_inferred_bpd: f64::NAN,
+                    renko_bpd_off_band: false,
+                    renko_bpd_median: f64::NAN,
+                    renko_bpd_mad: f64::NAN,
+                    renko_bpd_min_day: 0,
+                    renko_dist_drift: false,
+                    renko_samples: Vec::new(),
                     s10_bars: 0,
                     s10_violations: 0,
                     s10_samples: Vec::new(),
+                    s10_b03_violations: 0,
+                    s10_b03_gaps: 0,
+                    s10_misaligned: 0,
+                    s10_coverage_pct: f64::NAN,
+                    s10_coverage_fail: false,
+                    s10_coverage_warn: false,
                     verdict: "FAIL".to_string(),
                     fail_reasons: vec![format!("audit error: {e}")],
                 };

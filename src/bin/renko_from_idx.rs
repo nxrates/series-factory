@@ -98,6 +98,13 @@ fn main() -> Result<()> {
     for (_, path) in &shards {
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
         while let Some(rec) = stream.next()? {
+            // SEAM PARITY: skip heartbeat-sentinel records exactly like the live
+            // producers (core/src/bars_renko.rs:528, bars_s10.rs:198). Sentinels
+            // carry stale bid/ask liveness beacons; ingesting them offline (but
+            // not live) poisons the σ basis → hist↔live seam drift.
+            if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                continue;
+            }
             let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
             let mid = (rec.index.bid + rec.index.ask) * 0.5;
             if !(mid.is_finite() && mid > 0.0) {
@@ -188,6 +195,10 @@ fn main() -> Result<()> {
     for (_, path) in &shards {
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
         while let Some(rec) = stream.next()? {
+            // SEAM PARITY: skip heartbeat sentinels (mirror live bars_renko.rs:528).
+            if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                continue;
+            }
             let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
             let idx = rec.index;
             let mid = (idx.bid + idx.ask) * 0.5;
