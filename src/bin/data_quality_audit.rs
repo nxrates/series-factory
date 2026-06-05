@@ -280,6 +280,21 @@ impl TargetResolver {
         let fm: Vec<&str> = self.fx_majors.iter().map(String::as_str).collect();
         bucket_for_pair(&pair, ticker_id, &cm, &sc, &fm) == AssetClassBucket::CryptoStable
     }
+
+    /// Resolve the asset-class bucket for `ticker_id` (same recipe as the target
+    /// + stable resolvers). Unknown pair (unresolvable id) → `Default`, so the
+    /// widest spread/jump envelope applies and a thin/synth pair is never
+    /// false-flagged. Drives the per-class [`ClassBand`] for the invariant chain.
+    fn class_for(&self, ticker_id: u64) -> nxr_sdk::asset_class::AssetClassBucket {
+        use nxr_sdk::asset_class::{bucket_for_pair, AssetClassBucket};
+        let Some(pair) = Self::pair_sym(ticker_id) else {
+            return AssetClassBucket::Default;
+        };
+        let cm: Vec<&str> = self.crypto_majors.iter().map(String::as_str).collect();
+        let sc: Vec<&str> = self.stablecoins.iter().map(String::as_str).collect();
+        let fm: Vec<&str> = self.fx_majors.iter().map(String::as_str).collect();
+        bucket_for_pair(&pair, ticker_id, &cm, &sc, &fm)
+    }
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -365,6 +380,13 @@ struct TickerReport {
     // Q0.8 freshness `f = confidence/255` is below CONF_FRESHNESS_FLOOR. WARN, not
     // a FAIL — markets do go briefly stale. NEVER a `confidence > accepted` FAIL.
     conf_stale_advisories: u64,
+    // Quote DEPTH (FIX depth): vbid/vask backing-size validation.
+    zero_depth_violations: u64,   // HARD FAIL: vbid==0 && vask==0 (phantom liquidity)
+    one_sided_depth_warns: u64,   // WARN: vbid==0 XOR vask==0 (one-sided book)
+    // Reject dominance (FIX reject): per-record + window reject-rate signal.
+    reject_dominant_records: u64, // WARN: records where rejected > accepted
+    reject_rate: f64,             // window Σrejected / (Σrejected+Σaccepted); WARN > 0.5
+    reject_rate_warn: bool,
     // Anomalies
     mad_outliers: u64,
     worst_mad_z: f64,
@@ -630,20 +652,93 @@ fn check_rollup_parity(
 struct InvariantOutcome {
     reason: Option<&'static str>,
     conf_stale: bool,
+    /// FIX (depth) HIGH: `vbid == 0 && vask == 0` — a price with NO backing size
+    /// on EITHER side is phantom liquidity. A structural FAIL: a money-grade quote
+    /// must be tradeable. Distinct from `reason` so the count is reported as its
+    /// own depth metric (and so a legit one-sided-zero record still passes the
+    /// hard chain, surfacing only as `depth_one_sided` WARN below).
+    zero_depth: bool,
+    /// FIX (depth) WARN: `vbid == 0 XOR vask == 0` — one side has no backing
+    /// size. Real on some venues (e.g. a one-sided book snapshot), so advisory
+    /// rather than a hard FAIL, but still a quality signal worth surfacing.
+    depth_one_sided: bool,
+    /// FIX (reject) MED WARN: `rejected > accepted` — the composite rejected more
+    /// provider quotes than it accepted this tick → a degraded composite. WARN.
+    reject_dominant: bool,
 }
+
+/// Per-asset-class microstructure envelope: the spread-realness ceiling (bps)
+/// and the per-tick jump guard (fractional mid move). FLAT bands are wrong:
+/// a 2000 bps spread is impossible on BTC/USDT yet plausible on an illiquid
+/// synth, and a 10% tick jump is a clear anomaly on a major but routine on a
+/// thin alt. Conservative defaults TIGHTEN majors (catch more) without
+/// false-flagging thin pairs. Resolved from the `AssetClassBucket` so the
+/// envelope is instrument-agnostic (keyed on class, not a hardcoded symbol).
+#[derive(Debug, Clone, Copy)]
+struct ClassBand {
+    /// Spread-realness ceiling in bps. A spread above this is implausible for
+    /// the class → hard invariant FAIL (replaces the flat [0,2000] ceiling).
+    spread_ceiling_bps: f64,
+    /// Per-tick jump ceiling (fractional |Δmid|/prev_mid). Above → anomaly WARN
+    /// (advisory, like the audit's MAD/CUSUM battery — never a hard FAIL).
+    /// Reserved for the per-class jump guard (the existing MAD/CUSUM battery
+    /// already covers cross-tick anomalies); kept on the band for completeness.
+    #[allow(dead_code)]
+    jump_frac: f64,
+}
+
+/// Resolve the per-class spread/jump envelope. Conservative, class-keyed.
+/// crypto_major: tightest (deep books, sub-100bps spreads, ~5% tick moves).
+/// crypto_alt / crypto_cross: looser. crypto_stable: very tight spread but the
+/// renko/vol gates already handle cadence; fx tight; synth/default: widest so a
+/// thin synthetic pair is never false-flagged.
+fn class_band(class: nxr_sdk::asset_class::AssetClassBucket) -> ClassBand {
+    use nxr_sdk::asset_class::AssetClassBucket::*;
+    match class {
+        // Deep, liquid majors: a real spread is a few bps; >150 bps is corrupt
+        // or a flash dislocation. 5% per-tick jump is already extreme here.
+        CryptoMajor => ClassBand { spread_ceiling_bps: 150.0, jump_frac: 0.05 },
+        // Stable/stable: spread should be a handful of bps; cap tight.
+        CryptoStable => ClassBand { spread_ceiling_bps: 100.0, jump_frac: 0.02 },
+        // FX majors: extremely tight institutional spreads.
+        FxMajor => ClassBand { spread_ceiling_bps: 50.0, jump_frac: 0.03 },
+        // Alts / crypto-crosses: thinner books, wider real spreads + jumps.
+        CryptoAlt | CryptoCross => ClassBand { spread_ceiling_bps: 800.0, jump_frac: 0.15 },
+        FxCross => ClassBand { spread_ceiling_bps: 300.0, jump_frac: 0.08 },
+        // Synth / unknown: widest band — never false-flag a thin synthetic pair.
+        Default => ClassBand { spread_ceiling_bps: 2000.0, jump_frac: 0.25 },
+    }
+}
+
+/// Hard-FAIL reason for a both-sides-zero-depth (phantom-liquidity) quote. A
+/// named const so the per-record caller can recognize + sentinel-exempt exactly
+/// this reason (sentinels legitimately carry no fresh backing size).
+const ZERO_DEPTH_REASON: &str = "zero-depth quote (vbid==0 && vask==0, phantom liquidity)";
 
 /// Evaluate the microstructure invariant chain for one INDEX record. Mirrors
 /// integrity-check's G1 (price floor), crossed-quote, and G4 (freshness floor)
 /// semantics so the cert and the per-file checker agree on the wire contract.
+///
+/// `band` carries the per-asset-class spread ceiling (replaces the flat 2000bps
+/// cap). `vbid`/`vask`/`rejected` drive the depth + reject-dominant signals.
 fn eval_invariant(
     bid: f64,
     ask: f64,
     flags: u8,
     confidence: u8,
     accepted: u8,
+    rejected: u8,
+    vbid: u32,
+    vask: u32,
     spread_bps: f64,
+    band: ClassBand,
 ) -> InvariantOutcome {
     let is_freshness = (flags & FLAG_CONF_FRESHNESS) != 0;
+    // Depth (phantom-liquidity) signal, evaluated independently of the price
+    // chain so a structurally-valid quote with no backing size still FAILs.
+    let zero_depth = vbid == 0 && vask == 0;
+    let depth_one_sided = (vbid == 0) ^ (vask == 0);
+    let reject_dominant = rejected > accepted;
     let reason: Option<&'static str> = if !bid.is_finite() || !ask.is_finite() {
         Some("bid/ask non-finite")
     } else if bid <= 0.0 {
@@ -655,13 +750,20 @@ fn eval_invariant(
         Some("bid/ask below price floor (denormal)")
     } else if ask < bid {
         Some("crossed quote (ask < bid)")
+    } else if zero_depth {
+        // FIX (depth) HIGH: both sides zero size = phantom liquidity (a price
+        // with nothing backing it). Hard FAIL — a money-grade quote must be
+        // tradeable. One-sided zero is the softer `depth_one_sided` WARN.
+        // Sentinels carry no fresh depth → caller suppresses this reason for them.
+        Some(ZERO_DEPTH_REASON)
     } else if !is_freshness && confidence > accepted {
         // FIX #1: legacy semantics only — `confidence` = active-provider count.
         // Freshness-flagged records carry an independent Q0.8 byte that routinely
         // exceeds `accepted`, so the cross-constraint must NOT apply to them.
         Some("confidence > accepted")
-    } else if !(0.0..=2000.0).contains(&spread_bps) {
-        Some("spread_bps out of [0,2000]")
+    } else if !(0.0..=band.spread_ceiling_bps).contains(&spread_bps) {
+        // Per-class spread-realness ceiling (replaces the flat 2000bps cap).
+        Some("spread_bps out of per-class envelope")
     } else {
         None
     };
@@ -670,7 +772,13 @@ fn eval_invariant(
     let conf_stale = is_freshness
         && reason.is_none()
         && mitch::index::conf_from_u8(confidence) < CONF_FRESHNESS_FLOOR;
-    InvariantOutcome { reason, conf_stale }
+    InvariantOutcome {
+        reason,
+        conf_stale,
+        zero_depth,
+        depth_one_sided,
+        reject_dominant,
+    }
 }
 
 // ── Ticker discovery ───────────────────────────────────────────────────────
@@ -710,6 +818,7 @@ fn audit_ticker(
     target_resolved: bool,
     is_known_stable: bool,
     k_bounds: Option<(f64, f64)>,
+    band: ClassBand,
 ) -> Result<TickerReport> {
     let mut r = TickerReport {
         ticker_id: id,
@@ -724,6 +833,11 @@ fn audit_ticker(
         invariant_violations: 0,
         invariant_samples: Vec::new(),
         conf_stale_advisories: 0,
+        zero_depth_violations: 0,
+        one_sided_depth_warns: 0,
+        reject_dominant_records: 0,
+        reject_rate: f64::NAN,
+        reject_rate_warn: false,
         mad_outliers: 0,
         worst_mad_z: 0.0,
         cusum_alarms: 0,
@@ -857,10 +971,17 @@ fn audit_ticker(
     }
 
     // ── Check 2: microstructure invariants ────────────────────────────────
+    // Depth (vbid/vask) + reject-dominance run only on NON-sentinel records:
+    // a FLAG_HEARTBEAT_SENTINEL is a liveness beacon that legitimately carries
+    // no fresh backing size / provider tally, so it must never count as a
+    // phantom-liquidity FAIL or a reject-dominant WARN.
+    let mut sum_accepted: u64 = 0;
+    let mut sum_rejected: u64 = 0;
     for rec in &records {
         let idx = rec.index; // copy out of packed struct
         let bid = idx.bid;
         let ask = idx.ask;
+        let is_sentinel = (idx.flags & FLAG_HEARTBEAT_SENTINEL) != 0;
         // FIX #1/#2: structural invariants + wire-semantics-aware confidence
         // handling are evaluated by the pure `eval_invariant` (unit-tested). A
         // fresh record (FLAG_CONF_FRESHNESS, confidence≈200/255 > accepted) is NOT
@@ -871,22 +992,62 @@ fn audit_ticker(
         } else {
             f64::NAN
         };
-        let outcome = eval_invariant(bid, ask, idx.flags, idx.confidence, idx.accepted, sb_for_eval);
+        let outcome = eval_invariant(
+            bid,
+            ask,
+            idx.flags,
+            idx.confidence,
+            idx.accepted,
+            idx.rejected,
+            idx.vbid,
+            idx.vask,
+            sb_for_eval,
+            band,
+        );
         if outcome.conf_stale {
             r.conf_stale_advisories += 1;
         }
+        // Depth + reject signals: sentinel-exempt (see comment above).
+        if !is_sentinel {
+            if outcome.zero_depth {
+                r.zero_depth_violations += 1;
+            }
+            if outcome.depth_one_sided {
+                r.one_sided_depth_warns += 1;
+            }
+            if outcome.reject_dominant {
+                r.reject_dominant_records += 1;
+            }
+            sum_accepted += idx.accepted as u64;
+            sum_rejected += idx.rejected as u64;
+        }
+        // The zero-depth FAIL is surfaced as its own depth metric (not folded into
+        // the generic `reason` chain): for a sentinel the chain still returns
+        // `Some("zero-depth ...")`, so suppress that reason for sentinels here.
         if let Some(why) = outcome.reason {
-            r.invariant_violations += 1;
-            if r.invariant_samples.len() < 10 {
-                r.invariant_samples.push(ViolationSample {
-                    ts: rec.shard_ts_ms(),
-                    reason: why.to_string(),
-                    bid,
-                    ask,
-                    spread_bps: sb_for_eval,
-                });
+            if is_sentinel && outcome.zero_depth && outcome.reason == Some(ZERO_DEPTH_REASON) {
+                // sentinel zero-depth is legitimate — not a violation.
+            } else {
+                r.invariant_violations += 1;
+                if r.invariant_samples.len() < 10 {
+                    r.invariant_samples.push(ViolationSample {
+                        ts: rec.shard_ts_ms(),
+                        reason: why.to_string(),
+                        bid,
+                        ask,
+                        spread_bps: sb_for_eval,
+                    });
+                }
             }
         }
+    }
+    // Window reject-rate: Σrejected / (Σaccepted + Σrejected) over non-sentinel
+    // records. A composite that rejects > half the provider quotes it sees is a
+    // degraded feed → WARN (advisory, never a FAIL).
+    let reject_denom = sum_accepted + sum_rejected;
+    if reject_denom > 0 {
+        r.reject_rate = sum_rejected as f64 / reject_denom as f64;
+        r.reject_rate_warn = r.reject_rate > 0.5;
     }
 
     // ── Check 3: anomaly battery (log-returns, skipping sentinels) ─────────
@@ -1498,6 +1659,15 @@ fn audit_ticker(
     if r.invariant_violations > 0 {
         reasons.push(format!("{} invariant violation(s)", r.invariant_violations));
     }
+    // Depth (HIGH): both-sides-zero quotes are phantom liquidity → hard FAIL.
+    // (One-sided-zero + reject-dominance are WARN advisories, printed below, not
+    // gated here.) zero_depth_violations already excludes sentinels.
+    if r.zero_depth_violations > 0 {
+        reasons.push(format!(
+            "{} zero-depth/phantom quote(s) (vbid==0 && vask==0)",
+            r.zero_depth_violations
+        ));
+    }
     if r.s10_violations > 0 {
         reasons.push(format!("{} s10 OHLC violation(s)", r.s10_violations));
     }
@@ -1658,6 +1828,25 @@ fn print_human(report: &AuditReport) {
             println!(
                 "   conf-freshness (G4)  : {} record(s) below floor {} [WARN advisory]",
                 t.conf_stale_advisories, CONF_FRESHNESS_FLOOR
+            );
+        }
+        // Depth: both-zero is a FAIL (counted in verdict); one-sided is WARN.
+        if t.zero_depth_violations > 0 || t.one_sided_depth_warns > 0 {
+            println!(
+                "   quote depth          : zero-depth(FAIL)={} one-sided(WARN)={}",
+                t.zero_depth_violations, t.one_sided_depth_warns
+            );
+        }
+        // Reject dominance: per-record + window reject-rate (both WARN advisory).
+        if t.reject_dominant_records > 0 || t.reject_rate_warn {
+            let rate = if t.reject_rate.is_finite() {
+                format!("{:.1}%", t.reject_rate * 100.0)
+            } else {
+                "n/a".to_string()
+            };
+            println!(
+                "   reject dominance     : rejected>accepted in {} rec(s), window reject-rate={} [WARN advisory]",
+                t.reject_dominant_records, rate
             );
         }
         for s in &t.invariant_samples {
@@ -1868,6 +2057,7 @@ fn main() -> Result<()> {
         let per_ticker_target = resolved.unwrap_or(cli.target_bpd);
         let target_resolved = resolved.is_some();
         let is_known_stable = target_resolver.is_known_stable(id);
+        let band = class_band(target_resolver.class_for(id));
         match audit_ticker(
             &cli.common.data_root,
             id,
@@ -1879,6 +2069,7 @@ fn main() -> Result<()> {
             target_resolved,
             is_known_stable,
             k_bounds,
+            band,
         ) {
             Ok(r) => reports.push(r),
             Err(e) => {
@@ -1896,6 +2087,11 @@ fn main() -> Result<()> {
                     invariant_violations: 0,
                     invariant_samples: Vec::new(),
                     conf_stale_advisories: 0,
+                    zero_depth_violations: 0,
+                    one_sided_depth_warns: 0,
+                    reject_dominant_records: 0,
+                    reject_rate: f64::NAN,
+                    reject_rate_warn: false,
                     mad_outliers: 0,
                     worst_mad_z: 0.0,
                     cusum_alarms: 0,
@@ -1987,6 +2183,25 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Default band for invariant tests (Default bucket: widest envelope) — the
+    /// depth/reject/freshness tests don't exercise the spread ceiling.
+    fn test_band() -> ClassBand {
+        class_band(nxr_sdk::asset_class::AssetClassBucket::Default)
+    }
+
+    /// `eval_invariant` with HEALTHY depth (vbid/vask both non-zero) and reject
+    /// (rejected=0) defaults, so tests targeting the freshness/price chain don't
+    /// have to spell out the new args. Depth/reject tests call `eval_invariant`
+    /// directly to vary those bytes.
+    fn eval_inv(bid: f64, ask: f64, flags: u8, confidence: u8, accepted: u8, spread_bps: f64)
+        -> InvariantOutcome
+    {
+        eval_invariant(
+            bid, ask, flags, confidence, accepted, /*rejected*/ 0, /*vbid*/ 100, /*vask*/ 100,
+            spread_bps, test_band(),
+        )
+    }
 
     // ── K1 open-grid boundary (3 branches + false-positive elimination) ──────
 
@@ -2125,12 +2340,12 @@ mod tests {
     fn fix1_fresh_record_no_false_fail() {
         const FRESH: u8 = FLAG_CONF_FRESHNESS;
         // confidence=200 (>accepted=6) but freshness-flagged → must NOT FAIL.
-        let o = eval_invariant(100.0, 100.1, FRESH, 200, 6, 0.999_0 /*~spread bps*/);
+        let o = eval_inv(100.0, 100.1, FRESH, 200, 6, 0.999_0 /*~spread bps*/);
         assert!(o.reason.is_none(), "fresh record must not FAIL invariant: {:?}", o.reason);
         assert!(!o.conf_stale, "freshness 200/255 ≈ 0.78 is above floor → no advisory");
 
         // Same numbers WITHOUT the flag = legacy semantics → confidence>accepted FAIL.
-        let legacy = eval_invariant(100.0, 100.1, 0, 200, 6, 0.999_0);
+        let legacy = eval_inv(100.0, 100.1, 0, 200, 6, 0.999_0);
         assert_eq!(
             legacy.reason,
             Some("confidence > accepted"),
@@ -2139,7 +2354,7 @@ mod tests {
 
         // Freshness-flagged BUT stale (byte 5/255 ≈ 0.0196 < 0.05 floor) → advisory
         // WARN only, still NOT an invariant FAIL.
-        let stale = eval_invariant(100.0, 100.1, FRESH, 5, 6, 0.999_0);
+        let stale = eval_inv(100.0, 100.1, FRESH, 5, 6, 0.999_0);
         assert!(stale.reason.is_none(), "stale-fresh record must not FAIL: {:?}", stale.reason);
         assert!(stale.conf_stale, "freshness below floor → advisory WARN");
     }
@@ -2150,18 +2365,90 @@ mod tests {
     /// passes `> 0.0` yet cannot be a real quote. The cert must FAIL it (G1 parity).
     #[test]
     fn fix2_subfloor_price_fails() {
-        let o = eval_invariant(5e-10, 6e-10, 0, 1, 1, 0.0);
+        let o = eval_inv(5e-10, 6e-10, 0, 1, 1, 0.0);
         assert_eq!(
             o.reason,
             Some("bid/ask below price floor (denormal)"),
             "sub-floor denormal must FAIL the price floor"
         );
         // Normal price → no floor FAIL.
-        let ok = eval_invariant(100.0, 100.1, 0, 1, 1, 9.99);
+        let ok = eval_inv(100.0, 100.1, 0, 1, 1, 9.99);
         assert!(ok.reason.is_none(), "normal price must not FAIL: {:?}", ok.reason);
         // Crossed quote → explicit FAIL.
-        let crossed = eval_invariant(100.5, 100.0, 0, 1, 1, 0.0);
+        let crossed = eval_inv(100.5, 100.0, 0, 1, 1, 0.0);
         assert_eq!(crossed.reason, Some("crossed quote (ask < bid)"));
+    }
+
+    // ── FIX (depth): zero-depth / one-sided quote validation ─────────────────
+
+    /// Both sides zero size = phantom liquidity → hard FAIL (the `reason` chain
+    /// returns the named zero-depth reason and `zero_depth` is set). One-sided
+    /// zero is a WARN (`depth_one_sided`), NOT a hard FAIL. Healthy depth → clean.
+    #[test]
+    fn depth_zero_both_sides_is_error() {
+        // vbid==0 && vask==0 → hard FAIL.
+        let both = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 0, /*vask*/ 0, 9.99, test_band());
+        assert_eq!(
+            both.reason,
+            Some(ZERO_DEPTH_REASON),
+            "both-zero depth must hard-FAIL: {:?}",
+            both.reason
+        );
+        assert!(both.zero_depth, "zero_depth flag set");
+        assert!(!both.depth_one_sided, "both-zero is NOT one-sided");
+
+        // vbid==0 XOR vask==0 → WARN only, NO hard FAIL.
+        let bid_side = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 0, /*vask*/ 50, 9.99, test_band());
+        assert!(bid_side.reason.is_none(), "one-sided is WARN, not FAIL: {:?}", bid_side.reason);
+        assert!(bid_side.depth_one_sided, "one-sided depth WARN set");
+        assert!(!bid_side.zero_depth, "one-sided is NOT zero_depth");
+
+        let ask_side = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 50, /*vask*/ 0, 9.99, test_band());
+        assert!(ask_side.reason.is_none(), "one-sided is WARN, not FAIL: {:?}", ask_side.reason);
+        assert!(ask_side.depth_one_sided, "one-sided depth WARN set");
+
+        // Healthy two-sided depth → no depth signal at all.
+        let ok = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 10, /*vask*/ 10, 9.99, test_band());
+        assert!(!ok.zero_depth && !ok.depth_one_sided, "healthy depth → no signal");
+        assert!(ok.reason.is_none());
+    }
+
+    /// A FLAG_HEARTBEAT_SENTINEL legitimately carries no fresh depth: the pure
+    /// `eval_invariant` still flags `zero_depth` on its bytes, but the per-record
+    /// audit caller suppresses both the FAIL and the depth count for sentinels.
+    /// This mirrors the call-site exemption (see Check 2) at the unit level.
+    #[test]
+    fn depth_zero_sentinel_exempt() {
+        let sentinel_flags = FLAG_HEARTBEAT_SENTINEL;
+        let o = eval_invariant(100.0, 100.1, sentinel_flags, 1, 1, 0, 0, 0, 9.99, test_band());
+        // Pure fn reports the reason; the SENTINEL exemption lives at the caller.
+        assert_eq!(o.reason, Some(ZERO_DEPTH_REASON));
+        // Replicate the caller's suppression decision: sentinel + zero-depth reason
+        // → NOT counted as a violation.
+        let is_sentinel = (sentinel_flags & FLAG_HEARTBEAT_SENTINEL) != 0;
+        let suppressed = is_sentinel && o.zero_depth && o.reason == Some(ZERO_DEPTH_REASON);
+        assert!(suppressed, "sentinel zero-depth must be exempt at the caller");
+    }
+
+    // ── FIX (reject): rejected-byte dominance ────────────────────────────────
+
+    /// `rejected > accepted` (more provider quotes rejected than accepted this
+    /// tick) → a degraded composite → WARN advisory (`reject_dominant`), never a
+    /// hard FAIL. `rejected <= accepted` → no signal.
+    #[test]
+    fn reject_dominant_is_warn_not_fail() {
+        // 5 rejected vs 2 accepted → dominant WARN, no FAIL.
+        let dom = eval_invariant(100.0, 100.1, 0, 1, /*accepted*/ 2, /*rejected*/ 5, 100, 100, 9.99, test_band());
+        assert!(dom.reject_dominant, "rejected>accepted → reject_dominant WARN");
+        assert!(dom.reason.is_none(), "reject dominance is WARN, not FAIL: {:?}", dom.reason);
+
+        // Equal → NOT dominant (strictly greater required).
+        let eq = eval_invariant(100.0, 100.1, 0, 1, 3, 3, 100, 100, 9.99, test_band());
+        assert!(!eq.reject_dominant, "rejected==accepted is not dominant");
+
+        // Healthy (more accepted than rejected) → no signal.
+        let ok = eval_invariant(100.0, 100.1, 0, 1, 8, 1, 100, 100, 9.99, test_band());
+        assert!(!ok.reject_dominant, "accepted>rejected → no reject signal");
     }
 
     // ── FIX #3: rollup parity now checks vbid/vask + tick-weighted CI ────────

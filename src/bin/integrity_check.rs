@@ -639,6 +639,49 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                 });
             }
 
+            // G10 — quote DEPTH (vbid/vask backing size). A money-grade quote must
+            // be tradeable: a price with NO size behind it is phantom liquidity.
+            // SENTINELS are exempt — a FLAG_HEARTBEAT_SENTINEL re-prints the prior
+            // mid as a liveness beacon and legitimately carries no fresh depth.
+            //   • vbid==0 && vask==0 → ERROR (both-sides-zero = phantom quote).
+            //   • vbid==0 XOR vask==0 → WARN (one-sided book; real on some venues).
+            if !is_sentinel {
+                let vbid = idx_body.vbid;
+                let vask = idx_body.vask;
+                if vbid == 0 && vask == 0 {
+                    errors.push(Finding {
+                        record_ix: Some(i),
+                        msg: "zero-depth/phantom quote: vbid==0 && vask==0 (no backing size)"
+                            .to_string(),
+                    });
+                } else if (vbid == 0) ^ (vask == 0) {
+                    warnings.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!(
+                            "one-sided depth: vbid={} vask={} (one side has no backing size)",
+                            vbid, vask
+                        ),
+                    });
+                }
+            }
+
+            // G11 — `rejected` byte sanity (sibling of G8's `accepted`). A composite
+            // that rejects MORE provider quotes than it accepts this tick is a
+            // degraded-quality signal → WARN (never an ERROR; markets legitimately
+            // shed stale/outlier quotes). Sentinel-exempt (no fresh provider tally).
+            if !is_sentinel {
+                let rejected = idx_body.rejected;
+                if rejected > accepted {
+                    warnings.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!(
+                            "reject-dominant: rejected={} > accepted={} (suspect composite)",
+                            rejected, accepted
+                        ),
+                    });
+                }
+            }
+
             if let Err(e) = idx_body.validate() {
                 errors.push(Finding {
                     record_ix: Some(i),
@@ -1657,6 +1700,131 @@ mod tests {
         let p = write_idx("g8-accepted.idx", &[rec]);
         let r = check_idx(&p, false).unwrap();
         assert!(has_err(&r, "exceeds sane max"), "absurd accepted must ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── G10 quote depth (vbid/vask) ──────────────────────────────────────────
+
+    /// Build an `IndexRecord` at `epoch_ms` with explicit depth (`vbid`/`vask`)
+    /// and provider tallies (`accepted`/`rejected`). Used by the G10/G11 tests.
+    fn depth_record(
+        epoch_ms: i64,
+        vbid: u32,
+        vask: u32,
+        accepted: u8,
+        rejected: u8,
+    ) -> IndexRecord {
+        let mts = timestamp::from_epoch_ms(epoch_ms);
+        let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
+        let index = Index::new(
+            0xDEAD_BEEF, 100.0, 100.1, 100, vbid, vask, 1, 1, accepted, rejected,
+        );
+        IndexRecord::new(header, index)
+    }
+
+    #[test]
+    fn g10_zero_depth_both_sides_is_error() {
+        // vbid==0 && vask==0 → phantom liquidity → ERROR.
+        let rec = depth_record(T0, 0, 0, 1, 0);
+        let p = write_idx("g10-zero-both.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(
+            has_err(&r, "zero-depth/phantom quote"),
+            "both-zero depth must ERROR: {:?}",
+            r.errors
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g10_one_sided_depth_is_warn() {
+        // vbid==0 XOR vask==0 → one-sided book → WARN (NOT an ERROR).
+        let bid_zero = depth_record(T0, 0, 50, 1, 0);
+        let p = write_idx("g10-one-sided.idx", &[bid_zero]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(has_warn(&r, "one-sided depth"), "one-sided depth must WARN: {:?}", r.warnings);
+        assert!(
+            !has_err(&r, "zero-depth/phantom quote"),
+            "one-sided must NOT ERROR: {:?}",
+            r.errors
+        );
+        std::fs::remove_file(&p).ok();
+
+        // Mirror on the ask side.
+        let ask_zero = depth_record(T0, 50, 0, 1, 0);
+        let p2 = write_idx("g10-one-sided-ask.idx", &[ask_zero]);
+        let r2 = check_idx(&p2, false).unwrap();
+        assert!(has_warn(&r2, "one-sided depth"), "ask-side one-sided must WARN: {:?}", r2.warnings);
+        std::fs::remove_file(&p2).ok();
+    }
+
+    #[test]
+    fn g10_healthy_depth_no_finding() {
+        let rec = depth_record(T0, 100, 100, 1, 0);
+        let p = write_idx("g10-healthy.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(!has_err(&r, "zero-depth"), "healthy depth must not ERROR: {:?}", r.errors);
+        assert!(!has_warn(&r, "one-sided depth"), "healthy depth must not WARN: {:?}", r.warnings);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g10_zero_depth_sentinel_is_exempt() {
+        // A FLAG_HEARTBEAT_SENTINEL carries no fresh depth → the both-zero ERROR
+        // (and one-sided WARN) must NOT fire for it.
+        let mts = timestamp::from_epoch_ms(T0);
+        let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
+        let mut index = Index::new(0xDEAD_BEEF, 100.0, 100.1, 100, 0, 0, 1, 1, 1, 0);
+        index.flags |= nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL;
+        let rec = IndexRecord::new(header, index);
+        let p = write_idx("g10-sentinel-exempt.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(
+            !has_err(&r, "zero-depth/phantom quote"),
+            "sentinel zero-depth must be EXEMPT: {:?}",
+            r.errors
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── G11 reject-byte dominance (WARN) ─────────────────────────────────────
+
+    #[test]
+    fn g11_reject_dominant_is_warn() {
+        // rejected (5) > accepted (2) → suspect composite → WARN, no ERROR.
+        let rec = depth_record(T0, 100, 100, 2, 5);
+        let p = write_idx("g11-reject-dom.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(has_warn(&r, "reject-dominant"), "reject-dominant must WARN: {:?}", r.warnings);
+        assert!(!has_err(&r, "reject-dominant"), "reject dominance must not ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g11_reject_healthy_no_warn() {
+        // accepted (8) >= rejected (1) → no signal.
+        let rec = depth_record(T0, 100, 100, 8, 1);
+        let p = write_idx("g11-reject-ok.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(!has_warn(&r, "reject-dominant"), "healthy reject ratio must not WARN: {:?}", r.warnings);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g11_reject_dominant_sentinel_exempt() {
+        // Sentinel carries no fresh provider tally → reject-dominance must not fire.
+        let mts = timestamp::from_epoch_ms(T0);
+        let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
+        let mut index = Index::new(0xDEAD_BEEF, 100.0, 100.1, 100, 100, 100, 1, 1, 2, 5);
+        index.flags |= nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL;
+        let rec = IndexRecord::new(header, index);
+        let p = write_idx("g11-sentinel-exempt.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(
+            !has_warn(&r, "reject-dominant"),
+            "sentinel reject-dominance must be EXEMPT: {:?}",
+            r.warnings
+        );
         std::fs::remove_file(&p).ok();
     }
 
