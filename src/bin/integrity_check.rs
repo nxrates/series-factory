@@ -414,7 +414,11 @@ const IDX_MAX_GAP_MS: i64 = 60_000;
 /// this is treated as structural corruption (e.g. a price that underflowed to a
 /// denormal). `Index::validate()` only rejects `<= 0.0`; a value like `1e-15`
 /// passes it yet cannot be a real quote. ERROR always.
-const MIN_PX: f64 = 1e-9;
+///
+/// Sourced from `series_factory::seam::MIN_PX` so the cert (`data-quality-audit`
+/// invariant chain) and this per-file checker share ONE floor — they must never
+/// disagree on what a structurally-corrupt price is.
+use series_factory::seam::MIN_PX;
 
 /// G6 — lower timestamp bound: 2000-01-01T00:00:00Z in epoch ms. Any record ts
 /// below this is a corrupt/garbage clock. Defensive guard: a valid u48 mts
@@ -503,6 +507,11 @@ struct IdxState {
     cur_identical_run: usize,
     max_identical_run: usize,
     distinct_mids: std::collections::HashSet<u64>,
+    /// G9 — count of NON-sentinel finite mids (FIX #7). This is the denominator
+    /// for the distinct-mid fraction so it matches `distinct_mids` (which also
+    /// excludes sentinels); using the all-records `n_finite` would depress the
+    /// fraction on a sentinel-dense feed and falsely trip the stuck-feed gate.
+    n_nonsentinel_finite: usize,
     /// G4 — # records that carried `FLAG_CONF_FRESHNESS` with `f` below floor.
     n_stale_conf: usize,
 }
@@ -541,6 +550,12 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                 });
             }
 
+            // Forward inter-row gap (ms) when ts is monotone; None on the first
+            // record or a backward ts. FIX #7: the G5 jump guard is suppressed
+            // when this gap exceeds IDX_MAX_GAP_MS — a "jump" across a multi-minute
+            // outage is the feed resuming at a new fair price, NOT a tick-to-tick
+            // print anomaly, so it must not WARN.
+            let mut inter_row_gap: Option<i64> = None;
             if let Some(prev) = s.prev_ts_ms {
                 if ts < prev {
                     errors.push(Finding {
@@ -549,6 +564,7 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                     });
                 } else {
                     let gap = ts - prev;
+                    inter_row_gap = Some(gap);
                     if gap > IDX_MAX_GAP_MS {
                         warnings.push(Finding {
                             record_ix: Some(i),
@@ -567,6 +583,14 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
 
             // Copy out of packed before any field access.
             let idx_body = rec.index;
+            // FIX #7: a liveness sentinel re-prints the prior mid by design
+            // (FLAG_HEARTBEAT_SENTINEL). Feeding it into the G5 jump-guard or the
+            // G9 stuck-run / distinct-fraction accounting would inflate the
+            // identical-mid run and depress the distinct fraction → a spurious
+            // stuck-feed WARN on a perfectly healthy, sentinel-dense quiet feed.
+            // It is skipped in those three accumulators (but still validated for
+            // structural invariants G1/G6/G7/G8 above + below).
+            let is_sentinel = (idx_body.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL) != 0;
             let bid = idx_body.bid;
             let ask = idx_body.ask;
 
@@ -586,6 +610,19 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                 errors.push(Finding {
                     record_ix: Some(i),
                     msg: format!("ask {} below price floor {:e} (or non-finite)", ask, MIN_PX),
+                });
+            }
+
+            // FIX #8: explicit crossed-quote ERROR (ask < bid) at the invariant
+            // level — parity with the audit's invariant chain, which flags it
+            // directly. integrity-check previously only caught this transitively
+            // via G7 (the reconstructed spread goes negative); surface it as its
+            // own structural finding so the message is unambiguous and the check
+            // does not depend on the spread-realness path also firing.
+            if bid.is_finite() && ask.is_finite() && ask < bid {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!("crossed quote: ask {} < bid {} (structural)", ask, bid),
                 });
             }
 
@@ -651,41 +688,57 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                 }
 
                 // G5 — price-jump guard. Heuristic → WARN, strict → ERROR.
-                if let Some(prev_mid) = s.prev_mid {
-                    if prev_mid > 0.0 {
-                        let jump = (mid - prev_mid).abs() / prev_mid;
-                        if jump > JUMP_PCT {
-                            let msg = format!(
-                                "mid jump {:.2}% between rows {}..{} (>{:.0}%)",
-                                jump * 100.0,
-                                i.saturating_sub(1),
-                                i,
-                                JUMP_PCT * 100.0
-                            );
-                            if strict {
-                                errors.push(Finding { record_ix: Some(i), msg });
-                            } else {
-                                warnings.push(Finding { record_ix: Some(i), msg });
+                // FIX #7: skip sentinels (a re-printed prior mid has a ~0 jump
+                // anyway, but skipping keeps prev_mid anchored to the last REAL
+                // quote) and suppress the check across a gap > IDX_MAX_GAP_MS (a
+                // post-outage resume at a new fair price is not a print anomaly).
+                if !is_sentinel {
+                    if let Some(prev_mid) = s.prev_mid {
+                        let gap_ok = inter_row_gap.map(|g| g <= IDX_MAX_GAP_MS).unwrap_or(true);
+                        if prev_mid > 0.0 && gap_ok {
+                            let jump = (mid - prev_mid).abs() / prev_mid;
+                            if jump > JUMP_PCT {
+                                let msg = format!(
+                                    "mid jump {:.2}% between rows {}..{} (>{:.0}%)",
+                                    jump * 100.0,
+                                    i.saturating_sub(1),
+                                    i,
+                                    JUMP_PCT * 100.0
+                                );
+                                if strict {
+                                    errors.push(Finding { record_ix: Some(i), msg });
+                                } else {
+                                    warnings.push(Finding { record_ix: Some(i), msg });
+                                }
                             }
                         }
                     }
+                    // Anchor prev_mid to the last REAL quote only — a sentinel must
+                    // not become the jump baseline.
+                    s.prev_mid = Some(mid);
                 }
-                s.prev_mid = Some(mid);
 
                 // G9 — stuck/flatline run tracking. Compare on the raw bit
                 // pattern so only a truly frozen feed (identical to the bit)
                 // extends a run; any sub-tick wander resets it. Counted over
                 // finite mids only (same denominator as `n_finite`).
-                let bits = mid.to_bits();
-                s.distinct_mids.insert(bits);
-                match s.prev_mid_bits {
-                    Some(pb) if pb == bits => s.cur_identical_run += 1,
-                    _ => s.cur_identical_run = 1,
+                // FIX #7: sentinels are EXCLUDED — a sentinel deliberately
+                // re-prints the prior mid, which would extend the identical run
+                // and shrink the distinct-mid set, falsely tripping the stuck-feed
+                // gate on a healthy sentinel-dense quiet feed.
+                if !is_sentinel {
+                    let bits = mid.to_bits();
+                    s.distinct_mids.insert(bits);
+                    s.n_nonsentinel_finite += 1;
+                    match s.prev_mid_bits {
+                        Some(pb) if pb == bits => s.cur_identical_run += 1,
+                        _ => s.cur_identical_run = 1,
+                    }
+                    if s.cur_identical_run > s.max_identical_run {
+                        s.max_identical_run = s.cur_identical_run;
+                    }
+                    s.prev_mid_bits = Some(bits);
                 }
-                if s.cur_identical_run > s.max_identical_run {
-                    s.max_identical_run = s.cur_identical_run;
-                }
-                s.prev_mid_bits = Some(bits);
 
                 // G4 — confidence-freshness floor. Only meaningful when the
                 // record opts into the Q0.8 freshness wire semantics via
@@ -743,13 +796,17 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                     warnings.push(Finding { record_ix: None, msg });
                 }
             }
-            if s.n_finite >= STUCK_MIN_SAMPLE {
-                let distinct_frac = s.distinct_mids.len() as f64 / s.n_finite as f64;
+            // FIX #7: denominator is the NON-sentinel finite count (matches the
+            // sentinel-excluded `distinct_mids`), so a sentinel-dense quiet feed
+            // is not falsely flagged by an artificially depressed fraction.
+            if s.n_nonsentinel_finite >= STUCK_MIN_SAMPLE {
+                let distinct_frac =
+                    s.distinct_mids.len() as f64 / s.n_nonsentinel_finite as f64;
                 if distinct_frac < STUCK_MIN_DISTINCT_FRAC {
                     let msg = format!(
-                        "stuck feed: only {} distinct mids over {} finite ({:.4} < {})",
+                        "stuck feed: only {} distinct mids over {} non-sentinel finite ({:.4} < {})",
                         s.distinct_mids.len(),
-                        s.n_finite,
+                        s.n_nonsentinel_finite,
                         distinct_frac,
                         STUCK_MIN_DISTINCT_FRAC
                     );
@@ -1513,6 +1570,17 @@ mod tests {
         IndexRecord::new(header, index)
     }
 
+    /// Build an `IndexRecord` carrying `FLAG_HEARTBEAT_SENTINEL` (a liveness
+    /// sentinel that re-prints the prior mid by design). FIX #7 must EXCLUDE these
+    /// from the G5 jump + G9 stuck-run / distinct-fraction accounting.
+    fn sentinel_record(epoch_ms: i64, bid: f64, ask: f64) -> IndexRecord {
+        let mts = timestamp::from_epoch_ms(epoch_ms);
+        let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
+        let mut index = Index::new(0xDEAD_BEEF_u64, bid, ask, 100, 1_000, 1_000, 10, 1, 1, 0);
+        index.flags |= nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL;
+        IndexRecord::new(header, index)
+    }
+
     fn has_err(r: &FileReport, needle: &str) -> bool {
         r.errors.iter().any(|f| f.msg.contains(needle))
     }
@@ -1719,6 +1787,120 @@ mod tests {
         let r = check_idx(&p, true).unwrap();
         assert!(!has_err(&r, "stuck feed"), "small constant sample must not ERROR (strict): {:?}", r.errors);
         assert!(!has_warn(&r, "stuck feed"), "small constant sample must not WARN: {:?}", r.warnings);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── FIX #7: sentinel-dense feed must NOT false-trip the stuck-feed gate ────
+
+    /// A healthy quiet feed where every record between real prints is a liveness
+    /// SENTINEL (re-printing the prior mid). The OLD accounting counted sentinels
+    /// into the identical-run + distinct-fraction denominators → a guaranteed
+    /// spurious stuck-feed WARN. FIX #7 excludes them: a feed with enough DISTINCT
+    /// real mids (interleaved with dense sentinels) must NOT flag stuck.
+    #[test]
+    fn fix7_sentinel_dense_no_false_stuck() {
+        // STUCK_MIN_SAMPLE+ real moving prints, each separated by a long run of
+        // sentinels re-printing that print's mid. Real mids are all distinct.
+        let mut recs: Vec<IndexRecord> = Vec::new();
+        let mut t = T0;
+        let n_real = STUCK_MIN_SAMPLE + 50;
+        for k in 0..n_real {
+            let px = 100.0 + (k as f64) * 0.001; // strictly increasing → distinct
+            recs.push(good_record(t, px, px + 0.1));
+            t += 100;
+            // 5 sentinels re-printing the SAME mid between real prints. Under the
+            // old logic these 5×N identical sentinels would form a run ≫ STUCK_RUN
+            // AND crush the distinct fraction → false stuck.
+            for _ in 0..5 {
+                recs.push(sentinel_record(t, px, px + 0.1));
+                t += 100;
+            }
+        }
+        let p = write_idx("fix7-sentinel-dense.idx", &recs);
+        let r = check_idx(&p, true).unwrap(); // strict: would ERROR if it fired
+        assert!(
+            !has_err(&r, "stuck feed"),
+            "sentinel-dense healthy feed must NOT ERROR stuck (strict): {:?}",
+            r.errors
+        );
+        assert!(
+            !has_warn(&r, "stuck feed"),
+            "sentinel-dense healthy feed must NOT WARN stuck: {:?}",
+            r.warnings
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A genuinely frozen feed whose ONLY records are sentinels at one quote must
+    /// NOT trip the run/distinct gates either (no real mids to judge) — sentinels
+    /// are liveness markers, not quote evidence. (Stuck detection on the REAL
+    /// stream is unchanged; `g9_frozen_feed_*` still covers a true freeze.)
+    #[test]
+    fn fix7_all_sentinels_no_stuck_verdict() {
+        let n = STUCK_RUN + 10;
+        let recs: Vec<IndexRecord> = (0..n)
+            .map(|i| sentinel_record(T0 + (i as i64) * 100, 100.0, 100.1))
+            .collect();
+        let p = write_idx("fix7-all-sentinel.idx", &recs);
+        let r = check_idx(&p, true).unwrap();
+        assert!(!has_err(&r, "stuck feed"), "all-sentinel run must not ERROR stuck: {:?}", r.errors);
+        assert!(!has_warn(&r, "stuck feed"), "all-sentinel run must not WARN stuck: {:?}", r.warnings);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// FIX #7 gap-aware jump: a >10% mid move ACROSS an inter-row gap exceeding
+    /// IDX_MAX_GAP_MS is a post-outage resume, not a print anomaly → must NOT
+    /// WARN. The same move within a tight gap still WARNs (g5 unchanged there).
+    #[test]
+    fn fix7_jump_across_gap_suppressed() {
+        // Row 1 → Row 2 separated by 2× IDX_MAX_GAP_MS with a 20% move.
+        let recs = [
+            good_record(T0, 99.95, 100.05),
+            good_record(T0 + IDX_MAX_GAP_MS * 2, 119.95, 120.05),
+        ];
+        let p = write_idx("fix7-jump-gap.idx", &recs);
+        let r = check_idx(&p, false).unwrap();
+        assert!(
+            !has_warn(&r, "mid jump"),
+            "20% move across a >max-gap outage must NOT WARN jump: {:?}",
+            r.warnings
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// FIX #7: a sentinel must not become the jump baseline. A real print, then a
+    /// dense sentinel run at that mid, then a real print 5% away (tight spacing)
+    /// → the jump is measured print-to-print (5% < 10%) → no WARN. (Anchoring on a
+    /// sentinel would not change the value here, but this proves prev_mid tracks
+    /// the last REAL quote.)
+    #[test]
+    fn fix7_sentinel_not_jump_baseline() {
+        let mut recs = vec![good_record(T0, 100.0, 100.1)];
+        for k in 1..=5 {
+            recs.push(sentinel_record(T0 + k * 100, 100.0, 100.1));
+        }
+        recs.push(good_record(T0 + 600, 105.0, 105.1)); // 5% from the real 100
+        let p = write_idx("fix7-sentinel-baseline.idx", &recs);
+        let r = check_idx(&p, false).unwrap();
+        assert!(!has_warn(&r, "mid jump"), "5% real-to-real move must not WARN: {:?}", r.warnings);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── FIX #8: explicit crossed-quote ERROR ──────────────────────────────────
+
+    /// `ask < bid` is surfaced as its OWN structural ERROR (parity with the audit
+    /// invariant chain), not only transitively via G7's negative reconstructed
+    /// spread. The message names "crossed quote".
+    #[test]
+    fn fix8_crossed_quote_explicit_error() {
+        let rec = good_record(T0, 100.5, 100.0); // ask 100.0 < bid 100.5
+        let p = write_idx("fix8-crossed.idx", &[rec]);
+        let r = check_idx(&p, false).unwrap();
+        assert!(
+            has_err(&r, "crossed quote"),
+            "crossed quote must raise its own structural ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
