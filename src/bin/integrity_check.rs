@@ -26,7 +26,11 @@
 //!
 //! - `.idx` (`IndexRecord`, 56 B): length % 56 == 0; `header.message_type ==
 //!   INDEX`; ts non-decreasing; large gaps → WARN; `Index::validate()` passes;
-//!   strict → mean(ci_price/mid) < 100 bps, frac(spread > 500 bps) < 0.5 %.
+//!   stuck/flatline (G9: bit-identical mid run ≥ STUCK_RUN, or distinct-mid
+//!   fraction below floor over a large sample) → WARN/strict-ERROR;
+//!   confidence-freshness floor (G4: only when `FLAG_CONF_FRESHNESS` set) →
+//!   WARN/strict-ERROR; strict → mean(ci_price/mid) < 100 bps, frac(spread >
+//!   500 bps) < 0.5 %.
 //! - `.bars` (`mitch::Bar`, 96 B): length % 96 == 0; `open_ts <= close_ts`;
 //!   `high >= max(o,c,l)`, `low <= min(o,c,h)`; `kind ∈ {0,1,2,3}`;
 //!   `realized_var, bipower_var >= 0`. Renko (`kind == 1`):
@@ -35,7 +39,11 @@
 //!   from `config.yml::series.renko`. Kline (`kind == 0`):
 //!   `close_ts[i-1] == open_ts[i]`. Strict → bars/day ∈ `[10, 2000]`.
 //! - `.vol` (`series_factory::vol_bin::VolRecord`, 14 B): length % 14 == 0;
-//!   `mts` strictly increasing; `sigma_pct` ∈ `[0, 0.5]`; no NaN/Inf.
+//!   `mts` strictly increasing; `sigma_pct` ∈ `[0, 0.5]`; no NaN/Inf; max-gap
+//!   (> `IDX_MAX_GAP_MS`) → WARN.
+//!
+//! `.s10` additionally enforces K2 UTC grid alignment (`open_ts % bucket_ms ==
+//!   0`) per record → ERROR (the s10-from-idx misalignment regression).
 //!
 //! ## Internal structure
 //!
@@ -446,6 +454,36 @@ const CI_MAX_FRAC: f64 = 0.01;
 /// corruption. ERROR on gross mismatch. 0.5 bps absolute slack.
 const SPREAD_CONSISTENCY_BPS: f64 = 0.5;
 
+/// G9 — stuck/flatline detector: a run of this many *bit-identical* consecutive
+/// mids signals a frozen forwarder (the doc promises "no stuck feeds" but no
+/// check enforced it — a feed repeating one price could certify PASS). At the
+/// live 10 Hz cadence 600 records ≈ 60 s of an unmoving book. A genuinely
+/// quiet-but-moving stable pair re-prints sub-tick noise far more often than
+/// once a minute, so only a *true* freeze (identical to the bit) trips this.
+/// Heuristic → WARN by default, ERROR under `--strict`.
+const STUCK_RUN: usize = 600;
+
+/// G9 — distinct-mid floor: over a *large* sample (≥ `STUCK_MIN_SAMPLE`
+/// finite mids) the fraction of distinct mid values must exceed this. A
+/// near-degenerate distinct fraction over thousands of records is a partially
+/// stuck / quantised feed even when no single run hits `STUCK_RUN`. Kept very
+/// conservative (0.2 %) so a legitimately calm pair that still wanders never
+/// trips it. Heuristic → WARN by default, ERROR under `--strict`.
+const STUCK_MIN_DISTINCT_FRAC: f64 = 0.002;
+
+/// G9 — minimum finite-mid sample before the distinct-fraction gate is allowed
+/// to fire. Below this the statistic is too noisy (e.g. a 32-row smoke fixture
+/// of one constant quote is legitimate and must never FAIL). 2000 records.
+const STUCK_MIN_SAMPLE: usize = 2000;
+
+/// G4 — confidence-freshness floor (Q0.8, ∈[0,1]). When a record carries
+/// `FLAG_CONF_FRESHNESS` (bit 3) its `confidence` byte is a Q0.8 freshness
+/// `f = byte/255`; an `f` below this floor means the composite is built from
+/// stale components. Heuristic (real markets do go briefly stale) → WARN by
+/// default, ERROR under `--strict`. When the flag is *clear* the byte is the
+/// legacy active-provider count and this gate is skipped entirely. 0.05.
+const CONF_FRESHNESS_FLOOR: f64 = 0.05;
+
 /// Per-file accumulators threaded through the `.idx` validator.
 #[derive(Default)]
 struct IdxState {
@@ -457,6 +495,16 @@ struct IdxState {
     n_wide: usize,
     sum_spread_bps: f64,
     max_spread_bps: f64,
+    /// G9 — stuck-feed detector. `prev_mid_bits` is the bit pattern of the last
+    /// finite mid; `cur_run`/`max_run` track the longest bit-identical run;
+    /// `n_distinct_mids` counts distinct finite mid bit patterns (so the
+    /// distinct-fraction floor is over the same denominator as `n_finite`).
+    prev_mid_bits: Option<u64>,
+    cur_identical_run: usize,
+    max_identical_run: usize,
+    distinct_mids: std::collections::HashSet<u64>,
+    /// G4 — # records that carried `FLAG_CONF_FRESHNESS` with `f` below floor.
+    n_stale_conf: usize,
 }
 
 fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
@@ -624,6 +672,41 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                 }
                 s.prev_mid = Some(mid);
 
+                // G9 — stuck/flatline run tracking. Compare on the raw bit
+                // pattern so only a truly frozen feed (identical to the bit)
+                // extends a run; any sub-tick wander resets it. Counted over
+                // finite mids only (same denominator as `n_finite`).
+                let bits = mid.to_bits();
+                s.distinct_mids.insert(bits);
+                match s.prev_mid_bits {
+                    Some(pb) if pb == bits => s.cur_identical_run += 1,
+                    _ => s.cur_identical_run = 1,
+                }
+                if s.cur_identical_run > s.max_identical_run {
+                    s.max_identical_run = s.cur_identical_run;
+                }
+                s.prev_mid_bits = Some(bits);
+
+                // G4 — confidence-freshness floor. Only meaningful when the
+                // record opts into the Q0.8 freshness wire semantics via
+                // `FLAG_CONF_FRESHNESS`; otherwise the byte is the legacy
+                // active-provider count and carries no staleness meaning.
+                if (idx_body.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0 {
+                    let f = mitch::index::conf_from_u8(idx_body.confidence);
+                    if f < CONF_FRESHNESS_FLOOR {
+                        s.n_stale_conf += 1;
+                        let msg = format!(
+                            "confidence freshness {:.3} < floor {} (stale composite)",
+                            f, CONF_FRESHNESS_FLOOR
+                        );
+                        if strict {
+                            errors.push(Finding { record_ix: Some(i), msg });
+                        } else {
+                            warnings.push(Finding { record_ix: Some(i), msg });
+                        }
+                    }
+                }
+
                 let ratio = ci_price / mid;
                 if ratio.is_finite() {
                     s.sum_ci_over_mid += ratio;
@@ -634,13 +717,48 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                 if spread_bps > 500.0 { s.n_wide += 1; }
             }
         },
-        |s: IdxState, _n, errors, _warnings, stats| {
+        |s: IdxState, _n, errors, warnings, stats| {
             let mut idx_stats = IdxStats::default();
             if s.n_finite > 0 {
                 idx_stats.mean_ci_over_mid = s.sum_ci_over_mid / s.n_finite as f64;
                 idx_stats.mean_spread_bps = s.sum_spread_bps / s.n_finite as f64;
                 idx_stats.max_spread_bps = s.max_spread_bps;
                 idx_stats.frac_spread_gt_500_bps = s.n_wide as f64 / s.n_finite as f64;
+            }
+
+            // G9 — stuck/flatline whole-file verdict. Heuristic → WARN by
+            // default, ERROR under `--strict`. (a) a single bit-identical run
+            // ≥ STUCK_RUN = a sustained freeze; (b) over a large sample, a
+            // distinct-mid fraction below the floor = a partially-stuck feed.
+            // Conservative thresholds: a calm-but-moving stable pair re-prints
+            // sub-tick noise well within both bounds and never trips.
+            if s.max_identical_run >= STUCK_RUN {
+                let msg = format!(
+                    "stuck feed: {} consecutive bit-identical mids (>= {})",
+                    s.max_identical_run, STUCK_RUN
+                );
+                if strict {
+                    errors.push(Finding { record_ix: None, msg });
+                } else {
+                    warnings.push(Finding { record_ix: None, msg });
+                }
+            }
+            if s.n_finite >= STUCK_MIN_SAMPLE {
+                let distinct_frac = s.distinct_mids.len() as f64 / s.n_finite as f64;
+                if distinct_frac < STUCK_MIN_DISTINCT_FRAC {
+                    let msg = format!(
+                        "stuck feed: only {} distinct mids over {} finite ({:.4} < {})",
+                        s.distinct_mids.len(),
+                        s.n_finite,
+                        distinct_frac,
+                        STUCK_MIN_DISTINCT_FRAC
+                    );
+                    if strict {
+                        errors.push(Finding { record_ix: None, msg });
+                    } else {
+                        warnings.push(Finding { record_ix: None, msg });
+                    }
+                }
             }
 
             if strict {
@@ -821,7 +939,26 @@ fn check_s10(path: &Path, strict: bool, bucket_ms: i64) -> Result<FileReport> {
 
             // Shared OHLC core (ts span, open<=close, finiteness, high/low, vars).
             let (f, ohlc_finite) = check_bar_ohlc(i, bar, errors, stats);
+            let open_ts_ms = f.open_ts_ms;
             let close_ts_ms = f.close_ts_ms;
+
+            // K2 — UTC grid alignment: every s10 bucket's open_ts must sit on the
+            // bucket grid (`open_ts % bucket_ms == 0`). A nonzero residue is the
+            // s10-from-idx misalignment regression. Previously only
+            // `data_quality_audit` caught it; porting it here lets a single-file
+            // `integrity-check s10` invocation flag it. Structural → ERROR.
+            if bucket_ms > 0 && open_ts_ms % bucket_ms != 0 {
+                errors.push(Finding {
+                    record_ix: Some(i),
+                    msg: format!(
+                        "s10 off-grid: open_ts {} % bucket {} = {} (!= 0)",
+                        open_ts_ms,
+                        bucket_ms,
+                        open_ts_ms % bucket_ms
+                    ),
+                });
+            }
+
             if !ohlc_finite {
                 s.prev_close_ts_ms = Some(close_ts_ms);
                 return;
@@ -941,6 +1078,8 @@ const VOL_MAX: f64 = 5.0;
 struct VolState {
     vol_stats: VolStats,
     prev_mts: Option<u64>,
+    /// Previous record ts in epoch ms, for the max-gap WARN (mirrors `.idx`).
+    prev_ts_ms: Option<i64>,
     sum_sigma: f64,
 }
 
@@ -953,6 +1092,7 @@ impl Default for VolState {
                 mean_sigma_pct: 0.0,
             },
             prev_mts: None,
+            prev_ts_ms: None,
             sum_sigma: 0.0,
         }
     }
@@ -964,7 +1104,7 @@ fn check_vol(path: &Path, _strict: bool) -> Result<FileReport> {
         "vol",
         "VolRecord",
         VolState::default(),
-        |s: &mut VolState, i, r, errors, _warnings, stats| {
+        |s: &mut VolState, i, r, errors, warnings, stats| {
             let mts_bytes = r.mts;
             let mts = timestamp::decode_u48(&mts_bytes);
             let sigma = r.sigma_pct;
@@ -996,6 +1136,27 @@ fn check_vol(path: &Path, _strict: bool) -> Result<FileReport> {
                 }
             }
             s.prev_mts = Some(mts);
+
+            // Max-gap WARN (mirrors `IDX_MAX_GAP_MS`): vol bins should not have
+            // unbounded holes. A gap beyond the ceiling is a coverage hole, not
+            // structural corruption → WARN (never false-FAILs a real-but-sparse
+            // series; strict still promotes it to a fatal exit globally).
+            if let Some(prev_ms) = s.prev_ts_ms {
+                let gap = ts_ms - prev_ms;
+                if gap > IDX_MAX_GAP_MS {
+                    warnings.push(Finding {
+                        record_ix: Some(i),
+                        msg: format!(
+                            "vol gap {} ms between rows {}..{} (>{} ms)",
+                            gap,
+                            i.saturating_sub(1),
+                            i,
+                            IDX_MAX_GAP_MS
+                        ),
+                    });
+                }
+            }
+            s.prev_ts_ms = Some(ts_ms);
 
             if !sigma.is_finite() {
                 errors.push(Finding {
@@ -1325,6 +1486,33 @@ mod tests {
         write_tmp(name, &buf)
     }
 
+    fn write_bars(name: &str, bars: &[mitch::bar::Bar]) -> PathBuf {
+        let mut buf = Vec::with_capacity(bars.len() * std::mem::size_of::<mitch::bar::Bar>());
+        for b in bars { buf.extend_from_slice(bytes_of(b)); }
+        write_tmp(name, &buf)
+    }
+
+    /// Build an s10 Kline bar (`kind == 0`) over `[open_ms, close_ms]`.
+    fn s10_bar(open_ms: i64, close_ms: i64, px: f64) -> mitch::bar::Bar {
+        let open_mts = timestamp::from_epoch_ms(open_ms);
+        let close_mts = timestamp::from_epoch_ms(close_ms);
+        let mut b =
+            mitch::bar::Bar::new_ohlcv(open_mts, close_mts, px, px, px, px, 0, 0, 1);
+        b.kind = mitch::bar::BarKind::Kline as u8;
+        b
+    }
+
+    /// Build an `IndexRecord` carrying `FLAG_CONF_FRESHNESS` with a given Q0.8
+    /// freshness byte (so `check_idx` reads `confidence` as freshness, not a
+    /// provider count).
+    fn fresh_record(epoch_ms: i64, bid: f64, ask: f64, conf_byte: u8) -> IndexRecord {
+        let mts = timestamp::from_epoch_ms(epoch_ms);
+        let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
+        let mut index = Index::new(0xDEAD_BEEF_u64, bid, ask, 100, 1_000, 1_000, 10, conf_byte, 1, 0);
+        index.flags |= nxr_sdk::shard::FLAG_CONF_FRESHNESS;
+        IndexRecord::new(header, index)
+    }
+
     fn has_err(r: &FileReport, needle: &str) -> bool {
         r.errors.iter().any(|f| f.msg.contains(needle))
     }
@@ -1476,6 +1664,143 @@ mod tests {
         let p = write_vol("vol-ok.vol", &recs);
         let r = check_vol(&p, false).unwrap();
         assert!(r.errors.is_empty(), "normal vol must be clean: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── G9 stuck/flatline detector ───────────────────────────────────────────
+
+    #[test]
+    fn g9_frozen_feed_warns_default_errors_strict() {
+        // STUCK_RUN+1 bit-identical mids at a fixed quote → a frozen forwarder.
+        // Spread tiny + finite so no other gate fires; spacing 100 ms (< gap).
+        let n = STUCK_RUN + 1;
+        let recs: Vec<IndexRecord> = (0..n)
+            .map(|i| good_record(T0 + (i as i64) * 100, 100.0, 100.1))
+            .collect();
+        let p = write_idx("g9-frozen.idx", &recs);
+
+        let r = check_idx(&p, false).unwrap();
+        assert!(has_warn(&r, "stuck feed"), "frozen feed must WARN: {:?}", r.warnings);
+        assert!(!has_err(&r, "stuck feed"), "frozen feed must NOT ERROR (non-strict): {:?}", r.errors);
+
+        let r2 = check_idx(&p, true).unwrap();
+        assert!(has_err(&r2, "stuck feed"), "frozen feed must ERROR (strict): {:?}", r2.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g9_clean_moving_feed_no_stuck() {
+        // STUCK_RUN+50 records, each a distinct mid (tiny but real wander).
+        // Must NOT flag stuck under either mode (no false-FAIL on volatile data).
+        let n = STUCK_RUN + 50;
+        let recs: Vec<IndexRecord> = (0..n)
+            .map(|i| {
+                let drift = 100.0 + (i as f64) * 0.01; // strictly increasing → all distinct
+                good_record(T0 + (i as i64) * 100, drift, drift + 0.1)
+            })
+            .collect();
+        let p = write_idx("g9-moving.idx", &recs);
+
+        let r = check_idx(&p, false).unwrap();
+        assert!(!has_warn(&r, "stuck feed"), "moving feed must not WARN: {:?}", r.warnings);
+        let r2 = check_idx(&p, true).unwrap();
+        assert!(!has_err(&r2, "stuck feed"), "moving feed must not ERROR (strict): {:?}", r2.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g9_small_constant_sample_no_false_fail() {
+        // The 32-row all-identical-quote smoke fixture shape: below STUCK_RUN and
+        // below STUCK_MIN_SAMPLE → must never flag stuck (no false-FAIL).
+        let recs: Vec<IndexRecord> = (0..32)
+            .map(|i| good_record(T0 + (i as i64) * 100, 100.0, 100.1))
+            .collect();
+        let p = write_idx("g9-smoke-shape.idx", &recs);
+        let r = check_idx(&p, true).unwrap();
+        assert!(!has_err(&r, "stuck feed"), "small constant sample must not ERROR (strict): {:?}", r.errors);
+        assert!(!has_warn(&r, "stuck feed"), "small constant sample must not WARN: {:?}", r.warnings);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── G4 confidence-freshness floor ─────────────────────────────────────────
+
+    #[test]
+    fn g4_stale_freshness_warns_default_errors_strict() {
+        // conf byte 0 with FLAG_CONF_FRESHNESS set → f = 0 < floor → flagged.
+        let rec = fresh_record(T0, 100.0, 100.1, 0);
+        let p = write_idx("g4-stale.idx", &[rec]);
+
+        let r = check_idx(&p, false).unwrap();
+        assert!(has_warn(&r, "confidence freshness"), "stale freshness must WARN: {:?}", r.warnings);
+
+        let r2 = check_idx(&p, true).unwrap();
+        assert!(has_err(&r2, "confidence freshness"), "stale freshness must ERROR (strict): {:?}", r2.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn g4_fresh_or_legacy_no_false_fail() {
+        // (a) flag set + full freshness (byte 255 → f=1.0) → no flag.
+        let fresh = fresh_record(T0, 100.0, 100.1, 255);
+        let p = write_idx("g4-fresh.idx", &[fresh]);
+        let r = check_idx(&p, true).unwrap();
+        assert!(!has_err(&r, "confidence freshness"), "full freshness must not ERROR: {:?}", r.errors);
+        assert!(!has_warn(&r, "confidence freshness"), "full freshness must not WARN: {:?}", r.warnings);
+        std::fs::remove_file(&p).ok();
+
+        // (b) flag CLEAR + low conf byte → legacy provider-count semantics,
+        // freshness gate skipped entirely (must not flag).
+        let legacy = good_record(T0, 100.0, 100.1); // confidence=1, flag clear
+        let p2 = write_idx("g4-legacy.idx", &[legacy]);
+        let r2 = check_idx(&p2, true).unwrap();
+        assert!(!has_err(&r2, "confidence freshness"), "legacy conf must not ERROR: {:?}", r2.errors);
+        assert!(!has_warn(&r2, "confidence freshness"), "legacy conf must not WARN: {:?}", r2.warnings);
+        std::fs::remove_file(&p2).ok();
+    }
+
+    // ── K2 s10 grid alignment ─────────────────────────────────────────────────
+
+    #[test]
+    fn k2_s10_misaligned_open_is_error() {
+        // open_ts off the 10s grid (T0 + 3000 → % 10_000 = 3000) → ERROR.
+        let off = T0 + 3_000;
+        let bar = s10_bar(off, off + 10_000, 100.0);
+        let p = write_bars("k2-misaligned.s10", &[bar]);
+        let r = check_s10(&p, false, 10_000).unwrap();
+        assert!(has_err(&r, "off-grid"), "misaligned s10 open must ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn k2_s10_aligned_open_no_error() {
+        // T0 (= ...200_000) is grid-aligned at 10s; two consecutive buckets.
+        let b1 = s10_bar(T0, T0 + 10_000, 100.0);
+        let b2 = s10_bar(T0 + 10_000, T0 + 20_000, 100.0);
+        let p = write_bars("k2-aligned.s10", &[b1, b2]);
+        let r = check_s10(&p, false, 10_000).unwrap();
+        assert!(!has_err(&r, "off-grid"), "aligned s10 must not ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ── .vol gap WARN ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn vol_gap_warns() {
+        // Two bins > IDX_MAX_GAP_MS (60s) apart → coverage-hole WARN, no ERROR.
+        let recs = [vol_record(T0, 0.02), vol_record(T0 + 120_000, 0.03)];
+        let p = write_vol("vol-gap.vol", &recs);
+        let r = check_vol(&p, false).unwrap();
+        assert!(has_warn(&r, "vol gap"), "vol gap must WARN: {:?}", r.warnings);
+        assert!(r.errors.is_empty(), "vol gap must not ERROR: {:?}", r.errors);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn vol_no_gap_no_warn() {
+        let recs = [vol_record(T0, 0.02), vol_record(T0 + 1_000, 0.03)];
+        let p = write_vol("vol-nogap.vol", &recs);
+        let r = check_vol(&p, false).unwrap();
+        assert!(!has_warn(&r, "vol gap"), "tight spacing must not WARN: {:?}", r.warnings);
         std::fs::remove_file(&p).ok();
     }
 }
