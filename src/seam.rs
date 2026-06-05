@@ -28,6 +28,16 @@ use nxr_sdk::Bar;
 /// brick-grid break while permitting fp round-trip noise.
 pub const RENKO_B03_REL_TOL: f64 = 1e-9;
 
+/// Absolute price floor shared by the structural microstructure invariants of
+/// BOTH the `integrity-check` (G1) AND the `data-quality-audit` cert. Any
+/// finite, technically-positive bid/ask below this cannot be a real quote (it
+/// underflowed to a denormal); `Index::validate()` only rejects `<= 0.0`, so a
+/// value like `1e-15` would slip through unless this floor is enforced. The two
+/// validators MUST agree on the floor or the cutover gate and the per-file
+/// checker would disagree on what "structurally corrupt price" means — hence a
+/// single source here rather than a duplicated `1e-9` literal in each binary.
+pub const MIN_PX: f64 = 1e-9;
+
 /// Outcome of one cross-shard boundary continuity check.
 #[derive(Debug, Clone, Copy)]
 pub struct SeamBoundary {

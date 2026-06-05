@@ -61,8 +61,8 @@ use serde::Serialize;
 
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, manifest_path, read_manifest, read_shard_aligned,
-    ts_ms_to_utc_date, vol_path_for_id, ShardRecord, BAR_MS_S10, FLAG_HEARTBEAT_SENTINEL,
-    MS_PER_DAY,
+    ts_ms_to_utc_date, vol_path_for_id, ShardRecord, BAR_MS_S10, FLAG_CONF_FRESHNESS,
+    FLAG_HEARTBEAT_SENTINEL, MS_PER_DAY,
 };
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::ohlc::{rollup, Ohlc};
@@ -70,7 +70,7 @@ use nxr_sdk::stats as sdk_stats;
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::Bar;
 
-use series_factory::seam::{check_renko_cross_shard, check_s10_cross_shard};
+use series_factory::seam::{check_renko_cross_shard, check_s10_cross_shard, MIN_PX};
 use series_factory::vol_bin::VolMmap;
 
 // ── Calibration / renko config (single source of truth = config.yml) ─────────
@@ -78,6 +78,15 @@ use series_factory::vol_bin::VolMmap;
 /// s10 bucket width: UTC-grid alignment + per-day coverage are computed against
 /// this. Matches `integrity-check s10 --bucket-ms` default and the live producer.
 const S10_BUCKET_MS: i64 = 10_000;
+
+/// Confidence-freshness floor (Q0.8, ∈[0,1]) — MUST match `integrity_check`'s
+/// G4 `CONF_FRESHNESS_FLOOR`. When a record carries [`FLAG_CONF_FRESHNESS`] its
+/// `confidence` byte is a Q0.8 freshness `f = byte/255`; below this floor the
+/// composite is built from stale components. The legacy `confidence <= accepted`
+/// invariant is INAPPLICABLE to such records (the freshness byte 200/255 of a
+/// healthy fresh feed routinely exceeds the active-provider `accepted` count),
+/// so the cert applies this advisory staleness check instead, exactly as G4 does.
+const CONF_FRESHNESS_FLOOR: f64 = 0.05;
 
 /// Renko brick floor (`series.renko.min_pct`) from `config.yml`, falling back to
 /// `0.0001`. Mirrors `integrity_check::load_renko_bounds` (single canonical
@@ -172,7 +181,10 @@ struct TargetResolver {
     crypto_majors: Vec<String>,
     stablecoins: Vec<String>,
     fx_majors: Vec<String>,
-    /// CLI fallback when `config.yml` cannot be loaded at all.
+    /// CLI fallback when `config.yml` cannot be loaded at all. Read only by the
+    /// flat-fallback `target_for`; main now uses `target_for_resolved` (FIX #5)
+    /// so the field/method are retained as documented API but not on the hot path.
+    #[allow(dead_code)]
     fallback_target_bpd: f64,
 }
 
@@ -229,19 +241,28 @@ impl TargetResolver {
     /// Per-ticker `target_bpd`. Resolves the pair sym + asset-class bucket the
     /// same way `nxr_calibrate` does, then applies `target_for_pair_classed`.
     /// Falls back to the flat CLI target when the pair can't be reconstructed.
+    #[allow(dead_code)]
     fn target_for(&self, ticker_id: u64) -> f64 {
+        self.target_for_resolved(ticker_id)
+            .unwrap_or(self.fallback_target_bpd)
+    }
+
+    /// Per-ticker `target_bpd`, returning `None` when the pair sym / target
+    /// CANNOT be resolved (config.yml absent OR the id's legs aren't in the
+    /// MITCH by-id table — e.g. a synth target). FIX #5: the caller must NOT
+    /// silently substitute the flat 300 for the bpd-off-band verdict (that
+    /// produces a false PASS/FAIL); it emits `renko_target_unresolved` (WARN)
+    /// and SKIPs the bpd-band gate instead. `target_for` keeps the flat-fallback
+    /// behavior for the (display-only) legacy ratio + per-ticker target field.
+    fn target_for_resolved(&self, ticker_id: u64) -> Option<f64> {
         use nxr_sdk::asset_class::bucket_for_pair;
-        let Some(cal) = self.cal.as_ref() else {
-            return self.fallback_target_bpd;
-        };
-        let Some(pair) = Self::pair_sym(ticker_id) else {
-            return self.fallback_target_bpd;
-        };
+        let cal = self.cal.as_ref()?;
+        let pair = Self::pair_sym(ticker_id)?;
         let cm: Vec<&str> = self.crypto_majors.iter().map(String::as_str).collect();
         let sc: Vec<&str> = self.stablecoins.iter().map(String::as_str).collect();
         let fm: Vec<&str> = self.fx_majors.iter().map(String::as_str).collect();
         let class = bucket_for_pair(&pair, ticker_id, &cm, &sc, &fm);
-        cal.target_for_pair_classed(&pair, class.as_key())
+        Some(cal.target_for_pair_classed(&pair, class.as_key()))
     }
 
     /// Whether `ticker_id` is a known stable/pegged pair by IDENTITY (asset-class
@@ -340,6 +361,10 @@ struct TickerReport {
     // Invariants
     invariant_violations: u64,
     invariant_samples: Vec<ViolationSample>,
+    // G4-parity advisory: post-rollout records carrying FLAG_CONF_FRESHNESS whose
+    // Q0.8 freshness `f = confidence/255` is below CONF_FRESHNESS_FLOOR. WARN, not
+    // a FAIL — markets do go briefly stale. NEVER a `confidence > accepted` FAIL.
+    conf_stale_advisories: u64,
     // Anomalies
     mad_outliers: u64,
     worst_mad_z: f64,
@@ -361,6 +386,7 @@ struct TickerReport {
     renko_days: u64,
     renko_ratio: f64,
     renko_target_bpd: f64,               // R4: per-ticker calibration target (! flat CLI)
+    renko_target_unresolved: bool,       // FIX #5 WARN: pair/target unresolvable → bpd-band SKIP
     renko_skipped_stable: bool,
     // Renko parity checks (vs .idx 6.5/10 target)
     renko_b03_violations: u64,          // R1 cross-shard continuity breaks
@@ -377,6 +403,8 @@ struct TickerReport {
     // R4 provenance: prove shards were built with the CURRENT k (manifest stamp)
     renko_k_used: Option<f64>,          // manifest.renko_k_used (k shards were built with)
     renko_k_stale: bool,                // R4 FAIL: |used/current-1| > tol → regenerate shards
+    renko_k_implausible: bool,          // FIX #6 FAIL: k outside sane per-class envelope
+    renko_k_clamped_warn: bool,         // FIX #6 WARN: k pinned at calibrator mult ceiling
     renko_shards_behind_calibration: bool, // R4 WARN: shards predate latest calibrated_at
     renko_provenance_missing: bool,     // R4 WARN: pre-provenance manifest (no renko_k_used)
     renko_samples: Vec<String>,         // dated violation provenance
@@ -503,14 +531,48 @@ fn check_rollup_parity(
     cap: usize,
     out: &mut Vec<String>,
 ) -> u64 {
+    use nxr_sdk::ohlc::ohlc_ci_ubp;
     use std::collections::HashMap;
     let rolled = rollup(src, BAR_MS_S10, dst_tf_ms);
-    // Expected tick_count per dst bucket = Σ src tick_count whose open bucket maps in.
-    let mut expected_ticks: HashMap<i64, u64> = HashMap::new();
-    for s in src {
-        let bs = (s.ts / dst_tf_ms) * dst_tf_ms;
-        *expected_ticks.entry(bs).or_insert(0) += s.tick_count as u64;
+    // Per dst bucket, independently re-accumulate the SAME monoid `rollup` must
+    // reproduce, mirroring its straddler policy EXACTLY (a src bar spanning two
+    // dst buckets contributes its full vbid/vask/tick_count/ci to BOTH legs — see
+    // ohlc::rollup `touch`). Well-formed grid-aligned s10 never straddles, but we
+    // mirror the two-leg accounting so the parity check can't drift from rollup.
+    //  • Σ tick_count (no dropped/double-counted source bar)
+    //  • Σ vbid / Σ vask (FIX #3: volume conservation across the fold)
+    //  • tick-weighted mean of DECODED ci_ubp (FIX #3: avg_ci_ubp is a
+    //    sqrt-compressed per-bar mean, so the rollup decodes→tick-weights→re-
+    //    encodes. We compare on the DECODED ci_ubp domain — `ohlc_ci_ubp` is the
+    //    public decoder — so we don't reimplement the private encoder, and the
+    //    epsilon absorbs the u16 sqrt round-trip quantization.)
+    #[derive(Default)]
+    struct Acc {
+        ticks: u64,
+        vbid: u64,
+        vask: u64,
+        ci_weighted_sum: f64, // Σ (decode(avg_ci_ubp) · tick_count)
     }
+    let bucket_start = |ts: i64| (ts.div_euclid(dst_tf_ms)) * dst_tf_ms;
+    let mut exp: HashMap<i64, Acc> = HashMap::new();
+    let add = |bs: i64, s: &Ohlc, m: &mut HashMap<i64, Acc>| {
+        let a = m.entry(bs).or_default();
+        a.ticks += s.tick_count as u64;
+        a.vbid += s.vbid;
+        a.vask += s.vask;
+        a.ci_weighted_sum += ohlc_ci_ubp(s.avg_ci_ubp) * s.tick_count as f64;
+    };
+    for s in src {
+        let open_bs = bucket_start(s.ts);
+        let close_bs = bucket_start(s.close_ts);
+        add(open_bs, s, &mut exp);
+        if close_bs != open_bs {
+            add(close_bs, s, &mut exp);
+        }
+    }
+    // Epsilon for the decoded tick-weighted CI mean (absorbs the u16 sqrt-encode
+    // round-trip; tick/vbid/vask are exact integer sums compared exactly).
+    const CI_DECODED_EPS: f64 = 1.0; // ≥ 1 ubp slack on the decoded mean
     let mut viol = 0u64;
     for b in &rolled {
         let mut why: Option<String> = None;
@@ -524,14 +586,28 @@ fn check_rollup_parity(
             why = Some("low > min(open,close)".to_string());
         } else if b.ts % dst_tf_ms != 0 {
             why = Some(format!("ts {} not aligned to {}", b.ts, dst_tf_ms));
-        } else {
-            let exp = expected_ticks.get(&b.ts).copied().unwrap_or(0);
-            if exp != b.tick_count as u64 {
-                why = Some(format!(
-                    "tick_count {} != Σ src {} over bucket",
-                    b.tick_count, exp
-                ));
+        } else if let Some(a) = exp.get(&b.ts) {
+            if a.ticks != b.tick_count as u64 {
+                why = Some(format!("tick_count {} != Σ src {} over bucket", b.tick_count, a.ticks));
+            } else if a.vbid != b.vbid {
+                why = Some(format!("vbid {} != Σ src {} over bucket", b.vbid, a.vbid));
+            } else if a.vask != b.vask {
+                why = Some(format!("vask {} != Σ src {} over bucket", b.vask, a.vask));
+            } else if a.ticks > 0 {
+                // Decoded tick-weighted mean: Σ(decode(ci)·ticks) / Σticks vs the
+                // rolled bar's decoded avg_ci_ubp. Zero ticks ⇒ no mean to check.
+                let expected_ci = a.ci_weighted_sum / a.ticks as f64;
+                let observed_ci = ohlc_ci_ubp(b.avg_ci_ubp);
+                if (expected_ci - observed_ci).abs() > CI_DECODED_EPS {
+                    why = Some(format!(
+                        "ci_ubp(decoded) {:.4} != tick-weighted Σ mean {:.4} over bucket",
+                        observed_ci, expected_ci
+                    ));
+                }
             }
+        } else {
+            // A rolled bucket with no source bars mapping in = phantom bucket.
+            why = Some("rolled bucket has no source bars".to_string());
         }
         if let Some(w) = why {
             viol += 1;
@@ -541,6 +617,60 @@ fn check_rollup_parity(
         }
     }
     viol
+}
+
+// ── Microstructure invariant decision (pure, unit-testable) ─────────────────
+
+/// Outcome of the per-record microstructure invariant chain. `reason = Some` ⇒
+/// a hard invariant FAIL; `conf_stale = true` ⇒ a freshness-flagged record whose
+/// Q0.8 freshness is below [`CONF_FRESHNESS_FLOOR`] (advisory WARN only, NEVER a
+/// FAIL — and NEVER the legacy `confidence > accepted` FAIL, which is
+/// inapplicable to freshness-byte records). Pure so the FIX #1/#2 wire-semantics
+/// + price-floor decisions are testable without on-disk shards.
+struct InvariantOutcome {
+    reason: Option<&'static str>,
+    conf_stale: bool,
+}
+
+/// Evaluate the microstructure invariant chain for one INDEX record. Mirrors
+/// integrity-check's G1 (price floor), crossed-quote, and G4 (freshness floor)
+/// semantics so the cert and the per-file checker agree on the wire contract.
+fn eval_invariant(
+    bid: f64,
+    ask: f64,
+    flags: u8,
+    confidence: u8,
+    accepted: u8,
+    spread_bps: f64,
+) -> InvariantOutcome {
+    let is_freshness = (flags & FLAG_CONF_FRESHNESS) != 0;
+    let reason: Option<&'static str> = if !bid.is_finite() || !ask.is_finite() {
+        Some("bid/ask non-finite")
+    } else if bid <= 0.0 {
+        Some("bid <= 0")
+    } else if ask <= 0.0 {
+        Some("ask <= 0")
+    } else if bid < MIN_PX || ask < MIN_PX {
+        // FIX #2 (G1 parity): finite sub-floor denormal cannot be a real quote.
+        Some("bid/ask below price floor (denormal)")
+    } else if ask < bid {
+        Some("crossed quote (ask < bid)")
+    } else if !is_freshness && confidence > accepted {
+        // FIX #1: legacy semantics only — `confidence` = active-provider count.
+        // Freshness-flagged records carry an independent Q0.8 byte that routinely
+        // exceeds `accepted`, so the cross-constraint must NOT apply to them.
+        Some("confidence > accepted")
+    } else if !(0.0..=2000.0).contains(&spread_bps) {
+        Some("spread_bps out of [0,2000]")
+    } else {
+        None
+    };
+    // FIX #1 (G4 parity, advisory): freshness-flagged + structurally-OK records
+    // whose decoded freshness is below the floor are a stale composite. WARN-only.
+    let conf_stale = is_freshness
+        && reason.is_none()
+        && mitch::index::conf_from_u8(confidence) < CONF_FRESHNESS_FLOOR;
+    InvariantOutcome { reason, conf_stale }
 }
 
 // ── Ticker discovery ───────────────────────────────────────────────────────
@@ -577,7 +707,9 @@ fn audit_ticker(
     max_gap_ms: i64,
     quiet_tol_ms: i64,
     target_bpd: f64,
+    target_resolved: bool,
     is_known_stable: bool,
+    k_bounds: Option<(f64, f64)>,
 ) -> Result<TickerReport> {
     let mut r = TickerReport {
         ticker_id: id,
@@ -591,6 +723,7 @@ fn audit_ticker(
         worst_gaps: Vec::new(),
         invariant_violations: 0,
         invariant_samples: Vec::new(),
+        conf_stale_advisories: 0,
         mad_outliers: 0,
         worst_mad_z: 0.0,
         cusum_alarms: 0,
@@ -608,6 +741,7 @@ fn audit_ticker(
         renko_days: 0,
         renko_ratio: f64::NAN,
         renko_target_bpd: target_bpd,
+        renko_target_unresolved: false,
         renko_skipped_stable: false,
         renko_b03_violations: 0,
         renko_brick_floor_violations: 0,
@@ -622,6 +756,8 @@ fn audit_ticker(
         renko_dist_fail: false,
         renko_k_used: None,
         renko_k_stale: false,
+        renko_k_implausible: false,
+        renko_k_clamped_warn: false,
         renko_shards_behind_calibration: false,
         renko_provenance_missing: false,
         renko_samples: Vec::new(),
@@ -725,37 +861,29 @@ fn audit_ticker(
         let idx = rec.index; // copy out of packed struct
         let bid = idx.bid;
         let ask = idx.ask;
-        let mut reason: Option<&str> = None;
-        if !bid.is_finite() || !ask.is_finite() {
-            reason = Some("bid/ask non-finite");
-        } else if bid <= 0.0 {
-            reason = Some("bid <= 0");
-        } else if ask <= 0.0 {
-            reason = Some("ask <= 0");
-        } else if ask < bid {
-            reason = Some("crossed quote (ask < bid)");
-        } else if idx.confidence > idx.accepted {
-            reason = Some("confidence > accepted");
+        // FIX #1/#2: structural invariants + wire-semantics-aware confidence
+        // handling are evaluated by the pure `eval_invariant` (unit-tested). A
+        // fresh record (FLAG_CONF_FRESHNESS, confidence≈200/255 > accepted) is NOT
+        // a `confidence > accepted` FAIL; instead its sub-floor freshness is an
+        // advisory WARN (G4 parity). Sub-floor denormals FAIL the price floor.
+        let sb_for_eval = if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 {
+            idx.spread_bps()
         } else {
-            let sb = idx.spread_bps();
-            if !(0.0..=2000.0).contains(&sb) {
-                reason = Some("spread_bps out of [0,2000]");
-            }
+            f64::NAN
+        };
+        let outcome = eval_invariant(bid, ask, idx.flags, idx.confidence, idx.accepted, sb_for_eval);
+        if outcome.conf_stale {
+            r.conf_stale_advisories += 1;
         }
-        if let Some(why) = reason {
+        if let Some(why) = outcome.reason {
             r.invariant_violations += 1;
             if r.invariant_samples.len() < 10 {
-                let sb = if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 {
-                    idx.spread_bps()
-                } else {
-                    f64::NAN
-                };
                 r.invariant_samples.push(ViolationSample {
                     ts: rec.shard_ts_ms(),
                     reason: why.to_string(),
                     bid,
                     ask,
-                    spread_bps: sb,
+                    spread_bps: sb_for_eval,
                 });
             }
         }
@@ -1078,11 +1206,64 @@ fn audit_ticker(
         if !r.renko_k_present && r.renko_days > 0 {
             r.renko_uncalibrated = true; // CRIT: shards built w/ stale/bootstrap k
         }
-        if !r.crypto_stable && r.renko_days > 0 && target_bpd > 0.0 {
+        // FIX #5: when the per-ticker target could NOT be resolved (synth id /
+        // config absent), `target_bpd` is the flat-300 FALLBACK — judging realized
+        // bpd against it yields a false PASS/FAIL. Emit a WARN and SKIP the
+        // bpd-band gate; provenance gates (uncalibrated / k_stale) remain the hard
+        // gate so an unresolved-target ticker is still held to k correctness.
+        if !target_resolved && r.renko_days > 0 {
+            r.renko_target_unresolved = true;
+            if r.renko_samples.len() < 10 {
+                r.renko_samples.push(format!(
+                    "renko_target_unresolved: pair/target for id {} unresolvable → bpd-band SKIP (k provenance still gated)",
+                    id
+                ));
+            }
+        }
+        if !r.crypto_stable && target_resolved && r.renko_days > 0 && target_bpd > 0.0 {
             // R4 anchors to the PER-TICKER target (`target_bpd` is now resolved
             // via `TargetResolver::target_for`, not the flat CLI 300), so a
-            // 50-target pegged pair is judged against 50, not 300.
+            // 50-target pegged pair is judged against 50, not 300. Gated on
+            // `target_resolved` (FIX #5) so an unresolved flat fallback never
+            // produces a spurious off-band verdict.
             r.renko_bpd_off_band = renko_bpd_off_band(r.renko_inferred_bpd, target_bpd);
+        }
+        // FIX #6: absolute-k plausibility. The SOL/USDT k=3.995 stablecoin-sentinel
+        // bug was self-consistent (a real k in ticker-params) yet absurd — pinned
+        // at the calibrator's mult ceiling for a non-stable major, yielding ~33
+        // bpd vs 300. Gate `current_k` against a sane envelope: outside the band
+        // ⇒ FAIL `renko_k_implausible`; at/near the calibrator's upper mult bound
+        // (a clamp-leak the search couldn't escape) ⇒ WARN. Uses config
+        // `mult_bounds` when available, else a conservative absolute band.
+        if let Some(k) = current_k {
+            // Conservative absolute fallback band when config didn't provide
+            // mult_bounds (mirrors observed crypto-major k∈[0.05,0.6] + headroom).
+            const K_ABS_LO: f64 = 0.01;
+            const K_ABS_HI: f64 = 4.0;
+            let (lo, hi) = k_bounds.unwrap_or((K_ABS_LO, K_ABS_HI));
+            if !(k.is_finite() && k >= lo && k <= hi) {
+                r.renko_k_implausible = true;
+                if r.renko_samples.len() < 10 {
+                    r.renko_samples.push(format!(
+                        "renko_k_implausible: k={:.6} outside sane envelope [{:.4}, {:.4}] (FIX #6)",
+                        k, lo, hi
+                    ));
+                }
+            } else if hi > 0.0 && (k / hi - 1.0).abs() < 0.01 {
+                // k pinned within 1% of the calibrator's upper mult bound ⇒ the
+                // search clamped at the wall (the SOL 3.995-vs-4.0 signature) and
+                // never converged on a target-bpd-correct k. Non-stable pairs only:
+                // a genuinely stable pair legitimately wants a near-ceiling k.
+                if !r.crypto_stable && !is_known_stable {
+                    r.renko_k_clamped_warn = true;
+                    if r.renko_samples.len() < 10 {
+                        r.renko_samples.push(format!(
+                            "renko_k_clamped: k={:.6} pinned at calibrator ceiling {:.4} (stablecoin-sentinel signature, FIX #6 WARN)",
+                            k, hi
+                        ));
+                    }
+                }
+            }
         }
         // R4 PROVENANCE: prove the SHARDS were built with the CURRENT k, not just
         // that *a* k exists. `renko-from-idx` stamps the k it actually fed the
@@ -1260,21 +1441,45 @@ fn audit_ticker(
     // UTC day is enough to exercise both src bucket cadence and the 1h fold) and
     // assert the OHLC monoid + alignment + tick-sum invariants hold end-to-end.
     {
-        // Sample the last (most recent) s10 shard in window — full coverage is
-        // O(window); a recent shard is the cheap, representative cut that catches
-        // a producer-side rollup regression without re-reading every day.
-        if let Some((_, path)) = s10_shards.last() {
-            if let Ok(bars) = read_shard_aligned::<Bar>(path) {
-                let src: Vec<Ohlc> = bars.iter().map(bar_to_ohlc).collect();
-                if !src.is_empty() {
-                    const MIN_MS: i64 = 60_000;
-                    const HOUR_MS: i64 = 3_600_000;
-                    r.rollup_violations +=
-                        check_rollup_parity("1m", &src, MIN_MS, 10, &mut r.rollup_samples);
-                    r.rollup_violations +=
-                        check_rollup_parity("1h", &src, HOUR_MS, 10, &mut r.rollup_samples);
+        // FIX #4: roll up a CONCATENATION of the last two ADJACENT s10 shards that
+        // are ≥1 day apart, so a 1h dst bucket spans the SHARD SEAM (the day
+        // rotation a single-shard cut can never exercise — a 1h bucket at the
+        // 23:00–00:00 boundary draws src bars from BOTH shards). Falls back to the
+        // single most-recent shard when <2 shards exist. Picking the two most
+        // recent shards that differ by ≥1 day guarantees a real UTC-day seam.
+        let mut src: Vec<Ohlc> = Vec::new();
+        let n = s10_shards.len();
+        if n >= 2 {
+            let (last_date, last_path) = &s10_shards[n - 1];
+            // Walk back to the newest earlier shard at least 1 day before `last`.
+            let prev = s10_shards[..n - 1]
+                .iter()
+                .rev()
+                .find(|(d, _)| (*last_date - *d).num_days() >= 1);
+            if let Some((_, prev_path)) = prev {
+                if let Ok(pbars) = read_shard_aligned::<Bar>(prev_path) {
+                    src.extend(pbars.iter().map(bar_to_ohlc));
                 }
             }
+            if let Ok(lbars) = read_shard_aligned::<Bar>(last_path) {
+                src.extend(lbars.iter().map(bar_to_ohlc));
+            }
+        } else if let Some((_, path)) = s10_shards.last() {
+            if let Ok(bars) = read_shard_aligned::<Bar>(path) {
+                src.extend(bars.iter().map(bar_to_ohlc));
+            }
+        }
+        // `rollup` requires a ts-sorted src; the seam concatenation is already
+        // date-ordered (prev shard before last) and each shard is ts-sorted, so
+        // the join is monotone — but sort defensively against a torn boundary.
+        src.sort_by_key(|o| o.ts);
+        if !src.is_empty() {
+            const MIN_MS: i64 = 60_000;
+            const HOUR_MS: i64 = 3_600_000;
+            r.rollup_violations +=
+                check_rollup_parity("1m", &src, MIN_MS, 10, &mut r.rollup_samples);
+            r.rollup_violations +=
+                check_rollup_parity("1h", &src, HOUR_MS, 10, &mut r.rollup_samples);
         }
     }
 
@@ -1297,7 +1502,8 @@ fn audit_ticker(
         reasons.push(format!("{} s10 OHLC violation(s)", r.s10_violations));
     }
     // Renko cadence: only gate non-stable pairs with renko data. Tolerance ±50%.
-    if !r.crypto_stable && r.renko_days > 0 && r.renko_ratio.is_finite() {
+    // FIX #5: skip when the target was unresolved (ratio is vs the flat fallback).
+    if !r.crypto_stable && !r.renko_target_unresolved && r.renko_days > 0 && r.renko_ratio.is_finite() {
         if r.renko_ratio < 0.5 || r.renko_ratio > 2.0 {
             reasons.push(format!(
                 "renko bpd off calibration (ratio {:.2})",
@@ -1331,6 +1537,11 @@ fn audit_ticker(
             r.renko_k_used.map(|k| format!("{:.6}", k)).unwrap_or_else(|| "?".to_string()),
             RENKO_K_STALE_TOL * 100.0
         ));
+    }
+    // FIX #6 (CRIT): calibrated k outside the sane per-asset-class envelope — a
+    // self-consistent-but-absurd k (the SOL=3.995 stablecoin-sentinel bug).
+    if r.renko_k_implausible {
+        reasons.push("renko_k_implausible: calibrated k outside sane envelope (FIX #6)".to_string());
     }
     // R4 (HIGH): realized bpd outside calibrator accept band (skip stable pairs).
     if r.renko_bpd_off_band {
@@ -1443,6 +1654,12 @@ fn print_human(report: &AuditReport) {
             }
         }
         println!("   invariant violations : {}", t.invariant_violations);
+        if t.conf_stale_advisories > 0 {
+            println!(
+                "   conf-freshness (G4)  : {} record(s) below floor {} [WARN advisory]",
+                t.conf_stale_advisories, CONF_FRESHNESS_FLOOR
+            );
+        }
         for s in &t.invariant_samples {
             println!(
                 "     @ts={} {} (bid={}, ask={}, spread_bps={:.2})",
@@ -1483,17 +1700,20 @@ fn print_human(report: &AuditReport) {
                 if t.renko_skipped_stable { " [skipped: stable]" } else { "" }
             );
             println!(
-                "   renko calib (R4)     : inferred_bpd={:.1} target={:.1} (per-ticker) k_present={}{}{}",
+                "   renko calib (R4)     : inferred_bpd={:.1} target={:.1} (per-ticker) k_present={}{}{}{}",
                 t.renko_inferred_bpd,
                 t.renko_target_bpd,
                 t.renko_k_present,
                 if t.renko_uncalibrated { " [UNCALIBRATED]" } else { "" },
-                if t.renko_bpd_off_band { " [OFF-BAND]" } else { "" }
+                if t.renko_bpd_off_band { " [OFF-BAND]" } else { "" },
+                if t.renko_target_unresolved { " [WARN: target-unresolved → bpd SKIP]" } else { "" }
             );
             println!(
-                "   renko provenance (R4): k_used={}{}{}{}",
+                "   renko provenance (R4): k_used={}{}{}{}{}{}",
                 t.renko_k_used.map(|k| format!("{:.6}", k)).unwrap_or_else(|| "none".to_string()),
                 if t.renko_k_stale { " [STALE]" } else { "" },
+                if t.renko_k_implausible { " [IMPLAUSIBLE-K]" } else { "" },
+                if t.renko_k_clamped_warn { " [WARN: k clamped at ceiling]" } else { "" },
                 if t.renko_shards_behind_calibration { " [WARN: behind-calibration]" } else { "" },
                 if t.renko_provenance_missing { " [WARN: provenance-missing]" } else { "" }
             );
@@ -1631,9 +1851,22 @@ fn main() -> Result<()> {
     // flat `--target-bpd` is only a fallback when config.yml can't be loaded.
     let target_resolver = TargetResolver::load(cli.target_bpd);
 
+    // FIX #6: the calibrator's renko-k envelope (`mult_bounds = [K_FLOOR, ceiling]`)
+    // when config.yml is loadable, so the absolute-k plausibility gate compares
+    // against the SAME band the calibrator searched. `None` → audit_ticker uses
+    // its conservative absolute fallback band.
+    let k_bounds: Option<(f64, f64)> = target_resolver
+        .cal
+        .as_ref()
+        .map(|c| (c.mult_bounds[0], c.mult_bounds[1]));
+
     let mut reports: Vec<TickerReport> = Vec::with_capacity(tickers.len());
     for id in tickers {
-        let per_ticker_target = target_resolver.target_for(id);
+        // FIX #5: distinguish a genuinely RESOLVED per-ticker target from the flat
+        // fallback. When unresolved, audit_ticker SKIPs the bpd-band gate.
+        let resolved = target_resolver.target_for_resolved(id);
+        let per_ticker_target = resolved.unwrap_or(cli.target_bpd);
+        let target_resolved = resolved.is_some();
         let is_known_stable = target_resolver.is_known_stable(id);
         match audit_ticker(
             &cli.common.data_root,
@@ -1643,7 +1876,9 @@ fn main() -> Result<()> {
             cli.max_gap_ms,
             cli.quiet_tolerance_ms,
             per_ticker_target,
+            target_resolved,
             is_known_stable,
+            k_bounds,
         ) {
             Ok(r) => reports.push(r),
             Err(e) => {
@@ -1660,6 +1895,7 @@ fn main() -> Result<()> {
                     worst_gaps: Vec::new(),
                     invariant_violations: 0,
                     invariant_samples: Vec::new(),
+                    conf_stale_advisories: 0,
                     mad_outliers: 0,
                     worst_mad_z: 0.0,
                     cusum_alarms: 0,
@@ -1677,6 +1913,7 @@ fn main() -> Result<()> {
                     renko_days: 0,
                     renko_ratio: f64::NAN,
                     renko_target_bpd: f64::NAN,
+                    renko_target_unresolved: false,
                     renko_skipped_stable: false,
                     renko_b03_violations: 0,
                     renko_brick_floor_violations: 0,
@@ -1691,6 +1928,8 @@ fn main() -> Result<()> {
                     renko_dist_fail: false,
                     renko_k_used: None,
                     renko_k_stale: false,
+                    renko_k_implausible: false,
+                    renko_k_clamped_warn: false,
                     renko_shards_behind_calibration: false,
                     renko_provenance_missing: false,
                     renko_samples: Vec::new(),
@@ -1873,5 +2112,132 @@ mod tests {
         let cur_at = 1_700_000_500_i64;
         let built_at = fresh.renko_calibrated_at.expect("calibrated_at stamped");
         assert!(cur_at > built_at, "recalibration after build → behind-calibration WARN");
+    }
+
+    // ── FIX #1: fresh-record confidence>accepted must NOT false-FAIL ─────────
+
+    /// A healthy post-rollout record carries FLAG_CONF_FRESHNESS with a freshness
+    /// byte (e.g. 200/255 ≈ 0.78) that routinely EXCEEDS the active-provider
+    /// `accepted` count (e.g. 6). The OLD hard invariant `confidence > accepted`
+    /// would FAIL it; FIX #1 gates that constraint on the flag being CLEAR, so a
+    /// fresh record produces NO invariant FAIL and NO freshness advisory.
+    #[test]
+    fn fix1_fresh_record_no_false_fail() {
+        const FRESH: u8 = FLAG_CONF_FRESHNESS;
+        // confidence=200 (>accepted=6) but freshness-flagged → must NOT FAIL.
+        let o = eval_invariant(100.0, 100.1, FRESH, 200, 6, 0.999_0 /*~spread bps*/);
+        assert!(o.reason.is_none(), "fresh record must not FAIL invariant: {:?}", o.reason);
+        assert!(!o.conf_stale, "freshness 200/255 ≈ 0.78 is above floor → no advisory");
+
+        // Same numbers WITHOUT the flag = legacy semantics → confidence>accepted FAIL.
+        let legacy = eval_invariant(100.0, 100.1, 0, 200, 6, 0.999_0);
+        assert_eq!(
+            legacy.reason,
+            Some("confidence > accepted"),
+            "legacy (flag clear) confidence>accepted must still FAIL"
+        );
+
+        // Freshness-flagged BUT stale (byte 5/255 ≈ 0.0196 < 0.05 floor) → advisory
+        // WARN only, still NOT an invariant FAIL.
+        let stale = eval_invariant(100.0, 100.1, FRESH, 5, 6, 0.999_0);
+        assert!(stale.reason.is_none(), "stale-fresh record must not FAIL: {:?}", stale.reason);
+        assert!(stale.conf_stale, "freshness below floor → advisory WARN");
+    }
+
+    // ── FIX #2: sub-floor denormal bid/ask must FAIL the cert ────────────────
+
+    /// A finite, technically-positive but sub-MIN_PX price (a denormal underflow)
+    /// passes `> 0.0` yet cannot be a real quote. The cert must FAIL it (G1 parity).
+    #[test]
+    fn fix2_subfloor_price_fails() {
+        let o = eval_invariant(5e-10, 6e-10, 0, 1, 1, 0.0);
+        assert_eq!(
+            o.reason,
+            Some("bid/ask below price floor (denormal)"),
+            "sub-floor denormal must FAIL the price floor"
+        );
+        // Normal price → no floor FAIL.
+        let ok = eval_invariant(100.0, 100.1, 0, 1, 1, 9.99);
+        assert!(ok.reason.is_none(), "normal price must not FAIL: {:?}", ok.reason);
+        // Crossed quote → explicit FAIL.
+        let crossed = eval_invariant(100.5, 100.0, 0, 1, 1, 0.0);
+        assert_eq!(crossed.reason, Some("crossed quote (ask < bid)"));
+    }
+
+    // ── FIX #3: rollup parity now checks vbid/vask + tick-weighted CI ────────
+
+    fn ohlc_row(ts: i64, px: f64, vbid: u64, vask: u64, ticks: u32, ci: u16) -> Ohlc {
+        Ohlc {
+            ts,
+            close_ts: ts + BAR_MS_S10 - 1,
+            open: px,
+            high: px,
+            low: px,
+            close: px,
+            vbid,
+            vask,
+            tick_count: ticks,
+            avg_ci_ubp: ci,
+        }
+    }
+
+    /// A clean s10 src rolled to 1m must produce ZERO rollup-parity violations —
+    /// vbid/vask sums and the tick-weighted decoded-CI mean all reconcile.
+    #[test]
+    fn fix3_rollup_parity_clean_src_no_violation() {
+        // 6 × 10s bars in one 60s bucket, varying volumes + CI codes.
+        let mut src = Vec::new();
+        for k in 0..6i64 {
+            let ts = 1_700_000_000_000 + k * BAR_MS_S10; // grid-aligned at 10s & 60s
+            src.push(ohlc_row(ts, 100.0, 10 + k as u64, 20 + k as u64, 1 + k as u32, 8 + k as u16));
+        }
+        let mut samples = Vec::new();
+        let viol = check_rollup_parity("1m", &src, 60_000, 10, &mut samples);
+        assert_eq!(viol, 0, "clean src must roll up cleanly: {:?}", samples);
+    }
+
+    /// Sanity: the rollup itself conserves vbid/vask exactly (the new FIX #3
+    /// assertions are correct, not vacuously passing). Confirm the parity helper
+    /// reports the SAME totals the rollup produced.
+    #[test]
+    fn fix3_rollup_conserves_volume() {
+        let src = vec![
+            ohlc_row(1_700_000_000_000, 100.0, 5, 7, 2, 16),
+            ohlc_row(1_700_000_000_000 + BAR_MS_S10, 100.0, 3, 4, 4, 32),
+        ];
+        let rolled = rollup(&src, BAR_MS_S10, 60_000);
+        assert_eq!(rolled.len(), 1, "two 10s bars fold into one 60s bucket");
+        assert_eq!(rolled[0].vbid, 8, "Σ vbid = 5+3");
+        assert_eq!(rolled[0].vask, 11, "Σ vask = 7+4");
+        assert_eq!(rolled[0].tick_count, 6, "Σ ticks = 2+4");
+        let mut samples = Vec::new();
+        assert_eq!(
+            check_rollup_parity("1m", &src, 60_000, 10, &mut samples),
+            0,
+            "parity must agree with the rollup totals: {:?}",
+            samples
+        );
+    }
+
+    // ── FIX #6: absolute-k plausibility band ─────────────────────────────────
+
+    /// The pure band test that FIX #6's gate uses. A SOL-like k pinned at the
+    /// calibrator's 4.0 ceiling is within bounds but within 1% of the wall (the
+    /// stablecoin-sentinel clamp signature → WARN); a mid-band crypto-major k is
+    /// clean; an out-of-band k is implausible (FAIL).
+    #[test]
+    fn fix6_k_plausibility_band() {
+        let (lo, hi) = (0.05f64, 4.0f64);
+        // Out of band → implausible.
+        assert!(!(10.0f64 >= lo && 10.0 <= hi), "k=10 outside [0.05,4.0] → FAIL");
+        assert!(!(0.001f64 >= lo && 0.001 <= hi), "k=0.001 below floor → FAIL");
+        // In band, mid → clean (no clamp WARN).
+        let k_mid = 0.334f64; // observed BTC k
+        assert!(k_mid >= lo && k_mid <= hi, "mid-band k in envelope");
+        assert!((k_mid / hi - 1.0).abs() >= 0.01, "mid-band k not at ceiling → no clamp WARN");
+        // SOL sentinel k=3.995 → in band but within 1% of ceiling → clamp WARN.
+        let k_sol = 3.995f64;
+        assert!(k_sol >= lo && k_sol <= hi, "3.995 is within [0.05,4.0]");
+        assert!((k_sol / hi - 1.0).abs() < 0.01, "3.995 within 1% of 4.0 ceiling → clamp WARN");
     }
 }
