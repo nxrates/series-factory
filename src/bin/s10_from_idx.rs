@@ -30,6 +30,21 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
+/// Grid-stamp a flushed s10 bar's open/close timestamps to the bucket boundary,
+/// mirroring `core/src/bars_s10.rs::stamp_s10_bucket` so the offline series is
+/// byte-identical (10s-grid-aligned) to the live producer. `BarAccumulator`
+/// stamps the raw first/last-tick ts; without this re-stamp the on-disk
+/// `close_ts` deltas jitter off the bucket grid, tripping the integrity-check
+/// s10 invariant ("spacing not a multiple of bucket"). This was the offline-only
+/// defect behind every `s10-from-idx`-generated (migration / backfill) shard;
+/// live-written shards were always clean because the producer already grid-stamps.
+fn stamp_grid(bar: &mut Bar, bucket_open: i64, bucket_ms: i64) {
+    let open_mts = timestamp::from_epoch_ms(bucket_open);
+    let close_mts = timestamp::from_epoch_ms(bucket_open + bucket_ms - 1);
+    bar.open_ts = timestamp::encode_u48(open_mts);
+    bar.close_ts = timestamp::encode_u48(close_mts);
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "Build sharded 10s OHLC .s10 from a sharded composite idx dir.")]
 struct Args {
@@ -160,6 +175,8 @@ fn main() -> Result<()> {
                 Some(cb) if bucket > cb => {
                     if let Some(mut bar) = accum.flush() {
                         bar.kind = BarKind::Kline as u8;
+                        // Grid-snap to the closed bucket `cb` (offline == live).
+                        stamp_grid(&mut bar, cb, args.bucket_ms);
                         if bar.close > 0.0 && bar.close.is_finite() {
                             last_close = bar.close;
                         }
@@ -194,6 +211,9 @@ fn main() -> Result<()> {
     // first..last observed, matching live which fills only past boundaries).
     if let Some(mut bar) = accum.flush() {
         bar.kind = BarKind::Kline as u8;
+        if let Some(cb) = cur_bucket {
+            stamp_grid(&mut bar, cb, args.bucket_ms);
+        }
         flush_bar(&mut bars_by_date, bar);
     }
 
