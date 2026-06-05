@@ -60,13 +60,18 @@ use clap::Parser;
 use serde::Serialize;
 
 use nxr_sdk::shard::{
-    bars_dir, idx_dir, list_shards, read_shard_aligned, ts_ms_to_utc_date, ShardRecord,
-    FLAG_HEARTBEAT_SENTINEL, MS_PER_DAY,
+    bars_dir, idx_dir, list_shards, manifest_path, read_manifest, read_shard_aligned,
+    ts_ms_to_utc_date, vol_path_for_id, ShardRecord, BAR_MS_S10, FLAG_HEARTBEAT_SENTINEL,
+    MS_PER_DAY,
 };
 use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::ohlc::{rollup, Ohlc};
 use nxr_sdk::stats as sdk_stats;
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::Bar;
+
+use series_factory::seam::{check_renko_cross_shard, check_s10_cross_shard};
+use series_factory::vol_bin::VolMmap;
 
 // ── Calibration / renko config (single source of truth = config.yml) ─────────
 
@@ -90,6 +95,26 @@ fn load_renko_min_pct() -> f64 {
 /// the cert mirrors exactly what the calibrator accepted at fit time.
 const RENKO_BPD_ACCEPT_TOL: f64 = 0.20;
 
+/// R4-provenance staleness band: the `k` the renko shards were ACTUALLY built
+/// with (`manifest.renko_k_used`) must agree with the *current* ticker-params k
+/// within this relative tolerance. A larger drift ⇒ the shards were emitted with
+/// a materially different multiplier and must be regenerated (FAIL
+/// `renko_k_stale`). Tighter than the bpd accept band: k is the direct build
+/// input, not a noisy realized statistic.
+const RENKO_K_STALE_TOL: f64 = 0.05;
+
+/// R4 accept-band test: realized `inferred_bpd` is OFF-BAND when its relative
+/// error vs the (per-ticker) `target_bpd` exceeds [`RENKO_BPD_ACCEPT_TOL`].
+/// Non-positive/non-finite target ⇒ not off-band (caller already gates on
+/// `target > 0`); kept pure so the per-ticker-target wiring is unit-testable.
+#[inline]
+fn renko_bpd_off_band(inferred_bpd: f64, target_bpd: f64) -> bool {
+    if !(target_bpd > 0.0) || !inferred_bpd.is_finite() {
+        return false;
+    }
+    (inferred_bpd / target_bpd - 1.0).abs() > RENKO_BPD_ACCEPT_TOL
+}
+
 /// Look up the calibrated Renko k for `ticker_id` in
 /// `$NXR_TICKER_PARAMS_PATH` (default `/data/config/ticker-params.json`).
 /// Returns `None` if the file is missing/malformed or has no positive-finite
@@ -104,6 +129,136 @@ fn load_calibrated_k(ticker_id: u64) -> Option<f64> {
         .get(&ticker_id.to_string())
         .copied()
         .filter(|k| *k > 0.0 && k.is_finite())
+}
+
+/// File-level `calibrated_at` (unix-seconds of the last `nxr-calibrate` run)
+/// from the *current* ticker-params.json. Mirrors `renko_from_idx::
+/// load_calibrated_k`'s second tuple element. R4-provenance compares this to
+/// the manifest's build-time `renko_calibrated_at` to flag shards that predate
+/// the latest calibration (`renko_shards_behind_calibration`, advisory).
+fn load_current_calibrated_at() -> Option<i64> {
+    let cfg = nxr_sdk::NxrConfig::from_env();
+    let raw = std::fs::read_to_string(&cfg.ticker_params_path).ok()?;
+    let weights: WeightsFile = serde_json::from_str(&raw).ok()?;
+    weights.calibrated_at.map(|s| s as i64)
+}
+
+/// R4-provenance staleness test: the `k` the shards were built with (`used`)
+/// has drifted from the `current` ticker-params k beyond [`RENKO_K_STALE_TOL`].
+/// Non-positive/non-finite current ⇒ not stale (caller already gates on a
+/// present current k). Kept pure so the provenance wiring is unit-testable.
+#[inline]
+fn renko_k_stale(used: f64, current: f64) -> bool {
+    if !(current > 0.0) || !used.is_finite() {
+        return false;
+    }
+    (used / current - 1.0).abs() > RENKO_K_STALE_TOL
+}
+
+/// Resolves the per-ticker calibration target (`target_bpd`) exactly the way
+/// the calibrator + live producer do, instead of anchoring every ticker to the
+/// flat `--target-bpd`. Owns the `config.yml` calibration block + operator
+/// judgment lists so R4 (and the legacy ratio gate) compare realized bpd to the
+/// SAME per-pair/per-class target the renko shards were built against.
+///
+/// Mirrors `nxr_calibrate::run_once`: `bucket_for_pair` reads MITCH wire bits +
+/// the `crypto_majors`/`stablecoins`/`fx_majors` lists; `target_for_pair_classed`
+/// applies per-pair override → per-class default → flat fallback. The pair
+/// symbol is reconstructed from the numeric `ticker_id` via `get_asset_by_id`
+/// (the audit only knows ids, not the `pair_volumes` map the calibrator walks).
+struct TargetResolver {
+    /// `None` when `config.yml` failed to load → every lookup uses the CLI flat.
+    cal: Option<nxr_sdk::pipeline_config::CalibrationYml>,
+    crypto_majors: Vec<String>,
+    stablecoins: Vec<String>,
+    fx_majors: Vec<String>,
+    /// CLI fallback when `config.yml` cannot be loaded at all.
+    fallback_target_bpd: f64,
+}
+
+impl TargetResolver {
+    /// Load the calibration config + operator lists once. On any load failure,
+    /// every `target_for` returns `fallback_target_bpd` (the CLI value) so the
+    /// cert degrades to the old flat-anchor behavior rather than panicking.
+    fn load(fallback_target_bpd: f64) -> Self {
+        use nxr_sdk::asset_class::{
+            effective_list, DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
+        };
+        use nxr_sdk::pipeline_config::{ConfigHint, PipelineYml};
+        match PipelineYml::load_default(ConfigHint::Bin) {
+            Ok(yml) => {
+                // Same effective-list resolution the calibrator uses: YAML wins,
+                // audit-frozen sdk defaults fill an empty list.
+                let to_owned = |v: Vec<&str>| v.iter().map(|s| s.to_string()).collect();
+                TargetResolver {
+                    cal: Some(yml.series.calibration.clone()),
+                    crypto_majors: to_owned(effective_list(
+                        &yml.cexs.crypto_majors,
+                        DEFAULT_CRYPTO_MAJORS,
+                    )),
+                    stablecoins: to_owned(effective_list(
+                        &yml.cexs.stablecoins,
+                        DEFAULT_STABLECOINS,
+                    )),
+                    fx_majors: to_owned(effective_list(&yml.cexs.fx_majors, DEFAULT_FX_MAJORS)),
+                    fallback_target_bpd,
+                }
+            }
+            Err(_) => TargetResolver {
+                cal: None,
+                crypto_majors: Vec::new(),
+                stablecoins: Vec::new(),
+                fx_majors: Vec::new(),
+                fallback_target_bpd,
+            },
+        }
+    }
+
+    /// Reconstruct `<BASE>/<QUOTE>` from a packed `ticker_id` via the MITCH
+    /// asset registry. `None` if either leg is unknown (e.g. a synth id whose
+    /// legs aren't in the by-id table) — caller falls back to the flat target.
+    fn pair_sym(ticker_id: u64) -> Option<String> {
+        use nxr_sdk::mitch::ticker::TickerId;
+        let tid = TickerId::from_raw(ticker_id);
+        let base = nxr_sdk::resolve::get_asset_by_id(tid.base_asset_class(), tid.base_asset_id())?;
+        let quote =
+            nxr_sdk::resolve::get_asset_by_id(tid.quote_asset_class(), tid.quote_asset_id())?;
+        Some(format!("{}/{}", base.name, quote.name))
+    }
+
+    /// Per-ticker `target_bpd`. Resolves the pair sym + asset-class bucket the
+    /// same way `nxr_calibrate` does, then applies `target_for_pair_classed`.
+    /// Falls back to the flat CLI target when the pair can't be reconstructed.
+    fn target_for(&self, ticker_id: u64) -> f64 {
+        use nxr_sdk::asset_class::bucket_for_pair;
+        let Some(cal) = self.cal.as_ref() else {
+            return self.fallback_target_bpd;
+        };
+        let Some(pair) = Self::pair_sym(ticker_id) else {
+            return self.fallback_target_bpd;
+        };
+        let cm: Vec<&str> = self.crypto_majors.iter().map(String::as_str).collect();
+        let sc: Vec<&str> = self.stablecoins.iter().map(String::as_str).collect();
+        let fm: Vec<&str> = self.fx_majors.iter().map(String::as_str).collect();
+        let class = bucket_for_pair(&pair, ticker_id, &cm, &sc, &fm);
+        cal.target_for_pair_classed(&pair, class.as_key())
+    }
+
+    /// Whether `ticker_id` is a known stable/pegged pair by IDENTITY (asset-class
+    /// bucket = `crypto_stable`), independent of any volatility inference. Used
+    /// by the stuck-feed gate so a frozen non-stable feed cannot excuse itself
+    /// via the vol-derived `crypto_stable` flag. Unknown pair (unresolvable id)
+    /// → `false` (treat as non-stable; a flatline there is still suspicious).
+    fn is_known_stable(&self, ticker_id: u64) -> bool {
+        use nxr_sdk::asset_class::{bucket_for_pair, AssetClassBucket};
+        let Some(pair) = Self::pair_sym(ticker_id) else {
+            return false;
+        };
+        let cm: Vec<&str> = self.crypto_majors.iter().map(String::as_str).collect();
+        let sc: Vec<&str> = self.stablecoins.iter().map(String::as_str).collect();
+        let fm: Vec<&str> = self.fx_majors.iter().map(String::as_str).collect();
+        bucket_for_pair(&pair, ticker_id, &cm, &sc, &fm) == AssetClassBucket::CryptoStable
+    }
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -191,10 +346,21 @@ struct TickerReport {
     cusum_alarms: u64,
     sigma_park_ann: f64,
     crypto_stable: bool,
+    zero_return_frac: f64,              // fraction of zero log-returns (flatline proxy)
+    longest_flat_run: u64,             // longest run of identical mids (stuck-feed proxy)
+    stuck_feed: bool,                  // WARN: near-constant feed, NOT a known stable pair
+    // vol↔idx reconciliation (.vol stored sigma vs idx/s10-derived Parkinson)
+    vol_present: bool,
+    vol_sigma_stored: f64,             // median stored sigma_pct from .vol, annualized
+    vol_sigma_divergence: bool,        // WARN: stored vol grossly diverges from derived
+    // kline rollup-parity (s10 → 1m/1h via sdk ohlc::rollup)
+    rollup_violations: u64,            // OHLC monoid / alignment / tick-sum breaks
+    rollup_samples: Vec<String>,
     // Renko
     renko_bpd: f64,
     renko_days: u64,
     renko_ratio: f64,
+    renko_target_bpd: f64,               // R4: per-ticker calibration target (! flat CLI)
     renko_skipped_stable: bool,
     // Renko parity checks (vs .idx 6.5/10 target)
     renko_b03_violations: u64,          // R1 cross-shard continuity breaks
@@ -207,6 +373,12 @@ struct TickerReport {
     renko_bpd_mad: f64,
     renko_bpd_min_day: u64,
     renko_dist_drift: bool,             // R2 WARN: MAD > 0.5*median or min < 0.33*median
+    renko_dist_fail: bool,              // R2 FAIL: a single day's k transiently wrong (hard)
+    // R4 provenance: prove shards were built with the CURRENT k (manifest stamp)
+    renko_k_used: Option<f64>,          // manifest.renko_k_used (k shards were built with)
+    renko_k_stale: bool,                // R4 FAIL: |used/current-1| > tol → regenerate shards
+    renko_shards_behind_calibration: bool, // R4 WARN: shards predate latest calibrated_at
+    renko_provenance_missing: bool,     // R4 WARN: pre-provenance manifest (no renko_k_used)
     renko_samples: Vec<String>,         // dated violation provenance
     // s10 kline
     s10_bars: u64,
@@ -260,6 +432,117 @@ fn cusum_alarms(z: &[f64], k: f64, h: f64) -> u64 {
     alarms
 }
 
+// ── s10 K1 open-grid boundary classification ───────────────────────────────
+
+/// Outcome of the K1 open-grid boundary delta between consecutive s10 bars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S10Boundary {
+    /// `delta <= 0`: non-advancing (overlap / duplicate) — handled by the
+    /// separate overlap check, K1 ignores it.
+    NonAdvancing,
+    /// `delta == BAR_MS`: exactly one bucket forward — clean, contiguous grid.
+    Contiguous,
+    /// `delta == k·BAR_MS`, k>1: a whole-bucket gap (WARN, not a grid break).
+    Gap,
+    /// `delta % BAR_MS != 0`: off the 10s grid — FAIL.
+    OffGrid,
+}
+
+/// Classify the OPEN→OPEN delta between two s10 buckets on the UTC 10s grid.
+///
+/// This is the regression-proof form of K1: comparing on the OPEN grid (not
+/// `open - prev_CLOSE`, where the `close = open + (BAR_MS-1)` round-trip makes
+/// every contiguous pair yield ~2 ms and trips `% BAR_MS != 0` on every bar).
+#[inline]
+fn classify_s10_open_delta(prev_open_ms: i64, open_ms: i64) -> S10Boundary {
+    let delta = open_ms - prev_open_ms;
+    if delta <= 0 {
+        S10Boundary::NonAdvancing
+    } else if delta % S10_BUCKET_MS != 0 {
+        S10Boundary::OffGrid
+    } else if delta / S10_BUCKET_MS > 1 {
+        S10Boundary::Gap
+    } else {
+        S10Boundary::Contiguous
+    }
+}
+
+// ── kline rollup-parity (K-rollup) ─────────────────────────────────────────
+
+/// Project a canonical `Bar` onto the lighter `Ohlc` the SDK `rollup` consumes.
+/// Copies fields out of the packed struct first.
+#[inline]
+fn bar_to_ohlc(b: &Bar) -> Ohlc {
+    Ohlc {
+        ts: b.open_time_ms(),
+        close_ts: b.close_time_ms(),
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+        vbid: b.vbid as u64,
+        vask: b.vask as u64,
+        tick_count: b.tick_count,
+        avg_ci_ubp: b.avg_ci_ubp,
+    }
+}
+
+/// Validate one higher-TF series produced by `ohlc::rollup` against the s10
+/// source it was rolled from. Asserts, per output bar: OHLC monoid sanity
+/// (`high >= max(open,close)`, `low <= min(open,close)`, `open/close ∈ [low,high]`,
+/// `high >= low`), bucket-start alignment (`ts % dst_tf_ms == 0`), and that the
+/// summed `tick_count` over the covered s10 bars equals the rolled bar's
+/// `tick_count` (no dropped/double-counted source bar). Returns violation count
+/// and up to `cap` provenance samples. This exercises the SAME `rollup` path
+/// that serves every higher-TF kline (otherwise only SDK-unit-tested on synthetic
+/// data).
+fn check_rollup_parity(
+    label: &str,
+    src: &[Ohlc],
+    dst_tf_ms: i64,
+    cap: usize,
+    out: &mut Vec<String>,
+) -> u64 {
+    use std::collections::HashMap;
+    let rolled = rollup(src, BAR_MS_S10, dst_tf_ms);
+    // Expected tick_count per dst bucket = Σ src tick_count whose open bucket maps in.
+    let mut expected_ticks: HashMap<i64, u64> = HashMap::new();
+    for s in src {
+        let bs = (s.ts / dst_tf_ms) * dst_tf_ms;
+        *expected_ticks.entry(bs).or_insert(0) += s.tick_count as u64;
+    }
+    let mut viol = 0u64;
+    for b in &rolled {
+        let mut why: Option<String> = None;
+        if !(b.open.is_finite() && b.high.is_finite() && b.low.is_finite() && b.close.is_finite()) {
+            why = Some("non-finite OHLC".to_string());
+        } else if b.high < b.low {
+            why = Some(format!("high {} < low {}", b.high, b.low));
+        } else if b.high < b.open.max(b.close) {
+            why = Some("high < max(open,close)".to_string());
+        } else if b.low > b.open.min(b.close) {
+            why = Some("low > min(open,close)".to_string());
+        } else if b.ts % dst_tf_ms != 0 {
+            why = Some(format!("ts {} not aligned to {}", b.ts, dst_tf_ms));
+        } else {
+            let exp = expected_ticks.get(&b.ts).copied().unwrap_or(0);
+            if exp != b.tick_count as u64 {
+                why = Some(format!(
+                    "tick_count {} != Σ src {} over bucket",
+                    b.tick_count, exp
+                ));
+            }
+        }
+        if let Some(w) = why {
+            viol += 1;
+            if out.len() < cap {
+                out.push(format!("[rollup {}] ts={} {}", label, b.ts, w));
+            }
+        }
+    }
+    viol
+}
+
 // ── Ticker discovery ───────────────────────────────────────────────────────
 
 /// Enumerate ticker-id subdirectories under `<root>/indexes/`.
@@ -294,6 +577,7 @@ fn audit_ticker(
     max_gap_ms: i64,
     quiet_tol_ms: i64,
     target_bpd: f64,
+    is_known_stable: bool,
 ) -> Result<TickerReport> {
     let mut r = TickerReport {
         ticker_id: id,
@@ -312,9 +596,18 @@ fn audit_ticker(
         cusum_alarms: 0,
         sigma_park_ann: f64::NAN,
         crypto_stable: false,
+        zero_return_frac: f64::NAN,
+        longest_flat_run: 0,
+        stuck_feed: false,
+        vol_present: false,
+        vol_sigma_stored: f64::NAN,
+        vol_sigma_divergence: false,
+        rollup_violations: 0,
+        rollup_samples: Vec::new(),
         renko_bpd: f64::NAN,
         renko_days: 0,
         renko_ratio: f64::NAN,
+        renko_target_bpd: target_bpd,
         renko_skipped_stable: false,
         renko_b03_violations: 0,
         renko_brick_floor_violations: 0,
@@ -326,6 +619,11 @@ fn audit_ticker(
         renko_bpd_mad: f64::NAN,
         renko_bpd_min_day: 0,
         renko_dist_drift: false,
+        renko_dist_fail: false,
+        renko_k_used: None,
+        renko_k_stale: false,
+        renko_shards_behind_calibration: false,
+        renko_provenance_missing: false,
         renko_samples: Vec::new(),
         s10_bars: 0,
         s10_violations: 0,
@@ -582,11 +880,95 @@ fn audit_ticker(
         let zeros = returns.iter().filter(|&&x| x == 0.0).count();
         zero_return_frac = zeros as f64 / returns.len() as f64;
     }
+    r.zero_return_frac = if returns.is_empty() { f64::NAN } else { zero_return_frac };
+
+    // Longest run of identical consecutive mids (cheap stuck-feed proxy). A live
+    // feed jitters tick-to-tick; a frozen forwarder repeats the exact mid.
+    {
+        let mut run = 0u64;
+        let mut longest = 0u64;
+        let mut prev: Option<f64> = None;
+        for &(_, mid) in &mids {
+            match prev {
+                Some(p) if p == mid => run += 1,
+                _ => run = 1,
+            }
+            if run > longest {
+                longest = run;
+            }
+            prev = Some(mid);
+        }
+        r.longest_flat_run = longest;
+    }
 
     // Stable/stable inference: annualized Parkinson sigma < 0.5% OR >95% zero returns.
     let sigma_finite = r.sigma_park_ann.is_finite();
     if (sigma_finite && r.sigma_park_ann < 0.005) || zero_return_frac > 0.95 {
         r.crypto_stable = true;
+    }
+
+    // Stuck-feed gate (idx HIGH): near-constant feed (>99% zero returns) that is
+    // NOT a known stable/pegged pair (resolved from the asset-class bucket, NOT
+    // from the volatility-inferred `crypto_stable` flag — which would let a
+    // flatline excuse itself). A genuine non-stable pair frozen at one quote is
+    // a dead/stale forwarder, not legitimately quiet.
+    if !returns.is_empty()
+        && zero_return_frac > 0.99
+        && !is_known_stable
+        && !r.crypto_stable
+    {
+        r.stuck_feed = true;
+        if r.s10_samples.len() < 10 {
+            r.s10_samples.push(format!(
+                "stuck/flatline feed: zero_return_frac={:.3} longest_flat_run={}",
+                zero_return_frac, r.longest_flat_run
+            ));
+        }
+    }
+
+    // ── vol↔idx reconciliation (idx MED) ──────────────────────────────────
+    // Load the persisted `.vol` (the EMA-smoothed Rogers-Satchell σ the live
+    // renko producer primes from) and assert its stored σ agrees with the
+    // Parkinson σ this audit just derived over the same window. A gross
+    // divergence ⇒ orphan / mismatched / stale .vol — the seam-glue would feed
+    // the renko engine a wrong σ. WARN only (display); the .vol is an input to
+    // renko cadence, which R2/R4 gate downstream.
+    {
+        let vp = vol_path_for_id(data_root, id);
+        if vp.exists() {
+            if let Ok(vm) = VolMmap::open(&vp) {
+                use nxr_sdk::vol::VolSource;
+                let n = vm.len();
+                if n > 0 {
+                    r.vol_present = true;
+                    // Stored σ is a per-30-min fraction (e.g. 0.015 = 1.5%).
+                    // Annualize the median to the SAME basis as sigma_park_ann:
+                    // 30-min bins → 48/day × 365 days = 17_520 bins/yr.
+                    let mut sigmas: Vec<f64> = (0..n)
+                        .map(|i| vm.sigma_pct(i))
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                        .collect();
+                    if !sigmas.is_empty() {
+                        sigmas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let med = sigmas[sigmas.len() / 2];
+                        let bins_per_year = 48.0_f64 * 365.0;
+                        r.vol_sigma_stored = med * bins_per_year.sqrt();
+                        // Compare on a log scale: flag if the two σ estimates differ
+                        // by more than ~3× either way (gross orphan/stale, not the
+                        // expected RS-vs-Parkinson estimator gap of <2×).
+                        if r.sigma_park_ann.is_finite()
+                            && r.sigma_park_ann > 0.0
+                            && r.vol_sigma_stored > 0.0
+                        {
+                            let ratio = r.vol_sigma_stored / r.sigma_park_ann;
+                            if !(0.33..=3.0).contains(&ratio) {
+                                r.vol_sigma_divergence = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── Check 4: Renko bricks/day vs calibration ──────────────────────────
@@ -609,9 +991,13 @@ fn audit_ticker(
             };
             let mut day_count = 0u64;
             let first_open = bars.first().map(|b| b.open);
-            // R1: boundary continuity vs previous shard's last close.
+            // R1 (B03): boundary continuity vs previous shard's last close, via
+            // the SHARED production primitive `seam::check_renko_cross_shard`
+            // (DRY: same RENKO_B03_REL_TOL the renko-continuity-check binary uses,
+            // no duplicated 1e-9 literal). `prev close == first open` to relative
+            // tol so the live+offline series append into one seamless chart.
             if let (Some((pd, pc)), Some(fo)) = (prev_shard_close, first_open) {
-                if (pc - fo).abs() > pc.abs() * 1e-9 {
+                if check_renko_cross_shard(pc, fo).violated {
                     r.renko_b03_violations += 1;
                     if r.renko_samples.len() < 10 {
                         r.renko_samples.push(format!(
@@ -665,17 +1051,72 @@ fn audit_ticker(
             {
                 r.renko_dist_drift = true;
             }
+            // R2 hard FAIL: a single shard built with a transiently-wrong k is
+            // averaged away by the window-mean bpd (R4 uses the mean), so it
+            // never FAILs on bpd alone. The per-day distribution is the only
+            // place that asymmetry shows. Promote the same drift sub-condition
+            // to a verdict FAIL (skip stable pairs whose low cadence makes the
+            // ratios noisy). min_day < 0.33·median ⇒ ≥1 starved day; MAD >
+            // 0.5·median ⇒ wide day-to-day swing — both signal a bad shard.
+            if !r.crypto_stable
+                && med > 0.0
+                && (mad > 0.5 * med || (r.renko_bpd_min_day as f64) < 0.33 * med)
+            {
+                r.renko_dist_fail = true;
+                if r.renko_samples.len() < 10 {
+                    r.renko_samples.push(format!(
+                        "R2 per-day drift: median={:.1} MAD={:.1} min_day={} (transient bad-k shard)",
+                        med, mad, r.renko_bpd_min_day
+                    ));
+                }
+            }
         }
         // R4 calibration correctness: realized bpd must land in the calibrator's
         // accept band around target_bpd, AND a calibrated k must exist.
-        r.renko_k_present = load_calibrated_k(id).is_some();
+        let current_k = load_calibrated_k(id);
+        r.renko_k_present = current_k.is_some();
         if !r.renko_k_present && r.renko_days > 0 {
             r.renko_uncalibrated = true; // CRIT: shards built w/ stale/bootstrap k
         }
         if !r.crypto_stable && r.renko_days > 0 && target_bpd > 0.0 {
-            let rel_err = (r.renko_inferred_bpd / target_bpd - 1.0).abs();
-            if rel_err > RENKO_BPD_ACCEPT_TOL {
-                r.renko_bpd_off_band = true;
+            // R4 anchors to the PER-TICKER target (`target_bpd` is now resolved
+            // via `TargetResolver::target_for`, not the flat CLI 300), so a
+            // 50-target pegged pair is judged against 50, not 300.
+            r.renko_bpd_off_band = renko_bpd_off_band(r.renko_inferred_bpd, target_bpd);
+        }
+        // R4 PROVENANCE: prove the SHARDS were built with the CURRENT k, not just
+        // that *a* k exists. `renko-from-idx` stamps the k it actually fed the
+        // generator into `manifest.renko_k_used` (+ `renko_calibrated_at`); read
+        // it back and assert it still matches ticker-params.
+        if let Ok(Some(manifest)) = read_manifest(&manifest_path(&bdir)) {
+            r.renko_k_used = manifest.renko_k_used;
+            match manifest.renko_k_used {
+                Some(used) => {
+                    // FAIL: shards built with a materially different k than the
+                    // current ticker-params k → regenerate (skip when current k
+                    // is absent; `renko_uncalibrated` already FAILs that case).
+                    if let Some(cur) = current_k {
+                        if renko_k_stale(used, cur) {
+                            r.renko_k_stale = true;
+                        }
+                    }
+                    // WARN: a re-calibration landed after these shards were built
+                    // (current calibrated_at strictly newer than the stamp).
+                    if let (Some(cur_at), Some(built_at)) =
+                        (load_current_calibrated_at(), manifest.renko_calibrated_at)
+                    {
+                        if cur_at > built_at {
+                            r.renko_shards_behind_calibration = true;
+                        }
+                    }
+                }
+                // WARN (backward-compat): legacy manifest predates provenance
+                // stamping → can't prove which k the shards used. Advisory only.
+                None => {
+                    if r.renko_days > 0 {
+                        r.renko_provenance_missing = true;
+                    }
+                }
             }
         }
         if r.crypto_stable {
@@ -687,12 +1128,34 @@ fn audit_ticker(
     {
         use std::collections::BTreeMap;
         let mut prev_close_ms: Option<i64> = None; // across shards (date-sorted)
+        let mut prev_open_ms: Option<i64> = None; // K1 grid is computed OPEN→OPEN
+        let mut prev_close_bar: Option<Bar> = None; // last bar of prev shard (seam x-check)
         let mut buckets_per_day: BTreeMap<NaiveDate, u64> = BTreeMap::new();
         for (date, path) in &s10_shards {
             let bars = match read_shard_aligned::<Bar>(path) {
                 Ok(b) => b,
                 Err(_) => continue,
             };
+            // Cross-shard seam x-check via the SHARED production primitive
+            // (`seam::check_s10_cross_shard`, close→close residual, ±1ms jitter
+            // band). The per-bar K1 below tracks the OPEN grid for the precise
+            // ok/gap/off-grid classification; the seam call asserts the boundary
+            // bar pair agrees with `renko-continuity-check`'s tolerance so cert +
+            // binary never drift on what "contiguous at the day rotation" means.
+            if let (Some(pcb), Some(first)) = (prev_close_bar.as_ref(), bars.first()) {
+                let seam = check_s10_cross_shard(pcb.close_time_ms(), first.close_time_ms());
+                if seam.violated && first.open_time_ms() - pcb.open_time_ms() == BAR_MS_S10 {
+                    // Seam flags a break the open-grid K1 would NOT (a sub-bucket
+                    // close_ts corruption); surface it so neither check masks it.
+                    r.s10_b03_violations += 1;
+                    if r.s10_samples.len() < 10 {
+                        r.s10_samples.push(format!(
+                            "[{}] K1 seam residual {:.0}ms > jitter (close-grid) at shard boundary",
+                            date, seam.delta
+                        ));
+                    }
+                }
+            }
             for bar in &bars {
                 r.s10_bars += 1;
                 let o = bar.open;
@@ -742,28 +1205,38 @@ fn audit_ticker(
                     }
                 }
 
-                // K1 boundary continuity: first bucket of D+1 must be exactly one
-                // bucket after the last close of D. Off-grid delta (non-multiple)
-                // = FAIL; multiple>1 = gap (WARN). Same-shard consecutive bars are
-                // already covered by the overlap check above; this gate fires on
-                // the cross-shard boundary too via the shared prev_close_ms.
-                if let Some(pc) = prev_close_ms {
-                    let delta = open_ms - pc;
-                    if delta > 0 {
-                        if delta % S10_BUCKET_MS != 0 {
+                // K1 boundary continuity — computed on the OPEN grid.
+                //
+                // REGRESSION FIX: the prior gate compared `open_ms - prev_CLOSE_ms`.
+                // But a bucket's `close_ts = open + (BAR_MS-1)` (9999 ms), which
+                // round-trips through the u48 mts encoding to `open + 9998`. So for
+                // EVERY contiguous pair the close→open delta is ≈2 ms, making
+                // `delta % 10_000 != 0` fire on literally every healthy bar → a
+                // false CRIT on every ticker. The correct invariant is OPEN→OPEN:
+                //   contiguous → delta == BAR_MS (ok)
+                //   gap        → delta == k·BAR_MS, k>1 (WARN, s10_b03_gaps)
+                //   off-grid   → delta % BAR_MS != 0 (FAIL, s10_b03_violations)
+                // Non-advancing (delta<=0) is the overlap case already flagged above.
+                if let Some(po) = prev_open_ms {
+                    match classify_s10_open_delta(po, open_ms) {
+                        S10Boundary::OffGrid => {
                             r.s10_b03_violations += 1;
                             if r.s10_samples.len() < 10 {
                                 r.s10_samples.push(format!(
-                                    "[{}] K1 off-grid boundary: open_ts {} - prev_close {} = {} ms (not mult of {})",
-                                    date, open_ms, pc, delta, S10_BUCKET_MS
+                                    "[{}] K1 off-grid boundary: open_ts {} - prev_open {} = {} ms (not mult of {})",
+                                    date, open_ms, po, open_ms - po, S10_BUCKET_MS
                                 ));
                             }
-                        } else if delta / S10_BUCKET_MS > 1 {
-                            r.s10_b03_gaps += 1;
                         }
+                        S10Boundary::Gap => r.s10_b03_gaps += 1,
+                        S10Boundary::Contiguous | S10Boundary::NonAdvancing => {}
                     }
                 }
                 prev_close_ms = Some(close_ms);
+                prev_open_ms = Some(open_ms);
+            }
+            if let Some(last) = bars.last() {
+                prev_close_bar = Some(*last);
             }
         }
 
@@ -777,6 +1250,30 @@ fn audit_ticker(
                 r.s10_coverage_fail = true;
             } else if r.s10_coverage_pct < 0.8 {
                 r.s10_coverage_warn = true;
+            }
+        }
+    }
+
+    // ── Check 6: kline rollup-parity (s10 → 1m & 1h via sdk ohlc::rollup) ──
+    // The higher-TF kline REST path rolls s10 up with `ohlc::rollup`, currently
+    // only unit-tested on synthetic data. Roll the most-recent real shards (one
+    // UTC day is enough to exercise both src bucket cadence and the 1h fold) and
+    // assert the OHLC monoid + alignment + tick-sum invariants hold end-to-end.
+    {
+        // Sample the last (most recent) s10 shard in window — full coverage is
+        // O(window); a recent shard is the cheap, representative cut that catches
+        // a producer-side rollup regression without re-reading every day.
+        if let Some((_, path)) = s10_shards.last() {
+            if let Ok(bars) = read_shard_aligned::<Bar>(path) {
+                let src: Vec<Ohlc> = bars.iter().map(bar_to_ohlc).collect();
+                if !src.is_empty() {
+                    const MIN_MS: i64 = 60_000;
+                    const HOUR_MS: i64 = 3_600_000;
+                    r.rollup_violations +=
+                        check_rollup_parity("1m", &src, MIN_MS, 10, &mut r.rollup_samples);
+                    r.rollup_violations +=
+                        check_rollup_parity("1h", &src, HOUR_MS, 10, &mut r.rollup_samples);
+                }
             }
         }
     }
@@ -826,6 +1323,15 @@ fn audit_ticker(
     if r.renko_uncalibrated {
         reasons.push("renko uncalibrated: shards exist but no k in ticker-params (R4)".to_string());
     }
+    // R4 (CRIT): shards built with a materially different k than the current
+    // ticker-params k (manifest provenance mismatch) → regenerate renko shards.
+    if r.renko_k_stale {
+        reasons.push(format!(
+            "renko_k_stale: shards built with k={} but current ticker-params k differs by >{:.0}% (R4)",
+            r.renko_k_used.map(|k| format!("{:.6}", k)).unwrap_or_else(|| "?".to_string()),
+            RENKO_K_STALE_TOL * 100.0
+        ));
+    }
     // R4 (HIGH): realized bpd outside calibrator accept band (skip stable pairs).
     if r.renko_bpd_off_band {
         reasons.push(format!(
@@ -851,6 +1357,30 @@ fn audit_ticker(
         reasons.push(format!(
             "s10 coverage {:.1}% < 50% of expected (K3)",
             r.s10_coverage_pct * 100.0
+        ));
+    }
+    // R2 (MED→HARD): per-day brick distribution shows a transiently-wrong-k
+    // shard that the window-mean bpd (R4) averages away. Hard FAIL so a single
+    // bad day's shard can't pass on the mean alone.
+    if r.renko_dist_fail {
+        reasons.push(format!(
+            "renko per-day drift: min_day {} / median {:.1} (R2)",
+            r.renko_bpd_min_day, r.renko_bpd_median
+        ));
+    }
+    // K-rollup (HIGH): higher-TF kline rollup parity break (OHLC monoid /
+    // alignment / tick-sum). Guards the path serving all higher-TF klines.
+    if r.rollup_violations > 0 {
+        reasons.push(format!(
+            "{} kline rollup-parity violation(s) (K-rollup)",
+            r.rollup_violations
+        ));
+    }
+    // Stuck-feed (HIGH): near-constant non-stable feed = dead/stale forwarder.
+    if r.stuck_feed {
+        reasons.push(format!(
+            "stuck/flatline feed (zero_return_frac={:.3}, longest_flat_run={})",
+            r.zero_return_frac, r.longest_flat_run
         ));
     }
     // Anomalies are advisory (reported) but MAD outliers + CUSUM are warnings,
@@ -927,6 +1457,20 @@ fn print_human(report: &AuditReport) {
             "   sigma_park (ann)     : {}",
             fmt_sigma(t.sigma_park_ann)
         );
+        println!(
+            "   feed health          : zero_ret_frac={} longest_flat_run={}{}",
+            fmt_sigma(t.zero_return_frac),
+            t.longest_flat_run,
+            if t.stuck_feed { " [STUCK]" } else { "" }
+        );
+        if t.vol_present {
+            println!(
+                "   vol↔idx recon        : stored_sigma_ann={} parkinson_ann={}{}",
+                fmt_sigma(t.vol_sigma_stored),
+                fmt_sigma(t.sigma_park_ann),
+                if t.vol_sigma_divergence { " [DIVERGENCE]" } else { "" }
+            );
+        }
         if t.crypto_stable {
             println!("   crypto_stable        : YES (renko bpd check skipped)");
         }
@@ -939,12 +1483,19 @@ fn print_human(report: &AuditReport) {
                 if t.renko_skipped_stable { " [skipped: stable]" } else { "" }
             );
             println!(
-                "   renko calib (R4)     : inferred_bpd={:.1} target={:.1} k_present={}{}{}",
+                "   renko calib (R4)     : inferred_bpd={:.1} target={:.1} (per-ticker) k_present={}{}{}",
                 t.renko_inferred_bpd,
-                report.target_bpd,
+                t.renko_target_bpd,
                 t.renko_k_present,
                 if t.renko_uncalibrated { " [UNCALIBRATED]" } else { "" },
                 if t.renko_bpd_off_band { " [OFF-BAND]" } else { "" }
+            );
+            println!(
+                "   renko provenance (R4): k_used={}{}{}{}",
+                t.renko_k_used.map(|k| format!("{:.6}", k)).unwrap_or_else(|| "none".to_string()),
+                if t.renko_k_stale { " [STALE]" } else { "" },
+                if t.renko_shards_behind_calibration { " [WARN: behind-calibration]" } else { "" },
+                if t.renko_provenance_missing { " [WARN: provenance-missing]" } else { "" }
             );
             println!(
                 "   renko cont/floor     : R1_disc={} R3_floor_viol={}",
@@ -955,7 +1506,13 @@ fn print_human(report: &AuditReport) {
                 fmt_sigma(t.renko_bpd_median),
                 fmt_sigma(t.renko_bpd_mad),
                 t.renko_bpd_min_day,
-                if t.renko_dist_drift { " [WARN: drift]" } else { "" }
+                if t.renko_dist_fail {
+                    " [FAIL: drift]"
+                } else if t.renko_dist_drift {
+                    " [WARN: drift]"
+                } else {
+                    ""
+                }
             );
             for s in &t.renko_samples {
                 println!("     {}", s);
@@ -987,6 +1544,12 @@ fn print_human(report: &AuditReport) {
         );
         for s in &t.s10_samples {
             println!("     {}", s);
+        }
+        if t.rollup_violations > 0 {
+            println!("   kline rollup-parity  : {} violation(s)", t.rollup_violations);
+            for s in &t.rollup_samples {
+                println!("     {}", s);
+            }
         }
         println!("   VERDICT              : {}", t.verdict);
         if !t.fail_reasons.is_empty() {
@@ -1063,8 +1626,15 @@ fn main() -> Result<()> {
         None => discover_tickers(&cli.common.data_root),
     };
 
+    // Per-ticker calibration target + stable-pair identity, resolved exactly the
+    // way the calibrator + live producer do (config.yml per-pair/per-class). The
+    // flat `--target-bpd` is only a fallback when config.yml can't be loaded.
+    let target_resolver = TargetResolver::load(cli.target_bpd);
+
     let mut reports: Vec<TickerReport> = Vec::with_capacity(tickers.len());
     for id in tickers {
+        let per_ticker_target = target_resolver.target_for(id);
+        let is_known_stable = target_resolver.is_known_stable(id);
         match audit_ticker(
             &cli.common.data_root,
             id,
@@ -1072,7 +1642,8 @@ fn main() -> Result<()> {
             win_end,
             cli.max_gap_ms,
             cli.quiet_tolerance_ms,
-            cli.target_bpd,
+            per_ticker_target,
+            is_known_stable,
         ) {
             Ok(r) => reports.push(r),
             Err(e) => {
@@ -1094,9 +1665,18 @@ fn main() -> Result<()> {
                     cusum_alarms: 0,
                     sigma_park_ann: f64::NAN,
                     crypto_stable: false,
+                    zero_return_frac: f64::NAN,
+                    longest_flat_run: 0,
+                    stuck_feed: false,
+                    vol_present: false,
+                    vol_sigma_stored: f64::NAN,
+                    vol_sigma_divergence: false,
+                    rollup_violations: 0,
+                    rollup_samples: Vec::new(),
                     renko_bpd: f64::NAN,
                     renko_days: 0,
                     renko_ratio: f64::NAN,
+                    renko_target_bpd: f64::NAN,
                     renko_skipped_stable: false,
                     renko_b03_violations: 0,
                     renko_brick_floor_violations: 0,
@@ -1108,6 +1688,11 @@ fn main() -> Result<()> {
                     renko_bpd_mad: f64::NAN,
                     renko_bpd_min_day: 0,
                     renko_dist_drift: false,
+                    renko_dist_fail: false,
+                    renko_k_used: None,
+                    renko_k_stale: false,
+                    renko_shards_behind_calibration: false,
+                    renko_provenance_missing: false,
                     renko_samples: Vec::new(),
                     s10_bars: 0,
                     s10_violations: 0,
@@ -1156,4 +1741,137 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── K1 open-grid boundary (3 branches + false-positive elimination) ──────
+
+    /// Clean boundary: first bucket of D+1 opens exactly one BAR_MS past the
+    /// last open of D. The OLD close-grid form (`open - prev_close`) yielded
+    /// ~2 ms here (close = open + 9998) and FALSE-FAILED every contiguous bar;
+    /// the open-grid form classifies it Contiguous.
+    #[test]
+    fn k1_clean_boundary_is_contiguous() {
+        let prev_open = 1_700_000_000_000i64; // 10s-aligned
+        let open = prev_open + S10_BUCKET_MS; // next bucket
+        assert_eq!(
+            classify_s10_open_delta(prev_open, open),
+            S10Boundary::Contiguous
+        );
+        // False-positive proof: the OLD close-grid delta on the SAME healthy
+        // pair is non-grid (≈2 ms) and would have tripped OffGrid.
+        let prev_close = prev_open + (S10_BUCKET_MS - 1) - 1; // open+9998 round-trip
+        let old_close_delta = open - prev_close;
+        assert_ne!(old_close_delta % S10_BUCKET_MS, 0,
+            "old close-grid delta {} IS off-grid → false CRIT (the bug)", old_close_delta);
+        // New open-grid delta is a clean multiple → no false CRIT.
+        assert_eq!((open - prev_open) % S10_BUCKET_MS, 0);
+    }
+
+    /// One whole bucket missing at the boundary → Gap (WARN), not a grid break.
+    #[test]
+    fn k1_single_bucket_gap_is_gap() {
+        let prev_open = 1_700_000_000_000i64;
+        let open = prev_open + 2 * S10_BUCKET_MS; // skip one bucket
+        assert_eq!(classify_s10_open_delta(prev_open, open), S10Boundary::Gap);
+    }
+
+    /// Open not on the 10s grid (e.g. a 3 ms drift) → OffGrid (FAIL).
+    #[test]
+    fn k1_off_grid_open_is_fail() {
+        let prev_open = 1_700_000_000_000i64;
+        let open = prev_open + S10_BUCKET_MS + 3; // 10_003 ms forward
+        assert_eq!(classify_s10_open_delta(prev_open, open), S10Boundary::OffGrid);
+    }
+
+    /// Non-advancing (duplicate / overlap) is ignored by K1 (handled elsewhere).
+    #[test]
+    fn k1_non_advancing_ignored() {
+        let prev_open = 1_700_000_000_000i64;
+        assert_eq!(
+            classify_s10_open_delta(prev_open, prev_open),
+            S10Boundary::NonAdvancing
+        );
+        assert_eq!(
+            classify_s10_open_delta(prev_open, prev_open - S10_BUCKET_MS),
+            S10Boundary::NonAdvancing
+        );
+    }
+
+    // ── R4 per-ticker-target accept band ─────────────────────────────────────
+
+    /// A k yielding ~300 bpd on a TRUE-50-target pegged pair must be OFF-BAND
+    /// (the flat-300 anchor would have FALSE-PASSED it). Conversely a correct
+    /// k landing near the per-ticker 50 target must pass.
+    #[test]
+    fn r4_uses_per_ticker_target_not_flat() {
+        // Pegged pair: real target = 50. 300 realized is 6× over → off-band.
+        assert!(renko_bpd_off_band(300.0, 50.0), "300 bpd vs 50 target must be off-band");
+        // Correct k on the same pair: 48 realized vs 50 target → within ±20%.
+        assert!(!renko_bpd_off_band(48.0, 50.0), "48 bpd vs 50 target is in-band");
+        // The OLD flat-300 anchor would have judged 300 realized as a perfect
+        // match (ratio 1.0) → FALSE PASS. Prove the flat anchor masks it.
+        assert!(!renko_bpd_off_band(300.0, 300.0),
+            "flat-300 anchor false-passes the wrong-k pegged pair (the bug)");
+    }
+
+    /// An override pair (target 800) with a correct ~800 k must PASS, where the
+    /// flat-300 anchor would FALSE-FAIL it (800/300-1 = 1.67 > 0.20).
+    #[test]
+    fn r4_override_pair_passes_on_per_ticker_target() {
+        assert!(!renko_bpd_off_band(800.0, 800.0), "800 vs 800 target in-band");
+        assert!(renko_bpd_off_band(800.0, 300.0),
+            "flat-300 anchor false-fails the high-target override pair (the bug)");
+    }
+
+    // ── R4 provenance: shards built with the CURRENT k (manifest stamp) ───────
+
+    /// A renko manifest whose stamped `renko_k_used` materially differs from the
+    /// current ticker-params k → STALE (FAIL); a matching k → clean; a legacy
+    /// manifest with `None` provenance → warn-only (backward-compat, NOT a FAIL).
+    #[test]
+    fn r4_provenance_stale_matching_and_missing() {
+        use nxr_sdk::shard::Manifest;
+        let current_k = 0.075_f64;
+
+        // MISMATCH: shards built with a k 20% off the current k → STALE (FAIL).
+        let mut stale = Manifest::new("BTC-USDT".to_string(), 1, "renko");
+        stale.set_renko_provenance(current_k * 1.20, Some(1_700_000_000));
+        let used = stale.renko_k_used.expect("provenance stamped");
+        assert!(
+            renko_k_stale(used, current_k),
+            "k drift > {:.0}% must be flagged STALE → FAIL",
+            RENKO_K_STALE_TOL * 100.0
+        );
+
+        // MATCH: shards built with the current k (within tol) → clean, no FAIL.
+        let mut fresh = Manifest::new("BTC-USDT".to_string(), 1, "renko");
+        fresh.set_renko_provenance(current_k * 1.02, Some(1_700_000_000));
+        let used = fresh.renko_k_used.expect("provenance stamped");
+        assert!(
+            !renko_k_stale(used, current_k),
+            "k within {:.0}% of current must be clean (no FAIL)",
+            RENKO_K_STALE_TOL * 100.0
+        );
+
+        // MISSING: legacy/pre-provenance manifest → None. Warn-only: the
+        // report path sets `renko_provenance_missing` (advisory) and NEVER
+        // routes through `renko_k_stale`, so the verdict cannot FAIL on it.
+        let legacy = Manifest::new("BTC-USDT".to_string(), 1, "renko");
+        assert!(
+            legacy.renko_k_used.is_none(),
+            "legacy manifest has no provenance → warn-only branch, not FAIL"
+        );
+
+        // Staleness comparison: current calibrated_at strictly newer than the
+        // build-time stamp → behind-calibration WARN (advisory, not FAIL).
+        let cur_at = 1_700_000_500_i64;
+        let built_at = fresh.renko_calibrated_at.expect("calibrated_at stamped");
+        assert!(cur_at > built_at, "recalibration after build → behind-calibration WARN");
+    }
 }

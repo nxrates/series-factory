@@ -6,6 +6,11 @@
 //!   - Per-ticker bricks/day **median** + MAD (tracks calibrator target;
 //!     operator target = median ≈ 300, low avg error, tolerate 5× regime spikes).
 //!   - Gap-ms distribution across day boundaries (debug hist↔live restarts).
+//!   - **s10 cross-shard grid continuity**: for tickers with `.s10` shards, the
+//!     first bucket of day D+1 must be exactly one bucket (`BAR_MS_S10`) past the
+//!     last bucket of day D, via the SHARED `seam::check_s10_cross_shard_bars`
+//!     invariant. Promotes the s10 grid check from unit-test-only to the binary
+//!     that runs on real prod shards.
 //!
 //! ## Usage
 //!
@@ -13,8 +18,8 @@
 //! renko-continuity-check --data-root /data [--ticker <id>] [--json] [--out report.json]
 //! ```
 //!
-//! Exit codes: 0 = clean, 1 = warnings (gaps > 60s but no B03 violation),
-//! 2 = errors (any B03 violation).
+//! Exit codes: 0 = clean, 1 = warnings (gaps > 60s but no B03/s10 violation),
+//! 2 = errors (any B03 violation OR any s10 grid violation).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -91,6 +96,36 @@ struct TickerReport {
     worst_gaps: Vec<BoundaryReport>,
 }
 
+/// s10 cross-shard grid-continuity summary for one ticker. Mirrors the renko
+/// B03 pass but enforces the s10 invariant (`close_ts[D+1.first] -
+/// close_ts[D.last] == BAR_MS_S10` within `S10_SEAM_JITTER_MS`) on the SAME
+/// real prod shards, via `series_factory::seam::check_s10_cross_shard_bars`.
+/// This promotes the s10 grid invariant from a unit-test-only check to a
+/// binary that runs over the live shard tree.
+#[derive(Debug, Serialize, Deserialize)]
+struct S10TickerReport {
+    ticker_id: u64,
+    shards: usize,
+    total_bars: u64,
+    /// Cross-shard boundaries inspected (= s10 shards - 1).
+    boundaries: usize,
+    /// Boundaries violating the one-bucket grid step (dropped/dup bucket at seam).
+    grid_violations: usize,
+    /// Worst boundaries by |residual ms| (top-5), residual = (Δclose_ts - BAR_MS).
+    worst_grid: Vec<S10BoundaryReport>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct S10BoundaryReport {
+    day_from: String,
+    day_to: String,
+    last_close_ts_ms: i64,
+    first_close_ts_ms: i64,
+    /// Residual `(close_ts[D+1] - close_ts[D]) - BAR_MS_S10`. ≈0 ⇒ clean grid.
+    residual_ms: f64,
+    violated: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct GlobalReport {
     data_root: String,
@@ -101,6 +136,16 @@ struct GlobalReport {
     total_large_gaps: usize,
     /// Per-ticker breakdown, keyed by ticker_id (stringified for stable JSON ordering).
     per_ticker: BTreeMap<String, TickerReport>,
+    /// s10 grid-continuity pass — present only for tickers that have `.s10`
+    /// shards. Keyed by stringified ticker_id (stable JSON ordering).
+    #[serde(default)]
+    s10_per_ticker: BTreeMap<String, S10TickerReport>,
+    /// Total s10 boundaries inspected across all tickers.
+    #[serde(default)]
+    s10_total_boundaries: usize,
+    /// Total s10 grid violations across all tickers.
+    #[serde(default)]
+    s10_total_grid_violations: usize,
 }
 
 // ── Core ────────────────────────────────────────────────────────────────────
@@ -194,6 +239,81 @@ fn check_ticker(ticker_dir: &Path, ticker_id: u64, warn_gap_ms: i64) -> Result<T
     })
 }
 
+/// s10 grid-continuity pass for one ticker dir. Walks `.s10` shards in date
+/// order and runs the SHARED `series_factory::seam::check_s10_cross_shard_bars`
+/// invariant across every adjacent day boundary — the same function the cert
+/// (data-quality-audit) and the seam unit tests use, now exercised on real prod
+/// shards through this binary. Returns `None` when the dir holds no `.s10`
+/// shards (renko-only ticker) so the report stays renko-focused for those.
+fn check_ticker_s10(ticker_dir: &Path, ticker_id: u64) -> Result<Option<S10TickerReport>> {
+    let shards = list_shards(ticker_dir, "s10")
+        .with_context(|| format!("list_shards(s10) {}", ticker_dir.display()))?;
+    if shards.is_empty() {
+        return Ok(None);
+    }
+
+    let mut total_bars: u64 = 0;
+    let mut last_bar_of_prev: Option<(chrono::NaiveDate, Bar)> = None;
+    let mut all: Vec<S10BoundaryReport> = Vec::new();
+    let mut grid_violations: usize = 0;
+
+    for (date, path) in &shards {
+        let bars: Vec<Bar> = read_shard_aligned(path)
+            .with_context(|| format!("read_shard_aligned(s10) {}", path.display()))?;
+        total_bars += bars.len() as u64;
+        if bars.is_empty() {
+            continue;
+        }
+        if let Some((prev_date, prev_last)) = last_bar_of_prev.as_ref() {
+            let first = bars[0];
+            // SHARED seam check — identical tolerance/idiom to cert + unit tests.
+            let seam = series_factory::seam::check_s10_cross_shard_bars(prev_last, &first);
+            if seam.violated {
+                grid_violations += 1;
+            }
+            all.push(S10BoundaryReport {
+                day_from: prev_date.to_string(),
+                day_to: date.to_string(),
+                last_close_ts_ms: prev_last.close_time_ms(),
+                first_close_ts_ms: first.close_time_ms(),
+                residual_ms: seam.delta,
+                violated: seam.violated,
+            });
+        }
+        last_bar_of_prev = Some((*date, *bars.last().unwrap()));
+    }
+
+    let mut sorted = all
+        .iter()
+        .filter(|b| b.violated)
+        .cloned()
+        .collect::<Vec<_>>();
+    sorted.sort_by(|a, b| b.residual_ms.abs().partial_cmp(&a.residual_ms.abs()).unwrap());
+    let worst_grid = sorted.into_iter().take(5).collect();
+
+    Ok(Some(S10TickerReport {
+        ticker_id,
+        shards: shards.len(),
+        total_bars,
+        boundaries: all.len(),
+        grid_violations,
+        worst_grid,
+    }))
+}
+
+impl Clone for S10BoundaryReport {
+    fn clone(&self) -> Self {
+        Self {
+            day_from: self.day_from.clone(),
+            day_to: self.day_to.clone(),
+            last_close_ts_ms: self.last_close_ts_ms,
+            first_close_ts_ms: self.first_close_ts_ms,
+            residual_ms: self.residual_ms,
+            violated: self.violated,
+        }
+    }
+}
+
 impl Clone for BoundaryReport {
     fn clone(&self) -> Self {
         Self {
@@ -217,10 +337,13 @@ fn main() -> Result<()> {
     }
 
     let mut per_ticker: BTreeMap<String, TickerReport> = BTreeMap::new();
+    let mut s10_per_ticker: BTreeMap<String, S10TickerReport> = BTreeMap::new();
     let mut total_bricks: u64 = 0;
     let mut total_boundaries: usize = 0;
     let mut total_b03: usize = 0;
     let mut total_gaps: usize = 0;
+    let mut s10_total_boundaries: usize = 0;
+    let mut s10_total_grid_violations: usize = 0;
 
     for entry in std::fs::read_dir(&bars_root)? {
         let entry = entry?;
@@ -247,6 +370,14 @@ fn main() -> Result<()> {
         total_b03 += rep.b03_violations;
         total_gaps += rep.large_gaps;
         per_ticker.insert(format!("{:020}", ticker_id), rep);
+
+        // s10 grid-continuity pass on the SAME ticker dir (skips dirs without
+        // .s10 shards). Runs the shared seam invariant on real prod shards.
+        if let Some(s10) = check_ticker_s10(&path, ticker_id)? {
+            s10_total_boundaries += s10.boundaries;
+            s10_total_grid_violations += s10.grid_violations;
+            s10_per_ticker.insert(format!("{:020}", ticker_id), s10);
+        }
     }
 
     let global = GlobalReport {
@@ -257,6 +388,9 @@ fn main() -> Result<()> {
         total_b03_violations: total_b03,
         total_large_gaps: total_gaps,
         per_ticker,
+        s10_per_ticker,
+        s10_total_boundaries,
+        s10_total_grid_violations,
     };
 
     // Optional file output
@@ -279,6 +413,12 @@ fn main() -> Result<()> {
             global.total_boundaries,
             global.total_b03_violations,
             global.total_large_gaps
+        );
+        println!(
+            "s10: tickers={} boundaries={} grid_violations={}",
+            global.s10_per_ticker.len(),
+            global.s10_total_boundaries,
+            global.s10_total_grid_violations,
         );
         println!();
         println!(
@@ -312,8 +452,28 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // Print s10 grid-continuity violation details (errors — dropped/dup bucket).
+        for (_, r) in &global.s10_per_ticker {
+            if r.grid_violations > 0 {
+                println!("\n## s10 grid violations — ticker {}", r.ticker_id);
+                for b in &r.worst_grid {
+                    println!(
+                        "  {} → {}: close_ts[D]={} close_ts[D+1]={} residual_ms={:.1}",
+                        b.day_from, b.day_to, b.last_close_ts_ms, b.first_close_ts_ms, b.residual_ms
+                    );
+                }
+            }
+        }
     }
 
-    let exit_code = if total_b03 > 0 { 2 } else if total_gaps > 0 { 1 } else { 0 };
+    // s10 grid violation is an ERROR-class break (same severity as B03): a
+    // dropped/duplicated 10s bucket at the day seam breaks the contiguous grid.
+    let exit_code = if total_b03 > 0 || s10_total_grid_violations > 0 {
+        2
+    } else if total_gaps > 0 {
+        1
+    } else {
+        0
+    };
     std::process::exit(exit_code);
 }

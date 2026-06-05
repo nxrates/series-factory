@@ -39,10 +39,9 @@ use tracing::info;
 /// defect behind every `s10-from-idx`-generated (migration / backfill) shard;
 /// live-written shards were always clean because the producer already grid-stamps.
 fn stamp_grid(bar: &mut Bar, bucket_open: i64, bucket_ms: i64) {
-    let open_mts = timestamp::from_epoch_ms(bucket_open);
-    let close_mts = timestamp::from_epoch_ms(bucket_open + bucket_ms - 1);
-    bar.open_ts = timestamp::encode_u48(open_mts);
-    bar.close_ts = timestamp::encode_u48(close_mts);
+    // Delegate to the CANONICAL shared stamp so offline == live by construction
+    // (both call `nxr_sdk::bar_builder::stamp_s10_grid`).
+    nxr_sdk::bar_builder::stamp_s10_grid(bar, bucket_open, bucket_ms);
 }
 
 #[derive(Parser, Debug)]
@@ -266,20 +265,18 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// LIVE twin of the offline `stamp_grid`, copied VERBATIM from
-    /// `core/src/bars_s10.rs::stamp_s10_bucket` (+ its `bucket_close_ms`
-    /// helper). The SEAM-4 parity test below asserts these two stampers are
-    /// byte-identical for thousands of bucket boundaries. If the live producer
-    /// ever changes its grid-stamping, this copy diverges from the imported
-    /// `stamp_grid` and the test fails — permanently guarding the offline-only
-    /// grid-stamp defect that integrity-check (post-write) failed to catch.
+    /// LIVE-path stamper, expressed by calling the SAME canonical symbol the
+    /// live producer now delegates to. Post-Task-3 the live
+    /// `core/src/bars_s10.rs::stamp_s10_bucket` is a thin wrapper over
+    /// `nxr_sdk::bar_builder::stamp_s10_grid(bar, bucket_open, BAR_MS)`; calling
+    /// that real symbol here (instead of a hand-copied body) means any future
+    /// change to the live grid stamp recompiles + re-exercises this test
+    /// through the actual production code path. The offline `stamp_grid` ALSO
+    /// delegates to the same symbol, so SEAM-4 now proves the offline binary
+    /// and the live producer share one stamp implementation by construction.
     fn live_stamp_s10_bucket(bar: &mut Bar, bucket_open: i64) {
         const BAR_MS: i64 = 10_000;
-        let open_mts = timestamp::from_epoch_ms(bucket_open);
-        // bucket_close_ms = bucket_open + BAR_MS - 1 (live bars_s10.rs).
-        let close_mts = timestamp::from_epoch_ms(bucket_open + BAR_MS - 1);
-        bar.open_ts = timestamp::encode_u48(open_mts);
-        bar.close_ts = timestamp::encode_u48(close_mts);
+        nxr_sdk::bar_builder::stamp_s10_grid(bar, bucket_open, BAR_MS);
     }
 
     fn blank_bar() -> Bar {

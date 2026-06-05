@@ -147,7 +147,7 @@ fn main() -> Result<()> {
     // day). Running with 0.075 produces brick-storm overshoots we already
     // paid for once.
     let ticker_id = resolve_ticker_id(&format!("{}/{}", base, quote));
-    let calibrated_k = load_calibrated_k(ticker_id);
+    let (calibrated_k, calibrated_at) = load_calibrated_k(ticker_id);
     let multiplier = match calibrated_k {
         Some(k) => k as f32,
         None => {
@@ -287,6 +287,19 @@ fn main() -> Result<()> {
     manifest.ticker = ticker_str;
     manifest.ticker_id = ticker_id;
     manifest.refresh_kind::<Bar>(&out_dir, "renko")?;
+    // PROVENANCE: stamp the k actually fed to RenkoGenerator (the f32
+    // `multiplier`, promoted back to f64 so the recorded value matches the
+    // exact bits the generator saw) + the `calibrated_at` epoch-seconds read
+    // from ticker-params.json. The cert asserts manifest.renko_k_used ==
+    // current ticker-params k within tol, and flags `shards stale vs latest
+    // calibration` when ticker-params calibrated_at is newer than this stamp.
+    manifest.set_renko_provenance(multiplier as f64, calibrated_at);
+    info!(
+        ticker_id,
+        renko_k_used = multiplier as f64,
+        renko_calibrated_at = ?calibrated_at,
+        "renko provenance stamped into manifest"
+    );
     write_manifest(&mpath, &manifest)?;
 
     info!(out_dir = %out_dir.display(), manifest = %mpath.display(), "manifest updated");
@@ -294,29 +307,38 @@ fn main() -> Result<()> {
 }
 
 /// Look up the calibrated Renko multiplier for `ticker_id` in
-/// `$NXR_TICKER_PARAMS_PATH` (default `/data/config/ticker-params.json`).
-/// Returns `None` and logs a single warning if the file is missing, malformed,
-/// or has no entry for this ticker — callers fall back to the bootstrap k.
-fn load_calibrated_k(ticker_id: u64) -> Option<f64> {
+/// `$NXR_TICKER_PARAMS_PATH` (default `/data/config/ticker-params.json`),
+/// together with the file-level `calibrated_at` (unix-seconds of the last
+/// `nxr-calibrate` run) for build-time PROVENANCE stamping into the manifest.
+///
+/// Returns `(None, _)` and logs a single warning if the file is missing,
+/// malformed, or has no entry for this ticker — callers ABORT the renko build
+/// (no bootstrap-k fallback, per `feedback_no_k_fallback`). The second tuple
+/// element is the `calibrated_at` epoch-seconds (`None` for pre-calibration /
+/// legacy files); it is recorded even when k resolves so the cert can compare
+/// it against the *current* ticker-params `calibrated_at` to detect staleness.
+fn load_calibrated_k(ticker_id: u64) -> (Option<f64>, Option<i64>) {
     let cfg = nxr_sdk::NxrConfig::from_env();
     let path = PathBuf::from(&cfg.ticker_params_path);
     let raw = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(path = %path.display(), err = %e, "ticker-params.json read failed; using bootstrap k");
-            return None;
+            return (None, None);
         }
     };
     let weights: WeightsFile = match serde_json::from_str(&raw) {
         Ok(w) => w,
         Err(e) => {
             tracing::warn!(path = %path.display(), err = %e, "ticker-params.json parse failed; using bootstrap k");
-            return None;
+            return (None, None);
         }
     };
-    weights
+    let calibrated_at = weights.calibrated_at.map(|s| s as i64);
+    let k = weights
         .renko_k_per_ticker
         .get(&ticker_id.to_string())
         .copied()
-        .filter(|k| *k > 0.0 && k.is_finite())
+        .filter(|k| *k > 0.0 && k.is_finite());
+    (k, calibrated_at)
 }
