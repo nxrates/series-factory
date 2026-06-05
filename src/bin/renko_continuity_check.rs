@@ -129,12 +129,11 @@ fn check_ticker(ticker_dir: &Path, ticker_id: u64, warn_gap_ms: i64) -> Result<T
             // Copy out of packed struct before field math.
             let last_close = prev_last.close;
             let first_open = first.open;
-            let delta = first_open - last_close;
-            // Tolerance: 1e-12 × |last_close| catches real breaks while
-            // permitting fp round-trip noise (writer/reader bytes are identical
-            // for the same f64, so in practice delta should be exactly 0.0).
-            let tol = (last_close.abs() * 1e-12).max(1e-15);
-            let b03_violated = delta.abs() > tol;
+            // B03 via the shared seam check so the binary AND the cert
+            // (data-quality-audit) enforce byte-for-byte the same tolerance.
+            let seam = series_factory::seam::check_renko_cross_shard(last_close, first_open);
+            let delta = seam.delta;
+            let b03_violated = seam.violated;
             let gap_ms = first.open_time_ms() - prev_last.close_time_ms();
             if b03_violated {
                 b03_violations += 1;
