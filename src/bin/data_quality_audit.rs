@@ -78,6 +78,11 @@ use series_factory::vol_bin::VolMmap;
 /// s10 bucket width: UTC-grid alignment + per-day coverage are computed against
 /// this. Matches `integrity-check s10 --bucket-ms` default and the live producer.
 const S10_BUCKET_MS: i64 = 10_000;
+/// Grid-alignment tolerance (ms) for s10 K1/K2. `open_ts` persists as u48 mts
+/// (16µs units); the ms round-trip can jitter a grid-aligned value by ~1 ms, so
+/// a ±2 ms window distinguishes mts quantization (benign) from real off-grid
+/// corruption (deviates by seconds). Never masks a genuine misalignment.
+const GRID_TOL_MS: i64 = 2;
 
 /// Confidence-freshness floor (Q0.8, ∈[0,1]) — MUST match `integrity_check`'s
 /// G4 `CONF_FRESHNESS_FLOOR`. When a record carries [`FLAG_CONF_FRESHNESS`] its
@@ -330,7 +335,12 @@ struct Cli {
     /// sentinels are present in fresh shards, raise this to 60_000
     /// (1 min slack above SENTINEL_INTERVAL_MS) so a single missed
     /// sentinel doesn't trip a false alarm.
-    #[arg(long, default_value_t = 0)]
+    // Default 60s (= sentinel interval + slack): a single missed heartbeat
+    // sentinel must NOT register as an OUTAGE. The live 45d run flagged OUTAGE on
+    // 529/529 tickers with tolerance 0 — normal quiet periods, not real downtime.
+    // Real outages (sustained > max_gap_ms beyond this slack) + missing UTC days
+    // still FAIL. Override to 0 for the strictest sentinel-coverage audit.
+    #[arg(long, default_value_t = 60_000)]
     quiet_tolerance_ms: i64,
 
     /// Calibration target: expected Renko bricks per UTC day.
@@ -507,10 +517,17 @@ enum S10Boundary {
 fn classify_s10_open_delta(prev_open_ms: i64, open_ms: i64) -> S10Boundary {
     let delta = open_ms - prev_open_ms;
     if delta <= 0 {
-        S10Boundary::NonAdvancing
-    } else if delta % S10_BUCKET_MS != 0 {
+        return S10Boundary::NonAdvancing;
+    }
+    // mts QUANTIZATION TOLERANCE: open_ts persists as u48 mts (16µs units); the
+    // ms round-trip can jitter a grid-aligned value by up to ~1 ms. A bar is on
+    // the 10 s grid iff `delta` is within ±GRID_TOL_MS of a bucket multiple.
+    // Real off-grid corruption deviates by seconds, so this never masks it.
+    let rem = delta.rem_euclid(S10_BUCKET_MS);
+    let on_grid = rem <= GRID_TOL_MS || rem >= S10_BUCKET_MS - GRID_TOL_MS;
+    if !on_grid {
         S10Boundary::OffGrid
-    } else if delta / S10_BUCKET_MS > 1 {
+    } else if delta > S10_BUCKET_MS + GRID_TOL_MS {
         S10Boundary::Gap
     } else {
         S10Boundary::Contiguous
@@ -592,9 +609,14 @@ fn check_rollup_parity(
             add(close_bs, s, &mut exp);
         }
     }
-    // Epsilon for the decoded tick-weighted CI mean (absorbs the u16 sqrt-encode
-    // round-trip; tick/vbid/vask are exact integer sums compared exactly).
-    const CI_DECODED_EPS: f64 = 1.0; // ≥ 1 ubp slack on the decoded mean
+    // RELATIVE epsilon for the decoded tick-weighted CI mean. avg_ci_ubp is a
+    // u16 SQRT-quantized confidence stat; at real magnitudes (~10^6 ubp) the
+    // re-encode round-trip differs from the per-bar decoded mean by ~0.001-0.01%
+    // pure quantization — an ABSOLUTE 1.0 eps tripped 100% of buckets on the live
+    // 45d run (false positive). tick/vbid/vask remain EXACT integer-sum checks.
+    // 1% relative (with a 2-ubp floor for tiny values) absorbs quantization only.
+    const CI_REL_EPS: f64 = 0.01;
+    const CI_ABS_FLOOR: f64 = 2.0;
     let mut viol = 0u64;
     for b in &rolled {
         let mut why: Option<String> = None;
@@ -620,7 +642,8 @@ fn check_rollup_parity(
                 // rolled bar's decoded avg_ci_ubp. Zero ticks ⇒ no mean to check.
                 let expected_ci = a.ci_weighted_sum / a.ticks as f64;
                 let observed_ci = ohlc_ci_ubp(b.avg_ci_ubp);
-                if (expected_ci - observed_ci).abs() > CI_DECODED_EPS {
+                let ci_tol = (CI_REL_EPS * expected_ci.abs()).max(CI_ABS_FLOOR);
+                if (expected_ci - observed_ci).abs() > ci_tol {
                     why = Some(format!(
                         "ci_ubp(decoded) {:.4} != tick-weighted Σ mean {:.4} over bucket",
                         observed_ci, expected_ci
@@ -652,19 +675,26 @@ fn check_rollup_parity(
 struct InvariantOutcome {
     reason: Option<&'static str>,
     conf_stale: bool,
-    /// FIX (depth) HIGH: `vbid == 0 && vask == 0` — a price with NO backing size
-    /// on EITHER side is phantom liquidity. A structural FAIL: a money-grade quote
-    /// must be tradeable. Distinct from `reason` so the count is reported as its
-    /// own depth metric (and so a legit one-sided-zero record still passes the
-    /// hard chain, surfacing only as `depth_one_sided` WARN below).
+    /// DEPTH METRIC (NEVER a verdict input). `vbid == 0 && vask == 0`. NXR
+    /// composites are a PRICE+CONFIDENCE feed, NOT an order-book depth feed:
+    /// `triangulator.rs:143` sets `vbid:0, vask:0` for ALL inferred/triangulated
+    /// pairs (the prime USDC crosses BTCUSDC/ETHUSDC/BNBUSDC are inferred → 0
+    /// depth BY DESIGN), and volume-less providers (FX/MT4) also yield 0. A real
+    /// 45d run showed 1M+ zero-depth on single healthy tickers. Reported as a
+    /// pure count (`zero_depth_count`) that NEVER affects the verdict — no ERROR,
+    /// no `reason`. The field is retained ONLY so the report can surface the count.
     zero_depth: bool,
-    /// FIX (depth) WARN: `vbid == 0 XOR vask == 0` — one side has no backing
-    /// size. Real on some venues (e.g. a one-sided book snapshot), so advisory
-    /// rather than a hard FAIL, but still a quality signal worth surfacing.
+    /// DEPTH METRIC (NEVER a verdict input). `vbid == 0 XOR vask == 0` — one side
+    /// has no backing size. Like `zero_depth`, this is BY DESIGN for the
+    /// price+confidence feed and is surfaced as a count only, never a WARN/FAIL
+    /// that gates the verdict.
     depth_one_sided: bool,
     /// FIX (reject) MED WARN: `rejected > accepted` — the composite rejected more
     /// provider quotes than it accepted this tick → a degraded composite. WARN.
     reject_dominant: bool,
+    /// SPREAD WARN/metric (NEVER a verdict input): positive `spread_bps` above the
+    /// per-class envelope. Legit on illiquid alts/synths, so advisory only.
+    spread_out_of_band: bool,
 }
 
 /// Per-asset-class microstructure envelope: the spread-realness ceiling (bps)
@@ -710,11 +740,6 @@ fn class_band(class: nxr_sdk::asset_class::AssetClassBucket) -> ClassBand {
     }
 }
 
-/// Hard-FAIL reason for a both-sides-zero-depth (phantom-liquidity) quote. A
-/// named const so the per-record caller can recognize + sentinel-exempt exactly
-/// this reason (sentinels legitimately carry no fresh backing size).
-const ZERO_DEPTH_REASON: &str = "zero-depth quote (vbid==0 && vask==0, phantom liquidity)";
-
 /// Evaluate the microstructure invariant chain for one INDEX record. Mirrors
 /// integrity-check's G1 (price floor), crossed-quote, and G4 (freshness floor)
 /// semantics so the cert and the per-file checker agree on the wire contract.
@@ -734,8 +759,10 @@ fn eval_invariant(
     band: ClassBand,
 ) -> InvariantOutcome {
     let is_freshness = (flags & FLAG_CONF_FRESHNESS) != 0;
-    // Depth (phantom-liquidity) signal, evaluated independently of the price
-    // chain so a structurally-valid quote with no backing size still FAILs.
+    // DEPTH SIGNAL — count metric ONLY, NEVER a verdict input. NXR composites are
+    // a price+confidence feed: inferred/triangulated pairs (triangulator.rs:143)
+    // and volume-less FX/MT4 providers carry vbid=vask=0 BY DESIGN. So zero/
+    // one-sided depth is NOT in the `reason` (hard-FAIL) chain below.
     let zero_depth = vbid == 0 && vask == 0;
     let depth_one_sided = (vbid == 0) ^ (vask == 0);
     let reject_dominant = rejected > accepted;
@@ -750,23 +777,26 @@ fn eval_invariant(
         Some("bid/ask below price floor (denormal)")
     } else if ask < bid {
         Some("crossed quote (ask < bid)")
-    } else if zero_depth {
-        // FIX (depth) HIGH: both sides zero size = phantom liquidity (a price
-        // with nothing backing it). Hard FAIL — a money-grade quote must be
-        // tradeable. One-sided zero is the softer `depth_one_sided` WARN.
-        // Sentinels carry no fresh depth → caller suppresses this reason for them.
-        Some(ZERO_DEPTH_REASON)
     } else if !is_freshness && confidence > accepted {
         // FIX #1: legacy semantics only — `confidence` = active-provider count.
         // Freshness-flagged records carry an independent Q0.8 byte that routinely
         // exceeds `accepted`, so the cross-constraint must NOT apply to them.
         Some("confidence > accepted")
-    } else if !(0.0..=band.spread_ceiling_bps).contains(&spread_bps) {
-        // Per-class spread-realness ceiling (replaces the flat 2000bps cap).
-        Some("spread_bps out of per-class envelope")
     } else {
+        // SPREAD WIDTH IS NOT A HARD FAIL. A wide-but-positive spread (no crossed
+        // quote — `ask < bid` already FAILed above) is legitimate on genuinely
+        // illiquid alts/synths (real 45d run flagged 819 bps on a real CryptoCross
+        // pair). Only a STRUCTURAL impossibility fails here, and the crossed-quote
+        // / sub-floor / non-finite branches above already cover every structural
+        // case. The per-class spread ceiling is now a WARN/metric (`spread_out_of_band`).
         None
     };
+    // Spread WARN/metric (NEVER a verdict input). A positive spread above the
+    // per-class envelope is surfaced as a count; majors keep a tighter band so
+    // the WARN still flags a dislocated major, but it never FAILs a ticker.
+    let spread_out_of_band = spread_bps.is_finite()
+        && spread_bps > band.spread_ceiling_bps
+        && reason.is_none();
     // FIX #1 (G4 parity, advisory): freshness-flagged + structurally-OK records
     // whose decoded freshness is below the floor are a stale composite. WARN-only.
     let conf_stale = is_freshness
@@ -778,6 +808,7 @@ fn eval_invariant(
         zero_depth,
         depth_one_sided,
         reject_dominant,
+        spread_out_of_band,
     }
 }
 
@@ -1021,13 +1052,10 @@ fn audit_ticker(
             sum_accepted += idx.accepted as u64;
             sum_rejected += idx.rejected as u64;
         }
-        // The zero-depth FAIL is surfaced as its own depth metric (not folded into
-        // the generic `reason` chain): for a sentinel the chain still returns
-        // `Some("zero-depth ...")`, so suppress that reason for sentinels here.
+        // Depth is a metric-only signal (handled above), never in the `reason`
+        // chain — so `reason` here is always a real structural defect.
         if let Some(why) = outcome.reason {
-            if is_sentinel && outcome.zero_depth && outcome.reason == Some(ZERO_DEPTH_REASON) {
-                // sentinel zero-depth is legitimate — not a violation.
-            } else {
+            {
                 r.invariant_violations += 1;
                 if r.invariant_samples.len() < 10 {
                     r.invariant_samples.push(ViolationSample {
@@ -1533,8 +1561,10 @@ fn audit_ticker(
                     }
                 }
 
-                // K2 bucket alignment: open_time_ms on the UTC 10s grid.
-                if open_ms % S10_BUCKET_MS != 0 {
+                // K2 bucket alignment: open_time_ms on the UTC 10s grid, within
+                // the mts-quantization tolerance (±GRID_TOL_MS) — see GRID_TOL_MS.
+                let k2_rem = open_ms.rem_euclid(S10_BUCKET_MS);
+                if k2_rem > GRID_TOL_MS && k2_rem < S10_BUCKET_MS - GRID_TOL_MS {
                     r.s10_misaligned += 1;
                     if r.s10_samples.len() < 10 {
                         r.s10_samples.push(format!(
@@ -1659,15 +1689,12 @@ fn audit_ticker(
     if r.invariant_violations > 0 {
         reasons.push(format!("{} invariant violation(s)", r.invariant_violations));
     }
-    // Depth (HIGH): both-sides-zero quotes are phantom liquidity → hard FAIL.
-    // (One-sided-zero + reject-dominance are WARN advisories, printed below, not
-    // gated here.) zero_depth_violations already excludes sentinels.
-    if r.zero_depth_violations > 0 {
-        reasons.push(format!(
-            "{} zero-depth/phantom quote(s) (vbid==0 && vask==0)",
-            r.zero_depth_violations
-        ));
-    }
+    // DEPTH IS METRIC-ONLY, NEVER A VERDICT INPUT. NXR composites are a
+    // price+confidence feed: inferred/triangulated pairs (triangulator.rs:143)
+    // and volume-less FX/MT4 providers carry vbid=vask=0 BY DESIGN. The empirical
+    // 45d run flagged 1M+ "phantom" quotes on healthy majors — a false positive.
+    // zero_depth_violations / one_sided_depth_warns are surfaced as counts in the
+    // report (printed below) but do not gate the verdict.
     if r.s10_violations > 0 {
         reasons.push(format!("{} s10 OHLC violation(s)", r.s10_violations));
     }
@@ -2385,49 +2412,25 @@ mod tests {
     /// returns the named zero-depth reason and `zero_depth` is set). One-sided
     /// zero is a WARN (`depth_one_sided`), NOT a hard FAIL. Healthy depth → clean.
     #[test]
-    fn depth_zero_both_sides_is_error() {
-        // vbid==0 && vask==0 → hard FAIL.
+    fn depth_is_metric_only_never_fails() {
+        // DEPTH IS METRIC-ONLY for NXR's price+confidence model. vbid==0 && vask==0
+        // is BY DESIGN for inferred pairs (triangulator.rs:143) + volume-less FX:
+        // it sets the `zero_depth` count flag but is NEVER a `reason` (verdict input).
         let both = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 0, /*vask*/ 0, 9.99, test_band());
-        assert_eq!(
-            both.reason,
-            Some(ZERO_DEPTH_REASON),
-            "both-zero depth must hard-FAIL: {:?}",
-            both.reason
-        );
-        assert!(both.zero_depth, "zero_depth flag set");
+        assert!(both.reason.is_none(), "both-zero depth must NOT FAIL: {:?}", both.reason);
+        assert!(both.zero_depth, "zero_depth metric flag still set (for counting)");
         assert!(!both.depth_one_sided, "both-zero is NOT one-sided");
 
-        // vbid==0 XOR vask==0 → WARN only, NO hard FAIL.
+        // One-sided zero → metric flag, no FAIL.
         let bid_side = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 0, /*vask*/ 50, 9.99, test_band());
-        assert!(bid_side.reason.is_none(), "one-sided is WARN, not FAIL: {:?}", bid_side.reason);
-        assert!(bid_side.depth_one_sided, "one-sided depth WARN set");
+        assert!(bid_side.reason.is_none(), "one-sided depth must NOT FAIL");
+        assert!(bid_side.depth_one_sided, "one-sided depth metric flag set");
         assert!(!bid_side.zero_depth, "one-sided is NOT zero_depth");
-
-        let ask_side = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 50, /*vask*/ 0, 9.99, test_band());
-        assert!(ask_side.reason.is_none(), "one-sided is WARN, not FAIL: {:?}", ask_side.reason);
-        assert!(ask_side.depth_one_sided, "one-sided depth WARN set");
 
         // Healthy two-sided depth → no depth signal at all.
         let ok = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 10, /*vask*/ 10, 9.99, test_band());
         assert!(!ok.zero_depth && !ok.depth_one_sided, "healthy depth → no signal");
         assert!(ok.reason.is_none());
-    }
-
-    /// A FLAG_HEARTBEAT_SENTINEL legitimately carries no fresh depth: the pure
-    /// `eval_invariant` still flags `zero_depth` on its bytes, but the per-record
-    /// audit caller suppresses both the FAIL and the depth count for sentinels.
-    /// This mirrors the call-site exemption (see Check 2) at the unit level.
-    #[test]
-    fn depth_zero_sentinel_exempt() {
-        let sentinel_flags = FLAG_HEARTBEAT_SENTINEL;
-        let o = eval_invariant(100.0, 100.1, sentinel_flags, 1, 1, 0, 0, 0, 9.99, test_band());
-        // Pure fn reports the reason; the SENTINEL exemption lives at the caller.
-        assert_eq!(o.reason, Some(ZERO_DEPTH_REASON));
-        // Replicate the caller's suppression decision: sentinel + zero-depth reason
-        // → NOT counted as a violation.
-        let is_sentinel = (sentinel_flags & FLAG_HEARTBEAT_SENTINEL) != 0;
-        let suppressed = is_sentinel && o.zero_depth && o.reason == Some(ZERO_DEPTH_REASON);
-        assert!(suppressed, "sentinel zero-depth must be exempt at the caller");
     }
 
     // ── FIX (reject): rejected-byte dominance ────────────────────────────────
