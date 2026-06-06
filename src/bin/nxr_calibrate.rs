@@ -31,7 +31,7 @@ use nxr_sdk::asset_class::{
     DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
 };
 use nxr_sdk::ipc::record::IndexRecord;
-use nxr_sdk::shard::{list_shards, ShardStream, MS_PER_MIN};
+use nxr_sdk::shard::{list_shards, ShardStream};
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
@@ -135,11 +135,26 @@ fn calibrate_one(
         };
     }
 
-    // Pass 1: stream every .idx shard in date order → 1-min last-mid downsample
-    // for the in-memory calibration walk-forward. The vol basis is built
-    // separately from the gapless `.s10` shards (RS over s10 OHLC), NOT from
-    // idx-HLC — see the s10 vol build below.
-    let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
+    // Pass 1: stream every .idx shard in date order → FULL-TICK mid path for the
+    // in-memory calibration walk-forward. CRITICAL (2026-06-06 brick-storm RCA):
+    // the calibrator MUST fit/measure k on the SAME granularity the applier
+    // (`renko_from_idx.rs`) and the live producer (`core/src/bars_renko.rs`)
+    // emit bricks from — the full ~100ms idx mid stream — NOT a 1-min last-mid
+    // downsample. A renko brick forms on each price-level crossing along the
+    // PATH; 1-min last-mid discards all intra-minute extremes → the calibrator
+    // counts FAR fewer crossings → its bpd-accept-gate believes a too-small k
+    // yields ~target bpd, but the full-tick applier then over-emits ~3.3×
+    // (measured: BTC k=0.374 → 992 bpd applied vs ~300 target). Pushing every
+    // finite mid in ts order to a Vec preserves the path: shards are date-ordered
+    // and within-shard records are append-order (ts-ascending) from upstream.
+    //
+    // SEAM PARITY: skip heartbeat sentinels exactly as the applier
+    // (`renko_from_idx.rs:199`) and live producer (`bars_renko.rs:528`) do —
+    // they are not real mid moves and would inject phantom path points.
+    //
+    // The vol basis is built separately from the gapless `.s10` shards (RS over
+    // s10 OHLC), NOT from idx-HLC — see the s10 vol build below.
+    let mut tick_prices: Vec<(i64, f64)> = Vec::new();
     for (_date, shard_path) in &shards {
         let mut stream = match ShardStream::<IndexRecord>::open(shard_path) {
             Ok(s) => s,
@@ -157,20 +172,19 @@ fn calibrate_one(
                     reason: format!("read shard {}: {}", shard_path.display(), e),
                 },
             };
+            if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                continue;
+            }
             let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
             let bid = rec.index.bid;
             let ask = rec.index.ask;
             let mid = (bid + ask) * 0.5;
             if !(mid.is_finite() && mid > 0.0) { continue; }
-
-            // 1-min last-mid bucket for in-memory calibration.
-            let bucket = (ts / MS_PER_MIN) * MS_PER_MIN;
-            let pe = price_buckets.entry(bucket).or_insert((ts, mid));
-            if ts >= pe.0 { *pe = (ts, mid); }
+            tick_prices.push((ts, mid));
         }
     }
 
-    if price_buckets.is_empty() {
+    if tick_prices.is_empty() {
         return CalOutcome::Skipped { ticker_id, reason: "empty .idx".into() };
     }
 
@@ -213,11 +227,6 @@ fn calibrate_one(
         calc.precompute_sigma_cache()
     };
 
-    let tick_prices: Vec<(i64, f64)> = price_buckets
-        .into_iter()
-        .map(|(_, (ts, mid))| (ts, mid))
-        .collect();
-
     let base = RenkoConfig {
         multiplier: RenkoConfig::default().multiplier,
         min_pct: renko_yml.min_pct,
@@ -227,7 +236,7 @@ fn calibrate_one(
         return CalOutcome::Failed { ticker_id, reason: format!("base renko cfg: {}", e) };
     }
 
-    info!(ticker_id, pair, class = class.as_key(), target_bpd, "calibrating (walk-forward)");
+    info!(ticker_id, pair, class = class.as_key(), target_bpd, n_ticks = tick_prices.len(), "calibrating (walk-forward, full-tick)");
     // Walk-forward calibration (7d holdout non-overlapping with the training
     // slice) per audit point #5(i) 2026-05-26. Eliminates the regime-leak
     // overfit that produced k≈0.01 boundary-clamps on cross-pairs (live
@@ -317,6 +326,11 @@ impl LegStream {
             let stream = self.cur.as_mut().unwrap();
             match stream.next()? {
                 Some(rec) => {
+                    // SEAM PARITY: drop heartbeat sentinels (mirror native path
+                    // + applier) so synth legs carry only real mid moves.
+                    if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                        continue;
+                    }
                     let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
                     let bid = rec.index.bid;
                     let ask = rec.index.ask;
@@ -389,9 +403,12 @@ fn calibrate_one_synth(
     // NOT an in-memory mid reconstruction. The old reconstruction min/max/last on
     // raw mids ≠ the real s10 producer's `BarAccumulator` microstructure-weighted
     // OHLC + flat-fill timing → train/serve skew on synths. The leg merge below
-    // is now ONLY for the 1-min last-mid `price_buckets` (the calibration tick
-    // stream), exactly as the native path uses its `.idx` mids.
-    let mut price_buckets: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
+    // is now ONLY for the FULL-TICK `tick_prices` (the calibration tick stream),
+    // exactly as the native path uses its full `.idx` mid path. CRITICAL
+    // (2026-06-06 brick-storm RCA): calibrate granularity MUST == apply
+    // granularity; a 1-min last-mid downsample undercounts crossings → too-small
+    // k → live over-emit. Each leg event emits one synth path point.
+    let mut tick_prices: Vec<(i64, f64)> = Vec::new();
     loop {
         // Pick side with smaller ts (ties favor a → deterministic).
         let take_a = match (&a_next, &b_next) {
@@ -429,10 +446,10 @@ fn calibrate_one_synth(
                 continue;
             }
             let mid = (synth_bid + synth_ask) * 0.5;
-            // 1-min last-mid downsample (the calibration tick stream).
-            let bucket = (ts / MS_PER_MIN) * MS_PER_MIN;
-            let pe = price_buckets.entry(bucket).or_insert((ts, mid));
-            if ts >= pe.0 { *pe = (ts, mid); }
+            // Full-tick synth path point (the calibration tick stream). The leg
+            // merge is monotone-ascending in ts (both legs are ts-ordered and we
+            // always advance the earlier side), so push preserves path order.
+            tick_prices.push((ts, mid));
         }
     }
     // Drop leg streams now — frees the two ShardStream buffers before the
@@ -440,7 +457,7 @@ fn calibrate_one_synth(
     drop(leg_a_stream);
     drop(leg_b_stream);
 
-    if price_buckets.is_empty() {
+    if tick_prices.is_empty() {
         return CalOutcome::Skipped { ticker_id: synth_id, reason: "empty merged stream".into() };
     }
 
@@ -482,11 +499,6 @@ fn calibrate_one_synth(
         calc.precompute_sigma_cache()
     };
 
-    let tick_prices: Vec<(i64, f64)> = price_buckets
-        .into_iter()
-        .map(|(_, (ts, mid))| (ts, mid))
-        .collect();
-
     let base = RenkoConfig {
         multiplier: RenkoConfig::default().multiplier,
         min_pct: renko_yml.min_pct,
@@ -496,7 +508,7 @@ fn calibrate_one_synth(
         return CalOutcome::Failed { ticker_id: synth_id, reason: format!("base renko cfg: {}", e) };
     }
 
-    info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd, "calibrating synth (walk-forward)");
+    info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd, n_ticks = tick_prices.len(), "calibrating synth (walk-forward, full-tick)");
     // Walk-forward 7d holdout (matches direct path above; const at module scope).
     let mult = calibrate_mtf_walkforward(
         &tick_prices,

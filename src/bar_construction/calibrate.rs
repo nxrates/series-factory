@@ -703,6 +703,122 @@ mod tests {
         assert_eq!(dead.score(300.0), f64::INFINITY);
     }
 
+    /// Constant-σ VolSource for the regression test below. The brick size is
+    /// then `max(k * σ, min_pct) * price`, so k alone drives bpd on a fixed path.
+    struct ConstSigma(f64);
+    impl VolSource for ConstSigma {
+        fn len(&self) -> usize { 1 }
+        fn sigma_pct(&self, _i: usize) -> f64 { self.0 }
+        fn find_index_for_mts(&self, _mts: u64) -> usize { 0 }
+    }
+
+    /// Deterministic GBM-ish tick path: `n_days` of `ticks_per_day` points at
+    /// even ~`MS_PER_DAY/ticks_per_day` cadence, driven by a tiny LCG so the
+    /// test is reproducible without an RNG dependency. Returns `(ts, mid)`.
+    fn synth_gbm_path(n_days: usize, ticks_per_day: usize, sigma_step: f64, seed: u64) -> Vec<(i64, f64)> {
+        let dt_ms = (MS_PER_DAY / ticks_per_day as i64).max(1);
+        let mut state = seed;
+        let mut next_u = || {
+            // xorshift64* — uniform in (0,1).
+            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            ((state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let total = n_days * ticks_per_day;
+        let mut out = Vec::with_capacity(total);
+        let mut price = 100.0f64;
+        let t0: i64 = 1_700_000_000_000; // arbitrary epoch-ms anchor
+        for i in 0..total {
+            // Symmetric multiplicative step → full-tick path with intra-"minute"
+            // wiggle that a 1-min last-mid downsample would discard.
+            let z = next_u() - 0.5;
+            price *= (sigma_step * z).exp();
+            out.push((t0 + i as i64 * dt_ms, price));
+        }
+        out
+    }
+
+    /// Collapse a full-tick path to 1-min last-mid buckets (the OLD calibrator
+    /// granularity) so the test can prove the granularity gap.
+    fn downsample_1min_last(prices: &[(i64, f64)]) -> Vec<(i64, f64)> {
+        use std::collections::BTreeMap;
+        let mut m: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
+        for &(ts, mid) in prices {
+            let bucket = (ts / 60_000) * 60_000;
+            let e = m.entry(bucket).or_insert((ts, mid));
+            if ts >= e.0 { *e = (ts, mid); }
+        }
+        m.into_iter().map(|(_, (ts, mid))| (ts, mid)).collect()
+    }
+
+    /// REGRESSION GUARD (2026-06-06 brick-storm RCA): the k chosen by
+    /// `calibrate_mtf_walkforward` on a FULL-TICK path, when applied via the SAME
+    /// `RenkoGenerator` over the SAME full-tick path, must yield bpd within
+    /// `RENKO_BPD_ACCEPT_TOL` (0.20) of target. This pins calibrate-input ==
+    /// apply-input. A 1-min downsample (the old bug) undercounts crossings on the
+    /// identical k, which is asserted as the negative control.
+    #[test]
+    fn full_tick_calibrate_matches_full_tick_apply() {
+        const RENKO_BPD_ACCEPT_TOL: f64 = 0.20;
+        let target_bpd = 300.0;
+        // ~40d, 4000 ticks/day (~21s cadence) — dense enough that intra-minute
+        // extremes exist, small enough to keep the test < 1s. sigma_step tuned so
+        // target_bpd=300 lands at k≈0.5 (comfortably > K_FLOOR, < mult_bounds hi).
+        let prices = synth_gbm_path(40, 4000, 0.006, 0xC0FFEE);
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+
+        let vol = ConstSigma(0.01); // 1% σ_pct, flat
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+        };
+        let cal = CalibrationConfig {
+            target_bpd,
+            k_fit_windows_days: vec![14, 30],
+            min_window_days: 7,
+            max_rounds: 40,
+            tolerance: 0.02,
+            mult_bounds: [0.01, 50.0],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, target_bpd, 7,
+        );
+        assert!(k > 0.0, "calibration must produce a valid k (got {k})");
+
+        // Apply the chosen k over the SAME full-tick path (identical generator).
+        let applied = RenkoConfig { multiplier: k, min_pct: 0.0 };
+        let stats = count_bars_per_day_from_prices(
+            &prices, &applied, &vol, &vol_cfg, &sigma_cache, first, last,
+        );
+        let rel_err = (stats.median / target_bpd - 1.0).abs();
+        assert!(
+            rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "full-tick apply bpd (median {:.1}) within {:.0}% of target {:.0}? rel_err={:.3}",
+            stats.median, RENKO_BPD_ACCEPT_TOL * 100.0, target_bpd, rel_err
+        );
+
+        // NEGATIVE CONTROL: the SAME k on a 1-min last-mid downsample of the
+        // SAME path under-emits — proving the old (downsampled) calibrate input
+        // would have mis-measured bpd and selected a too-small k. Path crossings
+        // along full ticks >> crossings along 1-min last-mid.
+        let coarse = downsample_1min_last(&prices);
+        let coarse_stats = count_bars_per_day_from_prices(
+            &coarse, &applied, &vol, &vol_cfg, &sigma_cache, first, last,
+        );
+        assert!(
+            coarse_stats.median < stats.median,
+            "1-min downsample must undercount bricks vs full-tick for the same k \
+             (coarse median {:.1} < full {:.1})",
+            coarse_stats.median, stats.median
+        );
+    }
+
     #[test]
     fn bpd_accept_gate_threshold_math() {
         // The gate drops a window when |median/target - 1| > 0.20.
