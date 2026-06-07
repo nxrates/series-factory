@@ -9,8 +9,10 @@
 //! Pipeline
 //! ────────
 //!   1. Read every shard in `<data>/indexes/<ticker_id>/*.idx` (MITCH-id keyed).
-//!   2. Build ONE `.vol` file over the FULL trailing range (the sigma blender
-//!      itself is causal — `compute_sigma(t)` only reads bins ≤ `t`).
+//!   2. Build ONE `.vol` file from the persisted `.s10` shards over the FULL
+//!      trailing range (the sigma blender itself is causal — `compute_sigma(t)`
+//!      only reads bins ≤ `t`). The σ basis matches the live producer and the
+//!      calibrator exactly (both build from real `.s10`, not idx-mid recon).
 //!   3. Build the 1-min last-mid downsample used by the binary-search
 //!      calibrator (`calibrate_mtf_with_target`).
 //!   4. For each closed UTC day `D` (skip today, owned by the live producer):
@@ -54,7 +56,7 @@ use nxr_sdk::shard::{
     MS_PER_DAY,
 };
 use series_factory::bar_construction::{
-    build_vol_from_mid_ticks, calibrate_mtf_with_target, CalibrationConfig,
+    build_vol_from_s10, calibrate_mtf_with_target, CalibrationConfig, S10ShardIter,
 };
 use nxr_sdk::vol::{MtfVolCalculator, VolSource};
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
@@ -328,8 +330,9 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     //        max(k_fit_windows_days) days back from `to`). 120-180d × 10 Hz ≈
     //        130-200 MB, acceptable on 8 GiB pods. Symbols above 10 Hz are
     //        ignored — aggregator caps records at delta-gate cadence.
-    // Full-history mid stream → RS-over-s10 vol (vol bins are tiny + causal).
-    let mut vol_mids: Vec<(i64, f64)> = Vec::new();
+    // Full-tick stream feeds the per-day calibrator + brick replay. The vol
+    // basis is built separately from the PERSISTED `.s10` shards (below), not
+    // from idx mids, so no full-history mid buffer is collected here.
     let mut tick_stream: Vec<(i64, f64)> = Vec::new();
     let mut total_records: u64 = 0;
 
@@ -371,12 +374,8 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
             }
             total_records += 1;
 
-            // (a) Full-history mid stream for the vol blender (RS over gapless
-            // s10 OHLC; causal — compute_sigma reads only bins ≤ t).
-            vol_mids.push((ts, mid));
-
-            // (b) Full-tick stream, sliding window. Skip records older than
-            // the longest calibration window — they wouldn't be used anyway.
+            // Full-tick stream, sliding window. Skip records older than the
+            // longest calibration window — they wouldn't be used anyway.
             if ts >= tick_retain_from {
                 tick_stream.push((ts, mid));
             }
@@ -386,13 +385,12 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     info!(
         pair = pair_str,
         idx_records = total_records,
-        vol_mids = vol_mids.len(),
         tick_stream_len = tick_stream.len(),
         tick_retain_window_days = max_window_days,
-        "pass 1 (vol mid stream + full-tick stream) done"
+        "pass 1 (full-tick stream) done"
     );
 
-    if vol_mids.is_empty() || tick_stream.is_empty() {
+    if tick_stream.is_empty() {
         warn!(pair = pair_str, "no usable mid quotes after scan");
         return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
     }
@@ -400,6 +398,12 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     // ── Build the .vol file (scratch, deleted at end). One vol file covers
     //    the whole range; `compute_sigma(t)` only reads bins ≤ t so this is
     //    causal: no leakage from "future" sigma into bricks for past days.
+    //
+    // VOL-BASIS PARITY: σ MUST be built from the real persisted `.s10` shards
+    // the live producer wrote (nxr_calibrate.rs:199-211), NOT reconstructed
+    // from idx mids. idx-mid reconstruction diverges from the live/calibrator σ
+    // basis → backfilled bricks miss target bpd. Fail clearly when `.s10` is
+    // absent rather than silently falling back, matching the calibrator skip.
     std::fs::create_dir_all(&bars_directory)
         .with_context(|| format!("create_dir_all {}", bars_directory.display()))?;
     let vol_path = std::env::temp_dir().join(format!(
@@ -408,8 +412,18 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
         std::process::id()
     ));
     {
+        let s10_shards = list_shards(&bars_directory, "s10").unwrap_or_default();
+        if s10_shards.is_empty() {
+            warn!(
+                pair = pair_str,
+                s10_dir = %bars_directory.display(),
+                "no .s10 shards — run s10-from-idx first (vol basis MUST match live/calibrator)"
+            );
+            return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
+        }
         let mut writer = VolWriter::new(&vol_path)?;
-        build_vol_from_mid_ticks(vol_mids.iter().copied(), &yml.vol, &mut writer)?;
+        let mut s10_iter = S10ShardIter::new(s10_shards);
+        build_vol_from_s10(|| s10_iter.next_bar(), &yml.vol, &mut writer)?;
         writer.finish()?;
     }
 

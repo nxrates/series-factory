@@ -1,4 +1,4 @@
-//! heal-idx — repair sharded `.idx` in place (sort, 50→100 ms merge, re-shard).
+//! heal-idx — repair sharded `.idx` in place (sort, resample to 200 ms, re-shard).
 //!
 //! Usage:
 //!   heal-idx --ticker-id 435315775907037184 --data-root /data [--dry-run] [--commit]
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(about = "Repair sharded .idx: sort, resample to 100ms, re-partition by UTC date.")]
+#[command(about = "Repair sharded .idx: sort, resample to 200ms, re-partition by UTC date.")]
 struct Args {
     #[arg(long)]
     ticker_id: u64,
@@ -18,7 +18,7 @@ struct Args {
     #[clap(flatten)]
     common: series_factory::cli::CommonArgs,
 
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value = "200")]
     target_ms: i64,
 
     #[arg(long)]
