@@ -461,11 +461,11 @@ const SPREAD_CONSISTENCY_BPS: f64 = 0.5;
 /// G9 — stuck/flatline detector: a run of this many *bit-identical* consecutive
 /// mids signals a frozen forwarder (the doc promises "no stuck feeds" but no
 /// check enforced it — a feed repeating one price could certify PASS). At the
-/// live 10 Hz cadence 600 records ≈ 60 s of an unmoving book. A genuinely
+/// live 5 Hz cadence 300 records ≈ 60 s of an unmoving book. A genuinely
 /// quiet-but-moving stable pair re-prints sub-tick noise far more often than
 /// once a minute, so only a *true* freeze (identical to the bit) trips this.
 /// Heuristic → WARN by default, ERROR under `--strict`.
-const STUCK_RUN: usize = 600;
+const STUCK_RUN: usize = 300;
 
 /// G9 — distinct-mid floor: over a *large* sample (≥ `STUCK_MIN_SAMPLE`
 /// finite mids) the fraction of distinct mid values must exceed this. A

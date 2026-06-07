@@ -25,7 +25,7 @@ use series_factory::sharding::{
     ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
 };
 use series_factory::{
-    bar_construction::build_vol_from_mid_ticks,
+    bar_construction::{build_vol_from_s10, S10ShardIter},
     vol_bin::{VolMmap, VolWriter},
 };
 use nxr_sdk::vol::{MtfVolCalculator, VolSource};
@@ -91,11 +91,11 @@ fn main() -> Result<()> {
     }
     info!(input_shards = shards.len(), "input shard scan done");
 
-    // ═══ PASS 1: collect (ts, mid) from composite idx → RS-over-s10 vol ═══
+    // ═══ PASS 1: scan composite idx for the first valid mts → bootstrap anchor ═══
     let t0 = std::time::Instant::now();
-    let mut mids: Vec<(i64, f64)> = Vec::new();
+    let mut first_ts: i64 = 0;
     let mut pass1_count: u64 = 0;
-    for (_, path) in &shards {
+    'outer: for (_, path) in &shards {
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
         while let Some(rec) = stream.next()? {
             // SEAM PARITY: skip heartbeat-sentinel records exactly like the live
@@ -110,26 +110,41 @@ fn main() -> Result<()> {
             if !(mid.is_finite() && mid > 0.0) {
                 continue;
             }
-            mids.push((ts, mid));
             pass1_count += 1;
+            first_ts = (ts / MS_PER_30MIN) * MS_PER_30MIN;
+            break 'outer;
         }
     }
-    let first_ts = mids.first().map(|&(ts, _)| (ts / MS_PER_30MIN) * MS_PER_30MIN).unwrap_or(0);
     info!(
         pass1_records = pass1_count,
-        "pass 1: mid stream collected in {}ms",
+        "pass 1: bootstrap anchor found in {}ms",
         t0.elapsed().as_millis()
     );
 
-    // ═══ Build vol (.vol) file (RS over gapless s10 OHLC) ═══
+    // ═══ Build vol (.vol) file (RS over the PERSISTED s10 shards) ═══
+    // VOL-BASIS PARITY: σ MUST be built from the real `.s10` shards the live
+    // producer persisted (nxr_calibrate.rs:199-211), NOT reconstructed from idx
+    // mids. Reconstructing s10 from idx mids diverges from the live/calibrator σ
+    // basis → backfilled .renko bricks miss target bpd (BTC regen at correct k
+    // still emitted 992 bpd). Fail clearly when `.s10` is absent rather than
+    // silently falling back, matching the calibrator's "no .s10 shards" skip.
     std::fs::create_dir_all(&out_dir)?;
     // vol file lives alongside the shard dir; transient (deleted post-write).
     let vol_path = out_dir.join("_renko.vol");
+    let s10_dir = bars_dir(&data_root_bars, ticker_id);
+    let s10_shards = list_shards(&s10_dir, "s10").unwrap_or_default();
+    if s10_shards.is_empty() {
+        anyhow::bail!(
+            "no .s10 shards under {} — run s10-from-idx first (vol basis MUST match live/calibrator)",
+            s10_dir.display()
+        );
+    }
     let mut vol_writer = VolWriter::new(&vol_path)?;
-    let n_vol = build_vol_from_mid_ticks(mids.iter().copied(), &yml.vol, &mut vol_writer)?;
+    let mut s10_iter = S10ShardIter::new(s10_shards);
+    let n_vol = build_vol_from_s10(|| s10_iter.next_bar(), &yml.vol, &mut vol_writer)?;
     vol_writer.finish()?;
     let vol_mmap = VolMmap::open(&vol_path)?;
-    info!(vol_records = n_vol, "vol file written");
+    info!(vol_records = n_vol, "vol file written (from persisted .s10)");
 
     // ═══ PASS 2: feed composite mid → RenkoGenerator ═══
     let bootstrap_end = first_ts + yml.pipeline.bootstrap_days * MS_PER_DAY;

@@ -45,9 +45,9 @@ struct Args {
     /// Quote asset symbol (e.g. USDT).
     quote: String,
     /// Aggregation cycle in milliseconds. Default matches prod forwarder
-    /// cadence (100 ms = 10 Hz).
+    /// cadence (200 ms = 5 Hz).
     /// resolution for smaller `.idx` files on long replays.
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value = "200")]
     cycle_ms: u64,
     /// Z-score outlier gate on the mid price — ticks beyond `z` stddevs from
     /// the local EMA are dropped from the ingest and counted against

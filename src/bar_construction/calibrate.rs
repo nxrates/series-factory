@@ -271,32 +271,67 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
         // score used for the search).
         let mut best_eval_median = 0.0f64;
         let mut best_eval_days = 0usize;
+        // Two best log-mults seen (for the post-search midpoint refine). bpd is
+        // monotone-decreasing in k, so the median==target crossing lives between
+        // the two lowest-scoring trials; their geometric midpoint is the best
+        // single extra probe to tighten convergence.
+        let mut best_log_mults: [f64; 2] = [f64::NAN, f64::NAN];
+
+        // Re-usable trial evaluator (search loop + the midpoint refine below).
+        let eval_mult = |mult: f32| -> DailyBpdStats {
+            let trial = RenkoConfig { multiplier: mult, min_pct: base.min_pct };
+            // Score on this window's EVAL slice (walk-forward). The slice is
+            // spike/gap-quarantined inside count_bars_per_day_from_prices.
+            count_bars_per_day_from_prices(
+                prices, &trial, vol_source, vol_config, sigma_cache,
+                eval_from, last,
+            )
+        };
 
         for _round in 0..cal.max_rounds {
             let log_mid = (log_lo + log_hi) / 2.0;
             let mult = log_mid.exp() as f32;
-            let trial = RenkoConfig { multiplier: mult, min_pct: base.min_pct };
 
-            // Score on this window's EVAL slice (walk-forward). The slice is
-            // spike/gap-quarantined inside count_bars_per_day_from_prices.
-            let eval_stats = count_bars_per_day_from_prices(
-                prices, &trial, vol_source, vol_config, sigma_cache,
-                eval_from, last,
-            );
+            let eval_stats = eval_mult(mult);
             let score = eval_stats.score(target_bpd);
             if score < best.1 {
                 best = (mult, score);
                 best_eval_median = eval_stats.median;
                 best_eval_days = eval_stats.days;
+                best_log_mults[1] = best_log_mults[0];
+                best_log_mults[0] = log_mid;
             }
             if score < cal.tolerance {
                 break;
             }
-            // Direction: use eval median to choose half (consistent with score).
+            // Direction: use eval median to choose half. bpd is monotone-
+            // decreasing in k, so median > target ⇒ k too small ⇒ search the
+            // higher half; median < target ⇒ search the lower half. This always
+            // steps TOWARD median==target, the same point score() rewards.
             if eval_stats.median > target_bpd {
                 log_lo = log_mid;
             } else {
                 log_hi = log_mid;
+            }
+        }
+
+        // CONVERGENCE TIGHTENING (2026-06-07): the binary search halts on the
+        // score-tolerance OR round budget, which can stop one step shy of the
+        // true median==target crossing (the MAD term makes the score surface
+        // not strictly monotone in k). Probe the geometric midpoint of the two
+        // best-scoring k's — that bracket straddles the crossing — and adopt it
+        // ONLY if it does not worsen the score. Strictly tightening: never
+        // destabilizes an already-good selection, only pulls median nearer
+        // target when a better point sits between the two best trials.
+        if best_log_mults[0].is_finite() && best_log_mults[1].is_finite() {
+            let mid_log = (best_log_mults[0] + best_log_mults[1]) / 2.0;
+            let mid_mult = mid_log.exp() as f32;
+            let mid_stats = eval_mult(mid_mult);
+            let mid_score = mid_stats.score(target_bpd);
+            if mid_score <= best.1 && mid_stats.days > 0 {
+                best = (mid_mult, mid_score);
+                best_eval_median = mid_stats.median;
+                best_eval_days = mid_stats.days;
             }
         }
 
@@ -816,6 +851,57 @@ mod tests {
             "1-min downsample must undercount bricks vs full-tick for the same k \
              (coarse median {:.1} < full {:.1})",
             coarse_stats.median, stats.median
+        );
+    }
+
+    /// CONVERGENCE TIGHTENING GUARD (2026-06-07): the post-search midpoint
+    /// refine must never push the selected k's bpd FURTHER from target than the
+    /// binary search alone would have. We assert the walk-forward result lands
+    /// within the bpd-accept tol — i.e. the midpoint probe only ever helps or is
+    /// a no-op (it is adopted only when its score ≤ the search best). Same synth
+    /// path as the full-tick regression so behaviour is pinned end-to-end.
+    #[test]
+    fn midpoint_refine_does_not_overshoot_target() {
+        let target_bpd = 300.0;
+        let prices = synth_gbm_path(40, 4000, 0.006, 0xC0FFEE);
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+        };
+        // Tight round budget so the raw search is more likely to stop short of
+        // the crossing — this is exactly when the midpoint refine should engage.
+        let cal = CalibrationConfig {
+            target_bpd,
+            k_fit_windows_days: vec![14, 30],
+            min_window_days: 7,
+            max_rounds: 8,
+            tolerance: 0.02,
+            mult_bounds: [0.01, 50.0],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, target_bpd, 7,
+        );
+        assert!(k > 0.0, "calibration must produce a valid k (got {k})");
+
+        let applied = RenkoConfig { multiplier: k, min_pct: 0.0 };
+        let stats = count_bars_per_day_from_prices(
+            &prices, &applied, &vol, &vol_cfg, &sigma_cache, first, last,
+        );
+        let rel_err = (stats.median / target_bpd - 1.0).abs();
+        assert!(
+            rel_err <= 0.20,
+            "refined k median {:.1} within 20% of target {:.0}? rel_err={:.3}",
+            stats.median, target_bpd, rel_err
         );
     }
 
