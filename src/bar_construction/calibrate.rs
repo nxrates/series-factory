@@ -810,6 +810,10 @@ mod tests {
             winsorize_pct: [0.05, 0.95],
             winsorize_min_samples: 1,
             recompute_cooldown_ms: 0,
+            // Spike-responsive σ OFF for the granularity/convergence regression
+            // tests (they isolate calibrate-input == apply-input parity, which
+            // is orthogonal to the spike floor). Default OFF anyway.
+            ..VolConfig::default()
         };
         let cal = CalibrationConfig {
             target_bpd,
@@ -875,6 +879,10 @@ mod tests {
             winsorize_pct: [0.05, 0.95],
             winsorize_min_samples: 1,
             recompute_cooldown_ms: 0,
+            // Spike-responsive σ OFF for the granularity/convergence regression
+            // tests (they isolate calibrate-input == apply-input parity, which
+            // is orthogonal to the spike floor). Default OFF anyway.
+            ..VolConfig::default()
         };
         // Tight round budget so the raw search is more likely to stop short of
         // the crossing — this is exactly when the midpoint refine should engage.
