@@ -61,7 +61,23 @@ use nxr_sdk::shard::MS_PER_DAY;
 /// Tightened 0.20 → 0.08 (2026-06-09) now that the accept objective is anchored
 /// to the full-history median (FIX 1) and the score is pure-median (FIX 2b), so
 /// the fit objective == the operator's full-history measurement.
-const RENKO_BPD_ACCEPT_TOL: f64 = 0.08;
+const RENKO_BPD_ACCEPT_TOL: f64 = 0.05;
+
+/// PART B (2026-06-09 accuracy redesign): walk-forward fold-agreement guard.
+/// The per-window search is DEMOTED to an overfit guard: each fold still picks a
+/// k_w, but we no longer geo-mean them into the answer. If the folds disagree by
+/// more than this ratio (`max(k_w)/min(k_w) > K_AGREEMENT_MAX`) the windows are
+/// fitting different regimes → reject (return 0.0, caller drops the entry).
+const K_AGREEMENT_MAX: f64 = 1.5;
+
+/// PART B selection stop criterion: log-k bracket half-width at which the
+/// full-history-median bisection halts. `ln(1.005)` ⇒ the bracket [exp(lo),
+/// exp(hi)] is ≤ 0.5 % wide in k. We STOP ON BRACKET WIDTH, not on score: the
+/// snap_to_25_grid lattice + integer-day median make bpd(k) a STAIRCASE, so a
+/// score-stop stalls on a flat tread while the true crossing sits at the rung
+/// edge. The two-sided rung probe then picks the closer of the two bracketing
+/// rungs.
+const K_BRACKET_LN_EPS: f64 = 0.004988; // ln(1.005) → 0.5% k-width
 
 /// Dispersion side-guard bound (FIX 2b, 2026-06-09): reject a window when its
 /// MAD/median exceeds this. Kept as a SEPARATE diagnostic guard — NOT folded
@@ -193,9 +209,19 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
     let n_days = ((to_ts - from_ts) / MS_PER_DAY).max(1) as usize;
     let mut per_day: Vec<u64> = vec![0; n_days];
 
-    for &(ts, mid) in prices {
-        if ts < from_ts { continue; }
-        if ts > to_ts { break; }
+    // PERF A1 (2026-06-09): `prices` is ts-ASCENDING. The eval-search replays
+    // a 7–40d trailing slice ~60×/ticker but previously iterated the WHOLE
+    // (up-to-247M) Vec, skipping ~99 % via `ts < from_ts`. Binary-search the
+    // slice bounds ONCE so we iterate only the in-range window. Inclusivity is
+    // pinned to the ORIGINAL guards (`ts >= from_ts`, `ts <= to_ts`): `lo`
+    // drops everything strictly before `from_ts`; `hi` keeps everything `≤
+    // to_ts`. `day_idx` is still derived from the unchanged `from_ts`, so brick
+    // bucketing (and thus the fitted k) is byte-identical to the linear scan.
+    let lo = prices.partition_point(|p| p.0 < from_ts);
+    let hi = prices.partition_point(|p| p.0 <= to_ts);
+    let window = &prices[lo..hi];
+
+    for &(ts, mid) in window {
         let day_idx = ((ts - from_ts) / MS_PER_DAY).clamp(0, n_days as i64 - 1) as usize;
         let sigma = sigma_for_ts(ts, vol_source, sigma_cache);
         gen.feed_tick_with_sigma(ts, mid, sigma, &mut |_| {
@@ -243,11 +269,25 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
 ///   - `cal_slice  = [last - window_days,           last - eval_holdout_days]`
 ///   - `eval_slice = [last - eval_holdout_days,     last]`
 ///
-/// Binary-search `mult` to minimise the score on `eval_slice` (NOT cal_slice
-/// — that's the walk-forward property). Score = `DailyBpdStats::score`
-/// (median deviation + 0.3 × MAD). Same clamp-detector as `calibrate_mtf`:
-/// boundary-hit windows are dropped, not blended in. Returns geo-mean across
-/// surviving windows or 0.0 (cal-fail → caller keeps prior_k).
+/// PART B (2026-06-09 accuracy redesign — drives full-history median bpd error
+/// ≤ 5 %): the walk-forward search is DEMOTED to an OVERFIT GUARD. Each fold
+/// still binary-searches `mult` on its eval slice to produce a `k_w`, but the
+/// folds are NO LONGER geo-mean blended into the answer and the per-window
+/// full-history recompute/accept is removed from inside the loop. After the
+/// loop, if the folds disagree (`max(k_w)/min(k_w) > K_AGREEMENT_MAX`) the
+/// windows are fitting incompatible regimes → reject (return 0.0).
+///
+/// The ANSWER comes from a SEPARATE log-k bisection on the FULL-history median
+/// over `[first, last]` (the exact quantity the operator + data_quality_audit
+/// measure). bpd(k) is monotone-decreasing but STAIR-STEPPED (snap_to_25_grid
+/// lattice × integer-day median); the bisection brackets the median==target
+/// crossing to a 0.5 %-wide k-window, then a two-sided rung probe picks the
+/// bracketing rung (exp(lo) vs exp(hi)) with the smaller `|median/target-1|`.
+/// The achieved error is that structural-floor minimum — logged per ticker so
+/// the operator can spot tickers needing a per-pair forced-k override.
+///
+/// Final gate: accept `k_star` iff `achieved_err ≤ RENKO_BPD_ACCEPT_TOL` AND
+/// dispersion_ok AND `k_star ≥ K_FLOOR` AND no clamp; else 0.0 (caller drops).
 ///
 /// `eval_holdout_days` typically 7. With `k_fit_windows_days=[7,14,30]`, the
 /// 7d window degenerates (cal_slice is empty) — caller should size windows
@@ -293,10 +333,9 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
         }
         let (mut log_lo, mut log_hi) = (cal.mult_bounds[0].ln(), cal.mult_bounds[1].ln());
         let mut best = (base.multiplier, f64::INFINITY);
-        // Track the chosen mult's clean-eval median so the bpd-accept gate can
-        // recompute a pure relative-bpd error (independent of the MAD-weighted
-        // score used for the search).
-        let mut best_eval_median = 0.0f64;
+        // Track the chosen mult's clean-eval-day count for the degenerate-window
+        // guard below (PART B no longer needs the eval median — selection is the
+        // post-loop full-history bisection).
         let mut best_eval_days = 0usize;
         // Two best log-mults seen (for the post-search midpoint refine). bpd is
         // monotone-decreasing in k, so the median==target crossing lives between
@@ -323,7 +362,6 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             let score = eval_stats.score(target_bpd);
             if score < best.1 {
                 best = (mult, score);
-                best_eval_median = eval_stats.median;
                 best_eval_days = eval_stats.days;
                 best_log_mults[1] = best_log_mults[0];
                 best_log_mults[0] = log_mid;
@@ -344,12 +382,11 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
 
         // CONVERGENCE TIGHTENING (2026-06-07): the binary search halts on the
         // score-tolerance OR round budget, which can stop one step shy of the
-        // true median==target crossing (the MAD term makes the score surface
-        // not strictly monotone in k). Probe the geometric midpoint of the two
+        // true median==target crossing. Probe the geometric midpoint of the two
         // best-scoring k's — that bracket straddles the crossing — and adopt it
-        // ONLY if it does not worsen the score. Strictly tightening: never
-        // destabilizes an already-good selection, only pulls median nearer
-        // target when a better point sits between the two best trials.
+        // ONLY if it does not worsen the score. Still useful as part of the
+        // overfit-guard k_w estimate (PART B no longer blends k_w into the
+        // answer, but a tighter k_w sharpens the agreement check).
         if best_log_mults[0].is_finite() && best_log_mults[1].is_finite() {
             let mid_log = (best_log_mults[0] + best_log_mults[1]) / 2.0;
             let mid_mult = mid_log.exp() as f32;
@@ -357,7 +394,6 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             let mid_score = mid_stats.score(target_bpd);
             if mid_score <= best.1 && mid_stats.days > 0 {
                 best = (mid_mult, mid_score);
-                best_eval_median = mid_stats.median;
                 best_eval_days = mid_stats.days;
             }
         }
@@ -395,74 +431,156 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             );
             continue;
         }
-        // FIX 1 (2026-06-09): RE-ANCHOR the accept/select objective to the
-        // FULL-history median, NOT the trailing eval slice. The walk-forward
-        // search above (eval slice) still guards direction/overfit, but the
-        // operator regenerates renko over the FULL history and takes its median.
-        // The accept gate (and the selection) must measure the SAME thing, else
-        // the fitted k is biased (eval slice ≠ full history → median lands ~1.6-2×
-        // target). Recompute the chosen k's stats over [first, last] and gate on
-        // THAT median. `best_eval_median` is kept only for the diagnostic log.
-        let full_cfg = RenkoConfig { multiplier: best.0, min_pct: base.min_pct };
-        let full_stats = count_bars_per_day_from_prices(
-            prices, &full_cfg, vol_source, vol_config, sigma_cache, first, last,
-        );
-        if full_stats.days == 0 {
-            warn!(
-                window_days,
-                mult = best.0,
-                "wf full-history recompute had no scorable clean day — dropping window"
-            );
-            continue;
-        }
-        // Dispersion side-guard (FIX 2b): reject pure-noise windows. Separate
-        // from the minimized score so it never biases k upward.
-        if !full_stats.dispersion_ok() {
-            warn!(
-                window_days,
-                mult = best.0,
-                full_median = full_stats.median,
-                full_mad = full_stats.mad,
-                dispersion_max = RENKO_DISPERSION_MAX,
-                "wf dispersion side-guard — dropping window (MAD/median > bound)"
-            );
-            continue;
-        }
-        // bpd-target accept gate (RCA ROOT2b, 2026-06-01; re-anchored to
-        // full-history median by FIX 1, tolerance tightened to 0.08 by FIX 2a).
-        // DROP the window when the FULL-history median deviates from target by
-        // more than RENKO_BPD_ACCEPT_TOL. All windows dropped → return 0.0 →
-        // nxr_calibrate emits Failed → entry DROPPED from ticker-params.json
-        // (correct outcome — no midpoint/stale carry).
-        let rel_bpd_err = (full_stats.median / target_bpd - 1.0).abs();
-        if rel_bpd_err > RENKO_BPD_ACCEPT_TOL {
-            warn!(
-                window_days,
-                mult = best.0,
-                full_median = full_stats.median,
-                eval_median = best_eval_median,
-                target_bpd,
-                rel_bpd_err_pct = rel_bpd_err * 100.0,
-                accept_tol_pct = RENKO_BPD_ACCEPT_TOL * 100.0,
-                "wf bpd-target accept gate — dropping window (full-history |median-target|/target > tol)"
-            );
-            continue;
-        }
+        // PART B1 (2026-06-09): this fold's k_w is now ONLY an overfit-guard
+        // datum. The per-window full-history recompute + dispersion + accept gate
+        // that used to live here is REMOVED — the answer comes from the post-loop
+        // full-history log-k bisection (PART B2), which measures the same
+        // full-history median once, at the bracketing rungs, instead of once per
+        // fold on each fold's overfit k.
         mults.push(best.0);
     }
 
+    // ── PART B1: fold-agreement overfit guard ────────────────────────────────
+    // If no fold survived, the data is too gappy/short to trust → reject.
     if mults.is_empty() {
+        warn!("wf all folds dropped (quarantine/clamp/floor) — returning 0.0");
         return 0.0;
     }
-    let geo = (mults.iter().map(|m| (*m as f64).ln()).sum::<f64>() / mults.len() as f64).exp() as f32;
-    // EMERGENCY T0.1: final safety net — geo_mean below K_FLOOR is meaningless;
-    // signal calibrate-fail to caller (which per P0.4 drops the entry rather
-    // than carrying stale).
-    if (geo as f64) < K_FLOOR {
-        warn!(geo, k_floor = K_FLOOR, "wf geo_mean < K_FLOOR — returning 0.0 (caller drops entry)");
+    if mults.len() >= 2 {
+        let k_min = mults.iter().cloned().fold(f32::INFINITY, f32::min) as f64;
+        let k_max = mults.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        if k_min > 0.0 && k_max / k_min > K_AGREEMENT_MAX {
+            warn!(
+                k_min,
+                k_max,
+                ratio = k_max / k_min,
+                agreement_max = K_AGREEMENT_MAX,
+                "wf fold-agreement guard — folds disagree (max/min > bound), rejecting (overfit/regime split)"
+            );
+            return 0.0;
+        }
+    }
+
+    // ── PART B2: log-k bisection on the FULL-history median ───────────────────
+    // bpd(k) is monotone-decreasing in k over [first, last]; g(k) = median(k) -
+    // target therefore crosses zero exactly once. Bisect in log-k (k spans ~2
+    // decades, so log-space halving is uniform in relative k). The median is a
+    // STAIRCASE (snap_to_25_grid × integer-day median), so we stop on BRACKET
+    // WIDTH, not score, then pick the better of the two bracketing rungs.
+    let median_bpd = |k: f64| -> DailyBpdStats {
+        count_bars_per_day_from_prices(
+            prices,
+            &RenkoConfig { multiplier: k as f32, min_pct: base.min_pct },
+            vol_source, vol_config, sigma_cache, first, last,
+        )
+    };
+
+    let mut lo = cal.mult_bounds[0].ln();
+    let mut hi = cal.mult_bounds[1].ln();
+    let g_lo = median_bpd(lo.exp());
+    let g_hi = median_bpd(hi.exp());
+    // Bracket validity: smaller k (lo bound) must OVERSHOOT target (g(lo)>0) and
+    // larger k (hi bound) must UNDERSHOOT (g(hi)<0). If either degenerate or the
+    // crossing isn't bracketed, the target is structurally unreachable in
+    // [mult_bounds] → Failed (caller drops the entry).
+    if g_lo.days == 0 || g_hi.days == 0
+        || !(g_lo.median - target_bpd > 0.0)
+        || !(g_hi.median - target_bpd < 0.0)
+    {
+        warn!(
+            lo_median = g_lo.median,
+            hi_median = g_hi.median,
+            target_bpd,
+            "wf bisection bracket invalid (target not bracketed by mult_bounds) — returning 0.0"
+        );
         return 0.0;
     }
-    geo
+
+    for _ in 0..cal.max_rounds {
+        if (hi - lo) < K_BRACKET_LN_EPS {
+            break;
+        }
+        let mid = (lo + hi) / 2.0;
+        let m = median_bpd(mid.exp());
+        // median > target ⇒ k too small ⇒ move lo up (toward larger k);
+        // median ≤ target ⇒ k too large ⇒ move hi down (toward smaller k).
+        if m.median > target_bpd {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    // ── PART B2 two-sided rung probe ─────────────────────────────────────────
+    // lo is the LAST k whose median was > target (the small-k / overshoot rung);
+    // hi is the LAST k whose median was ≤ target (the large-k / undershoot rung).
+    // Re-measure both and keep whichever lands closer to target — the staircase
+    // makes the true achievable optimum one of these two bracketing rungs.
+    let small_k = lo.exp(); // ≥ target side
+    let large_k = hi.exp(); // ≤ target side
+    let s_small = median_bpd(small_k);
+    let s_large = median_bpd(large_k);
+    let err_small = if s_small.days == 0 { f64::INFINITY } else { (s_small.median / target_bpd - 1.0).abs() };
+    let err_large = if s_large.days == 0 { f64::INFINITY } else { (s_large.median / target_bpd - 1.0).abs() };
+    let (k_star, achieved_err, full_stats) = if err_small <= err_large {
+        (small_k, err_small, s_small)
+    } else {
+        (large_k, err_large, s_large)
+    };
+
+    info!(
+        k_star,
+        achieved_err_pct = achieved_err * 100.0,
+        full_median = full_stats.median,
+        target_bpd,
+        accept_tol_pct = RENKO_BPD_ACCEPT_TOL * 100.0,
+        "wf full-history rung selection (structural floor = achieved_err)"
+    );
+
+    // ── PART B3: final gate ──────────────────────────────────────────────────
+    if full_stats.days == 0 {
+        warn!(k_star, "wf selected rung had no scorable clean day — returning 0.0");
+        return 0.0;
+    }
+    if achieved_err > RENKO_BPD_ACCEPT_TOL {
+        warn!(
+            k_star,
+            achieved_err_pct = achieved_err * 100.0,
+            accept_tol_pct = RENKO_BPD_ACCEPT_TOL * 100.0,
+            full_median = full_stats.median,
+            target_bpd,
+            "wf accept gate — structural floor exceeds tol (needs per-pair renko_k override), returning 0.0"
+        );
+        return 0.0;
+    }
+    if !full_stats.dispersion_ok() {
+        warn!(
+            k_star,
+            full_median = full_stats.median,
+            full_mad = full_stats.mad,
+            dispersion_max = RENKO_DISPERSION_MAX,
+            "wf dispersion side-guard — pure-noise full history, returning 0.0"
+        );
+        return 0.0;
+    }
+    if k_star < K_FLOOR {
+        warn!(k_star, k_floor = K_FLOOR, "wf k_star < K_FLOOR — returning 0.0 (caller drops entry)");
+        return 0.0;
+    }
+    // Clamp-detector on the FINAL k_star: a selection parked at either bound is
+    // a degenerate σ / unreachable-target artifact, not a fit.
+    let lo_clamp = (k_star - cal.mult_bounds[0]).abs() / cal.mult_bounds[0] < 0.01;
+    let hi_clamp = (k_star - cal.mult_bounds[1]).abs() / cal.mult_bounds[1] < 0.01;
+    if lo_clamp || hi_clamp {
+        warn!(
+            k_star,
+            bound = if lo_clamp { "lower" } else { "upper" },
+            "wf final clamp-detector — k_star parked at mult bound, returning 0.0"
+        );
+        return 0.0;
+    }
+
+    k_star as f32
 }
 
 /// Replay `prices` through a fresh `RenkoGenerator(config)` and count bars
@@ -894,7 +1012,7 @@ mod tests {
             min_window_days: 7,
             max_rounds: 40,
             tolerance: 0.02,
-            mult_bounds: [0.01, 50.0],
+            mult_bounds: [0.05, 4.0],   // PART B: production K_FLOOR..MULT_UPPER_BOUND (bracket must hold)
         };
         let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
 
@@ -968,7 +1086,7 @@ mod tests {
             min_window_days: 7,
             max_rounds: 8,
             tolerance: 0.02,
-            mult_bounds: [0.01, 50.0],
+            mult_bounds: [0.05, 4.0],   // PART B: production K_FLOOR..MULT_UPPER_BOUND (bracket must hold)
         };
         let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
 
@@ -1040,5 +1158,114 @@ mod tests {
             bricks_per_day: vec![], median: 0.0, mean: 0.0, mad: 0.0, days: 0,
         };
         assert!(!dead.dispersion_ok(), "dead window not ok");
+    }
+
+    /// PART B2: the full-history log-k bisection + two-sided rung probe must
+    /// return the k whose full-history median is the CLOSER of the two
+    /// bracketing rungs. We reproduce the bracket independently and assert the
+    /// returned k lands on the better rung (its err ≤ the other rung's err).
+    #[test]
+    fn rootfind_lands_on_optimal_rung() {
+        let target_bpd = 300.0;
+        let prices = synth_gbm_path(40, 4000, 0.006, 0xC0FFEE);
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+            ..VolConfig::default()
+        };
+        let cal = CalibrationConfig {
+            target_bpd,
+            k_fit_windows_days: vec![14, 30],
+            min_window_days: 7,
+            max_rounds: 20,
+            tolerance: 0.02,
+            mult_bounds: [0.05, 4.0],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, target_bpd, 7,
+        );
+        assert!(k > 0.0, "must produce a valid k (got {k})");
+
+        // The selected k's full-history median err IS the achieved structural
+        // floor; it must be ≤ RENKO_BPD_ACCEPT_TOL (gate) AND ≤ the err at a
+        // k one bracket-rung away on each side (it is the rung minimum).
+        let median_err = |kk: f64| -> f64 {
+            let s = count_bars_per_day_from_prices(
+                &prices, &RenkoConfig { multiplier: kk as f32, min_pct: 0.0 },
+                &vol, &vol_cfg, &sigma_cache, first, last,
+            );
+            if s.days == 0 { f64::INFINITY } else { (s.median / target_bpd - 1.0).abs() }
+        };
+        let err_star = median_err(k as f64);
+        assert!(err_star <= RENKO_BPD_ACCEPT_TOL,
+            "achieved_err {err_star} must be within accept tol");
+        // Step a full bracket-width (0.5%) to each side: the chosen rung is the
+        // local optimum, so neither neighbor beats it.
+        let step = (K_BRACKET_LN_EPS).exp(); // ×1.005
+        let err_up = median_err(k as f64 * step);
+        let err_dn = median_err(k as f64 / step);
+        assert!(err_star <= err_up && err_star <= err_dn,
+            "k={k} sits on the optimal rung (err_star={err_star} up={err_up} dn={err_dn})");
+    }
+
+    /// PART B1: when the per-fold overfit-guard k_w's disagree by more than
+    /// `K_AGREEMENT_MAX` (1.5×) the function must REJECT (return 0.0). We craft a
+    /// path whose recent week is far higher-vol than the older history, so the
+    /// short fold fits a much smaller k than the long fold (path crossings drive
+    /// k under flat σ), tripping the agreement guard.
+    #[test]
+    fn agreement_guard_rejects_divergent_folds() {
+        // 35 calm days then 5 EXTREMELY turbulent days (15× step). Holdout
+        // scales with window: the 14d fold scores a ~4.7d trailing eval slice
+        // (fully inside the 5d spike → needs a LARGE k to hit target) while the
+        // 30d fold scores a ~10d trailing slice (half spike, half calm → much
+        // SMALLER k). The two k_w then differ by > 1.5× ⇒ agreement guard fires.
+        let calm = synth_gbm_path(35, 4000, 0.0015, 0xABCDEF);
+        let mut turbulent = synth_gbm_path(5, 4000, 0.0225, 0x123456);
+        // Re-anchor the turbulent segment's timestamps to follow `calm`.
+        let dt = calm[1].0 - calm[0].0;
+        let t_after = calm.last().unwrap().0 + dt;
+        for (i, p) in turbulent.iter_mut().enumerate() {
+            p.0 = t_after + i as i64 * dt;
+        }
+        let mut prices = calm;
+        prices.extend(turbulent);
+
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+            ..VolConfig::default()
+        };
+        let cal = CalibrationConfig {
+            target_bpd: 300.0,
+            k_fit_windows_days: vec![14, 30],
+            min_window_days: 7,
+            max_rounds: 20,
+            tolerance: 0.02,
+            mult_bounds: [0.05, 4.0],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, 300.0, 7,
+        );
+        assert_eq!(k, 0.0,
+            "divergent folds (recent turbulence vs calm history) must trip the \
+             agreement guard and reject (got k={k})");
     }
 }

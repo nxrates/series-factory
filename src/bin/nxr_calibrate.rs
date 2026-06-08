@@ -39,7 +39,7 @@ use series_factory::bar_construction::{
     build_vol_from_s10, calibrate_mtf_walkforward, CalibrationConfig, S10ShardIter,
 };
 use nxr_sdk::vol::{MtfVolCalculator, VolConfig};
-use nxr_sdk::renko::RenkoConfig;
+use nxr_sdk::renko::{RenkoConfig, K_FLOOR, MULT_UPPER_BOUND};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
@@ -154,7 +154,17 @@ fn calibrate_one(
     //
     // The vol basis is built separately from the gapless `.s10` shards (RS over
     // s10 OHLC), NOT from idx-HLC — see the s10 vol build below.
-    let mut tick_prices: Vec<(i64, f64)> = Vec::new();
+    // PERF A2 (2026-06-09): pre-size the tick Vec from the on-disk shard byte
+    // sizes (each IndexRecord = 56 B) so the per-tick push loop over up to
+    // ~247M records does NOT pay log-N reallocation churn (~6 GB of memmove on
+    // a cold ticker). Upper bound only — heartbeat sentinels / non-finite mids
+    // are filtered below, so the Vec ends ≤ this reservation; no correctness
+    // impact, purely a capacity hint.
+    let est_ticks: usize = shards
+        .iter()
+        .filter_map(|(_d, p)| std::fs::metadata(p).ok().map(|m| m.len() as usize / 56))
+        .sum();
+    let mut tick_prices: Vec<(i64, f64)> = Vec::with_capacity(est_ticks);
     for (_date, shard_path) in &shards {
         let mut stream = match ShardStream::<IndexRecord>::open(shard_path) {
             Ok(s) => s,
@@ -298,6 +308,19 @@ struct LegStream {
     cur: Option<ShardStream<IndexRecord>>,
 }
 
+/// PERF A2: upper-bound tick count for one synth leg from its `.idx` shard
+/// byte sizes (each IndexRecord = 56 B). Used only to pre-size the merged synth
+/// tick Vec — a missing dir / unreadable shard simply contributes 0, so the
+/// reservation degrades to the old grow-on-push behavior, never wrong.
+fn est_leg_ticks(idx_root: &Path, ticker_id: u64) -> usize {
+    let dir = idx_root.join(ticker_id.to_string());
+    list_shards(&dir, "idx")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(_d, p)| std::fs::metadata(p).ok().map(|m| m.len() as usize / 56))
+        .sum()
+}
+
 impl LegStream {
     fn open(idx_root: &Path, ticker_id: u64) -> Result<Self> {
         let dir = idx_root.join(ticker_id.to_string());
@@ -408,7 +431,14 @@ fn calibrate_one_synth(
     // (2026-06-06 brick-storm RCA): calibrate granularity MUST == apply
     // granularity; a 1-min last-mid downsample undercounts crossings → too-small
     // k → live over-emit. Each leg event emits one synth path point.
-    let mut tick_prices: Vec<(i64, f64)> = Vec::new();
+    // PERF A2 (2026-06-09): pre-size the synth tick Vec. The event-merge emits
+    // ≤ one point per leg event (once both legs primed), so the merged length is
+    // bounded by (leg_a_ticks + leg_b_ticks). Estimate each leg's tick count from
+    // its on-disk shard bytes (56 B/IndexRecord). Upper bound — non-finite/skip
+    // records trim it — so capacity is reserved once, no push reallocation churn.
+    let est_synth_ticks: usize = est_leg_ticks(idx_root, leg_a_id)
+        .saturating_add(est_leg_ticks(idx_root, leg_b_id));
+    let mut tick_prices: Vec<(i64, f64)> = Vec::with_capacity(est_synth_ticks);
     loop {
         // Pick side with smaller ts (ties favor a → deterministic).
         let take_a = match (&a_next, &b_next) {
@@ -671,6 +701,20 @@ fn run_once(args: &Args) -> Result<()> {
             // path — operator policy: never skip a day, always return a target.
             let target_bpd = target_for_pair(cal_ext, pair, *class);
 
+            // PART B4 (2026-06-09): per-pair FORCED renko-k escape hatch. If the
+            // operator pinned a k for this pair (e.g. a structural-floor ticker
+            // the staircase keeps out of accept tol), emit it DIRECTLY and skip
+            // the fit — provided it is within [K_FLOOR, MULT_UPPER_BOUND].
+            if let Some(&forced_k) = cal_ext.renko_k_overrides.get(pair) {
+                if (K_FLOOR..=MULT_UPPER_BOUND).contains(&forced_k) {
+                    info!(ticker_id = *ticker_id, pair, forced_k, "renko_k override — skipping fit (operator-forced k)");
+                    results.lock().unwrap().push(CalOutcome::Ok { ticker_id: *ticker_id, k: forced_k });
+                    return;
+                }
+                warn!(ticker_id = *ticker_id, pair, forced_k, k_floor = K_FLOOR, mult_upper = MULT_UPPER_BOUND,
+                    "renko_k override out of [K_FLOOR, MULT_UPPER_BOUND] — ignoring, running fit");
+            }
+
             // Panic-safe: one bad ticker (malformed .idx, OOM in sigma cache,
             // ...) must not abort the whole cron. AssertUnwindSafe is sound
             // here because nothing inside is moved across the boundary.
@@ -769,6 +813,16 @@ fn run_once(args: &Args) -> Result<()> {
         let synth_class =
             bucket_for_pair(synth_sym, synth_id, &crypto_majors, &stablecoins, &fx_majors);
         let synth_target = target_for_pair(cal_ext, synth_sym, synth_class);
+        // PART B4: synth pairs honor the same per-pair forced-k escape hatch.
+        if let Some(&forced_k) = cal_ext.renko_k_overrides.get(synth_sym) {
+            if (K_FLOOR..=MULT_UPPER_BOUND).contains(&forced_k) {
+                info!(synth_id, synth_sym, forced_k, "synth renko_k override — skipping fit (operator-forced k)");
+                s_passed += 1;
+                renko_k.insert(synth_id.to_string(), forced_k);
+                continue;
+            }
+            warn!(synth_id, synth_sym, forced_k, "synth renko_k override out of [K_FLOOR, MULT_UPPER_BOUND] — ignoring, running fit");
+        }
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             calibrate_one_synth(
                 synth_id, synth_sym, leg_a_id, leg_b_id,
