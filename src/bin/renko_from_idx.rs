@@ -97,7 +97,8 @@ fn main() -> Result<()> {
     let mut pass1_count: u64 = 0;
     'outer: for (_, path) in &shards {
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
-        while let Some(rec) = stream.next()? {
+        while let Some(chunk) = stream.next_chunk()? {
+          for rec in chunk {
             // SEAM PARITY: skip heartbeat-sentinel records exactly like the live
             // producers (core/src/bars_renko.rs:528, bars_s10.rs:198). Sentinels
             // carry stale bid/ask liveness beacons; ingesting them offline (but
@@ -113,6 +114,7 @@ fn main() -> Result<()> {
             pass1_count += 1;
             first_ts = (ts / MS_PER_30MIN) * MS_PER_30MIN;
             break 'outer;
+          }
         }
     }
     info!(
@@ -209,7 +211,8 @@ fn main() -> Result<()> {
 
     for (_, path) in &shards {
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
-        while let Some(rec) = stream.next()? {
+        while let Some(chunk) = stream.next_chunk()? {
+          for rec in chunk {
             // SEAM PARITY: skip heartbeat sentinels (mirror live bars_renko.rs:528).
             if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
                 continue;
@@ -272,6 +275,7 @@ fn main() -> Result<()> {
                     anyhow::bail!("bar count exceeds {} safety limit", yml.pipeline.max_bars);
                 }
             }
+          }
         }
     }
 

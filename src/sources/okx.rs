@@ -19,8 +19,9 @@ impl OKXSource {
         let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(Cursor::new(csv_data));
         let mut ticks = Vec::new();
         let pid = provider_id_for("okx");
-        for result in rdr.records() {
-            let r = result?;
+        // Reuse one StringRecord across rows (no per-row alloc).
+        let mut r = csv::StringRecord::new();
+        while rdr.read_record(&mut r)? {
             // OKX: instrument_name, trade_id, side, price, size, created_time
             let price: f64 = match r[3].parse() { Ok(v) => v, Err(_) => continue };
             let size: f64 = match r[4].parse() { Ok(v) => v, Err(_) => continue };
