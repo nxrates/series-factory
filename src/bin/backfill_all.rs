@@ -472,6 +472,17 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
 
     let mut steps_out: Vec<StepReport> = Vec::new();
     let cfg = ctx.args.config.to_string_lossy().to_string();
+    // Aggregation cadence — SINGLE source of truth: network.aggregation_interval_ms
+    // (the exact value the live aggregator runs at, 200ms = 5Hz). Historical
+    // backfill MUST use the identical cadence for both the per-provider
+    // (ticks-to-idx) and composite (merge-idx) TDWAP, else the rebuilt .idx is
+    // denser than live and renko bpd calibrates off by the cadence ratio
+    // (the 100ms/10Hz hardcode produced ~2× the target median).
+    let cycle_ms = nxr_sdk::pipeline_config::PipelineYml::load(&ctx.args.config)
+        .ok()
+        .and_then(|y| y.network.aggregation_interval_ms)
+        .unwrap_or(200)
+        .to_string();
     let out_dir = &ctx.args.out_dir;
     // Sharded paths — MITCH-ID keyed (canonical, U3/U4). See `docs/sharding-spec.md`.
     let ticker_id = nxr_sdk::resolve_ticker_id(&format!("{}/{}", base, quote));
@@ -559,7 +570,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     base.clone(),
                     quote.clone(),
                     "--cycle-ms".to_string(),
-                    "100".to_string(),
+                    cycle_ms.clone(),
                 ];
                 let mut rep = run_step(ticker, "ticks-to-idx", &args, Some(&per_idx));
                 rep.name = format!("ticks-to-idx[{}]", ex);
@@ -595,7 +606,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 errors: Vec::new(),
             });
         } else {
-            let args = vec![base.clone(), quote.clone()];
+            let args = vec![
+                base.clone(),
+                quote.clone(),
+                "--cycle-ms".to_string(),
+                cycle_ms.clone(),
+            ];
             let rep = run_step(ticker, "merge-idx", &args, Some(&composite_dir));
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
