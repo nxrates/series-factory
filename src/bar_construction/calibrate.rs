@@ -86,6 +86,45 @@ const K_BRACKET_LN_EPS: f64 = 0.004988; // ln(1.005) → 0.5% k-width
 /// large as the median itself, a sane "this window is pure noise" ceiling.
 const RENKO_DISPERSION_MAX: f64 = 1.0;
 
+/// min_pct clamp-detector fraction ceiling (2026-06-09, expert caveat #1: "the
+/// only path to a passing-but-wrong k"). `compute_brick_size` floors the brick
+/// at `min_pct`: `brick = max(k·σ_pct, min_pct)·price`. When `k_star·σ_pct ≤
+/// min_pct` the brick is INDEPENDENT of k — bpd(k) goes flat and the bisection's
+/// monotonicity assumption silently breaks, so it can "accept" a k whose brick
+/// is actually min_pct-clamped (unresponsive to the fitted k). If MORE than this
+/// fraction of the calibration window is min_pct-clamped at `k_star`, the k is
+/// meaningless → REJECT (caller drops → per-ticker `renko_k_overrides`).
+const MIN_PCT_CLAMP_MAX_FRAC: f64 = 0.5;
+
+/// Fraction of `[first, last]` price samples whose brick at `k_star` is
+/// min_pct-clamped (`k_star · σ_pct(ts) ≤ min_pct`). Pure (no Renko replay) so
+/// the accept-gate guard is unit-testable. Returns 0.0 when the window is empty
+/// (no samples ⇒ nothing to clamp).
+fn min_pct_clamped_fraction<S: VolSource + ?Sized>(
+    prices: &[(i64, f64)],
+    k_star: f64,
+    min_pct: f32,
+    vol_source: &S,
+    sigma_cache: &[f64],
+    first: i64,
+    last: i64,
+) -> f64 {
+    let lo = prices.partition_point(|p| p.0 < first);
+    let hi = prices.partition_point(|p| p.0 <= last);
+    let window = &prices[lo..hi];
+    if window.is_empty() {
+        return 0.0;
+    }
+    let clamped = window
+        .iter()
+        .filter(|&&(ts, _)| {
+            let sigma_pct = sigma_for_ts(ts, vol_source, sigma_cache);
+            k_star * sigma_pct <= min_pct as f64
+        })
+        .count();
+    clamped as f64 / window.len() as f64
+}
+
 /// Spike/gap quarantine for a per-day brick-count vector (RCA ROOT2c).
 ///
 /// Drops gap days (zero counts) and spike days (outside `[median/3, median*3]`
@@ -589,6 +628,27 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
     }
     if k_star < K_FLOOR {
         warn!(k_star, k_floor = K_FLOOR, "wf k_star < K_FLOOR — returning 0.0 (caller drops entry)");
+        return 0.0;
+    }
+    // min_pct CLAMP-DETECTOR (2026-06-09, expert caveat #1). The bisection assumes
+    // bpd(k) is monotone in k, but `compute_brick_size` floors the brick at
+    // min_pct: once `k_star·σ_pct ≤ min_pct` the brick is min_pct-clamped and
+    // INDEPENDENT of k, so bpd goes flat and the search can "accept" a k whose
+    // brick is unresponsive to the fitted k (a passing-but-meaningless k). If a
+    // MATERIAL fraction of the full history is min_pct-clamped at k_star, FAIL the
+    // ticker so it routes to a per-ticker `renko_k_overrides` entry instead of
+    // shipping a k the renko engine ignores.
+    let clamp_frac = min_pct_clamped_fraction(
+        prices, k_star, base.min_pct, vol_source, sigma_cache, first, last,
+    );
+    if clamp_frac > MIN_PCT_CLAMP_MAX_FRAC {
+        warn!(
+            k_star,
+            min_pct = base.min_pct,
+            clamp_frac_pct = clamp_frac * 100.0,
+            clamp_max_pct = MIN_PCT_CLAMP_MAX_FRAC * 100.0,
+            "selected brick min_pct-clamped, k unresponsive — failing ticker for per-ticker override"
+        );
         return 0.0;
     }
     // Clamp-detector on the FINAL k_star: a selection parked at either bound is
@@ -1182,6 +1242,104 @@ mod tests {
             bricks_per_day: vec![], median: 0.0, mean: 0.0, mad: 0.0, days: 0,
         };
         assert!(!dead.dispersion_ok(), "dead window not ok");
+    }
+
+    /// Per-tick σ VolSource: `sigma_cache[i]` indexed by tick ORDER (one cache
+    /// slot per tick), so a path can mix clamped and unclamped regions. Holds the
+    /// exact per-tick `mts` list and recovers `i` by exact match (the test stamps
+    /// distinct, ≥16µs-apart tick mts so the map is a bijection). Used by
+    /// `min_pct_clamped_brick_is_rejected`.
+    struct PerTickSigma {
+        mts: Vec<u64>,
+    }
+    impl VolSource for PerTickSigma {
+        fn len(&self) -> usize { self.mts.len() }
+        fn sigma_pct(&self, i: usize) -> f64 { i as f64 } // unused by calibrate (cache wins)
+        fn find_index_for_mts(&self, mts: u64) -> usize {
+            // Last index whose mts ≤ query (ticks are ascending) — the same
+            // "most-recent-σ-as-of-ts" semantics the real VolSource uses.
+            self.mts.partition_point(|&m| m <= mts).saturating_sub(1)
+        }
+    }
+
+    /// EXPERT CAVEAT #1 (2026-06-09): the min_pct CLAMP-DETECTOR. When
+    /// `k_star · σ_pct ≤ min_pct` the brick floors at `min_pct·price` and becomes
+    /// INDEPENDENT of k — bpd(k) goes flat, the bisection's monotonicity breaks,
+    /// and a "passing-but-wrong" k can slip through. The accept gate must REJECT
+    /// (return 0.0) when a MATERIAL fraction of the series is min_pct-clamped at
+    /// the selected k, so the ticker routes to a per-ticker `renko_k_overrides`.
+    #[test]
+    fn min_pct_clamped_brick_is_rejected() {
+        // ── Part A: the pure detector arithmetic ─────────────────────────────
+        // sigma_cache[i] is the σ_pct AT tick i. Ticks are stamped 1s apart from a
+        // post-MITCH-epoch anchor so each maps to a distinct mts; PerTickSigma
+        // recovers tick i by mts. 10 ticks: first 8 LOW σ (0.001), last 2 HIGH
+        // σ (0.02).
+        let sigma_cache = vec![
+            0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.02, 0.02,
+        ];
+        let t0: i64 = 1_700_000_000_000; // well past MITCH epoch (2024-01-01)
+        let prices: Vec<(i64, f64)> = (0..sigma_cache.len() as i64)
+            .map(|i| (t0 + i * 1000, 100.0))
+            .collect();
+        let mts: Vec<u64> = prices
+            .iter()
+            .map(|&(ts, _)| timestamp::from_epoch_ms(ts))
+            .collect();
+        let vol = PerTickSigma { mts };
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+
+        // k_star = 0.5, min_pct = 0.002. Clamp when k·σ ≤ min_pct ⇒ σ ≤ 0.004.
+        // 8/10 ticks have σ=0.001 (clamped); 2/10 have σ=0.02 (unclamped).
+        let frac = min_pct_clamped_fraction(
+            &prices, 0.5, 0.002, &vol, &sigma_cache, first, last,
+        );
+        assert!((frac - 0.8).abs() < 1e-9, "8/10 ticks clamped (got {frac})");
+        assert!(frac > MIN_PCT_CLAMP_MAX_FRAC, "0.8 > 0.5 ⇒ gate would reject");
+
+        // Raise k so the brick is k-responsive everywhere: k=10, min_pct=0.002 ⇒
+        // clamp when σ ≤ 0.0002 — no tick qualifies ⇒ fraction 0 (accept).
+        let frac_ok = min_pct_clamped_fraction(
+            &prices, 10.0, 0.002, &vol, &sigma_cache, first, last,
+        );
+        assert_eq!(frac_ok, 0.0, "no tick clamped at large k ⇒ accept");
+
+        // ── Part B: the gate REJECTS end-to-end ──────────────────────────────
+        // A calm, LOW-σ full-tick path with a min_pct set ABOVE k·σ for the whole
+        // series. Every brick floors at min_pct ⇒ bpd is flat in k ⇒ the search
+        // cannot bracket target AND/OR lands on a min_pct-clamped k_star. Either
+        // way the calibrator MUST NOT ship a (meaningless) positive k.
+        let prices2 = synth_gbm_path(40, 4000, 0.0005, 0xC0FFEE); // tiny σ_step
+        let vol2 = ConstSigma(0.0008); // 0.08% σ_pct, flat
+        let sigma_cache2 = vec![0.0008];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+            ..VolConfig::default()
+        };
+        let cal = CalibrationConfig {
+            target_bpd: 300.0,
+            k_fit_windows_days: vec![14, 30],
+            min_window_days: 7,
+            max_rounds: 20,
+            tolerance: 0.02,
+            mult_bounds: [0.05, 4.0],
+        };
+        // min_pct = 1% — far above k·σ for any k ∈ [0.05,4]·0.0008 = [0.00004,0.0032].
+        // Every brick is min_pct-clamped over the whole search ⇒ k is unresponsive.
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.01 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices2, &cal, &base, &vol2, &vol_cfg, &sigma_cache2, 300.0, 7,
+        );
+        assert_eq!(
+            k, 0.0,
+            "min_pct-dominated series must FAIL (return 0.0 → per-ticker override), not ship a clamped k"
+        );
     }
 
     /// PART B2: the full-history log-k bisection + two-sided rung probe must

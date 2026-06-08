@@ -1,5 +1,6 @@
 //! Convert raw per-exchange `.ticks` files into a single per-provider `.idx`
-//! AppendLog of 56-byte `IndexRecord` entries (50 ms aggregated by default).
+//! AppendLog of 56-byte `IndexRecord` entries (200 ms / 5 Hz aggregated by
+//! default — the production `network.aggregation_interval_ms` cadence).
 //!
 //! This is the offline equivalent of the prod forwarder's inner loop:
 //!   raw tick  →  `TickAccumulator`  →  `Index` per cycle  →  `.idx`
@@ -44,8 +45,8 @@ struct Args {
     /// Quote asset symbol (e.g. USDT).
     quote: String,
     /// Aggregation cycle in milliseconds. Default matches prod forwarder
-    /// cadence (200 ms = 5 Hz).
-    /// resolution for smaller `.idx` files on long replays.
+    /// cadence (200 ms = 5 Hz, `network.aggregation_interval_ms`). MUST match
+    /// live; a finer value over-samples intra-cycle and skews renko bpd.
     #[arg(long, default_value = "200")]
     cycle_ms: u64,
     /// Z-score outlier gate on the mid price — ticks beyond `z` stddevs from
