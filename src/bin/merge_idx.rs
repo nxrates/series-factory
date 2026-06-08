@@ -71,7 +71,11 @@ struct Args {
     exchanges: Vec<String>,
     /// Composite cycle in ms. Each cycle reruns the TDWAP over whichever
     /// providers have delivered data in [last_cycle, this_cycle].
-    #[arg(long, default_value = "100")]
+    /// 200ms = 5Hz = the production cadence (network.aggregation_interval_ms).
+    /// MUST match live; a finer default (100ms/10Hz) over-samples intra-cycle
+    /// oscillation and inflates renko bpd by the cadence ratio. backfill-all
+    /// passes the config value explicitly; this is the live-matching fallback.
+    #[arg(long, default_value = "200")]
     cycle_ms: u64,
     /// Half-life clamp feed for the TDWAP decay (prod default = 30 s).
     #[arg(long, default_value = "30")]
