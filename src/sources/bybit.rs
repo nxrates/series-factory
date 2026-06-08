@@ -24,8 +24,9 @@ impl BybitSource {
             .from_reader(Cursor::new(csv_data));
         let mut ticks = Vec::new();
         let pid = provider_id_for("bybit");
-        for result in rdr.records() {
-            let r = result?;
+        // Reuse one StringRecord across rows (no per-row alloc).
+        let mut r = csv::StringRecord::new();
+        while rdr.read_record(&mut r)? {
             // Bybit: id, timestamp, price, volume, side, [rpi]
             let ts_raw: i64 = match r[1].parse() { Ok(v) => v, Err(_) => continue };
             let price: f64 = match r[2].parse() { Ok(v) => v, Err(_) => continue };

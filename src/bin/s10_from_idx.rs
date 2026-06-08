@@ -154,7 +154,8 @@ fn main() -> Result<()> {
     for (date, path) in &shards {
         info!(date = %date, path = %path.display(), "reading input shard");
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
-        while let Some(rec) = stream.next()? {
+        while let Some(chunk) = stream.next_chunk()? {
+          for rec in chunk {
             // SEAM PARITY: skip heartbeat sentinels (mirror live bars_s10.rs:198).
             // Sentinels carry stale bid/ask; ingesting offline (but not live)
             // poisons the s10 OHLC → vol-ring σ → hist↔live seam drift.
@@ -211,6 +212,7 @@ fn main() -> Result<()> {
                 idx.accepted as u32,
                 idx.rejected as u32,
             );
+          }
         }
     }
     // flush final open bucket (no trailing gap-fill: gapless only spans

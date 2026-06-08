@@ -25,7 +25,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -192,7 +192,67 @@ fn dir_bytes(p: &Path) -> u64 {
     total
 }
 
+/// Upper bound on concurrent HEAVY work units (`ticks-to-idx` / `merge-idx` /
+/// `s10-from-idx` / `renko-from-idx` subprocesses). The outer ticker pool and
+/// the inner per-exchange `par_iter` share one rayon pool, so without a global
+/// gate up to `parallel × n_exchanges` heavy procs could spawn at once — each
+/// can mmap a multi-GiB monthly tick file, OOM-killing a 16 GiB box. We cap the
+/// *total* in-flight heavy procs at this many regardless of pool fan-out.
+const HEAVY_WORK_RAM_CAP: usize = 4;
+
+/// Process-global gate bounding concurrent heavy `run_step` subprocesses to
+/// `min(available_parallelism, HEAVY_WORK_RAM_CAP)`. A counting semaphore built
+/// on `Mutex<usize>` + `Condvar` (no extra dep). Scheduling-only — it changes
+/// *when* heavy procs run, never their output.
+struct HeavySemaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl HeavySemaphore {
+    fn new(permits: usize) -> Self {
+        Self { permits: Mutex::new(permits.max(1)), cv: Condvar::new() }
+    }
+    fn acquire(&self) -> HeavyPermit<'_> {
+        let mut p = self.permits.lock().unwrap();
+        while *p == 0 {
+            p = self.cv.wait(p).unwrap();
+        }
+        *p -= 1;
+        HeavyPermit { sem: self }
+    }
+}
+
+/// RAII permit — releases its slot and wakes one waiter on drop.
+struct HeavyPermit<'a> {
+    sem: &'a HeavySemaphore,
+}
+
+impl Drop for HeavyPermit<'_> {
+    fn drop(&mut self) {
+        let mut p = self.sem.permits.lock().unwrap();
+        *p += 1;
+        self.sem.cv.notify_one();
+    }
+}
+
+/// Lazily-initialised global heavy-work gate. Sized on first use from
+/// `available_parallelism` floored by [`HEAVY_WORK_RAM_CAP`].
+static HEAVY_GATE: OnceLock<HeavySemaphore> = OnceLock::new();
+
+fn heavy_gate() -> &'static HeavySemaphore {
+    HEAVY_GATE.get_or_init(|| {
+        let par = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(HEAVY_WORK_RAM_CAP);
+        HeavySemaphore::new(par.min(HEAVY_WORK_RAM_CAP))
+    })
+}
+
 fn run_step(ticker: &str, bin: &str, args: &[String], out_path: Option<&Path>) -> StepReport {
+    // Bound total concurrent heavy subprocesses (OOM guard). Permit held for
+    // the lifetime of the child process; released on scope exit.
+    let _permit = heavy_gate().acquire();
     let name = bin.to_string();
     info!(ticker, bin, args = ?args, "step start");
     let start = Instant::now();

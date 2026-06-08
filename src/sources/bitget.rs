@@ -20,8 +20,9 @@ impl BitgetSource {
         let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(Cursor::new(csv_data));
         let mut ticks = Vec::new();
         let pid = provider_id_for("bitget");
-        for result in rdr.records() {
-            let r = result?;
+        // Reuse one StringRecord across rows (no per-row alloc).
+        let mut r = csv::StringRecord::new();
+        while rdr.read_record(&mut r)? {
             // Bitget: trade_id, timestamp, price, side, volume_quote, size_base
             let ts: i64 = match r[1].parse() { Ok(v) => v, Err(_) => continue };
             let price: f64 = match r[2].parse() { Ok(v) => v, Err(_) => continue };

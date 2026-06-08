@@ -31,7 +31,6 @@ use nxr_sdk::{
 };
 use series_factory::TickFrame;
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -129,7 +128,11 @@ fn main() -> Result<()> {
     // --- State ---
     let mut acc = TickAccumulator::new(ticker_id);
     let mut stats = RunningStats::default();
-    let mut log: AppendLog<IndexRecord> = AppendLog::open(&out_path)
+    // OFFLINE builder: buffered AppendLog (256 KiB BufWriter) coalesces the
+    // per-record 56B writes. Safe here ∵ nothing tails this shard until the
+    // build finishes (unlike the live aggregator path which MUST stay
+    // unbuffered for forwarder reader-visibility).
+    let mut log: AppendLog<IndexRecord> = AppendLog::open_buffered(&out_path)
         .with_context(|| format!("open AppendLog {}", out_path.display()))?;
     let cycle_ms = args.cycle_ms as i64;
     let z_threshold = args.z;
@@ -209,70 +212,58 @@ fn stream_file_into_acc(
     z_threshold: f64,
     cycle_ms: i64,
 ) -> Result<()> {
-    const BATCH: usize = 10_000;
     let rec_size = core::mem::size_of::<TickFrame>();
-    let mut file = File::open(path)?;
+    let file = File::open(path)?;
     let len = file.metadata()?.len() as usize;
     if len == 0 {
         return Ok(());
     }
-    if len % rec_size != 0 {
-        anyhow::bail!(
-            "{} size {} is not a multiple of TickFrame ({})",
-            path.display(),
-            len,
-            rec_size
-        );
+    // mmap + zero-copy cast (mirror generate_renko_from_ticks::mmap_tick_file).
+    // Replaces the old 480 KiB chunked-read loop: the kernel pages the file in
+    // on demand, so resident memory stays O(1) without an explicit batch buffer.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    unsafe {
+        libc::madvise(mmap.as_ptr() as *mut _, mmap.len(), libc::MADV_SEQUENTIAL);
     }
-    let mut buf = vec![0u8; BATCH * rec_size];
-    loop {
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            match file.read(&mut buf[filled..])? {
-                0 => break,
-                n => filled += n,
-            }
+    // Torn-tail guard: keep ONLY whole TickFrames. A monthly file killed
+    // mid-write can end with a partial frame (1..rec_size bytes); discard it
+    // rather than mis-cast. Same effect as the prior `len % rec_size` bail,
+    // but tolerant instead of fatal (one record lost, never corrupt).
+    let n_frames = len / rec_size;
+    if n_frames == 0 {
+        return Ok(());
+    }
+    let frames: &[TickFrame] = bytemuck::cast_slice(&mmap[..n_frames * rec_size]);
+    for tf in frames {
+        let ts_ms = tf.timestamp_ms();
+        let body = tf.body;
+        if !(body.bid > 0.0 && body.ask > 0.0 && body.ask >= body.bid) {
+            continue;
         }
-        if filled == 0 {
-            break;
+        if next_cycle_ms.is_none() {
+            *next_cycle_ms = Some(ts_ms + cycle_ms);
         }
-        if filled % rec_size != 0 {
-            anyhow::bail!("short read {} not aligned to TickFrame {}", filled, rec_size);
+        while ts_ms >= next_cycle_ms.unwrap() {
+            let boundary = next_cycle_ms.unwrap();
+            if let Some(index) = acc.flush() {
+                let mts = mitch::timestamp::from_epoch_ms(boundary);
+                let header = MitchHeader::new(message_type::INDEX, provider_id, mts, 1);
+                log.append(&IndexRecord { header, index })?;
+                *records_written += 1;
+            }
+            *next_cycle_ms = Some(boundary + cycle_ms);
         }
-        let frames: &[TickFrame] = bytemuck::cast_slice(&buf[..filled]);
-        for tf in frames {
-            let ts_ms = tf.timestamp_ms();
-            let body = tf.body;
-            if !(body.bid > 0.0 && body.ask > 0.0 && body.ask >= body.bid) {
-                continue;
-            }
-            if next_cycle_ms.is_none() {
-                *next_cycle_ms = Some(ts_ms + cycle_ms);
-            }
-            while ts_ms >= next_cycle_ms.unwrap() {
-                let boundary = next_cycle_ms.unwrap();
-                if let Some(index) = acc.flush() {
-                    let mts = mitch::timestamp::from_epoch_ms(boundary);
-                    let header = MitchHeader::new(message_type::INDEX, provider_id, mts, 1);
-                    log.append(&IndexRecord { header, index })?;
-                    *records_written += 1;
-                }
-                *next_cycle_ms = Some(boundary + cycle_ms);
-            }
-            let mid = (body.bid + body.ask) * 0.5;
-            let z = stats.update(mid);
-            if z > z_threshold {
-                acc.reject();
-                *rejected += 1;
-                continue;
-            }
-            acc.ingest(body.bid, body.ask, body.vbid, body.vask);
-            *ingested += 1;
-            *last_tick_ms = ts_ms;
+        let mid = (body.bid + body.ask) * 0.5;
+        let z = stats.update(mid);
+        if z > z_threshold {
+            acc.reject();
+            *rejected += 1;
+            continue;
         }
-        if filled < buf.len() {
-            break;
-        }
+        acc.ingest(body.bid, body.ask, body.vbid, body.vask);
+        *ingested += 1;
+        *last_tick_ms = ts_ms;
     }
     Ok(())
 }

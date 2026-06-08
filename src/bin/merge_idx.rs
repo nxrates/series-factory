@@ -257,12 +257,14 @@ fn main() -> Result<()> {
     }
     writer.close()?;
 
-    // build manifest by scanning shards
+    // build manifest by scanning shards — collect all entries then sort once
+    // via set_shards_batch (O(n log n)) instead of O(n²) per-entry upsert.
     let mut manifest = Manifest::new(ticker_str.clone(), ticker_id, "idx");
+    let mut entries = Vec::new();
     for (date, path) in list_shards(&out_dir, "idx")? {
-        let entry = shard_entry_for_idx(date, &path)?;
-        manifest.upsert(entry);
+        entries.push(shard_entry_for_idx(date, &path)?);
     }
+    manifest.set_shards_batch(entries);
     let mpath = manifest_path(&out_dir);
     write_manifest(&mpath, &manifest)?;
 
@@ -281,14 +283,34 @@ fn main() -> Result<()> {
 struct ShardedWriter {
     out_dir: PathBuf,
     current: Option<(NaiveDate, AppendLog<IndexRecord>)>,
+    /// Cached `[start, end)` epoch-ms window of `current`'s UTC day. An in-window
+    /// ts is provably same-day, so we skip the per-record `ts_ms_to_utc_date`
+    /// chrono call and decide "no rotate" with two int compares. UTC days are
+    /// exactly MS_PER_DAY ms so the window↔date mapping is exact. `(MAX, MIN)`
+    /// sentinel = "no day yet" → first record takes the chrono path.
+    cur_day_start_ms: i64,
+    cur_day_end_ms: i64,
 }
 
 impl ShardedWriter {
     fn new(out_dir: PathBuf) -> Self {
-        Self { out_dir, current: None }
+        Self {
+            out_dir,
+            current: None,
+            cur_day_start_ms: i64::MAX,
+            cur_day_end_ms: i64::MIN,
+        }
     }
 
     fn append(&mut self, ts_ms: i64, rec: &IndexRecord) -> Result<()> {
+        // Same-day fast path: in-window ts ⇒ no rotation, no chrono conversion.
+        if ts_ms >= self.cur_day_start_ms
+            && ts_ms < self.cur_day_end_ms
+            && self.current.is_some()
+        {
+            self.current.as_mut().unwrap().1.append(rec)?;
+            return Ok(());
+        }
         let date = ts_ms_to_utc_date(ts_ms);
         let need_rotate = match &self.current {
             Some((d, _)) => *d != date,
@@ -297,8 +319,15 @@ impl ShardedWriter {
         if need_rotate {
             // close prior shard ∵ AppendLog has Drop fsync
             self.current = None;
+            // Refresh cached day window in lock-step with the new shard date.
+            self.cur_day_start_ms = nxr_sdk::shard::day_start_ms(date);
+            self.cur_day_end_ms = self.cur_day_start_ms + nxr_sdk::shard::MS_PER_DAY;
             let path = shard_path(&self.out_dir, date, "idx");
-            let log = AppendLog::<IndexRecord>::open(&path)
+            // OFFLINE builder: buffered AppendLog (256 KiB BufWriter). The merge
+            // output shard is not tailed by any live reader until the build is
+            // done, so coalescing the per-record 56B writes is a pure win.
+            // (The LIVE aggregator path keeps the unbuffered `open`.)
+            let log = AppendLog::<IndexRecord>::open_buffered(&path)
                 .with_context(|| format!("open shard {}", path.display()))?;
             self.current = Some((date, log));
         }
@@ -372,19 +401,12 @@ fn shard_entry_for_idx(date: NaiveDate, path: &Path) -> Result<ShardEntry> {
 fn resolve_weights(args: &Args) -> Result<std::collections::BTreeMap<String, f64>> {
     let mut m: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
 
-    // 1. Seed from YAML config (`cexs.exchanges.<name>.weight`) — canonical
-    //    source of truth, lives next to the live aggregator's scraper inputs.
-    if let Ok(pl) = nxr_sdk::pipeline_config::PipelineYml::load_default(
-        nxr_sdk::pipeline_config::ConfigHint::Bin,
-    ) {
-        // The PipelineYml::CexsYml schema is "soft" (forward-compat). We
-        // ALSO accept the older richer schema via a side-load of the raw
-        // YAML — until pipeline_config gains an `exchanges` field, parse
-        // it ad-hoc here. Bonus: this keeps the merge bin functional even
-        // on stripped configs (assets-only).
-        let _ = &pl; // silence unused; placeholder for full SDK integration
-    }
-    // Raw YAML side-channel: read `cexs.exchanges.<name>.weight`.
+    // Seed from YAML config (`cexs.exchanges.<name>.weight`) — canonical
+    // source of truth, lives next to the live aggregator's scraper inputs.
+    // Read via the raw YAML side-channel below: the PipelineYml::CexsYml schema
+    // is "soft" (forward-compat) and does not yet expose an `exchanges` field,
+    // so we parse `cexs.exchanges.<name>.weight` ad-hoc. This also keeps the
+    // merge bin functional on stripped (assets-only) configs.
     let cfg_path = nxr_sdk::pipeline_config::PipelineYml::resolve_path(
         nxr_sdk::pipeline_config::ConfigHint::Bin,
     );
@@ -425,6 +447,9 @@ fn resolve_weights(args: &Args) -> Result<std::collections::BTreeMap<String, f64
 struct SourceStream {
     file: std::fs::File,
     buf: Vec<IndexRecord>,
+    /// Reusable byte scratch for `refill` (WINDOW*rec_size). Allocated once at
+    /// `load` and reused every refill instead of a fresh `vec![0u8; …]` per call.
+    raw: Vec<u8>,
     cursor: usize,
     base_weight: f64,
     eof: bool,
@@ -460,9 +485,11 @@ impl SourceStream {
             file.set_len(aligned as u64)
                 .with_context(|| format!("truncate {} to {}", path.display(), aligned))?;
         }
+        let rec_size = core::mem::size_of::<IndexRecord>();
         let mut s = Self {
             file,
             buf: Vec::with_capacity(WINDOW),
+            raw: vec![0u8; WINDOW * rec_size],
             cursor: 0,
             base_weight,
             eof: false,
@@ -477,10 +504,11 @@ impl SourceStream {
             return Ok(());
         }
         let rec_size = core::mem::size_of::<IndexRecord>();
-        let mut raw = vec![0u8; WINDOW * rec_size];
+        // Reuse the pre-allocated byte scratch (no per-refill heap alloc).
+        let cap = self.raw.len();
         let mut filled = 0;
-        while filled < raw.len() {
-            match self.file.read(&mut raw[filled..])? {
+        while filled < cap {
+            match self.file.read(&mut self.raw[filled..])? {
                 0 => break,
                 n => filled += n,
             }
@@ -494,11 +522,11 @@ impl SourceStream {
         if filled % rec_size != 0 {
             anyhow::bail!("short read {} not aligned to IndexRecord {}", filled, rec_size);
         }
-        let slice: &[IndexRecord] = bytemuck::cast_slice(&raw[..filled]);
+        let slice: &[IndexRecord] = bytemuck::cast_slice(&self.raw[..filled]);
         self.buf.clear();
         self.buf.extend_from_slice(slice);
         self.cursor = 0;
-        if filled < raw.len() {
+        if filled < cap {
             self.eof = true;
         }
         Ok(())

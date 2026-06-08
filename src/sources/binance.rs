@@ -17,13 +17,15 @@ impl BinanceSource {
         let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(Cursor::new(csv_data));
         let mut ticks = Vec::new();
         let pid = provider_id_for("binance");
-        for result in rdr.records() {
-            let r = result?;
+        // Reuse one StringRecord across rows (read_record reuses its buffer)
+        // instead of allocating a fresh record per row via `records()`.
+        let mut r = csv::StringRecord::new();
+        while rdr.read_record(&mut r)? {
             // Binance aggTrades: id, price, qty, first_id, last_id, timestamp, is_buyer_maker
             let price: f64 = r[1].parse()?;
             let qty: f64 = r[2].parse()?;
             let ts = normalize_timestamp_ms(r[5].parse()?);
-            let is_buyer = r[6].to_lowercase() != "true"; // is_buyer_maker=true → seller initiated
+            let is_buyer = !r[6].eq_ignore_ascii_case("true"); // is_buyer_maker=true → seller initiated
             ticks.push(TickFrame::new(pid,
                 mitch::timestamp::from_epoch_ms(ts),
                 infer_tick(ticker_id, price, (price * qty) as u32, is_buyer),
