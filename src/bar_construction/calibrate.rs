@@ -56,6 +56,20 @@ pub struct CalibrationConfig {
 
 use nxr_sdk::shard::MS_PER_DAY;
 
+/// bpd-accept gate tolerance: a window's chosen k is rejected when its
+/// FULL-history median bpd deviates from target by more than this fraction.
+/// Tightened 0.20 → 0.08 (2026-06-09) now that the accept objective is anchored
+/// to the full-history median (FIX 1) and the score is pure-median (FIX 2b), so
+/// the fit objective == the operator's full-history measurement.
+const RENKO_BPD_ACCEPT_TOL: f64 = 0.08;
+
+/// Dispersion side-guard bound (FIX 2b, 2026-06-09): reject a window when its
+/// MAD/median exceeds this. Kept as a SEPARATE diagnostic guard — NOT folded
+/// into the minimized score (the old `0.3*MAD/target` term biased k upward by
+/// rewarding the dispersion-compressing effect of bigger bricks). 1.0 = MAD as
+/// large as the median itself, a sane "this window is pure noise" ceiling.
+const RENKO_DISPERSION_MAX: f64 = 1.0;
+
 /// Spike/gap quarantine for a per-day brick-count vector (RCA ROOT2c).
 ///
 /// Drops gap days (zero counts) and spike days (outside `[median/3, median*3]`
@@ -103,20 +117,33 @@ pub struct DailyBpdStats {
 }
 
 impl DailyBpdStats {
-    /// Calibration score: weighted (median deviation from target) + (MAD dispersion).
-    /// Operator policy 2026-05-26: "median should be 300, average error low,
-    /// wide swings OK up to 5×". MAD is robust to regime-spike days (5× tail
-    /// inflates MAD only when sustained), so weighting MAD * 0.3 keeps the
-    /// optimizer focused on median accuracy without forbidding regime moves.
+    /// Calibration score: PURE median deviation from target — `|median/target-1|`.
+    ///
+    /// FIX 2b (2026-06-09): removed the `0.3*MAD/target` term that previously
+    /// contaminated the objective. Larger bricks mechanically compress per-day
+    /// dispersion, so a MAD penalty inside the MINIMIZED score biased k upward
+    /// (smaller bpd) — pulling the full-history median above target. The pure
+    /// median objective now equals the operator's full-history measurement.
+    /// MAD is retained as a SEPARATE side-guard via [`dispersion_ok`], not here.
     ///
     /// Lower = better. Returns `f64::INFINITY` when `days == 0` (cal-fail).
     pub fn score(&self, target_bpd: f64) -> f64 {
         if self.days == 0 || target_bpd <= 0.0 {
             return f64::INFINITY;
         }
-        let median_err = (self.median / target_bpd - 1.0).abs();
-        let mad_norm = self.mad / target_bpd;
-        median_err + 0.3 * mad_norm
+        (self.median / target_bpd - 1.0).abs()
+    }
+
+    /// Dispersion side-guard (FIX 2b, 2026-06-09): `true` when the window's
+    /// per-day brick spread is sane (`MAD/median ≤ RENKO_DISPERSION_MAX`). Used
+    /// as a window REJECT gate, deliberately OUTSIDE the minimized [`score`] so
+    /// it cannot bias k. A `days==0` (dead) or non-positive-median window is not
+    /// OK. MAD computation itself is unchanged in `count_bars_per_day_from_prices`.
+    pub fn dispersion_ok(&self) -> bool {
+        if self.days == 0 || self.median <= 0.0 {
+            return false;
+        }
+        self.mad / self.median <= RENKO_DISPERSION_MAX
     }
 }
 
@@ -368,24 +395,56 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             );
             continue;
         }
-        // bpd-target accept gate (RCA ROOT2b, 2026-06-01). Ported from the
-        // sibling `calibrate_mtf_with_target` (duplication drift left it out of
-        // the production walk-forward path). The MAD-weighted score may pick a
-        // min-cost mult that is still far off target_bpd (e.g. SOL/USDT parking
-        // at k≈4 / 33 bpd vs 300 target). Recompute a PURE relative-bpd error on
-        // the chosen mult's clean-eval median and DROP the window when it
-        // exceeds 20%. All windows dropped → return 0.0 → nxr_calibrate emits
-        // Failed → entry DROPPED from ticker-params.json (correct outcome — no
-        // midpoint/stale carry).
-        let rel_bpd_err = (best_eval_median / target_bpd - 1.0).abs();
-        if rel_bpd_err > 0.20 {
+        // FIX 1 (2026-06-09): RE-ANCHOR the accept/select objective to the
+        // FULL-history median, NOT the trailing eval slice. The walk-forward
+        // search above (eval slice) still guards direction/overfit, but the
+        // operator regenerates renko over the FULL history and takes its median.
+        // The accept gate (and the selection) must measure the SAME thing, else
+        // the fitted k is biased (eval slice ≠ full history → median lands ~1.6-2×
+        // target). Recompute the chosen k's stats over [first, last] and gate on
+        // THAT median. `best_eval_median` is kept only for the diagnostic log.
+        let full_cfg = RenkoConfig { multiplier: best.0, min_pct: base.min_pct };
+        let full_stats = count_bars_per_day_from_prices(
+            prices, &full_cfg, vol_source, vol_config, sigma_cache, first, last,
+        );
+        if full_stats.days == 0 {
             warn!(
                 window_days,
                 mult = best.0,
+                "wf full-history recompute had no scorable clean day — dropping window"
+            );
+            continue;
+        }
+        // Dispersion side-guard (FIX 2b): reject pure-noise windows. Separate
+        // from the minimized score so it never biases k upward.
+        if !full_stats.dispersion_ok() {
+            warn!(
+                window_days,
+                mult = best.0,
+                full_median = full_stats.median,
+                full_mad = full_stats.mad,
+                dispersion_max = RENKO_DISPERSION_MAX,
+                "wf dispersion side-guard — dropping window (MAD/median > bound)"
+            );
+            continue;
+        }
+        // bpd-target accept gate (RCA ROOT2b, 2026-06-01; re-anchored to
+        // full-history median by FIX 1, tolerance tightened to 0.08 by FIX 2a).
+        // DROP the window when the FULL-history median deviates from target by
+        // more than RENKO_BPD_ACCEPT_TOL. All windows dropped → return 0.0 →
+        // nxr_calibrate emits Failed → entry DROPPED from ticker-params.json
+        // (correct outcome — no midpoint/stale carry).
+        let rel_bpd_err = (full_stats.median / target_bpd - 1.0).abs();
+        if rel_bpd_err > RENKO_BPD_ACCEPT_TOL {
+            warn!(
+                window_days,
+                mult = best.0,
+                full_median = full_stats.median,
                 eval_median = best_eval_median,
                 target_bpd,
                 rel_bpd_err_pct = rel_bpd_err * 100.0,
-                "wf bpd-target accept gate — dropping window (|measured-target|/target > 20%)"
+                accept_tol_pct = RENKO_BPD_ACCEPT_TOL * 100.0,
+                "wf bpd-target accept gate — dropping window (full-history |median-target|/target > tol)"
             );
             continue;
         }
@@ -627,20 +686,33 @@ pub fn calibrate_mtf_with_target<S: VolSource + ?Sized>(
             );
             continue;
         }
-        // EMERGENCY 2026-06-01 T0.1 (per docs/EMERGENCY-12-PRIORITY-2026-06-01.md +
-        // memory feedback_sol_renko_k_stablecoin_sentinel): bpd-target acceptance
-        // gate. The MAD/median scoring chooses a min-cost mult that may still be
-        // far off the target_bpd (e.g. SOL/USDT converging on k≈4 with 33 bpd vs
-        // 300 target — 9× undershoot). Reject windows where best.1 (the relative
-        // bpd error) exceeds 20%. This is the missing per-window invariant from
-        // feedback_target_bpd_simplified.
-        if best.1 > 0.20 {
+        // bpd-target acceptance gate (EMERGENCY 2026-06-01 T0.1; re-anchored to
+        // FULL-history median by FIX 1, tolerance tightened to 0.08 by FIX 2a).
+        // FIX 1 (2026-06-09): `best.1` is the relative bpd error on the trailing
+        // WINDOW slice — not what the operator measures (full-history median).
+        // Recompute the chosen k's median over [first, last] and gate on THAT,
+        // so the fit objective == the operator's measurement (eliminates the
+        // ~1.6-2× median overshoot). Reject windows beyond RENKO_BPD_ACCEPT_TOL.
+        let full_stats = count_bars_per_day_from_prices(
+            prices,
+            &RenkoConfig { multiplier: best.0, min_pct: base.min_pct },
+            vol_source, vol_config, sigma_cache, first, last,
+        );
+        let rel_bpd_err = if full_stats.days == 0 {
+            f64::INFINITY
+        } else {
+            (full_stats.median / target_bpd - 1.0).abs()
+        };
+        if rel_bpd_err > RENKO_BPD_ACCEPT_TOL {
             warn!(
                 window_days,
                 mult = best.0,
-                err_pct = best.1 * 100.0,
+                full_median = full_stats.median,
+                window_err_pct = best.1 * 100.0,
                 target_bpd,
-                "bpd-target accept gate — dropping window from MTF blend (|measured-target|/target > 20%)"
+                rel_bpd_err_pct = rel_bpd_err * 100.0,
+                accept_tol_pct = RENKO_BPD_ACCEPT_TOL * 100.0,
+                "bpd-target accept gate — dropping window (full-history |median-target|/target > tol)"
             );
             continue;
         }
@@ -788,12 +860,13 @@ mod tests {
     /// REGRESSION GUARD (2026-06-06 brick-storm RCA): the k chosen by
     /// `calibrate_mtf_walkforward` on a FULL-TICK path, when applied via the SAME
     /// `RenkoGenerator` over the SAME full-tick path, must yield bpd within
-    /// `RENKO_BPD_ACCEPT_TOL` (0.20) of target. This pins calibrate-input ==
-    /// apply-input. A 1-min downsample (the old bug) undercounts crossings on the
-    /// identical k, which is asserted as the negative control.
+    /// `RENKO_BPD_ACCEPT_TOL` (0.08 post FIX 2a) of target. This pins
+    /// calibrate-input == apply-input AND, with FIX 1, asserts that the accept
+    /// objective is the FULL-history median (the gate now recomputes over
+    /// [first,last]). A 1-min downsample (the old bug) undercounts crossings on
+    /// the identical k, which is asserted as the negative control.
     #[test]
     fn full_tick_calibrate_matches_full_tick_apply() {
-        const RENKO_BPD_ACCEPT_TOL: f64 = 0.20;
         let target_bpd = 300.0;
         // ~40d, 4000 ticks/day (~21s cadence) — dense enough that intra-minute
         // extremes exist, small enough to keep the test < 1s. sigma_step tuned so
@@ -835,6 +908,9 @@ mod tests {
         let stats = count_bars_per_day_from_prices(
             &prices, &applied, &vol, &vol_cfg, &sigma_cache, first, last,
         );
+        // FIX 1: the calibrator now gates the chosen k on the FULL-history median
+        // over [first,last]; this assertion measures exactly that, so it must
+        // land within the (tightened) module accept tol.
         let rel_err = (stats.median / target_bpd - 1.0).abs();
         assert!(
             rel_err <= RENKO_BPD_ACCEPT_TOL,
@@ -907,21 +983,62 @@ mod tests {
         );
         let rel_err = (stats.median / target_bpd - 1.0).abs();
         assert!(
-            rel_err <= 0.20,
-            "refined k median {:.1} within 20% of target {:.0}? rel_err={:.3}",
-            stats.median, target_bpd, rel_err
+            rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "refined k median {:.1} within {:.0}% of target {:.0}? rel_err={:.3}",
+            stats.median, RENKO_BPD_ACCEPT_TOL * 100.0, target_bpd, rel_err
         );
     }
 
     #[test]
     fn bpd_accept_gate_threshold_math() {
-        // The gate drops a window when |median/target - 1| > 0.20.
+        // The gate drops a window when |median/target - 1| > RENKO_BPD_ACCEPT_TOL
+        // (tightened 0.20 → 0.08 by FIX 2a).
         let target = 300.0;
         // 33 bpd vs 300 target → rel-err ≈ 0.89 → dropped (the SOL/USDT k≈4 case).
         let rel_err_bad = (33.0_f64 / target - 1.0).abs();
-        assert!(rel_err_bad > 0.20);
-        // 280 bpd vs 300 → rel-err ≈ 0.067 → accepted.
-        let rel_err_ok = (280.0_f64 / target - 1.0).abs();
-        assert!(rel_err_ok <= 0.20);
+        assert!(rel_err_bad > RENKO_BPD_ACCEPT_TOL);
+        // 290 bpd vs 300 → rel-err ≈ 0.033 → accepted under the tight 0.08 gate.
+        let rel_err_ok = (290.0_f64 / target - 1.0).abs();
+        assert!(rel_err_ok <= RENKO_BPD_ACCEPT_TOL);
+        // 330 bpd vs 300 → rel-err = 0.10 → now DROPPED (would have passed @0.20).
+        let rel_err_was_ok_now_bad = (330.0_f64 / target - 1.0).abs();
+        assert!(rel_err_was_ok_now_bad > RENKO_BPD_ACCEPT_TOL);
+    }
+
+    #[test]
+    fn score_is_pure_median_no_mad_term() {
+        // FIX 2b: score must be exactly |median/target - 1|, independent of MAD.
+        let target = 300.0;
+        let lo_disp = DailyBpdStats {
+            bricks_per_day: vec![], median: 300.0, mean: 300.0, mad: 5.0, days: 10,
+        };
+        let hi_disp = DailyBpdStats {
+            bricks_per_day: vec![], median: 300.0, mean: 300.0, mad: 120.0, days: 10,
+        };
+        // Same median ⇒ identical score regardless of MAD (old objective would
+        // have penalised hi_disp by 0.3*120/300 = 0.12).
+        assert_eq!(lo_disp.score(target), hi_disp.score(target));
+        assert!((lo_disp.score(target) - 0.0).abs() < 1e-12);
+        let off = DailyBpdStats {
+            bricks_per_day: vec![], median: 330.0, mean: 330.0, mad: 0.0, days: 10,
+        };
+        assert!((off.score(target) - 0.10).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dispersion_guard_rejects_pure_noise() {
+        // FIX 2b side-guard: MAD/median > RENKO_DISPERSION_MAX ⇒ reject.
+        let ok = DailyBpdStats {
+            bricks_per_day: vec![], median: 300.0, mean: 300.0, mad: 100.0, days: 10,
+        };
+        assert!(ok.dispersion_ok(), "MAD/median=0.33 ≤ bound ⇒ ok");
+        let noisy = DailyBpdStats {
+            bricks_per_day: vec![], median: 100.0, mean: 100.0, mad: 150.0, days: 10,
+        };
+        assert!(!noisy.dispersion_ok(), "MAD/median=1.5 > bound ⇒ reject");
+        let dead = DailyBpdStats {
+            bricks_per_day: vec![], median: 0.0, mean: 0.0, mad: 0.0, days: 0,
+        };
+        assert!(!dead.dispersion_ok(), "dead window not ok");
     }
 }
