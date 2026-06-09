@@ -351,8 +351,13 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
 /// The achieved error is that structural-floor minimum — logged per ticker so
 /// the operator can spot tickers needing a per-pair forced-k override.
 ///
-/// Final gate: accept `k_star` iff `achieved_err ≤ RENKO_BPD_ACCEPT_TOL` AND
-/// dispersion_ok AND `k_star ≥ K_FLOOR` AND no clamp; else 0.0 (caller drops).
+/// Final gate: `k_star` is ALWAYS returned as the closest-achievable k (k>0).
+/// `RENKO_BPD_ACCEPT_TOL` is ADVISORY — exceeding it only WARNs (snap-grid
+/// structural floor), it does NOT drop the ticker (operator 2026-06-09: "k must
+/// be the PRODUCT of calibration, never give up to a manual override"). Only the
+/// genuinely-degenerate guards return 0.0: dispersion !ok (pure-noise full
+/// history), median at K_FLOOR ≤ target (too flat to reach target at any k),
+/// degenerate-σ / no crossing below K_MAX_SAFETY, min_pct-clamp fraction > floor.
 ///
 /// `eval_holdout_days` typically 7. With `k_fit_windows_days=[7,14,30]`, the
 /// 7d window degenerates (cal_slice is empty) — caller should size windows
@@ -677,16 +682,25 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
         warn!(k_star, "wf selected rung had no scorable clean day — returning 0.0");
         return 0.0;
     }
+    // ACCEPT-TOL is now ADVISORY (operator directive 2026-06-09: "k must be the
+    // PRODUCT of calibration — always find the closest-possible k, never give up
+    // to a manual override"). The two-sided rung probe already selected k_star =
+    // closest achievable rung. The snap_to_25_grid × integer-day-median staircase
+    // can leave the best rung structurally a few % off target (BNB/USDT, SOL/USDT
+    // full-2yr cannot land within 5% of 300). That is a STRUCTURAL FLOOR, NOT an
+    // "no valid k" condition — so we ACCEPT k_star and only WARN. The genuinely
+    // degenerate guards below (dispersion, K_FLOOR, min_pct-clamp) still 0.0.
     if achieved_err > RENKO_BPD_ACCEPT_TOL {
         warn!(
             k_star,
-            achieved_err_pct = achieved_err * 100.0,
-            accept_tol_pct = RENKO_BPD_ACCEPT_TOL * 100.0,
             full_median = full_stats.median,
             target_bpd,
-            "wf accept gate — structural floor exceeds tol (needs per-pair renko_k override), returning 0.0"
+            achieved_err_pct = achieved_err * 100.0,
+            accept_tol_pct = RENKO_BPD_ACCEPT_TOL * 100.0,
+            "wf accept gate (advisory) — best-achievable rung {:.1}% off target — accepting closest k (snap-grid structural floor)",
+            achieved_err * 100.0
         );
-        return 0.0;
+        // fall through — do NOT return 0.0; k_star is the closest achievable k.
     }
     if !full_stats.dispersion_ok() {
         warn!(
@@ -1464,18 +1478,23 @@ mod tests {
 
     #[test]
     fn bpd_accept_gate_threshold_math() {
-        // The gate drops a window when |median/target - 1| > RENKO_BPD_ACCEPT_TOL
-        // (tightened 0.20 → 0.08 by FIX 2a).
+        // ADVISORY tol (2026-06-09): `RENKO_BPD_ACCEPT_TOL` no longer DROPS a
+        // ticker — exceeding it only WARNs (snap-grid structural floor) while
+        // `k_star` (the closest achievable rung) is still returned. This test pins
+        // the THRESHOLD ARITHMETIC (which side of the advisory line each err lands
+        // on) — the constant comparison is unchanged; only the consequence (warn
+        // vs return-0.0) changed in the gate.
         let target = 300.0;
-        // 33 bpd vs 300 target → rel-err ≈ 0.89 → dropped (the SOL/USDT k≈4 case).
+        // 33 bpd vs 300 → rel-err ≈ 0.89 → ADVISORY warn (the SOL/USDT k≈4 case);
+        // pre-fix this dropped the ticker, post-fix it accepts the closest k.
         let rel_err_bad = (33.0_f64 / target - 1.0).abs();
         assert!(rel_err_bad > RENKO_BPD_ACCEPT_TOL);
-        // 290 bpd vs 300 → rel-err ≈ 0.033 → accepted under the tight 0.08 gate.
+        // 290 bpd vs 300 → rel-err ≈ 0.033 → within tol (no warn).
         let rel_err_ok = (290.0_f64 / target - 1.0).abs();
         assert!(rel_err_ok <= RENKO_BPD_ACCEPT_TOL);
-        // 330 bpd vs 300 → rel-err = 0.10 → now DROPPED (would have passed @0.20).
-        let rel_err_was_ok_now_bad = (330.0_f64 / target - 1.0).abs();
-        assert!(rel_err_was_ok_now_bad > RENKO_BPD_ACCEPT_TOL);
+        // 330 bpd vs 300 → rel-err = 0.10 → above tol ⇒ advisory warn (still k>0).
+        let rel_err_warn = (330.0_f64 / target - 1.0).abs();
+        assert!(rel_err_warn > RENKO_BPD_ACCEPT_TOL);
     }
 
     #[test]
@@ -1997,6 +2016,101 @@ mod tests {
     /// (K_FLOOR) legitimately cannot reach target — the bisection must NOT expand
     /// downward; it returns 0.0 so the ticker routes to a per-pair target/k
     /// override. Only the MAX side was unclamped; the MIN side is unchanged.
+    /// ADVISORY ACCEPT-TOL (2026-06-09, operator directive "k must be the PRODUCT
+    /// of calibration — always find the closest-possible k, never give up to a
+    /// manual override"): when the snap_to_25_grid × integer-day-median STAIRCASE
+    /// leaves the best bracketing rung structurally OFF target by MORE than
+    /// `RENKO_BPD_ACCEPT_TOL` (the BNB/USDT + SOL/USDT full-2yr case), the
+    /// calibrator must STILL return that closest-achievable k (k>0) — it must NOT
+    /// reject-to-0.0. The 5% tol is ADVISORY (warn-only), not a drop gate.
+    ///
+    /// Construction: a calm path at a VERY LOW target so consecutive achievable
+    /// per-day-median rungs (snap_to_25_grid × integer-day median) are coarse in
+    /// RELATIVE terms. At target=5.5 the two bracketing rungs are median=6 and
+    /// median=5 — BOTH ~9.1% off — so no rung lands within 5% (structural floor).
+    /// Pre-fix this returned 0.0 (accept-gate reject); post-fix it returns the
+    /// closest rung's k (k>0) with `achieved_err` in the 6-10% band.
+    #[test]
+    fn best_rung_off_target_accepts_closest_k_not_zero() {
+        // target between two adjacent integer rungs (5 and 6): err = 0.5/5.5 ≈
+        // 9.1% on EITHER side ⇒ the closest achievable rung is structurally >5%
+        // off — the exact BNB/USDT + SOL/USDT staircase-floor regime.
+        let target_bpd = 5.5;
+        let prices = synth_gbm_path(40, 400, 0.0025, 0xFEED);
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+            ..VolConfig::default()
+        };
+        // Upper bracket 0.65 lands in a VALID region (median≈4-5, days≥38 < target
+        // 5.5) so the bracket holds; K_FLOOR overshoots (median=335 > 5.5). The
+        // two bracketing rungs straddling 5.5 are median=6 and median=5 — both
+        // ~9% off — the snap-grid structural floor under test.
+        let cal = CalibrationConfig {
+            target_bpd,
+            k_fit_windows_days: vec![30],
+            min_window_days: 7,
+            max_rounds: 40,
+            tolerance: 0.02,
+            mult_bounds: [0.05, 0.65],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, target_bpd, 7,
+        );
+        // PRIMARY assertion: the closest-achievable rung k is returned, NOT 0.0.
+        assert!(
+            k > 0.0,
+            "best rung off-target by >5% (snap-grid structural floor) must return \
+             the closest k, NOT reject to 0.0 (got {k}) — operator: k is the \
+             PRODUCT of calibration, never give up to a manual override"
+        );
+        assert!((k as f64) >= K_FLOOR, "returned k must be ≥ K_FLOOR (got {k})");
+
+        // The structural floor (achieved_err) must EXCEED the advisory tol — this
+        // is exactly the regime the old gate REJECTED. Confirm we are testing the
+        // >5%-off branch (6-10% band), and that the returned k is the closer rung.
+        let stats = count_bars_per_day_from_prices(
+            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 },
+            &vol, &vol_cfg, &sigma_cache, first, last,
+        );
+        let achieved_err = (stats.median / target_bpd - 1.0).abs();
+        assert!(
+            achieved_err > RENKO_BPD_ACCEPT_TOL,
+            "this test must exercise the >5%-off advisory branch — achieved_err \
+             {:.3} must exceed tol {:.3} (median {} vs target {})",
+            achieved_err, RENKO_BPD_ACCEPT_TOL, stats.median, target_bpd
+        );
+        assert!(
+            achieved_err < 0.12,
+            "structural floor in the 6-10% band (got {:.1}% — median {} vs {})",
+            achieved_err * 100.0, stats.median, target_bpd
+        );
+        // The returned k must be the OPTIMAL rung: neither bracket neighbour beats
+        // its err (it IS the closest-achievable k, just structurally off target).
+        let median_err = |kk: f64| -> f64 {
+            let s = count_bars_per_day_from_prices(
+                &prices, &RenkoConfig { multiplier: kk as f32, min_pct: 0.0 },
+                &vol, &vol_cfg, &sigma_cache, first, last,
+            );
+            if s.days == 0 { f64::INFINITY } else { (s.median / target_bpd - 1.0).abs() }
+        };
+        let step = K_BRACKET_LN_EPS.exp();
+        assert!(
+            achieved_err <= median_err(k as f64 * step)
+                && achieved_err <= median_err(k as f64 / step),
+            "returned k sits on the optimal (closest) rung despite being off target"
+        );
+    }
+
     #[test]
     fn too_quiet_series_below_target_at_floor_returns_zero() {
         let target_bpd = 300.0;
