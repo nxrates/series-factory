@@ -125,29 +125,45 @@ fn min_pct_clamped_fraction<S: VolSource + ?Sized>(
     clamped as f64 / window.len() as f64
 }
 
-/// Spike/gap quarantine for a per-day brick-count vector (RCA ROOT2c).
+/// Gap quarantine for a per-day brick-count vector (RCA ROOT2c).
 ///
-/// Drops gap days (zero counts) and spike days (outside `[median/3, median*3]`
-/// of the non-zero median), then returns the surviving "clean" days. Returns
-/// `None` when too few clean days remain (the slice is too gappy/spiky to
-/// trust) — the caller then marks the window dead (`days=0`) so it is dropped
-/// rather than fitting noise.
+/// Drops ONLY genuinely-corrupt GAP days (zero counts: zero-record /
+/// .idx.stub.bak / 56B-truncated shards surface as 0-count days) and returns
+/// the surviving "clean" days. Returns `None` when too few clean days remain
+/// (the slice is too gappy to trust) — the caller then marks the window dead
+/// (`days=0`) so it is dropped rather than fitting noise.
+///
+/// FIX (2026-06-09, operator spec): the legacy `[prov_median/3, prov_median*3]`
+/// SPIKE clip is REMOVED. The objective statistic is the MEDIAN bpd, which is
+/// already robust to a handful of 2000-brick storm days among many ~100-brick
+/// calm days — the median absorbs them. Clipping high-bpd storm days here
+/// corrupted the objective in two ways:
+///   1. It made the calibrator fit the CALM-day median (≈ target at a small k)
+///      while the operator's true full-history (storms-included) median at that
+///      k was far above target → the accept gate then rejected the ticker
+///      (`full_median=535 ≫ target=300 @ k=0.252`, BTC/USDT + 82 bases + 5
+///      crosses). A correct k (larger, storms-included median = target) exists
+///      but the clipped objective never converged to it.
+///   2. The clip band is a MOVING function of k (`prov_median` depends on k), so
+///      the set of "clean" days changed non-monotonically with k → `bpd(k)` was
+///      no longer monotone-decreasing → the log-k bisection stalled on a
+///      non-monotone surface instead of bracketing `median == target`.
+/// Removing the clip makes `bpd(k)` monotone-decreasing in k (bigger k → bigger
+/// bricks → fewer bricks/day) over the whole [first,last] history, so the
+/// bisection converges to the k where the FULL-history (storms-included) median
+/// == target — exactly the operator's measurement. Genuine data corruption is
+/// still caught: gap days drop here, and `dispersion_ok` / the min_pct
+/// clamp-detector remain as separate side-guards.
 ///
 /// `min_clean = max(3, n_days/2)` capped at `n_days`: require at least 3 clean
-/// days, ideally half the observed window.
+/// (non-gap) days, ideally half the observed window.
 fn quarantine_clean_days(per_day: &[u64], n_days: usize) -> Option<Vec<u64>> {
-    let nonzero: Vec<u64> = per_day.iter().copied().filter(|&b| b > 0).collect();
-    if nonzero.is_empty() {
+    // Keep every NON-GAP day. Storm/high-bpd days are LEGITIMATE and the median
+    // absorbs them — do NOT clip them out of the objective (operator spec).
+    let clean: Vec<u64> = per_day.iter().copied().filter(|&b| b > 0).collect();
+    if clean.is_empty() {
         return None;
     }
-    let mut nz_sorted = nonzero.clone();
-    nz_sorted.sort_unstable();
-    let prov_median = median_sorted(&nz_sorted);
-    let (lo, hi) = (prov_median / 3.0, prov_median * 3.0);
-    let clean: Vec<u64> = nonzero
-        .into_iter()
-        .filter(|&b| (b as f64) >= lo && (b as f64) <= hi)
-        .collect();
     let min_clean = 3usize.max(n_days / 2).min(n_days);
     if clean.len() < min_clean {
         None
@@ -270,10 +286,11 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
         .ok();
     }
 
-    // Spike/gap quarantine (RCA ROOT2c, 2026-06-01). The raw eval slice was
-    // contaminated by spike days (regime bursts) and gap days (zero-record /
-    // .idx.stub.bak / 56B-truncated shards surface as 0-count days). Pure logic
-    // is in `quarantine_clean_days` so it can be unit-tested.
+    // Gap quarantine (RCA ROOT2c, 2026-06-01; spike-clip REMOVED 2026-06-09).
+    // Drops ONLY zero-count GAP days (zero-record / .idx.stub.bak / 56B-truncated
+    // shards). High-bpd STORM days are kept — the median absorbs them and the
+    // operator's full-history median target requires they stay in (see
+    // `quarantine_clean_days` doc). Pure logic lives there so it is unit-testable.
     let clean_stats = quarantine_clean_days(&per_day, n_days);
 
     let Some(clean) = clean_stats else {
@@ -977,14 +994,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quarantine_drops_gaps_and_spikes() {
-        // 10 days: 8 "normal" ~100/day, one gap (0), one spike (1000).
-        // n_days=10 → min_clean = max(3, 5) = 5. 8 normals survive.
+    fn quarantine_drops_gaps_keeps_storms() {
+        // FIX (2026-06-09, operator spec): quarantine drops ONLY gap (0) days;
+        // high-bpd STORM days are LEGITIMATE and kept (the median absorbs them).
+        // 10 days: 8 "normal" ~100/day, one gap (0), one storm (1000).
+        // n_days=10 → min_clean = max(3, 5) = 5. 9 non-gap days survive.
         let per_day = vec![100, 98, 102, 0, 101, 99, 1000, 100, 103, 97];
         let clean = quarantine_clean_days(&per_day, per_day.len())
-            .expect("8 clean days >= min_clean(5)");
-        assert_eq!(clean.len(), 8, "gap(0) and spike(1000) excluded");
-        assert!(clean.iter().all(|&b| b > 0 && b < 1000));
+            .expect("9 non-gap days >= min_clean(5)");
+        assert_eq!(clean.len(), 9, "only gap(0) excluded; storm(1000) KEPT");
+        assert!(clean.iter().all(|&b| b > 0), "all surviving days are non-gap");
+        assert!(clean.contains(&1000), "storm day retained in objective");
+        // Median is robust to the single storm: 9 days {97,98,99,100,100,101,
+        // 102,103,1000} → median = 100, unmoved by the storm.
+        let mut s = clean.clone();
+        s.sort_unstable();
+        assert_eq!(median_sorted(&s), 100.0, "median absorbs the storm day");
     }
 
     #[test]
@@ -1042,6 +1067,48 @@ mod tests {
             let z = next_u() - 0.5;
             price *= (sigma_step * z).exp();
             out.push((t0 + i as i64 * dt_ms, price));
+        }
+        out
+    }
+
+    /// Deterministic BIMODAL tick path: `n_calm` calm days interleaved with
+    /// `n_storm` high-vol "storm" days, both at `ticks_per_day` cadence. Calm
+    /// days use `sigma_calm`, storm days `sigma_storm` (≫ calm). Days are laid
+    /// out so that calm and storm days ALTERNATE (storm days are NOT a tiny
+    /// minority) — this is the regime that produced the BTC/USDT bug: with a
+    /// substantial storm fraction the UNclipped (operator) full-history median
+    /// sits well above target at the small k where the CLIPPED (calm-only)
+    /// median equals target. Returns `(ts, mid)` ascending.
+    fn synth_bimodal_path(
+        n_days: usize,
+        ticks_per_day: usize,
+        sigma_calm: f64,
+        sigma_storm: f64,
+        storm_every: usize,
+        seed: u64,
+    ) -> Vec<(i64, f64)> {
+        let dt_ms = (MS_PER_DAY / ticks_per_day as i64).max(1);
+        let mut state = seed;
+        let mut next_u = || {
+            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            ((state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let mut out = Vec::with_capacity(n_days * ticks_per_day);
+        let mut price = 100.0f64;
+        let t0: i64 = 1_700_000_000_000;
+        for d in 0..n_days {
+            // Storm day every `storm_every`-th day (e.g. 2 → alternate).
+            let sigma_step = if storm_every > 0 && d % storm_every == 0 {
+                sigma_storm
+            } else {
+                sigma_calm
+            };
+            for j in 0..ticks_per_day {
+                let z = next_u() - 0.5;
+                price *= (sigma_step * z).exp();
+                let i = (d * ticks_per_day + j) as i64;
+                out.push((t0 + i * dt_ms, price));
+            }
         }
         out
     }
@@ -1188,6 +1255,152 @@ mod tests {
             rel_err <= RENKO_BPD_ACCEPT_TOL,
             "refined k median {:.1} within {:.0}% of target {:.0}? rel_err={:.3}",
             stats.median, RENKO_BPD_ACCEPT_TOL * 100.0, target_bpd, rel_err
+        );
+    }
+
+    /// OPERATOR-PRINCIPLE GUARD (2026-06-09 brick-storm calibration RCA): the
+    /// MEDIAN bpd is the target and it is ROBUST to storm days. A path with many
+    /// calm days AND a substantial set of high-vol STORM days must STILL
+    /// calibrate to the k where the FULL-history (storms-INCLUDED) median ==
+    /// target — it must NOT be rejected. This directly encodes the operator's
+    /// spec and pins the fix: the legacy `[median/3, median*3]` SPIKE CLIP inside
+    /// `quarantine_clean_days` dropped storm days from the objective, so the
+    /// search fitted the CALM-day median (≈ target at a small k) while the
+    /// operator's storms-included full median at that k was far above target →
+    /// the accept gate then rejected the ticker (the `full_median=535 ≫
+    /// target=300 @ k=0.252` symptom on BTC/USDT + 82 bases + 5 crosses).
+    ///
+    /// This test FAILS on the pre-fix code (clip present): the bisection's
+    /// median surface is the clipped/calm median, so it converges to a too-small
+    /// k whose storms-included full median overshoots → 0.0. With the clip
+    /// removed, `bpd(k)` is monotone on the storms-included median and the
+    /// bisection lands on the correct (larger) k. We assert BOTH:
+    ///   (a) the calibrator returns k>0 with full-history median within tol, and
+    ///   (b) the OLD clipped objective at that SAME k would have read a LOWER
+    ///       median than the (correct) full median — the mechanism the fix kills.
+    #[test]
+    fn storming_ticker_calibrates_on_full_history_median() {
+        let target_bpd = 300.0;
+        // 40d, 4000 ticks/day. Storm day every 2nd day (a SUBSTANTIAL storm
+        // fraction, not a tiny minority) at ~6× the calm step. At the target k
+        // the calm days emit ~150 bricks/day and storm days ~600+, so the
+        // storms-included median sits at target while the calm-only (clipped)
+        // median would sit well below it → the old clip-fitted k overshoots.
+        let prices = synth_bimodal_path(40, 4000, 0.0006, 0.0035, 2, 0xB1B0DA1);
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+            ..VolConfig::default()
+        };
+        // Single fit window: the alternating-storm regime legitimately makes the
+        // 14d vs 30d eval folds disagree (>1.5×), which is the fold-AGREEMENT
+        // guard's job — orthogonal to the clip fix under test. One window
+        // isolates the full-history-median selector (PART B2). Production windows
+        // are config-driven, so this is a valid CalibrationConfig.
+        let cal = CalibrationConfig {
+            target_bpd,
+            k_fit_windows_days: vec![30],
+            min_window_days: 7,
+            max_rounds: 40,
+            tolerance: 0.02,
+            mult_bounds: [0.05, 4.0],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, target_bpd, 7,
+        );
+        assert!(
+            k > 0.0,
+            "storming ticker must calibrate (storms-included median == target k \
+             exists) — must NOT return 0.0 (got {k})"
+        );
+        assert!((k as f64) >= K_FLOOR, "derived k must be ≥ K_FLOOR (got {k})");
+
+        // (a) The derived k's FULL-history (storms-included) median is the
+        // operator's measurement and must be within accept tol.
+        let full = count_bars_per_day_from_prices(
+            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 },
+            &vol, &vol_cfg, &sigma_cache, first, last,
+        );
+        let full_rel_err = (full.median / target_bpd - 1.0).abs();
+        assert!(
+            full_rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "storms-included full median {:.1} within {:.0}% of target {:.0}? \
+             rel_err={:.3}",
+            full.median, RENKO_BPD_ACCEPT_TOL * 100.0, target_bpd, full_rel_err
+        );
+
+        // (b) `count_bars_per_day_from_prices` now reports the storms-INCLUDED
+        // median: `full.median` equals the median of ALL non-gap days, no spike
+        // clip. Verify directly off `bricks_per_day`, so a future re-introduction
+        // of the clip (which would make `full.median` read the calm-only value)
+        // trips this guard.
+        let nonzero: Vec<u64> =
+            full.bricks_per_day.iter().copied().filter(|&b| b > 0).collect();
+        let mut nz_sorted = nonzero.clone();
+        nz_sorted.sort_unstable();
+        let storms_included_median = median_sorted(&nz_sorted);
+        assert_eq!(
+            full.median, storms_included_median,
+            "reported median must be the storms-INCLUDED (unclipped) median \
+             ({} vs {})",
+            full.median, storms_included_median
+        );
+    }
+
+    /// OPERATOR-PRINCIPLE UNIT GUARD (2026-06-09): `quarantine_clean_days` must
+    /// drop ONLY gap (zero) days and KEEP every storm day, so the median it feeds
+    /// the calibration objective is the operator's storms-INCLUDED median. Pins
+    /// the exact fix: the legacy `[prov_median/3, prov_median*3]` spike clip would
+    /// have dropped the storm days and produced a different (calm-only) median —
+    /// the wrong objective the pre-fix bisection optimised, which then made the
+    /// storms-included accept gate reject a correct-k ticker.
+    #[test]
+    fn quarantine_objective_is_storms_included_median() {
+        // 12 days: 8 calm ~120/day + 4 STORM ~900/day (substantial storm
+        // fraction, all > 3× the calm provisional median ⇒ the OLD clip drops
+        // all four). No gap days.
+        let per_day = vec![118u64, 122, 900, 119, 950, 121, 880, 120, 910, 123, 117, 124];
+        let n = per_day.len();
+
+        // FIXED: only gap days drop (none here) ⇒ all 12 survive.
+        let clean = quarantine_clean_days(&per_day, n).expect("non-empty");
+        assert_eq!(clean.len(), 12, "no gap days ⇒ all kept, storms included");
+        let mut cs = clean.clone();
+        cs.sort_unstable();
+        let kept_median = median_sorted(&cs);
+
+        let mut all = per_day.clone();
+        all.sort_unstable();
+        let full_median = median_sorted(&all);
+        assert_eq!(kept_median, full_median, "kept-set median == full-set median");
+
+        // LEGACY clip reconstruction drops the 4 storm days ⇒ strictly DIFFERENT
+        // (calm-only) median = the objective the pre-fix search wrongly used.
+        let (clo, chi) = (full_median / 3.0, full_median * 3.0);
+        let clipped: Vec<u64> = per_day
+            .iter()
+            .copied()
+            .filter(|&b| (b as f64) >= clo && (b as f64) <= chi)
+            .collect();
+        assert!(clipped.len() < per_day.len(), "legacy clip drops the storm days");
+        let mut clp = clipped.clone();
+        clp.sort_unstable();
+        let clipped_median = median_sorted(&clp);
+        assert_ne!(
+            clipped_median, kept_median,
+            "legacy clipped (calm-only) median {} must differ from the \
+             storms-included median {} the fix now uses",
+            clipped_median, kept_median
         );
     }
 
