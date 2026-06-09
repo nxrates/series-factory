@@ -48,6 +48,35 @@ use tracing::{info, warn};
 /// branches in lock-step (audit point #5(i), 2026-05-26 — `feedback_no_k_fallback`).
 const EVAL_HOLDOUT_DAYS: usize = 7;
 
+/// Upper clamp on the up-front `Vec::<(i64,f64)>::with_capacity` reservation for
+/// the full-tick mid path (PERF A2 pre-sizing).
+///
+/// **Why a cap (OOM RCA, 2026-06-09):** the pre-size estimate is
+/// `Σ shard_bytes / 56` — an *accurate* upper bound of the records on disk, but
+/// only an upper bound of the records actually *kept*. Heartbeat-sentinel and
+/// non-finite-mid records are filtered in the push loop, and on sentinel-heavy
+/// tickers (BTC/USDT: ~763M on-disk records vs ~247M finite mids, ≈3.1×) the
+/// raw estimate over-reserves by 3×. At 16 B/elem that is a single ~12 GB
+/// up-front allocation which OOMs the 22Gi calibrator pod (`memory allocation
+/// of 12211304480 bytes failed`) once the σ cache + other allocations are
+/// added. We keep the estimate (it is correct, and cheap reallocation is only
+/// paid on the few huge sentinel-heavy tickers) but clamp the *reservation* so
+/// a large or skewed estimate can never trigger a giant up-front alloc; above
+/// the cap the Vec starts empty and grows normally.
+///
+/// 64M elements × 16 B ≈ 1 GiB — comfortably below the per-worker budget while
+/// still pre-sizing the common case (most tickers are << 64M finite mids).
+const MAX_PRERESERVE_TICKS: usize = 64_000_000;
+
+/// Clamp a pre-size estimate to [`MAX_PRERESERVE_TICKS`]. Pure sizing helper —
+/// never affects which records are loaded or their order; only the initial Vec
+/// capacity. Above the cap returns `MAX_PRERESERVE_TICKS` so the Vec grows by
+/// realloc rather than OOMing on the up-front reservation.
+#[inline]
+fn clamp_prereserve(estimate: usize) -> usize {
+    estimate.min(MAX_PRERESERVE_TICKS)
+}
+
 // Synth pair registry — canonical source @ nxr_sdk::synth::pairs.
 use nxr_sdk::pipeline_config::SynthPairYml;
 use nxr_sdk::synth::pairs::{SynthPairSpec, DEFAULT_INITIAL_SYNTH_PAIRS};
@@ -164,7 +193,11 @@ fn calibrate_one(
         .iter()
         .filter_map(|(_d, p)| std::fs::metadata(p).ok().map(|m| m.len() as usize / 56))
         .sum();
-    let mut tick_prices: Vec<(i64, f64)> = Vec::with_capacity(est_ticks);
+    // Clamp the reservation: `est_ticks` is an accurate upper bound of on-disk
+    // records but heartbeat sentinels / non-finite mids are filtered below, so
+    // on sentinel-heavy tickers it over-reserves ~3× → a single multi-GB alloc
+    // OOMs the pod. See `MAX_PRERESERVE_TICKS`.
+    let mut tick_prices: Vec<(i64, f64)> = Vec::with_capacity(clamp_prereserve(est_ticks));
     for (_date, shard_path) in &shards {
         let mut stream = match ShardStream::<IndexRecord>::open(shard_path) {
             Ok(s) => s,
@@ -438,7 +471,9 @@ fn calibrate_one_synth(
     // records trim it — so capacity is reserved once, no push reallocation churn.
     let est_synth_ticks: usize = est_leg_ticks(idx_root, leg_a_id)
         .saturating_add(est_leg_ticks(idx_root, leg_b_id));
-    let mut tick_prices: Vec<(i64, f64)> = Vec::with_capacity(est_synth_ticks);
+    // Clamp the reservation (see `MAX_PRERESERVE_TICKS`): two sentinel-heavy legs
+    // (e.g. BTC) summed can exceed the budget → a single multi-GB up-front alloc.
+    let mut tick_prices: Vec<(i64, f64)> = Vec::with_capacity(clamp_prereserve(est_synth_ticks));
     loop {
         // Pick side with smaller ts (ties favor a → deterministic).
         let take_a = match (&a_next, &b_next) {
@@ -901,4 +936,60 @@ fn main() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(nxr_sdk::shard::SECS_PER_DAY));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records-per-byte sizing must match the on-disk `IndexRecord` stride the
+    /// loader reads (`ShardStream` reads `file_bytes / size_of::<IndexRecord>()`
+    /// with no file header), so `bytes / 56` is the exact pre-filter count.
+    #[test]
+    fn index_record_is_56_bytes() {
+        assert_eq!(core::mem::size_of::<IndexRecord>(), 56);
+    }
+
+    /// The pre-size estimate (`Σ shard_bytes / 56`) is an upper bound on records
+    /// kept; for a realistic, lightly-filtered shard set it stays within ~1.2× of
+    /// the actual finite-mid count. Model a 1 GB shard (≈18.7M records on disk)
+    /// where ~10% are heartbeat sentinels: estimate / actual ≈ 1.11 ≤ 1.2.
+    #[test]
+    fn estimate_within_1_2x_of_actual_when_lightly_filtered() {
+        let on_disk_records = 1_073_741_824usize / 56; // 1 GiB of IndexRecords
+        let actual_kept = (on_disk_records as f64 * 0.90) as usize; // 10% sentinels
+        let estimate = on_disk_records; // bytes/56 == record count
+        let ratio = estimate as f64 / actual_kept as f64;
+        assert!(ratio <= 1.2, "estimate {} / actual {} = {:.3} > 1.2", estimate, actual_kept, ratio);
+        // And the clamp is a no-op here (well under the cap).
+        assert_eq!(clamp_prereserve(estimate), estimate);
+    }
+
+    /// The clamp must never let the reservation exceed `MAX_PRERESERVE_TICKS`,
+    /// even for the BTC OOM case (~763M estimated → 12 GB at 16 B/elem).
+    #[test]
+    fn clamp_never_exceeds_cap() {
+        // BTC OOM reproduction: 12211304480 bytes / 16 = 763_206_530 elements.
+        let btc_oom_estimate = 12_211_304_480usize / 16;
+        assert!(btc_oom_estimate > MAX_PRERESERVE_TICKS);
+        assert_eq!(clamp_prereserve(btc_oom_estimate), MAX_PRERESERVE_TICKS);
+
+        // Arbitrary huge / saturating estimates also clamp.
+        assert_eq!(clamp_prereserve(usize::MAX), MAX_PRERESERVE_TICKS);
+        assert_eq!(clamp_prereserve(MAX_PRERESERVE_TICKS + 1), MAX_PRERESERVE_TICKS);
+
+        // At/below the cap the estimate passes through unchanged.
+        assert_eq!(clamp_prereserve(MAX_PRERESERVE_TICKS), MAX_PRERESERVE_TICKS);
+        assert_eq!(clamp_prereserve(0), 0);
+        assert_eq!(clamp_prereserve(1_000), 1_000);
+    }
+
+    /// Capped reservation byte ceiling: 64M × 16 B ≈ 1 GiB, comfortably below the
+    /// per-worker budget that the raw 12 GB estimate blew past.
+    #[test]
+    fn capped_reservation_byte_ceiling_is_about_1gib() {
+        let bytes = MAX_PRERESERVE_TICKS * core::mem::size_of::<(i64, f64)>();
+        assert_eq!(core::mem::size_of::<(i64, f64)>(), 16);
+        assert!(bytes <= 1_100_000_000, "capped reservation {} B > ~1 GiB", bytes);
+    }
 }
