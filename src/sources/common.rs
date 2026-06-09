@@ -10,7 +10,7 @@ use chrono::{Datelike, Duration, NaiveDate};
 use memmap2::Mmap;
 use mitch::Tick;
 use std::fs::{self, File};
-use std::io::{BufWriter, Cursor, Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -110,22 +110,159 @@ pub fn archive_urls(exch: &'static str) -> &'static ArchiveUrls {
     urls
 }
 
-/// Download URL to memory (blocking, runs on spawn_blocking).
-pub async fn download_bytes(agent: &Arc<ureq::Agent>, url: &str) -> Result<Vec<u8>> {
+/// Streaming copy buffer size. Bounds peak resident memory during a download
+/// to O(this) regardless of archive size — an ETH-USDT monthly aggTrades zip is
+/// 181-460 MiB compressed (≈654 MiB decompressed); buffering the whole body in
+/// RAM (the old `download_bytes` → `read_to_end` into a `Vec<u8>`) caused
+/// intermittent OOM/truncation. 8 MiB is large enough to keep syscall overhead
+/// negligible and small enough to be irrelevant to RSS.
+const DOWNLOAD_STREAM_BUF_BYTES: usize = 8 * 1024 * 1024;
+
+/// Outcome of a streamed-to-disk download.
+pub struct DownloadedArchive {
+    /// Temp file holding the compressed archive on disk (same dir as the final
+    /// cache file, so it lives on the big ticks PVC, not a small TMPDIR).
+    pub path: PathBuf,
+    /// Bytes actually written to disk.
+    pub bytes_got: u64,
+    /// `Content-Length` advertised by the server, if any.
+    pub content_length: Option<u64>,
+}
+
+impl Drop for DownloadedArchive {
+    fn drop(&mut self) {
+        // Delete-as-you-go: the temp archive is purely transient scratch; the
+        // durable artifact is the decompressed `.ticks` file. Never leak it.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Stream an HTTP body to a temp file on disk with a bounded copy buffer
+/// (`DOWNLOAD_STREAM_BUF_BYTES`), so peak RAM is O(buffer) not O(archive).
+///
+/// `dst_dir` is where the temp `.partial-dl` lands; callers pass the final
+/// cache file's parent so the scratch shares the ticks PVC. Returns the temp
+/// path plus the byte counts needed for truncation detection by the caller.
+///
+/// Truncation detection lives in the caller (`download_to_file_retry`): this fn
+/// reports `bytes_got` and `content_length` but does NOT itself decide that a
+/// short read is fatal, so the decision can be retried with backoff.
+pub async fn download_to_file(
+    agent: &Arc<ureq::Agent>,
+    url: &str,
+    dst_dir: &Path,
+) -> Result<DownloadedArchive> {
     let agent = agent.clone();
     let url = url.to_string();
+    let dst_dir = dst_dir.to_path_buf();
 
-    tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        debug!("Downloading: {}", url);
+    tokio::task::spawn_blocking(move || -> Result<DownloadedArchive> {
+        debug!("Downloading (stream→disk): {}", url);
+        std::fs::create_dir_all(&dst_dir)?;
+
         let response = agent
             .get(&url)
             .call()
             .map_err(|e| anyhow::anyhow!("Download failed {}: {}", url, e))?;
-        let mut data = Vec::new();
-        response.into_reader().read_to_end(&mut data)?;
-        Ok(data)
+
+        let content_length = response
+            .header("Content-Length")
+            .and_then(|s| s.trim().parse::<u64>().ok());
+
+        // Unique temp name so concurrent downloads in the same dir don't clash.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_path = dst_dir.join(format!(".partial-dl-{nonce}-{:x}", url.len()));
+
+        let mut reader = response.into_reader();
+        let out = File::create(&tmp_path)?;
+        let mut writer = BufWriter::with_capacity(DOWNLOAD_STREAM_BUF_BYTES, out);
+        let mut buf = vec![0u8; DOWNLOAD_STREAM_BUF_BYTES];
+        let mut bytes_got: u64 = 0;
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    // Mid-transfer error (the failure mode that lost ETH
+                    // months): drop the partial file, surface as Err so the
+                    // retry loop can re-attempt rather than accept a stub.
+                    let _ = writer.flush();
+                    drop(writer);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(anyhow::anyhow!("stream read failed {}: {}", url, e));
+                }
+            };
+            writer.write_all(&buf[..n])?;
+            bytes_got += n as u64;
+        }
+        writer.flush()?;
+        drop(writer);
+
+        Ok(DownloadedArchive { path: tmp_path, bytes_got, content_length })
     })
     .await?
+}
+
+/// Truncation predicate: a download is truncated iff a `Content-Length` was
+/// advertised and fewer bytes arrived. Split out so the rule is unit-testable
+/// without a live HTTP server.
+#[inline]
+pub fn is_truncated(bytes_got: u64, content_length: Option<u64>) -> bool {
+    matches!(content_length, Some(expected) if bytes_got < expected)
+}
+
+/// Stream-download to disk with retry + truncation detection.
+///
+/// A download whose written byte count falls short of the advertised
+/// `Content-Length` is treated as a FAILED transfer (retried up to
+/// `max_attempts`), NOT as a valid-but-empty archive. This is the fix for the
+/// ETH 2024-2025 silent-gap: a partial body that decompressed to few/zero ticks
+/// was previously accepted as "empty month".
+pub async fn download_to_file_retry(
+    agent: &Arc<ureq::Agent>,
+    url: &str,
+    dst_dir: &Path,
+    max_attempts: usize,
+) -> Result<DownloadedArchive> {
+    let mut last_err = None;
+    for attempt in 0..max_attempts {
+        match download_to_file(agent, url, dst_dir).await {
+            Ok(dl) => {
+                if is_truncated(dl.bytes_got, dl.content_length) {
+                    let expected = dl.content_length.unwrap_or(0);
+                    {
+                        warn!(
+                            bytes_got = dl.bytes_got,
+                            bytes_expected = expected,
+                            url,
+                            "TRUNCATED download (short of Content-Length) — \
+                             treating as failed transfer, NOT empty archive",
+                        );
+                        last_err = Some(anyhow::anyhow!(
+                            "truncated download {}: got {} of {} bytes",
+                            url, dl.bytes_got, expected
+                        ));
+                        // `dl` drops here → temp file removed before retry.
+                        if attempt + 1 < max_attempts {
+                            warn!("Attempt {}/{} truncated: {} - retrying", attempt + 1, max_attempts, url);
+                        }
+                        continue;
+                    }
+                }
+                return Ok(dl);
+            }
+            Err(e) => {
+                if attempt + 1 < max_attempts {
+                    warn!("Attempt {}/{} failed: {} - retrying", attempt + 1, max_attempts, url);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap())
 }
 
 // ─── Tick file I/O (native TickFrame) ───────────────────────────────────��────
@@ -335,32 +472,24 @@ async fn stream_as_tick_frames(
 #[derive(Clone, Copy)]
 pub enum Compression { Zip, Gzip }
 
-/// Download with retry (immediate retry, up to `max_attempts`).
-pub async fn download_bytes_retry(agent: &Arc<ureq::Agent>, url: &str, max_attempts: usize) -> Result<Vec<u8>> {
-    let mut last_err = None;
-    for attempt in 0..max_attempts {
-        match download_bytes(agent, url).await {
-            Ok(data) => return Ok(data),
-            Err(e) => {
-                if attempt + 1 < max_attempts {
-                    warn!("Attempt {}/{} failed: {} - retrying", attempt + 1, max_attempts, url);
-                }
-                last_err = Some(e);
-            }
-        }
-    }
-    Err(last_err.unwrap())
-}
-
-/// Download archive, stream-decompress + stream-parse CSV, stream-write the
-/// `.ticks` cache file. Peak resident memory is bounded to:
-///   * the downloaded archive bytes (compressed, ~50-300 MiB for monthly)
+/// Download archive (streamed to disk), stream-decompress from disk +
+/// stream-parse CSV, stream-write the `.ticks` cache file. Peak resident memory
+/// is bounded to:
+///   * one `DOWNLOAD_STREAM_BUF_BYTES` copy buffer (8 MiB) during download
 ///   * one `CSV_CHUNK_BYTES` line-aligned chunk (~1 MiB)
 ///   * one `BATCH_SIZE`-tick parsed batch (~480 KiB)
 ///
-/// The old path extracted all CSVs from the zip into memory (~1.5 GiB for
-/// binance monthly), then parsed to a second Vec<Vec<TickFrame>>, then
-/// flattened, then sorted. Peak ≥ 4.8 GiB. On 2026-04-23 this OOM-killed
+/// Critically, the compressed archive is NEVER held in RAM as a `Vec<u8>`:
+/// it is streamed to a temp file on the ticks PVC and decompressed from disk.
+/// The previous path buffered the entire compressed body via `read_to_end`
+/// into a `Vec<u8>` (181-460 MiB for ETH-USDT monthly) before decompressing —
+/// under memory pressure this intermittently OOM'd or truncated mid-transfer,
+/// and the truncated body was silently accepted as a few/zero-tick "empty"
+/// month (the ETH 2024-2025 gap).
+///
+/// The older path before that extracted all CSVs from the zip into memory
+/// (~1.5 GiB for binance monthly), then parsed to a second Vec<Vec<TickFrame>>,
+/// then flattened, then sorted. Peak ≥ 4.8 GiB. On 2026-04-23 this OOM-killed
 /// the host mid-download of the first monthly archive.
 ///
 /// Exchange CSVs are time-ordered on disk (binance: by-id ≈ by-time; bybit,
@@ -382,12 +511,19 @@ pub async fn download_and_convert<P>(
 where
     P: Fn(&[u8], u64) -> Result<Vec<TickFrame>> + Sync,
 {
-    use std::io::{BufRead, BufReader};
+    use std::io::BufReader;
 
     const CSV_CHUNK_BYTES: usize = 1_000_000;
 
-    let data = download_bytes_retry(agent, url, max_attempts).await?;
     ensure_parent_dir(cache_path)?;
+    // Stream the compressed archive to a temp file on the same dir (ticks PVC),
+    // with truncation detection + retry. The archive is decompressed FROM DISK
+    // below; it is never held in RAM as a Vec<u8>. `archive` drops at end of
+    // scope → temp file removed (delete-as-you-go scratch).
+    let dst_dir = cache_path.parent().unwrap_or_else(|| Path::new("."));
+    let archive = download_to_file_retry(agent, url, dst_dir, max_attempts).await?;
+    let archive_path = archive.path.clone();
+    let archive_bytes = archive.bytes_got;
     let tmp_path = cache_path.with_extension("ticks.partial");
     let mut total_ticks: u64 = 0;
 
@@ -418,9 +554,12 @@ where
 
         match compression {
             Compression::Zip => {
-                let mut archive = ZipArchive::new(Cursor::new(&data))?;
-                for i in 0..archive.len() {
-                    let file = match archive.by_index(i) {
+                // `ZipArchive` needs Read+Seek; a `File` provides both, so the
+                // central directory is read from disk without loading the body.
+                let zip_file = File::open(&archive_path)?;
+                let mut zarchive = ZipArchive::new(zip_file)?;
+                for i in 0..zarchive.len() {
+                    let file = match zarchive.by_index(i) {
                         Ok(f) => f,
                         Err(e) => {
                             tracing::warn!(ticker_id, idx = i, err = %e, "zip entry unreadable");
@@ -434,7 +573,8 @@ where
                 }
             }
             Compression::Gzip => {
-                let decoder = flate2::read::GzDecoder::new(Cursor::new(&data));
+                let gz_file = File::open(&archive_path)?;
+                let decoder = flate2::read::GzDecoder::new(BufReader::with_capacity(64 * 1024, gz_file));
                 stream_csv_in_chunks(BufReader::with_capacity(64 * 1024, decoder), CSV_CHUNK_BYTES, &mut feed)?;
             }
         }
@@ -454,16 +594,17 @@ where
         // schema drift) or the member was truncated/empty. Surface it loudly —
         // never let a zero-record month pass as a normal success.
         warn!(
-            bytes_downloaded = data.len(),
+            bytes_downloaded = archive_bytes,
             url,
             cache = %cache_path.display(),
-            "download_and_convert produced ZERO ticks (truncated archive or CSV schema drift?) — \
+            "download_and_convert produced ZERO ticks (CSV schema drift or genuinely empty \
+             member — truncation is now caught upstream as a failed transfer) — \
              treating as empty so caller can fall back / flag the gap",
         );
     } else {
         info!("Converted {} ticks → {}", total_ticks, cache_path.display());
     }
-    drop(data);
+    drop(archive); // remove temp compressed archive (delete-as-you-go scratch)
     Ok(total_ticks)
 }
 
@@ -705,6 +846,67 @@ mod tests {
                 ),
             );
         }
+    }
+
+    /// Truncation predicate: short-of-Content-Length ⇒ truncated (failed
+    /// transfer, retried), exact/over ⇒ OK, unknown length ⇒ OK (can't judge).
+    /// This is the rule that stops a partial ETH archive being accepted as an
+    /// empty month.
+    #[test]
+    fn is_truncated_predicate() {
+        assert!(is_truncated(100, Some(200)), "short body must be truncated");
+        assert!(!is_truncated(200, Some(200)), "exact body is complete");
+        assert!(!is_truncated(201, Some(200)), "over-read (chunked) not truncated");
+        assert!(!is_truncated(0, None), "no Content-Length ⇒ cannot flag truncation");
+        assert!(!is_truncated(100, None), "no Content-Length ⇒ accept");
+    }
+
+    /// A COMPLETE gzip archive on disk streams + decompresses to the exact tick
+    /// count via `download_and_convert`'s decompress path; a TRUNCATED gzip
+    /// (bytes lopped off) fails to decompress and yields ZERO ticks rather than
+    /// a wrong-but-accepted partial — proving truncated data is never silently
+    /// converted to a "valid empty" month at the decompress layer (the HTTP
+    /// layer additionally rejects it via Content-Length before we get here).
+    #[test]
+    fn gzip_complete_vs_truncated_decompress_from_disk() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression as GzLevel;
+        use std::io::Write as _;
+
+        let csv = "0,1,2,3\n1,2,3,4\n2,3,4,5\n";
+        let mut enc = GzEncoder::new(Vec::new(), GzLevel::default());
+        enc.write_all(csv.as_bytes()).unwrap();
+        let gz = enc.finish().unwrap();
+
+        let dir = std::env::temp_dir().join(format!("sf-gz-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // helper: decode a gz file on disk through stream_csv_in_chunks, count lines.
+        let decode_lines = |bytes: &[u8]| -> Result<usize> {
+            let p = dir.join("a.gz");
+            std::fs::write(&p, bytes).unwrap();
+            let f = File::open(&p).unwrap();
+            let decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(f));
+            let mut lines = 0usize;
+            let mut feed = |chunk: &[u8]| -> Result<()> {
+                lines += chunk.iter().filter(|&&b| b == b'\n').count();
+                Ok(())
+            };
+            stream_csv_in_chunks(std::io::BufReader::new(decoder), 1_000_000, &mut feed)?;
+            Ok(lines)
+        };
+
+        // Complete archive → all 3 rows decode.
+        assert_eq!(decode_lines(&gz).unwrap(), 3, "complete gz must decode all rows");
+
+        // Truncated archive (drop trailing CRC/length + payload) → decode errors.
+        let truncated = &gz[..gz.len() / 2];
+        assert!(
+            decode_lines(truncated).is_err(),
+            "truncated gz must fail to decompress, not yield a partial-accepted result",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `month_ranges` tiles [from,to] contiguously with no per-symbol logic —
