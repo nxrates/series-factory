@@ -509,11 +509,14 @@ fn free_bytes(path: &Path) -> Option<u64> {
     Some(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
-/// Pre-flight disk-headroom guard (P2.2). With monthly stream-and-delete the
-/// peak raw footprint is bounded to roughly
-///   1 month × n_exch × parallel × bytes_per_exchange_day × days_in_peak_month.
-/// We size the peak month at 31 days (worst case). Abort if that projection
-/// exceeds `free * headroom_safety_factor`. Knobs are YAML-sourced
+/// Pre-flight disk-headroom guard (P2.2). With delete-as-you-go (t2i removes
+/// each `.ticks` the instant it folds it into the `.idx`) the peak raw
+/// footprint is bounded to roughly ONE archive file per exchange in flight:
+///   1 file × n_exch × parallel × bytes_per_exchange_day × PEAK_FILE_DAYS,
+/// where `PEAK_FILE_DAYS` sizes the single largest archive unit. The worst
+/// case is a completed-month monthly archive (~31 days of one exchange's
+/// ticks in one file). Abort if that projection exceeds
+/// `free * headroom_safety_factor`. Knobs are YAML-sourced
 /// (`series.pipeline.backfill`), never hardcoded.
 fn preflight_disk_guard(
     out_dir: &Path,
@@ -521,11 +524,14 @@ fn preflight_disk_guard(
     parallel: usize,
     cfg: &nxr_sdk::pipeline_config::BackfillDiskYml,
 ) -> Result<()> {
-    const PEAK_DAYS: u64 = 31;
+    // One monthly archive is the largest single `.ticks` unit a fetch can land
+    // before t2i folds+deletes it. A daily-fallback file is 1 day; a completed
+    // month is up to 31. Size the in-flight peak at the worst single file.
+    const PEAK_FILE_DAYS: u64 = 31;
     let projected = cfg.bytes_per_exchange_day
         .saturating_mul(n_exch as u64)
         .saturating_mul(parallel.max(1) as u64)
-        .saturating_mul(PEAK_DAYS);
+        .saturating_mul(PEAK_FILE_DAYS);
     let free = match free_bytes(out_dir) {
         Some(f) => f,
         None => {
@@ -546,7 +552,7 @@ fn preflight_disk_guard(
     );
     if projected > budget {
         return Err(anyhow!(
-            "pre-flight disk guard: projected monthly raw peak {:.1} GiB > {:.1} GiB \
+            "pre-flight disk guard: projected in-flight raw peak {:.1} GiB > {:.1} GiB \
              (free {:.1} GiB × safety {:.2}). Lower --parallel, free space, or tune \
              series.pipeline.backfill.{{bytes_per_exchange_day,headroom_safety_factor}}.",
             gib(projected), gib(budget), gib(free), cfg.headroom_safety_factor
@@ -783,19 +789,25 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         info!(ticker, active_exchanges = ?active_exchanges, "availability check ok");
     }
 
-    // 1+2) fetch + t2i — MONTHLY STREAM-AND-DELETE (R-disk, 2026-06-09).
+    // 1+2) fetch + t2i — DELETE-AS-YOU-GO at FILE granularity (R-disk, 2026-06-09).
     //
     // Previously fetch downloaded the WHOLE [from,to) range of raw `.ticks` for
     // every exchange up-front, and t2i folded them afterwards — so for a 2y x
     // n-exch backfill the full raw range coexisted on the PVC per ticker (peak
-    // ≈ range × n_exch). That overran the data volume.
+    // ≈ range × n_exch). That overran the data volume. A first fix bounded it
+    // to ~1 month via a per-month batch delete; the operator (correctly) asked
+    // why we batch at all — we should delete as we go.
     //
-    // Now we drive ONE calendar month at a time:
+    // We still iterate per calendar month so fetch never runs more than ~1
+    // month ahead of t2i, but the disk bound is now FILE-granular: t2i runs
+    // with `--delete-after-convert`, removing each `.ticks` the instant it has
+    // been folded into the per-exch `.idx`. So peak raw on disk ≈ 1 archive
+    // file per exchange in flight (the one t2i is currently folding + at most
+    // the one fetch is currently writing), NEVER a whole month or range.
     //   for each month M in [from,to]:
     //     fetch-crypto-history --from-date M.start --to-date M.end  (all exch)
-    //     ticks-to-idx <exch> ...  (APPENDS M's records into the per-exch .idx)
-    //     delete ticks/<exch>/<BASE><QUOTE>/*.ticks  (before next month)
-    // so peak raw is bounded to ~1 month × n_exch regardless of range length.
+    //     ticks-to-idx <exch> --delete-after-convert  (folds + deletes per file)
+    //     defensive delete of any raw t2i could not remove  (before next month)
     //
     // t2i's AppendLog::open_buffered appends, and it discovers the .ticks files
     // present in the dir at call time (ticks_to_idx.rs:136,275), so per-month
@@ -808,7 +820,10 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     // active exchanges, skip the whole fetch+t2i loop (preserves prior resume
     // semantics via the same integrity gate). Otherwise we rebuild fresh: any
     // stale/partial per-exch .idx is removed first so months are not appended
-    // on top of a half-built log (which would duplicate records).
+    // on top of a half-built log (which would duplicate records). Because t2i
+    // fdatasync-flushes the .idx before deleting each raw file, a crash leaves
+    // the .idx ⊇ every deleted file's records; the fresh-build path then
+    // re-fetches the whole window from empty, so resume never double-counts.
     if want("fetch") || want("t2i") {
         let per_idx_paths: Vec<PathBuf> = active_exchanges
             .iter()
@@ -897,6 +912,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
 
                 // fold this month into each per-exch .idx (parallel across exch)
                 if want("t2i") {
+                    // delete-as-you-go: unless the operator asked to retain raw
+                    // (`--keep-staging`), t2i deletes each `.ticks` the instant
+                    // it folds it into the `.idx`, so peak raw never exceeds ~1
+                    // file per exchange in flight (true file-granular cleanup,
+                    // not a post-window batch delete).
+                    let delete_as_you_go = !ctx.args.keep_staging;
                     let reps: Vec<(String, StepReport)> = active_exchanges
                         .par_iter()
                         .map(|ex| {
@@ -904,13 +925,16 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                                 .join("indexes")
                                 .join(ex)
                                 .join(format!("{}-{}.idx", base, quote));
-                            let args = vec![
+                            let mut args = vec![
                                 ex.clone(),
                                 base.clone(),
                                 quote.clone(),
                                 "--cycle-ms".to_string(),
                                 cycle_ms.clone(),
                             ];
+                            if delete_as_you_go {
+                                args.push("--delete-after-convert".to_string());
+                            }
                             let rep = run_step(ticker, "ticks-to-idx", &args, Some(&per_idx));
                             (ex.clone(), rep)
                         })
@@ -925,9 +949,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     }
                 }
 
-                // DELETE this month's raw before the next month is fetched.
-                // This is the footprint bound: at any instant only 1 month of
-                // raw `.ticks` × n_exch is resident.
+                // Defensive sweep: t2i with --delete-after-convert already
+                // removed each `.ticks` the instant it folded it, so the real
+                // footprint bound is ~1 file per exchange in flight. This mops
+                // up anything t2i could not delete (e.g. a file whose stream
+                // errored mid-fold and was kept for retry, or the whole step
+                // being skipped) before the next month is fetched.
                 total_freed += delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
 
                 if hard_fail {
@@ -1417,9 +1444,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // P2.2 — pre-flight disk-headroom guard. With monthly stream-and-delete the
-    // raw peak is bounded; abort early if even that projection won't fit free
-    // space (× safety factor). Knobs are YAML-sourced (no hardcode).
+    // P2.2 — pre-flight disk-headroom guard. With delete-as-you-go the raw peak
+    // is bounded to ~1 archive file per exchange in flight; abort early if even
+    // that (tiny) projection won't fit free space (× safety factor). Knobs are
+    // YAML-sourced (no hardcode).
     if want_step(&ctx.steps, "fetch") {
         let disk_cfg = nxr_sdk::pipeline_config::PipelineYml::load(&args.config)
             .map(|y| y.series.pipeline.backfill)
