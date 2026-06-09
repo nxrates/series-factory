@@ -619,17 +619,27 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
     } else {
         let k_min = mults.iter().cloned().fold(f32::INFINITY, f32::min) as f64;
         let k_max = mults.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        // FOLD-AGREEMENT is ADVISORY (operator directive 2026-06-09: "k must be the
+        // PRODUCT of calibration — the full-history median bisection is the source of
+        // truth; never give up to 0"). Per-window k LEGITIMATELY varies across the
+        // 2-year history because crypto vol REGIMES change (BNB/USDT k≈0.39 in a calm
+        // regime vs ≈0.65 in a storm regime ⇒ ratio 1.67). That regime spread is the
+        // operator-sanctioned variance, NOT overfit. The folds are now ONLY a logged
+        // advisory signal; the authoritative k is the full-history log-k bisection
+        // (PART B2) on the storms-included 2-year median. Same reject→advisory
+        // conversion already applied to accept-tol, storm-clip, and dispersion gates.
         if k_min > 0.0 && k_max / k_min > K_AGREEMENT_MAX {
-            warn!(
+            info!(
                 k_min,
                 k_max,
                 ratio = k_max / k_min,
                 agreement_max = K_AGREEMENT_MAX,
                 n_folds = mults.len(),
-                "GUARD reject: fold-agreement — folds disagree (k_max/k_min {:.2} > {:.2}), overfit/regime split — returning 0.0",
+                "fold-agreement advisory — per-window k spread {:.2}x > {:.2}x (vol-regime variation, NOT overfit), proceeding with full-history k (PART B2)",
                 k_max / k_min, K_AGREEMENT_MAX
             );
-            return 0.0;
+            // fall through — do NOT return 0.0; full-history bisection (PART B2) is
+            // the authoritative k selector regardless of fold spread.
         }
     }
 
@@ -1938,18 +1948,26 @@ mod tests {
         );
     }
 
-    /// PART B1: when the per-fold overfit-guard k_w's disagree by more than
-    /// `K_AGREEMENT_MAX` (1.5×) the function must REJECT (return 0.0). We craft a
-    /// path whose recent week is far higher-vol than the older history, so the
-    /// short fold fits a much smaller k than the long fold (path crossings drive
-    /// k under flat σ), tripping the agreement guard.
+    /// PART B1 ADVISORY (2026-06-09 fold-agreement reject→advisory fix): when the
+    /// per-fold overfit-guard k_w's disagree by more than `K_AGREEMENT_MAX` (1.5×)
+    /// the function must NO LONGER reject to 0.0. Per-window k legitimately varies
+    /// across the multi-regime history (calm vs storm), so the fold spread is an
+    /// ADVISORY signal only — the authoritative k is the full-history log-k
+    /// bisection (PART B2) on the storms-included median, which exists whenever the
+    /// median brackets target. This was the BNB/USDT + SOL/USDT blocker (folds
+    /// k_min≈0.39 / k_max≈0.65 / ratio 1.67 > 1.5 ⇒ old code rejected a perfectly
+    /// good full-history k). We craft a path whose recent week is far higher-vol
+    /// than the older history, so the short fold fits a much smaller k than the
+    /// long fold (path crossings drive k under flat σ), tripping the OLD agreement
+    /// guard — and assert the calibrator now FALLS THROUGH to a valid k>0.
     #[test]
-    fn agreement_guard_rejects_divergent_folds() {
+    fn agreement_advisory_falls_through_to_full_history_k() {
         // 35 calm days then 5 EXTREMELY turbulent days (15× step). Holdout
         // scales with window: the 14d fold scores a ~4.7d trailing eval slice
         // (fully inside the 5d spike → needs a LARGE k to hit target) while the
         // 30d fold scores a ~10d trailing slice (half spike, half calm → much
-        // SMALLER k). The two k_w then differ by > 1.5× ⇒ agreement guard fires.
+        // SMALLER k). The two k_w then differ by > 1.5× ⇒ OLD agreement guard would
+        // have rejected; the NEW advisory path must fall through to full-history k.
         let calm = synth_gbm_path(35, 4000, 0.0015, 0xABCDEF);
         let mut turbulent = synth_gbm_path(5, 4000, 0.0225, 0x123456);
         // Re-anchor the turbulent segment's timestamps to follow `calm`.
@@ -1984,9 +2002,31 @@ mod tests {
         let k = calibrate_mtf_walkforward(
             &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, 300.0, 7,
         );
-        assert_eq!(k, 0.0,
-            "divergent folds (recent turbulence vs calm history) must trip the \
-             agreement guard and reject (got k={k})");
+        // Divergent folds (recent turbulence vs calm history) are now ADVISORY:
+        // the full-history median brackets target, so the bisection returns a
+        // valid k>0 — must NOT reject to 0.0 (the BNB/SOL fix).
+        assert!(
+            k > 0.0,
+            "divergent folds must NOT reject — full-history bisection k must be \
+             returned despite fold spread > 1.5× (got k={k})"
+        );
+        assert!((k as f64) >= K_FLOOR, "advisory-path k must be ≥ K_FLOOR (got {k})");
+
+        // The returned k is the full-history (storms-included) bisection k; its
+        // full median must be within accept tol of target (the authoritative fit).
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+        let full = count_bars_per_day_from_prices(
+            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 },
+            &vol, &vol_cfg, &sigma_cache, first, last,
+        );
+        let full_rel_err = (full.median / 300.0 - 1.0).abs();
+        assert!(
+            full_rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "advisory-path full-history median {:.1} within {:.0}% of target 300? \
+             rel_err={:.3}",
+            full.median, RENKO_BPD_ACCEPT_TOL * 100.0, full_rel_err
+        );
     }
 
     /// SYNTH SELECTOR PARITY (2026-06-09): production synth calibration
