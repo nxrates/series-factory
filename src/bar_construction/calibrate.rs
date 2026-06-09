@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, K_FLOOR, SIGMA_FALLBACK};
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, K_FLOOR, K_MAX_SAFETY, SIGMA_FALLBACK};
 use nxr_sdk::vol::{VolConfig, VolSource};
 use nxr_sdk::mitch::timestamp;
 
@@ -473,15 +473,37 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             continue;
         }
 
-        // Clamp detector — same policy as calibrate_mtf.
+        // LOWER clamp detector (UPPER rejection removed 2026-06-09: "K should
+        // not have a max"). A fold parked at the K_FLOOR edge IS a degenerate-σ
+        // artifact and still drops the window.
         let lo_clamp = (best.0 as f64 - cal.mult_bounds[0]).abs() / cal.mult_bounds[0] < 0.01;
-        let hi_clamp = (best.0 as f64 - cal.mult_bounds[1]).abs() / cal.mult_bounds[1] < 0.01;
-        if lo_clamp || hi_clamp {
+        if lo_clamp {
             warn!(
                 window_days,
                 mult = best.0,
-                bound = if lo_clamp { "lower" } else { "upper" },
-                "wf clamp-detector — window dropped"
+                bound = "lower",
+                "wf clamp-detector — window dropped (parked at K_FLOOR edge)"
+            );
+            continue;
+        }
+        // UPPER-bracket-PARKED fold: the per-fold search brackets ONLY
+        // [mult_bounds] (it does NOT auto-expand — only the full-history
+        // bisection does). When a fold's true k_w sits ABOVE the initial bracket
+        // (a storming eval slice), the fold parks at the upper edge. That parked
+        // value is an UNCONVERGED estimate, NOT a genuine fit — it must NOT be
+        // counted as a disagreeing datum in the fold-AGREEMENT guard (else it
+        // spuriously trips max/min on a wall artifact). This is NOT a ticker
+        // rejection (the operator's no-max directive): the answer still comes
+        // from the upward-auto-expanding full-history bisection (PART B2). We
+        // simply OMIT the unconverged fold from the agreement set.
+        let hi_parked = (best.0 as f64 - cal.mult_bounds[1]).abs() / cal.mult_bounds[1] < 0.01;
+        if hi_parked {
+            info!(
+                window_days,
+                mult = best.0,
+                upper_bracket = cal.mult_bounds[1],
+                "wf fold parked at upper bracket (true k_w above hint) — omitted from \
+                 agreement set (NOT rejected); full-history bisection auto-expands upward"
             );
             continue;
         }
@@ -558,20 +580,53 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
     let mut lo = cal.mult_bounds[0].ln();
     let mut hi = cal.mult_bounds[1].ln();
     let g_lo = median_bpd(lo.exp());
-    let g_hi = median_bpd(hi.exp());
-    // Bracket validity: smaller k (lo bound) must OVERSHOOT target (g(lo)>0) and
-    // larger k (hi bound) must UNDERSHOOT (g(hi)<0). If either degenerate or the
-    // crossing isn't bracketed, the target is structurally unreachable in
-    // [mult_bounds] → Failed (caller drops the entry).
-    if g_lo.days == 0 || g_hi.days == 0
-        || !(g_lo.median - target_bpd > 0.0)
-        || !(g_hi.median - target_bpd < 0.0)
-    {
+    let mut g_hi = median_bpd(hi.exp());
+
+    // LOWER side (PRESERVED FLOOR — operator directive: "Maybe a minimum"). The
+    // smallest k (lo bound = K_FLOOR) must OVERSHOOT target (g(lo) > 0). If even
+    // the smallest brick yields TOO FEW bricks/day (g(lo) ≤ 0) the asset is so
+    // flat it CANNOT reach target — legitimately unreachable. We do NOT
+    // auto-expand downward; drop it (return 0.0 → caller routes to a per-pair
+    // target/k override). A dead lo window is likewise unfittable.
+    if g_lo.days == 0 || !(g_lo.median - target_bpd > 0.0) {
         warn!(
             lo_median = g_lo.median,
+            target_bpd,
+            mult_lo = cal.mult_bounds[0],
+            "wf bisection: median at K_FLOOR ≤ target (asset too flat to reach target) — returning 0.0 (floor preserved, per-pair override needed)"
+        );
+        return 0.0;
+    }
+
+    // UPPER side (NO CEILING — operator directive 2026-06-09: "do not clamp K. K
+    // should not have a max"). The largest k (initial hi = mult_bounds[1]) must
+    // UNDERSHOOT target (g(hi) < 0) to bracket the crossing. If even the biggest
+    // brick still emits TOO MANY bricks/day (g(hi) ≥ target) the crossing sits
+    // ABOVE the initial bracket — a storming crypto that needs k beyond the old
+    // 4.0 wall. Instead of rejecting, EXPAND UPWARD: double k_hi until the
+    // median drops below target OR the numeric safety cap K_MAX_SAFETY is hit.
+    while g_hi.days != 0 && g_hi.median - target_bpd >= 0.0 && hi.exp() < K_MAX_SAFETY {
+        let new_hi_k = (hi.exp() * 2.0).min(K_MAX_SAFETY);
+        hi = new_hi_k.ln();
+        g_hi = median_bpd(hi.exp());
+        debug!(
+            hi_k = new_hi_k,
             hi_median = g_hi.median,
             target_bpd,
-            "wf bisection bracket invalid (target not bracketed by mult_bounds) — returning 0.0"
+            "wf bisection: doubling upper bracket (storming crypto, crossing above initial hi)"
+        );
+    }
+    // After expansion, the hi bound must bracket the crossing (median < target).
+    // It can still fail to bracket only when: (a) the hi eval degenerated
+    // (days==0), or (b) the safety cap was reached and median STILL ≥ target
+    // (a degenerate flat-σ series whose median never drops). Both ⇒ unfittable.
+    if g_hi.days == 0 || !(g_hi.median - target_bpd < 0.0) {
+        warn!(
+            hi_median = g_hi.median,
+            hi_k = hi.exp(),
+            target_bpd,
+            k_max_safety = K_MAX_SAFETY,
+            "wf bisection: median at K_MAX_SAFETY still ≥ target (degenerate σ, no crossing below safety cap) — returning 0.0"
         );
         return 0.0;
     }
@@ -668,15 +723,18 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
         );
         return 0.0;
     }
-    // Clamp-detector on the FINAL k_star: a selection parked at either bound is
-    // a degenerate σ / unreachable-target artifact, not a fit.
+    // LOWER clamp-detector on the FINAL k_star (UPPER rejection REMOVED, operator
+    // directive 2026-06-09: "K should not have a max" — a large k is VALID, not
+    // degenerate; the upper bracket auto-expands so a k near/above mult_bounds[1]
+    // is the genuine fit, not a parked artifact). The lower side is kept: a k
+    // parked at the K_FLOOR bracket edge is a degenerate-σ / unreachable-target
+    // artifact (the floor preservation side).
     let lo_clamp = (k_star - cal.mult_bounds[0]).abs() / cal.mult_bounds[0] < 0.01;
-    let hi_clamp = (k_star - cal.mult_bounds[1]).abs() / cal.mult_bounds[1] < 0.01;
-    if lo_clamp || hi_clamp {
+    if lo_clamp {
         warn!(
             k_star,
-            bound = if lo_clamp { "lower" } else { "upper" },
-            "wf final clamp-detector — k_star parked at mult bound, returning 0.0"
+            bound = "lower",
+            "wf final clamp-detector — k_star parked at K_FLOOR bracket edge, returning 0.0"
         );
         return 0.0;
     }
@@ -1861,6 +1919,120 @@ mod tests {
             rel_err <= RENKO_BPD_ACCEPT_TOL,
             "synth full-history median {:.1} within {:.0}% of target {:.0}? rel_err={:.3}",
             stats.median, RENKO_BPD_ACCEPT_TOL * 100.0, target_bpd, rel_err
+        );
+    }
+
+    /// NO-UPPER-CAP (2026-06-09, operator directive "K should not have a max"):
+    /// a STORMING series whose median==target crossing sits ABOVE the initial
+    /// upper bracket (`mult_bounds[1]`) must AUTO-EXPAND the bracket upward and
+    /// return THAT (large) k with the full-history median within tol — it must
+    /// NOT be bracket-invalid-rejected nor clamp-dropped. Pre-fix this returned
+    /// 0.0 ("bracket invalid: median(hi) ≥ target"); post-fix the bisection
+    /// doubles `k_hi` past the wall until it brackets the crossing.
+    #[test]
+    fn storming_series_above_initial_bracket_auto_expands_upward() {
+        let target_bpd = 300.0;
+        // A VERY volatile path with a DELIBERATELY SMALL initial upper bracket
+        // (mult_bounds[1] = 0.5) so the true crossing is far above it. With
+        // ConstSigma σ=0.01, brick_pct = k·0.01; at the bracket hi k=0.5 the
+        // brick is 0.5 % — far too small for this storm ⇒ median ≫ target ⇒ the
+        // old code returned "bracket invalid". The fix doubles k_hi upward until
+        // the (much larger) brick brings the median down to target.
+        let prices = synth_gbm_path(40, 4000, 0.012, 0x5704);
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+            ..VolConfig::default()
+        };
+        // INITIAL upper bracket hint = 0.5 (small ON PURPOSE). The fix must climb
+        // above it. mult_bounds[0] stays at K_FLOOR (lower floor preserved).
+        let cal = CalibrationConfig {
+            target_bpd,
+            k_fit_windows_days: vec![30],
+            min_window_days: 7,
+            max_rounds: 40,
+            tolerance: 0.02,
+            mult_bounds: [0.05, 0.5],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, target_bpd, 7,
+        );
+        assert!(
+            k > 0.0,
+            "storming series above the initial bracket must auto-expand upward \
+             and calibrate — NOT return 0.0 (got {k})"
+        );
+        // The whole point: the returned k must sit ABOVE the initial bracket hi,
+        // proving the upward auto-expansion (not a parked-at-bound artifact).
+        assert!(
+            (k as f64) > cal.mult_bounds[1],
+            "fitted k={k} must exceed the initial upper bracket {} (auto-expanded)",
+            cal.mult_bounds[1]
+        );
+
+        let stats = count_bars_per_day_from_prices(
+            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 },
+            &vol, &vol_cfg, &sigma_cache, first, last,
+        );
+        let rel_err = (stats.median / target_bpd - 1.0).abs();
+        assert!(
+            rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "auto-expanded k median {:.1} within {:.0}% of target {:.0}? rel_err={:.3}",
+            stats.median, RENKO_BPD_ACCEPT_TOL * 100.0, target_bpd, rel_err
+        );
+    }
+
+    /// FLOOR PRESERVED (2026-06-09, operator directive "Maybe a minimum"): a
+    /// TOO-QUIET series whose median is BELOW target even at the smallest k
+    /// (K_FLOOR) legitimately cannot reach target — the bisection must NOT expand
+    /// downward; it returns 0.0 so the ticker routes to a per-pair target/k
+    /// override. Only the MAX side was unclamped; the MIN side is unchanged.
+    #[test]
+    fn too_quiet_series_below_target_at_floor_returns_zero() {
+        let target_bpd = 300.0;
+        // A near-flat path: tiny per-tick step ⇒ very few brick crossings even at
+        // the SMALLEST k (K_FLOOR). With ConstSigma σ=0.01, at k=K_FLOOR=0.05 the
+        // brick is 0.05 % — yet this path barely moves, so the full-history median
+        // sits well BELOW target. g(lo) = median(K_FLOOR) - target < 0 ⇒ the lower
+        // bracket does NOT overshoot ⇒ unreachable ⇒ 0.0 (floor preserved).
+        let prices = synth_gbm_path(40, 4000, 0.00005, 0xDEAD);
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+            ..VolConfig::default()
+        };
+        let cal = CalibrationConfig {
+            target_bpd,
+            k_fit_windows_days: vec![30],
+            min_window_days: 7,
+            max_rounds: 40,
+            tolerance: 0.02,
+            mult_bounds: [0.05, 4.0],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, target_bpd, 7,
+        );
+        assert_eq!(
+            k, 0.0,
+            "too-quiet series (median < target even at K_FLOOR) must return 0.0 \
+             (floor preserved, NO downward expansion) — got {k}"
         );
     }
 }
