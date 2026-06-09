@@ -430,13 +430,19 @@ pub fn scale_to_target_k<S: VolSource + ?Sized>(
             hi = new_hi_k.ln();
             g_hi = median_bpd(hi.exp());
         }
-        if g_hi.days == 0 || !(g_hi.median - target_bpd < 0.0) {
+        // A zero-brick hi window (days==0 ⇒ median 0) is a VALID upper bracket:
+        // m(hi)=0 < target, and the K_FLOOR overshoot was already verified
+        // above — the crossing lies inside (lo, hi] and bisection finds it.
+        // Slow crosses (ETH/BTC et al.) legitimately emit 0 bricks/365d at the
+        // mult_bounds[1] seed; rejecting them as "DEAD" was the 2026-06-09
+        // synth-calibration wipeout. The only genuine no-crossing case is a
+        // median still ≥ target after expansion capped at K_MAX_SAFETY.
+        if g_hi.days != 0 && !(g_hi.median - target_bpd < 0.0) {
             warn!(
                 hi_median = g_hi.median, hi_k = hi.exp(), target_bpd,
                 k_max_safety = K_MAX_SAFETY, median_sigma_pct, hi_days = g_hi.days,
-                "GUARD reject: at upper bracket k={:.4} median={:.1} {} target {:.1} (degenerate σ / no crossing below K_MAX_SAFETY) — returning 0.0",
-                hi.exp(), g_hi.median,
-                if g_hi.days == 0 { "DEAD hi-window vs" } else { "still ≥" }, target_bpd
+                "GUARD reject: at upper bracket k={:.4} median={:.1} still ≥ target {:.1} (no crossing below K_MAX_SAFETY) — returning 0.0",
+                hi.exp(), g_hi.median, target_bpd
             );
             return 0.0;
         }
@@ -923,6 +929,33 @@ mod tests {
         let rel_err = (stats.median / target_bpd - 1.0).abs();
         assert!(rel_err <= RENKO_BPD_ACCEPT_TOL,
             "auto-expanded k median {:.1} within tol? rel_err={:.3}", stats.median, rel_err);
+    }
+
+    /// Dead hi-seed bracket: a slow cross emits ZERO bricks/day at the
+    /// mult_bounds[1] hi seed (days==0 ⇒ median 0). That is a VALID upper
+    /// bracket — m(hi)=0 < target while K_FLOOR overshoots — so the solver
+    /// must bisect into the crossing, not reject as "DEAD hi-window".
+    /// Regression for the 2026-06-09 synth wipeout (ETH/BTC, SOL/BTC,
+    /// BNB/BTC, SOL/ETH all returned 0.0 from a bisectable window).
+    #[test]
+    fn dead_hi_seed_is_valid_bracket_and_calibrates() {
+        let target_bpd = 100.0;
+        let prices = synth_gbm_path(40, 4000, 0.0008, 0xC205);
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vc = vol_cfg();
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+        // Prior k parked at the (dead) hi seed: m0 has days==0 → zero/cliff
+        // guard → bracket fallback with g_hi dead at mult_bounds[1]=4.0.
+        let k = scale_to_target_k(&prices, &cal(target_bpd), &base, &vol, &vc, &sigma_cache, target_bpd, Some(4.0));
+        assert!(k > 0.0, "dead-hi-seed series must bisect, not reject (got {k})");
+        let stats = count_bars_per_day_from_prices(
+            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 }, &vol, &vc, &sigma_cache, first, last);
+        let rel_err = (stats.median / target_bpd - 1.0).abs();
+        assert!(rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "bisected k median {:.1} off target, rel_err={:.3}", stats.median, rel_err);
     }
 
     /// ADVISORY accept-tol: when the snap-grid staircase leaves the best rung
