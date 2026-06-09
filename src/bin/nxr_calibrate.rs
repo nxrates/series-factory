@@ -39,7 +39,7 @@ use series_factory::bar_construction::{
     build_vol_from_s10, calibrate_mtf_walkforward, CalibrationConfig, S10ShardIter,
 };
 use nxr_sdk::vol::{MtfVolCalculator, VolConfig};
-use nxr_sdk::renko::{RenkoConfig, K_FLOOR, MULT_UPPER_BOUND};
+use nxr_sdk::renko::{RenkoConfig, K_FLOOR, K_MAX_SAFETY};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
@@ -741,13 +741,13 @@ fn run_once(args: &Args) -> Result<()> {
             // the staircase keeps out of accept tol), emit it DIRECTLY and skip
             // the fit — provided it is within [K_FLOOR, MULT_UPPER_BOUND].
             if let Some(&forced_k) = cal_ext.renko_k_overrides.get(pair) {
-                if (K_FLOOR..=MULT_UPPER_BOUND).contains(&forced_k) {
+                if (K_FLOOR..=K_MAX_SAFETY).contains(&forced_k) {
                     info!(ticker_id = *ticker_id, pair, forced_k, "renko_k override — skipping fit (operator-forced k)");
                     results.lock().unwrap().push(CalOutcome::Ok { ticker_id: *ticker_id, k: forced_k });
                     return;
                 }
-                warn!(ticker_id = *ticker_id, pair, forced_k, k_floor = K_FLOOR, mult_upper = MULT_UPPER_BOUND,
-                    "renko_k override out of [K_FLOOR, MULT_UPPER_BOUND] — ignoring, running fit");
+                warn!(ticker_id = *ticker_id, pair, forced_k, k_floor = K_FLOOR, k_max_safety = K_MAX_SAFETY,
+                    "renko_k override out of [K_FLOOR, K_MAX_SAFETY] — ignoring, running fit");
             }
 
             // Panic-safe: one bad ticker (malformed .idx, OOM in sigma cache,
@@ -824,6 +824,36 @@ fn run_once(args: &Args) -> Result<()> {
         "calibration summary (base; stale entries dropped per feedback_no_k_fallback)"
     );
 
+    // k-STABILITY DIAGNOSTIC (2026-06-09): log the DISTRIBUTION of accepted k
+    // values so the operator can see at a glance whether k is stable/clustered
+    // (good σ — k is the intended mostly-stable per-ticker normalization) or
+    // wild (σ problem — the daily adaptiveness has leaked into k). Now that k has
+    // NO upper cap, a fat right tail here is the canary for a σ regression.
+    {
+        let mut ks: Vec<f64> = renko_k.values().copied().collect();
+        ks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if ks.is_empty() {
+            warn!("k-stability (base): no accepted k values");
+        } else {
+            let n = ks.len();
+            let k_min = ks[0];
+            let k_max = ks[n - 1];
+            let k_median = if n % 2 == 1 {
+                ks[n / 2]
+            } else {
+                0.5 * (ks[n / 2 - 1] + ks[n / 2])
+            };
+            info!(
+                k_count = n,
+                k_min,
+                k_median,
+                k_max,
+                spread = k_max / k_min.max(f64::MIN_POSITIVE),
+                "k-stability distribution (base) — clustered=good σ, wide=σ problem"
+            );
+        }
+    }
+
     // SLA-CRITICAL (phase60.η): write ticker-params.json AFTER base pass so
     // renko emission unblocks for base tickers even if synth pass hangs/fails.
     // Synth pass below re-writes with synth k's added.
@@ -853,13 +883,13 @@ fn run_once(args: &Args) -> Result<()> {
         let synth_target = target_for_pair(cal_ext, synth_sym, synth_class);
         // PART B4: synth pairs honor the same per-pair forced-k escape hatch.
         if let Some(&forced_k) = cal_ext.renko_k_overrides.get(synth_sym) {
-            if (K_FLOOR..=MULT_UPPER_BOUND).contains(&forced_k) {
+            if (K_FLOOR..=K_MAX_SAFETY).contains(&forced_k) {
                 info!(synth_id, synth_sym, forced_k, "synth renko_k override — skipping fit (operator-forced k)");
                 s_passed += 1;
                 renko_k.insert(synth_id.to_string(), forced_k);
                 continue;
             }
-            warn!(synth_id, synth_sym, forced_k, "synth renko_k override out of [K_FLOOR, MULT_UPPER_BOUND] — ignoring, running fit");
+            warn!(synth_id, synth_sym, forced_k, "synth renko_k override out of [K_FLOOR, K_MAX_SAFETY] — ignoring, running fit");
         }
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             calibrate_one_synth(
@@ -890,6 +920,34 @@ fn run_once(args: &Args) -> Result<()> {
         }
     }
     info!(s_passed, s_skipped, s_failed, "calibration summary (synth)");
+
+    // k-STABILITY DIAGNOSTIC (2026-06-09): final distribution over ALL accepted
+    // base+synth k values — the operator's at-a-glance σ-health check now that k
+    // is uncapped.
+    {
+        let mut ks: Vec<f64> = renko_k.values().copied().collect();
+        ks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if ks.is_empty() {
+            warn!("k-stability (all): no accepted k values");
+        } else {
+            let n = ks.len();
+            let k_min = ks[0];
+            let k_max = ks[n - 1];
+            let k_median = if n % 2 == 1 {
+                ks[n / 2]
+            } else {
+                0.5 * (ks[n / 2 - 1] + ks[n / 2])
+            };
+            info!(
+                k_count = n,
+                k_min,
+                k_median,
+                k_max,
+                spread = k_max / k_min.max(f64::MIN_POSITIVE),
+                "k-stability distribution (base+synth) — clustered=good σ, wide=σ problem"
+            );
+        }
+    }
 
     weights_file.renko_k_per_ticker = renko_k;
     weights_file.calibrated_at = Some(nxr_sdk::now_sec());
