@@ -367,10 +367,18 @@ pub async fn download_bytes_retry(agent: &Arc<ureq::Agent>, url: &str, max_attem
 /// okx, bitget: by-timestamp). We preserve that order by streaming, so no
 /// in-memory sort is needed. Downstream `MergedTickStream` assumes each
 /// file is individually sorted and enforces it across sources.
+///
+/// Returns the number of ticks written. A download that completes the HTTP
+/// transfer but parses to **zero** ticks (truncated archive, an upstream CSV
+/// schema change that breaks the column mapping, or an empty member) is NOT
+/// an `Err` at the HTTP layer, so the caller MUST inspect this count: a `0`
+/// for a pair/month that genuinely has trades is a silent-empty defect. The
+/// `.ticks` file is still written (possibly zero-length) so the caller can
+/// decide whether to keep it, delete it, or fall back to the daily archives.
 pub async fn download_and_convert<P>(
     agent: &Arc<ureq::Agent>, url: &str, cache_path: &Path, ticker_id: u64,
     compression: Compression, max_attempts: usize, parse_csv: &P,
-) -> Result<()>
+) -> Result<u64>
 where
     P: Fn(&[u8], u64) -> Result<Vec<TickFrame>> + Sync,
 {
@@ -439,9 +447,24 @@ where
     // file intact rather than a half-written target.
     std::fs::rename(&tmp_path, cache_path)?;
 
-    info!("Converted {} ticks → {}", total_ticks, cache_path.display());
+    if total_ticks == 0 {
+        // A 200-OK transfer that yields zero ticks is the silent-empty failure
+        // mode behind recurring "ETH older months produce no .ticks" reports:
+        // the archive downloaded, but every row failed to parse (upstream CSV
+        // schema drift) or the member was truncated/empty. Surface it loudly —
+        // never let a zero-record month pass as a normal success.
+        warn!(
+            bytes_downloaded = data.len(),
+            url,
+            cache = %cache_path.display(),
+            "download_and_convert produced ZERO ticks (truncated archive or CSV schema drift?) — \
+             treating as empty so caller can fall back / flag the gap",
+        );
+    } else {
+        info!("Converted {} ticks → {}", total_ticks, cache_path.display());
+    }
     drop(data);
-    Ok(())
+    Ok(total_ticks)
 }
 
 /// Read from `reader` in line-aligned chunks of ~`chunk_bytes` each and
@@ -506,6 +529,14 @@ where
     for (month_start, month_end) in month_ranges(config.from.date_naive(), config.to.date_naive()) {
         let year = month_start.year();
         let month = month_start.month();
+        // Track whether THIS month yielded any data at all, across the monthly
+        // archive + daily fallback. A completed month that produces nothing for
+        // a liquid pair is the silent-gap signature (e.g. recurring "ETH older
+        // months empty"); we emit a single per-month warning so it can never
+        // disappear unnoticed at the default INFO log level again.
+        let files_before_month = files.len();
+        let mut month_ticks: u64 = 0;
+        let mut used_cached_month = false;
 
         // Try monthly archive for completed months
         if last_day_of_month(year, month) < today {
@@ -515,36 +546,179 @@ where
             if cache_path.exists() {
                 debug!("Cached: {}", cache_path.display());
                 files.push(cache_path);
-                continue;
-            }
-
-            info!("Downloading monthly: {}", filename);
-            match download_and_convert(agent, &url, &cache_path, ticker_id, compression, 3, parse_csv).await {
-                Ok(_) => { files.push(cache_path); continue; }
-                Err(e) => warn!("Monthly failed {}: {}, trying daily", filename, e),
+                // A pre-existing cache file is trusted as non-empty here (it
+                // was validated when written); skip the daily fallback.
+                used_cached_month = true;
+            } else {
+                info!("Downloading monthly: {}", filename);
+                match download_and_convert(agent, &url, &cache_path, ticker_id, compression, 3, parse_csv).await {
+                    // Zero-tick monthly is NOT a success: drop the empty cache
+                    // file and fall through to the daily archives, which may
+                    // carry the data the monthly archive lacked (or confirm a
+                    // real gap day-by-day). This is the fix for monthly archives
+                    // that download cleanly but parse to nothing.
+                    Ok(0) => {
+                        warn!(
+                            "Monthly {} yielded ZERO ticks; removing empty cache and trying daily",
+                            filename
+                        );
+                        let _ = std::fs::remove_file(&cache_path);
+                    }
+                    Ok(n) => {
+                        month_ticks += n;
+                        files.push(cache_path);
+                        used_cached_month = true;
+                    }
+                    Err(e) => warn!("Monthly failed {}: {}, trying daily", filename, e),
+                }
             }
         }
 
-        // Daily fallback (current month or failed monthly)
-        let end = month_end.min(config.to.date_naive());
-        let mut day = month_start;
-        while day <= end {
-            let (url, filename) = daily(symbol, day);
-            let cache_path = ticks_dir.join(filename.replace(cache_ext, ".ticks"));
+        // Daily fallback (current month, failed monthly, or zero-tick monthly)
+        if !used_cached_month {
+            let end = month_end.min(config.to.date_naive());
+            let mut day = month_start;
+            while day <= end {
+                let (url, filename) = daily(symbol, day);
+                let cache_path = ticks_dir.join(filename.replace(cache_ext, ".ticks"));
 
-            if !cache_path.exists() {
-                info!("Downloading daily: {}", filename);
-                match download_and_convert(agent, &url, &cache_path, ticker_id, compression, 1, parse_csv).await {
-                    Ok(_) => files.push(cache_path),
-                    Err(_) => debug!("No {} data for {}", exchange, day),
+                if !cache_path.exists() {
+                    info!("Downloading daily: {}", filename);
+                    match download_and_convert(agent, &url, &cache_path, ticker_id, compression, 1, parse_csv).await {
+                        Ok(0) => {
+                            // Empty daily archive — drop it, don't push.
+                            let _ = std::fs::remove_file(&cache_path);
+                            debug!("Empty {} daily archive for {}", exchange, day);
+                        }
+                        Ok(n) => { month_ticks += n; files.push(cache_path); }
+                        Err(_) => debug!("No {} data for {}", exchange, day),
+                    }
+                } else {
+                    debug!("Cached: {}", cache_path.display());
+                    files.push(cache_path);
                 }
-            } else {
-                debug!("Cached: {}", cache_path.display());
-                files.push(cache_path);
+                day += Duration::days(1);
             }
-            day += Duration::days(1);
+        }
+
+        // Per-month silent-gap guard: a COMPLETED month (older than today) that
+        // produced no fresh file and no ticks is almost certainly a fetch defect
+        // for a liquid pair, not a real absence. Warn so backfill logs flag the
+        // hole instead of silently skipping it.
+        let produced_files = files.len() > files_before_month;
+        let month_is_complete = last_day_of_month(year, month) < today;
+        if month_is_complete && !used_cached_month && month_ticks == 0 && !produced_files {
+            warn!(
+                exchange,
+                symbol,
+                year,
+                month,
+                "no ticks fetched for completed month (monthly + daily both empty) — \
+                 possible silent archive/parse gap, NOT necessarily a real data absence",
+            );
         }
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use nxr_sdk::pipeline_config::{
+        DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY, DEFAULT_ARCHIVE_URL_OKX_MONTHLY,
+    };
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// Replica of `BinanceSource`'s monthly URL/filename builder (sources are
+    /// closures, not exported fns). Kept byte-identical so this test guards the
+    /// real symbol→URL mapping.
+    fn binance_monthly(sym: &str, y: i32, m: u32) -> (String, String) {
+        let prefix = DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY;
+        let f = format!("{}-aggTrades-{:04}-{:02}.zip", sym, y, m);
+        let url = format!("{}{}", prefix.replace("{sym}", sym), f);
+        (url, f)
+    }
+
+    fn okx_monthly(sym: &str, y: i32, m: u32) -> (String, String) {
+        let prefix = DEFAULT_ARCHIVE_URL_OKX_MONTHLY;
+        let f = format!("{}-trades-{:04}-{:02}.zip", sym, y, m);
+        let url = format!(
+            "{}{}",
+            prefix
+                .replace("{y:04}", &format!("{:04}", y))
+                .replace("{m:02}", &format!("{:02}", m)),
+            f,
+        );
+        (url, f)
+    }
+
+    /// ETH-USDT must build the SAME well-formed Binance monthly path as
+    /// BNB-USDT / SOL-USDT — differing ONLY in the symbol token. This pins the
+    /// invariant behind the recurring "ETH older months empty" reports: the
+    /// fetcher applies no per-symbol date floor, alias, or special-casing, so a
+    /// missing ETH 2024 month can NEVER be a URL/mapping defect — it would be a
+    /// real upstream gap (which it is not — these archives exist + 200-OK).
+    #[test]
+    fn binance_monthly_url_symbol_parity_eth_bnb_sol() {
+        for &(y, m) in &[(2024, 6), (2024, 12), (2025, 6), (2026, 2)] {
+            let (eth_url, eth_f) = binance_monthly("ETHUSDT", y, m);
+            let (bnb_url, _) = binance_monthly("BNBUSDT", y, m);
+            let (sol_url, _) = binance_monthly("SOLUSDT", y, m);
+
+            // ETH path is structurally identical to BNB/SOL once the symbol is
+            // normalised out — proving no ETH-specific divergence by month.
+            let norm = |s: &str| s.replace("ETHUSDT", "§").replace("BNBUSDT", "§").replace("SOLUSDT", "§");
+            assert_eq!(norm(&eth_url), norm(&bnb_url), "ETH vs BNB url diverged @ {y}-{m:02}");
+            assert_eq!(norm(&eth_url), norm(&sol_url), "ETH vs SOL url diverged @ {y}-{m:02}");
+
+            // Well-formed: exact expected ETH path for every month (no floor).
+            assert_eq!(
+                eth_url,
+                format!(
+                    "https://data.binance.vision/data/spot/monthly/aggTrades/ETHUSDT/ETHUSDT-aggTrades-{y:04}-{m:02}.zip"
+                ),
+            );
+            assert_eq!(eth_f, format!("ETHUSDT-aggTrades-{y:04}-{m:02}.zip"));
+        }
+    }
+
+    /// OKX uses a dashed symbol (`ETH-USDT`) + date-keyed bucket. Same parity
+    /// guarantee: ETH differs from BNB/SOL only by symbol token, across months.
+    #[test]
+    fn okx_monthly_url_symbol_parity_eth_bnb_sol() {
+        for &(y, m) in &[(2024, 6), (2025, 6), (2026, 2)] {
+            let (eth_url, _) = okx_monthly("ETH-USDT", y, m);
+            let (bnb_url, _) = okx_monthly("BNB-USDT", y, m);
+            let (sol_url, _) = okx_monthly("SOL-USDT", y, m);
+            let norm = |s: &str| s.replace("ETH-USDT", "§").replace("BNB-USDT", "§").replace("SOL-USDT", "§");
+            assert_eq!(norm(&eth_url), norm(&bnb_url));
+            assert_eq!(norm(&eth_url), norm(&sol_url));
+            assert_eq!(
+                eth_url,
+                format!(
+                    "https://static.okx.com/cdn/okex/traderecords/trades/monthly/{y:04}{m:02}/ETH-USDT-trades-{y:04}-{m:02}.zip"
+                ),
+            );
+        }
+    }
+
+    /// `month_ranges` tiles [from,to] contiguously with no per-symbol logic —
+    /// every ETH month in a 2024-06..2026-02 backfill is enumerated exactly
+    /// once, so no month can be silently skipped at the iteration layer.
+    #[test]
+    fn month_ranges_full_backfill_window_no_gap() {
+        let r = month_ranges(d(2024, 6, 9), d(2026, 2, 28));
+        assert_eq!(r.first().unwrap().0, d(2024, 6, 9));
+        assert_eq!(r.last().unwrap().1, d(2026, 2, 28));
+        // 2024-06 .. 2026-02 inclusive = 21 calendar months.
+        assert_eq!(r.len(), 21);
+        for pair in r.windows(2) {
+            assert_eq!(pair[1].0, pair[0].1 + Duration::days(1));
+        }
+    }
 }

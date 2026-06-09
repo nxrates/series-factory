@@ -67,6 +67,9 @@ impl TickSource for BitgetSource {
                 }
                 let url = format!("{}{}", daily_prefix, filename);
                 match download_and_convert(&self.agent, &url, &cache_path, tid, Compression::Zip, 1, &Self::parse_csv).await {
+                    // Zero-tick seq file: drop the empty cache and stop scanning
+                    // this day's sequence (an empty member means no more trades).
+                    Ok(0) => { let _ = std::fs::remove_file(&cache_path); break; }
                     Ok(_) => { files.push(cache_path); seq += 1; }
                     Err(_) => { if seq == 1 { debug!("No Bitget data for {}", ds); } break; }
                 }
