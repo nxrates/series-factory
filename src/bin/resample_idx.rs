@@ -252,7 +252,19 @@ struct ShardRef {
 
 /// Walk `<input_dir>/<ticker_id>/<YYYY-MM-DD>.idx`. Ticker id is the SUBDIR
 /// name (decimal u64); date is the file stem. `only` filters by ticker dir.
+///
+/// ⚠ LIVE-SHARD SAFETY: the CURRENT UTC day's shard is the file the live
+/// aggregator (`IdxShardWriter`) holds open. Resampling it (atomic
+/// `<date>.idx → .idx.bak`, `<date>.new → .idx`) orphans the live writer's fd
+/// into the `.idx.bak` inode — live ticks then append to `.bak` while the API
+/// reads the frozen resampled `.idx`. This is UNCONDITIONAL: not even `--force`
+/// can override it (`--force` only relaxes invariant/quality gates, never this
+/// invariant). The only safe way to rewrite today's shard is to coordinate a
+/// live-writer stop/flush/reopen — out of scope here. Confirmed prod incident
+/// 2026-06-10. Skipped shards are logged at INFO; they resample after midnight
+/// rotation closes them.
 fn collect_shards(root: &Path, only: Option<&str>) -> Result<Vec<ShardRef>> {
+    let today = shard::today_utc();
     let mut out = Vec::new();
     for entry in fs::read_dir(root).with_context(|| format!("read_dir {}", root.display()))? {
         let entry = entry?;
@@ -275,6 +287,16 @@ fn collect_shards(root: &Path, only: Option<&str>) -> Result<Vec<ShardRef>> {
         }
         // `list_shards` only matches `<YYYY-MM-DD>.idx` (date-parseable stem).
         for (date, shard_path) in shard::list_shards(&path, "idx")? {
+            // LIVE-SHARD SAFETY: never rewrite the current UTC day's shard —
+            // it is held open by the live aggregator (see fn doc + skip guard).
+            if date >= today {
+                info!(
+                    ticker = %ticker,
+                    date = %shard::date_stem(date),
+                    "skipping current-day shard (live-open, will resample after rotation)"
+                );
+                continue;
+            }
             out.push(ShardRef {
                 ticker: ticker.clone(),
                 date: shard::date_stem(date),
@@ -731,6 +753,53 @@ mod tests {
             assert_eq!(ts_of(a), ts_of(b), "re-run ts stable");
             assert_eq!(a.index.confidence, b.index.confidence, "body stable");
         }
+    }
+
+    /// LIVE-SHARD SAFETY: the resample plan (`collect_shards`) EXCLUDES the
+    /// current UTC day's shard (live-open by the aggregator) while still
+    /// including a closed past-day shard. Renaming today's shard would orphan
+    /// the live writer's fd into the `.idx.bak` inode (prod incident 2026-06-10).
+    #[test]
+    fn plan_excludes_today_includes_past() {
+        use nxr_sdk::shard::{date_stem, idx_dir, shard_path, today_utc, write_shard_atomic};
+
+        let root = std::env::temp_dir().join(format!(
+            "resample_skip_today_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let ticker_id: u64 = 42;
+        let dir = idx_dir(&root, ticker_id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let today = today_utc();
+        let past = today.pred_opt().unwrap(); // yesterday (closed)
+
+        // One record per shard is enough — collect_shards only inspects the
+        // <YYYY-MM-DD>.idx filename, not the body.
+        let one = [rec(ticker_id, 1_700_000_000_000, 100.0, 1, 0)];
+        let bytes: Vec<u8> = one
+            .iter()
+            .flat_map(|r| bytemuck::bytes_of(r).iter().copied())
+            .collect();
+        write_shard_atomic(&shard_path(&dir, past, "idx"), &bytes).unwrap();
+        write_shard_atomic(&shard_path(&dir, today, "idx"), &bytes).unwrap();
+
+        let indexes_root = root.join("indexes");
+        let plan = collect_shards(&indexes_root, None).unwrap();
+        let dates: Vec<&str> = plan.iter().map(|s| s.date.as_str()).collect();
+
+        assert!(
+            dates.contains(&date_stem(past).as_str()),
+            "past-day shard must be in the resample plan: {dates:?}"
+        );
+        assert!(
+            !dates.contains(&date_stem(today).as_str()),
+            "today's live-open shard must be EXCLUDED from the plan: {dates:?}"
+        );
+        assert_eq!(plan.len(), 1, "exactly the one past-day shard, today skipped");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Confidence is NEVER converted: a legacy-count record (flag clear) stays a

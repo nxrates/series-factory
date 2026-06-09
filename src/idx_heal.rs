@@ -11,8 +11,8 @@ use mitch::index::Index;
 use mitch::timestamp::{from_epoch_ms, to_epoch_ms};
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::shard::{
-    idx_dir, list_shards, read_shard_aligned, shard_path, ts_ms_to_utc_date, write_shard_atomic,
-    FLAG_IDX_HEALED, FLAG_RENKO_SYNTHETIC_BRICK, ShardRecord,
+    idx_dir, list_shards, read_shard_aligned, shard_path, today_utc, ts_ms_to_utc_date,
+    write_shard_atomic, FLAG_IDX_HEALED, FLAG_RENKO_SYNTHETIC_BRICK, ShardRecord,
 };
 use nxr_sdk::tdwap::{decode_ci_ubp, encode_ci_ubp};
 use std::collections::BTreeMap;
@@ -58,9 +58,41 @@ pub fn heal_ticker_shards(
         bail!("missing idx dir {}", dir.display());
     }
 
-    let shards = list_shards(&dir, "idx")?;
-    if shards.is_empty() {
+    let all_shards = list_shards(&dir, "idx")?;
+    if all_shards.is_empty() {
         bail!("no idx shards under {}", dir.display());
+    }
+
+    // ⚠ LIVE-SHARD SAFETY: heal rebuilds the whole `<id>/` dir in staging then
+    // atomically swaps `<id>` → `<id>.bak-TS` and `staging` → `<id>`. That swap
+    // would carry away the CURRENT UTC day's shard — the file the live
+    // aggregator (`IdxShardWriter`) holds open — orphaning its fd into the
+    // `.bak` inode (live ticks then land in the dead backup while the API reads
+    // the healed, frozen `<id>/<today>.idx`). So we (a) EXCLUDE today's shard
+    // from the heal/resample pass and (b) copy the live `<today>.idx` verbatim
+    // into staging before the swap, so the post-swap dir still contains the
+    // untouched live shard for the writer to keep appending to. The commit also
+    // takes the writer-lock (below); both guards are intentional. Confirmed
+    // prod incident 2026-06-10. UNCONDITIONAL — no flag overrides it.
+    let today = today_utc();
+    let today_src: Option<PathBuf> = all_shards
+        .iter()
+        .find(|(d, _)| *d >= today)
+        .map(|(_, p)| p.clone());
+    let shards: Vec<(NaiveDate, PathBuf)> =
+        all_shards.into_iter().filter(|(d, _)| *d < today).collect();
+    if let Some(p) = &today_src {
+        info!(
+            ticker_id,
+            shard = %p.display(),
+            "skipping current-day shard (live-open, will heal after rotation)"
+        );
+    }
+    if shards.is_empty() {
+        bail!(
+            "no closed (past-day) idx shards to heal under {} (only today's live shard present)",
+            dir.display()
+        );
     }
 
     // Sample source cadence across first/middle/last shards (median of the
@@ -159,6 +191,17 @@ pub fn heal_ticker_shards(
             target_ms,
             resampled,
         });
+    }
+
+    // Carry the live current-day shard through the directory swap untouched, so
+    // the post-swap `<id>/` still holds it for the live writer (see safety note
+    // at the top of this fn). Without this the swap would drop today's shard.
+    if let Some(src) = &today_src {
+        let date = today;
+        let dst = shard_path(&staging, date, "idx");
+        fs::copy(src, &dst)
+            .with_context(|| format!("passthrough live shard {} → {}", src.display(), dst.display()))?;
+        info!(date = %date, "copied live current-day shard into staging verbatim (passthrough)");
     }
 
     if commit {
@@ -445,7 +488,9 @@ mod tests {
         let id = nxr_sdk::resolve_ticker_id("BTC/USDT");
         let dir = idx_dir(&root, id);
         fs::create_dir_all(&dir).unwrap();
-        let base = nxr_sdk::now_ms() as i64 - 3600_000;
+        // Anchor on a CLOSED past day (2 days ago) so the live-shard skip guard
+        // does not exclude it — heal only operates on past-day shards now.
+        let base = nxr_sdk::now_ms() as i64 - 2 * 86_400_000;
         let recs = vec![rec(base + 200, 100.0), rec(base, 99.0)];
         let bytes: Vec<u8> = recs
             .iter()
@@ -505,4 +550,63 @@ mod tests {
     }
 
     const MS_PER_DAY_LOCAL: i64 = 86_400_000;
+
+    /// LIVE-SHARD SAFETY: heal excludes the current UTC day's shard (live-open)
+    /// and carries it through the directory swap verbatim, while still healing a
+    /// closed past-day shard. Renaming today's shard would orphan the live
+    /// writer's fd into the `.bak` inode (prod incident 2026-06-10).
+    #[test]
+    fn heal_skips_today_passes_through_live_shard() {
+        let root = std::env::temp_dir().join("heal_idx_skip_today");
+        let _ = fs::remove_dir_all(&root);
+        let id = nxr_sdk::resolve_ticker_id("BTC/USDT");
+        let dir = idx_dir(&root, id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let now = nxr_sdk::now_ms() as i64;
+        let today = today_utc();
+        let past_ts = now - 3 * MS_PER_DAY_LOCAL; // closed past day
+        let past = ts_ms_to_utc_date(past_ts);
+
+        // Past-day shard (will be healed).
+        let past_bytes: Vec<u8> = [rec(past_ts, 100.0), rec(past_ts + 200, 101.0)]
+            .iter()
+            .flat_map(|r| bytemuck::bytes_of(r).iter().copied())
+            .collect();
+        write_shard_atomic(&shard_path(&dir, past, "idx"), &past_bytes).unwrap();
+
+        // Today's live shard with a distinctive bid → must survive untouched.
+        let live_bid = 424_242.0_f64;
+        let live_bytes: Vec<u8> = [rec(now - 1000, live_bid)]
+            .iter()
+            .flat_map(|r| bytemuck::bytes_of(r).iter().copied())
+            .collect();
+        let live_path = shard_path(&dir, today, "idx");
+        write_shard_atomic(&live_path, &live_bytes).unwrap();
+
+        let rep = heal_ticker_shards(&root, id, 100, false, true).unwrap();
+        // Only the past shard's records were healed (today's excluded).
+        assert_eq!(rep.records_in, 2, "today's shard not read into the heal pass");
+
+        let shards = list_shards(&idx_dir(&root, id), "idx").unwrap();
+        let dates: Vec<NaiveDate> = shards.iter().map(|(d, _)| *d).collect();
+        assert!(dates.contains(&past), "past-day shard healed + present");
+        assert!(dates.contains(&today), "today's live shard carried through swap");
+
+        // Today's shard is byte-identical to the original live data (verbatim
+        // passthrough — NOT healed, NOT flagged).
+        let today_path = shard_path(&idx_dir(&root, id), today, "idx");
+        let live = read_shard_aligned::<IndexRecord>(&today_path).unwrap();
+        assert_eq!(live.len(), 1, "live shard untouched (1 record)");
+        let live_idx = live[0].index; // copy out of packed struct
+        let (live_out_bid, live_out_flags) = (live_idx.bid, live_idx.flags); // scalar copies
+        assert_eq!(live_out_bid, live_bid, "live bid preserved verbatim");
+        assert_eq!(
+            live_out_flags & FLAG_IDX_HEALED,
+            0,
+            "live shard NOT marked healed (passthrough only)"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

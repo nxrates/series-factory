@@ -134,6 +134,13 @@ enum Cmd {
         report: Option<PathBuf>,
         #[arg(long)]
         strict: bool,
+        /// Auto-heal orphaned live-writer shards: if `<today>.idx.bak` is
+        /// fresher than `<today>.idx`, the live aggregator's fd was orphaned
+        /// into the `.bak` inode by an in-place resample/heal of the live shard
+        /// (prod incident 2026-06-10) — promote `.bak` → `.idx`. Without this
+        /// flag the condition is only DETECTED and reported (ERROR).
+        #[arg(long)]
+        heal_orphaned_bak: bool,
     },
 }
 
@@ -1380,11 +1387,116 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// One orphaned-live-writer finding: `<today>.idx.bak` is fresher than
+/// `<today>.idx`, meaning an in-place resample/heal renamed the live-open shard
+/// and the aggregator's fd is now appending to the `.bak` inode while readers
+/// see the frozen `.idx` (prod incident 2026-06-10).
+#[derive(Debug, Serialize)]
+struct OrphanBakFinding {
+    idx: String,
+    bak: String,
+    idx_mtime: String,
+    bak_mtime: String,
+    promoted: bool,
+}
+
+/// Scan `indexes/<id>/` for the orphaned-live-writer signature: a
+/// `<today>.idx.bak` whose mtime is strictly newer than its sibling
+/// `<today>.idx`. That can only happen when an offline tool renamed the
+/// live-open current-day shard out from under the aggregator (the fd follows
+/// the inode into `.bak`, so the live writer keeps appending there). When
+/// `heal` is set, promote `.bak` → `.idx` (atomic rename) to reunite readers
+/// with the live data; otherwise just report.
+///
+/// Only TODAY's shard is considered: a `.bak` on a past-day shard is a normal
+/// rollback artifact (the original predates its replacement by design).
+fn scan_orphaned_bak(root: &Path, heal: bool) -> Vec<OrphanBakFinding> {
+    use std::time::SystemTime;
+
+    fn mtime(p: &Path) -> Option<SystemTime> {
+        std::fs::metadata(p).and_then(|m| m.modified()).ok()
+    }
+    fn fmt(t: SystemTime) -> String {
+        chrono::DateTime::<chrono::Utc>::from(t)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    let today_stem = nxr_sdk::shard::date_stem(nxr_sdk::shard::today_utc());
+    let bak_name = format!("{today_stem}.idx.bak");
+    let idx_name = format!("{today_stem}.idx");
+
+    let indexes = root.join("indexes");
+    // Accept either an `indexes/` root or a root that already IS the indexes
+    // dir (each child = a ticker-id dir).
+    let scan_root = if indexes.is_dir() { indexes } else { root.to_path_buf() };
+
+    let mut out = Vec::new();
+    let read = match std::fs::read_dir(&scan_root) {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    for entry in read.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let bak = dir.join(&bak_name);
+        let idx = dir.join(&idx_name);
+        if !bak.is_file() {
+            continue;
+        }
+        let (bm, im) = match (mtime(&bak), mtime(&idx)) {
+            (Some(b), Some(i)) => (b, i),
+            // `.bak` exists but no `.idx` at all → the live shard is entirely
+            // missing; that is also an orphan (readers have nothing). Treat as
+            // promotable.
+            (Some(b), None) => (b, SystemTime::UNIX_EPOCH),
+            _ => continue,
+        };
+        if bm <= im {
+            continue; // normal: idx is at least as fresh as its backup.
+        }
+        let mut promoted = false;
+        if heal {
+            // Atomic promote: .bak → .idx (replaces the stale frozen .idx).
+            match std::fs::rename(&bak, &idx) {
+                Ok(()) => {
+                    promoted = true;
+                    warn!(
+                        idx = %idx.display(),
+                        "PROMOTED orphaned live-writer .bak → .idx (recovered live data)"
+                    );
+                }
+                Err(e) => warn!(bak = %bak.display(), err = %e, "promote .bak failed"),
+            }
+        } else {
+            warn!(
+                idx = %idx.display(), bak = %bak.display(),
+                "ORPHANED live writer: <today>.idx.bak fresher than .idx — \
+                 rerun with --heal-orphaned-bak to promote"
+            );
+        }
+        out.push(OrphanBakFinding {
+            idx: idx.display().to_string(),
+            bak: bak.display().to_string(),
+            idx_mtime: if im == SystemTime::UNIX_EPOCH { "MISSING".into() } else { fmt(im) },
+            bak_mtime: fmt(bm),
+            promoted,
+        });
+    }
+    out
+}
+
 #[derive(Debug, Serialize)]
 struct AggregateReport {
     root: String,
     files: Vec<FileReport>,
     summary: AggregateSummary,
+    /// Orphaned live-writer shards detected (`<today>.idx.bak` fresher than
+    /// `.idx`). Empty in the healthy case.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    orphaned_bak: Vec<OrphanBakFinding>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -1397,9 +1509,19 @@ struct AggregateSummary {
     total_bytes: u64,
 }
 
-fn check_dir(root: &Path, parallel: usize, strict: bool) -> Result<AggregateReport> {
+fn check_dir(root: &Path, parallel: usize, strict: bool, heal_orphaned_bak: bool) -> Result<AggregateReport> {
     let files = collect_files(root);
     info!(root = %root.display(), n = files.len(), "integrity-check dir");
+
+    // Orphaned live-writer detection / auto-heal (prod incident 2026-06-10).
+    let orphaned_bak = scan_orphaned_bak(root, heal_orphaned_bak);
+    if !orphaned_bak.is_empty() {
+        warn!(
+            n = orphaned_bak.len(),
+            healed = heal_orphaned_bak,
+            "orphaned live-writer shard(s) detected (<today>.idx.bak fresher than .idx)"
+        );
+    }
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(parallel.max(1))
@@ -1456,6 +1578,7 @@ fn check_dir(root: &Path, parallel: usize, strict: bool) -> Result<AggregateRepo
         root: root.display().to_string(),
         files: reports,
         summary,
+        orphaned_bak,
     })
 }
 
@@ -1496,8 +1619,9 @@ fn main() -> Result<()> {
             parallel,
             report,
             strict,
+            heal_orphaned_bak,
         } => {
-            let agg = check_dir(&path, parallel, strict)?;
+            let agg = check_dir(&path, parallel, strict, heal_orphaned_bak)?;
             for r in &agg.files {
                 print_summary(r);
             }
@@ -1510,13 +1634,25 @@ fn main() -> Result<()> {
                 agg.summary.total_records,
                 agg.summary.total_bytes,
             );
+            for o in &agg.orphaned_bak {
+                println!(
+                    "ORPHAN-BAK {} (bak {} > idx {}){}",
+                    o.idx,
+                    o.bak_mtime,
+                    o.idx_mtime,
+                    if o.promoted { " → PROMOTED" } else { "" }
+                );
+            }
             if let Some(rp) = report {
                 let json = serde_json::to_string_pretty(&agg)?;
                 std::fs::write(&rp, json)
                     .with_context(|| format!("write report {}", rp.display()))?;
                 info!(report = %rp.display(), "aggregate report written");
             }
-            std::process::exit(exit_code(&agg.files, strict));
+            // An UN-healed orphan is a live data-corruption condition → fail (2).
+            let unhealed_orphan = agg.orphaned_bak.iter().any(|o| !o.promoted);
+            let code = exit_code(&agg.files, strict).max(if unhealed_orphan { 2 } else { 0 });
+            std::process::exit(code);
         }
     }
 }
@@ -1550,6 +1686,46 @@ mod tests {
             1, /*confidence*/ 1, /*accepted*/ 0, /*rejected*/
         );
         IndexRecord::new(header, index)
+    }
+
+    /// Orphaned live-writer auto-heal: a `<today>.idx.bak` fresher than its
+    /// `<today>.idx` sibling is detected, and with `heal=true` the `.bak` is
+    /// promoted to `.idx` (prod incident 2026-06-10). A past-day `.bak` and a
+    /// healthy (idx-fresher) today pair are NOT touched.
+    #[test]
+    fn orphaned_bak_detect_and_heal() {
+        use std::io::Write as _;
+        let root = std::env::temp_dir().join(format!("orphan_bak_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let id_dir = root.join("indexes").join("99");
+        std::fs::create_dir_all(&id_dir).unwrap();
+
+        let today = nxr_sdk::shard::date_stem(nxr_sdk::shard::today_utc());
+        let idx = id_dir.join(format!("{today}.idx"));
+        let bak = id_dir.join(format!("{today}.idx.bak"));
+
+        // Write idx first, then bak — bak ends up with the newer mtime → orphan.
+        std::fs::File::create(&idx).unwrap().write_all(b"OLD-FROZEN").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::File::create(&bak).unwrap().write_all(b"LIVE-FRESH").unwrap();
+
+        // Detect-only: reports the orphan, does NOT promote.
+        let found = scan_orphaned_bak(&root, false);
+        assert_eq!(found.len(), 1, "orphan detected");
+        assert!(!found[0].promoted, "detect-only must not promote");
+        assert!(bak.exists() && idx.exists(), "files untouched in detect mode");
+
+        // Heal: promote .bak → .idx (live data recovered).
+        let healed = scan_orphaned_bak(&root, true);
+        assert_eq!(healed.len(), 1);
+        assert!(healed[0].promoted, "promoted");
+        assert!(!bak.exists(), ".bak consumed by rename");
+        assert_eq!(std::fs::read(&idx).unwrap(), b"LIVE-FRESH", ".idx now holds live data");
+
+        // A SECOND scan is clean (idx now fresh, no bak).
+        assert!(scan_orphaned_bak(&root, false).is_empty(), "healthy after heal");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Build a `VolRecord` at `epoch_ms` with the given sigma fraction.
