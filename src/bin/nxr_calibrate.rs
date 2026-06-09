@@ -36,17 +36,20 @@ use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
 use series_factory::bar_construction::{
-    build_vol_from_s10, calibrate_mtf_walkforward, CalibrationConfig, S10ShardIter,
+    build_vol_from_s10, scale_to_target_k, CalibrationConfig, S10ShardIter,
 };
 use nxr_sdk::vol::{MtfVolCalculator, VolConfig};
 use nxr_sdk::renko::{RenkoConfig, K_FLOOR, K_MAX_SAFETY};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
-/// Walk-forward calibration holdout window. Used by both the direct and the
-/// synth calibration paths; defined once at module scope to keep the two
-/// branches in lock-step (audit point #5(i), 2026-05-26 — `feedback_no_k_fallback`).
-const EVAL_HOLDOUT_DAYS: usize = 7;
+/// Drift-gate sub-window (days): k is also fit on the first `DRIFT_SUBWINDOW_DAYS`
+/// vs the last `DRIFT_SUBWINDOW_DAYS` of the rolling window; `k_drift =
+/// |k_end−k_start|/k_start`. `k_drift > DRIFT_GATE_MAX` ⇒ WARN "needs
+/// point-in-time rebuild" (does NOT block — just surfaces the single-latest-k
+/// look-ahead bound, `docs/renko-methodology.md` §6).
+const DRIFT_SUBWINDOW_DAYS: i64 = 90;
+const DRIFT_GATE_MAX: f64 = 0.05;
 
 /// Upper clamp on the up-front `Vec::<(i64,f64)>::with_capacity` reservation for
 /// the full-tick mid path (PERF A2 pre-sizing).
@@ -100,15 +103,67 @@ struct Args {
 use nxr_sdk::pipeline_config::{CalibrationYml, PipelineYml};
 
 /// Convert the shared calibration block into the inner `CalibrationConfig`
-/// the MTF calibrator consumes.
+/// the direct scale-to-target solver consumes.
 fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
     CalibrationConfig {
         target_bpd: c.target_bpd,
-        k_fit_windows_days: c.k_fit_windows_days.clone(),
+        rolling_window_days: c.rolling_window_days,
         min_window_days: c.min_window_days,
-        max_rounds: c.max_rounds,
-        tolerance: c.tolerance,
+        bracket_max_iters: c.bracket_max_iters,
+        accept_tol: c.accept_tol,
         mult_bounds: c.mult_bounds,
+    }
+}
+
+/// Drift gate (`docs/renko-methodology.md` §6): fit k on the FIRST vs the LAST
+/// `DRIFT_SUBWINDOW_DAYS` of the (already window-trimmed) `prices`, log
+/// `k_drift = |k_end−k_start|/k_start` at INFO, and WARN (does NOT block) when it
+/// exceeds `DRIFT_GATE_MAX` — flagging the ticker for point-in-time rebuild. A
+/// sub-window that fails to fit (returns 0.0) is logged and skipped (drift
+/// unknown, not a block).
+fn drift_gate<S: nxr_sdk::vol::VolSource + ?Sized>(
+    label: &str,
+    ticker_id: u64,
+    prices: &[(i64, f64)],
+    cal: &CalibrationConfig,
+    base: &RenkoConfig,
+    vol_source: &S,
+    vol_cfg: &VolConfig,
+    sigma_cache: &[f64],
+    target_bpd: f64,
+    fitted_k: f64,
+) {
+    let first = match prices.first() { Some(p) => p.0, None => return };
+    let last = match prices.last() { Some(p) => p.0, None => return };
+    const MS_PER_DAY: i64 = 86_400_000;
+    let span_days = (last - first) / MS_PER_DAY;
+    if span_days < 2 * DRIFT_SUBWINDOW_DAYS {
+        info!(label, ticker_id, span_days, "drift gate: window < 2× sub-window — skipped");
+        return;
+    }
+    let start_lo = prices.partition_point(|p| p.0 < first);
+    let start_hi = prices.partition_point(|p| p.0 <= first + DRIFT_SUBWINDOW_DAYS * MS_PER_DAY);
+    let end_lo = prices.partition_point(|p| p.0 < last - DRIFT_SUBWINDOW_DAYS * MS_PER_DAY);
+    let end_hi = prices.partition_point(|p| p.0 <= last);
+    let start_slice = &prices[start_lo..start_hi];
+    let end_slice = &prices[end_lo..end_hi];
+    // Seed each sub-fit with the full-window fitted_k so the warm start is cheap.
+    let k_start = scale_to_target_k(
+        start_slice, cal, base, vol_source, vol_cfg, sigma_cache, target_bpd, Some(fitted_k as f32)) as f64;
+    let k_end = scale_to_target_k(
+        end_slice, cal, base, vol_source, vol_cfg, sigma_cache, target_bpd, Some(fitted_k as f32)) as f64;
+    if !(k_start > 0.0 && k_end > 0.0) {
+        info!(label, ticker_id, k_start, k_end,
+            "drift gate: a sub-window failed to fit — k_drift unknown (not a block)");
+        return;
+    }
+    let k_drift = (k_end - k_start).abs() / k_start;
+    info!(label, ticker_id, k_start, k_end, k_drift, fitted_k,
+        "drift gate: first-{DRIFT_SUBWINDOW_DAYS}d vs last-{DRIFT_SUBWINDOW_DAYS}d k drift");
+    if k_drift > DRIFT_GATE_MAX {
+        warn!(label, ticker_id, k_start, k_end, k_drift, drift_max = DRIFT_GATE_MAX,
+            "drift gate: k_drift > {:.0}% — ticker needs point-in-time rebuild (single-latest-k look-ahead exceeds bound; NOT blocking)",
+            DRIFT_GATE_MAX * 100.0);
     }
 }
 
@@ -145,6 +200,7 @@ fn calibrate_one(
     target_bpd: f64,
     vol_cfg: &VolConfig,
     renko_yml: &nxr_sdk::pipeline_config::RenkoYml,
+    prior_k: Option<f32>,
 ) -> CalOutcome {
     // Phase 55 sharded layout: shards live at `<idx_dir>/<ticker_id>/<YYYY-MM-DD>.idx`.
     // Enumerate via `list_shards`, then stream each shard via `ShardStream` so
@@ -279,31 +335,53 @@ fn calibrate_one(
         return CalOutcome::Failed { ticker_id, reason: format!("base renko cfg: {}", e) };
     }
 
-    info!(ticker_id, pair, class = class.as_key(), target_bpd, n_ticks = tick_prices.len(), "calibrating (walk-forward, full-tick)");
-    // Walk-forward calibration (7d holdout non-overlapping with the training
-    // slice) per audit point #5(i) 2026-05-26. Eliminates the regime-leak
-    // overfit that produced k≈0.01 boundary-clamps on cross-pairs (live
-    // brick-storm root cause). Holdout const hoisted to module scope.
-    let mult = calibrate_mtf_walkforward(
-        &tick_prices,
-        &calibration_inner(cal_ext),
+    // Trim to the trailing rolling window (methodology §3): the .idx may hold
+    // more history than `rolling_window_days`; the median objective is over the
+    // single trailing window only.
+    let cal_inner = calibration_inner(cal_ext);
+    let window = trailing_window(&tick_prices, cal_inner.rolling_window_days);
+
+    info!(ticker_id, pair, class = class.as_key(), target_bpd,
+        n_ticks = window.len(), window_days = cal_inner.rolling_window_days,
+        "calibrating (direct scale-to-target, full-tick)");
+    // Direct SCALE-TO-TARGET solver (methodology §4). prior_k (yesterday's k from
+    // the weights file) is the warm-start seed.
+    let mult = scale_to_target_k(
+        window,
+        &cal_inner,
         &base,
         &vol_mmap,
         vol_cfg,
         &sigma_cache,
         target_bpd,
-        EVAL_HOLDOUT_DAYS,
+        prior_k,
     );
+
+    if mult > 0.0 && (mult as f64).is_finite() {
+        // Drift gate (§6): bound the single-latest-k look-ahead. Logging only.
+        drift_gate("base", ticker_id, window, &cal_inner, &base, &vol_mmap,
+            vol_cfg, &sigma_cache, target_bpd, mult as f64);
+    }
 
     let _ = std::fs::remove_file(&vol_path);
 
     if !(mult > 0.0 && (mult as f64).is_finite()) {
         return CalOutcome::Failed {
             ticker_id,
-            reason: "calibration returned 0 (no window had enough data)".into(),
+            reason: "calibration returned 0 (degenerate window / unreachable target)".into(),
         };
     }
     CalOutcome::Ok { ticker_id, k: mult as f64 }
+}
+
+/// Trailing-window slice: the last `window_days` of the ts-ascending `prices`
+/// (by the LAST timestamp). The median objective is over this single window.
+fn trailing_window(prices: &[(i64, f64)], window_days: usize) -> &[(i64, f64)] {
+    const MS_PER_DAY: i64 = 86_400_000;
+    let Some(&(last, _)) = prices.last() else { return prices };
+    let from = last - (window_days as i64) * MS_PER_DAY;
+    let lo = prices.partition_point(|p| p.0 < from);
+    &prices[lo..]
 }
 
 // ── Synth-pair calibration ───────────────────────────────────────────────────
@@ -414,6 +492,7 @@ fn calibrate_one_synth(
     target_bpd: f64,
     vol_cfg: &VolConfig,
     renko_yml: &nxr_sdk::pipeline_config::RenkoYml,
+    prior_k: Option<f32>,
 ) -> CalOutcome {
     // ── 1. Open both leg streams (no materialization) ───────────────────────
     // Streams pull one tick at a time from on-disk shards. Memory bounded
@@ -573,24 +652,34 @@ fn calibrate_one_synth(
         return CalOutcome::Failed { ticker_id: synth_id, reason: format!("base renko cfg: {}", e) };
     }
 
-    info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd, n_ticks = tick_prices.len(), "calibrating synth (walk-forward, full-tick)");
-    // Walk-forward 7d holdout (matches direct path above; const at module scope).
-    let mult = calibrate_mtf_walkforward(
-        &tick_prices,
-        &calibration_inner(cal_ext),
+    let cal_inner = calibration_inner(cal_ext);
+    let window = trailing_window(&tick_prices, cal_inner.rolling_window_days);
+    info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd,
+        n_ticks = window.len(), window_days = cal_inner.rolling_window_days,
+        "calibrating synth (direct scale-to-target, full-tick)");
+    // Same direct solver the base path uses (methodology §4). prior_k = yesterday's.
+    let mult = scale_to_target_k(
+        window,
+        &cal_inner,
         &base,
         &vol_mmap,
         vol_cfg,
         &sigma_cache,
         target_bpd,
-        EVAL_HOLDOUT_DAYS,
+        prior_k,
     );
+
+    if mult > 0.0 && (mult as f64).is_finite() {
+        drift_gate("synth", synth_id, window, &cal_inner, &base, &vol_mmap,
+            vol_cfg, &sigma_cache, target_bpd, mult as f64);
+    }
+
     let _ = std::fs::remove_file(&vol_path);
 
     if !(mult > 0.0 && (mult as f64).is_finite()) {
         return CalOutcome::Failed {
             ticker_id: synth_id,
-            reason: "synth calibration returned 0 (clamp-dropped windows or insufficient data)".into(),
+            reason: "synth calibration returned 0 (degenerate window / unreachable target)".into(),
         };
     }
     CalOutcome::Ok { ticker_id: synth_id, k: mult as f64 }
@@ -720,6 +809,16 @@ fn run_once(args: &Args) -> Result<()> {
     let vol_cfg = &series.vol;
     let renko_yml = &series.renko;
 
+    // Prior-day k seeds (warm start for the direct scale-to-target solver), read
+    // from the existing weights file BEFORE it is mutated. Keyed by ticker_id
+    // string. Absent ⇒ the solver uses its k0=0.5 cold-start default. This is a
+    // SEARCH SEED only — never an emit fallback (renko_k starts empty;
+    // feedback_no_k_fallback).
+    let prior_k_map: BTreeMap<String, f64> = weights_file.renko_k_per_ticker.clone();
+    let prior_k_for = |id: u64| -> Option<f32> {
+        prior_k_map.get(&id.to_string()).map(|&k| k as f32)
+    };
+
     // Fail fast if config's mult_bounds disagree with the SDK's single-source
     // renko ceiling/floor (RCA ROOT2a). A mismatch makes the clamp-detector
     // watch the wrong wall and the search park at a lattice artifact.
@@ -755,6 +854,7 @@ fn run_once(args: &Args) -> Result<()> {
             // here because nothing inside is moved across the boundary.
             let pair_clone = pair.clone();
             let class_clone = *class;
+            let prior_k = prior_k_for(*ticker_id);
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 calibrate_one(
                     *ticker_id,
@@ -766,6 +866,7 @@ fn run_once(args: &Args) -> Result<()> {
                     target_bpd,
                     vol_cfg,
                     renko_yml,
+                    prior_k,
                 )
             }))
             .unwrap_or_else(|p| {
@@ -866,12 +967,12 @@ fn run_once(args: &Args) -> Result<()> {
     // ── Synth-pair pass (5 crosses) ──────────────────────────────────────────
     // Runs unconditionally after the base pass. Cheap (~10 pairs, mostly
     // bound by leg .idx I/O which the base pass already warmed in page
-    // cache). Synths route through the SAME `calibrate_mtf_walkforward`
-    // selector the base pass uses (full-history log-k bisection + two-sided
-    // rung probe + accept gate, walk-forward demoted to an agreement guard —
-    // see `calibrate_one_synth`); the accept/clamp/dispersion gates inside it
-    // drop degenerate windows. If all windows fail, k is NOT persisted (caller
-    // keeps prior). Phase 60.π: per-pair override or flat default per synth.
+    // cache). Synths route through the SAME `scale_to_target_k` direct solver
+    // the base pass uses (warm start + bounded bracket fallback + ±1-rung probe;
+    // see `calibrate_one_synth`); the K_FLOOR / min_pct-clamp / unreachable-target
+    // guards inside it drop degenerate windows. If the fit fails, k is NOT
+    // persisted (caller keeps prior). Phase 60.π: per-pair override or flat
+    // default per synth.
     let synth_work = resolve_synth_work(&root.synths.initial_pairs);
     info!(n_synth = synth_work.len(), "synth calibration pass starting");
     let (mut s_passed, mut s_skipped, mut s_failed) = (0usize, 0usize, 0usize);
@@ -891,10 +992,12 @@ fn run_once(args: &Args) -> Result<()> {
             }
             warn!(synth_id, synth_sym, forced_k, "synth renko_k override out of [K_FLOOR, K_MAX_SAFETY] — ignoring, running fit");
         }
+        let synth_prior_k = prior_k_for(synth_id);
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             calibrate_one_synth(
                 synth_id, synth_sym, leg_a_id, leg_b_id,
                 &idx_dir, &bars_root, cal_ext, synth_target, vol_cfg, renko_yml,
+                synth_prior_k,
             )
         }))
         .unwrap_or_else(|p| {

@@ -8,10 +8,6 @@ name = "series_factory"
 path = "src/lib.rs"
 
 [[bin]]
-name = "generate-renko-from-ticks"
-path = "src/bin/generate_renko_from_ticks.rs"
-
-[[bin]]
 name = "optimize-renko-stats"
 path = "src/bin/optimize_renko_stats.rs"
 
@@ -70,14 +66,6 @@ path = "src/bin/integrity_check.rs"
 [[bin]]
 name = "glue-check"
 path = "src/bin/glue_check.rs"
-
-[[bin]]
-name = "mtf-sweep"
-path = "src/bin/mtf_sweep.rs"
-
-[[bin]]
-name = "synth-sigma-benchmark"
-path = "src/bin/synth_sigma_benchmark.rs"
 
 [[bin]]
 name = "synth-backfill-from-idx"

@@ -9,10 +9,7 @@ pub mod stats;
 pub mod types;
 pub mod vol_bin;
 
-pub use bar_construction::{
-    calibrate_mtf, calibrate_mtf_walkforward, calibrate_mtf_with_target, count_bars_from_prices,
-    CalibrationConfig,
-};
+pub use bar_construction::{scale_to_target_k, CalibrationConfig};
 pub use sources::{create_source, TickSource};
 pub use sources::common::read_tick_file;
 pub use vol_bin::VolMmap;

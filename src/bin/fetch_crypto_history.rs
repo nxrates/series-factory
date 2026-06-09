@@ -41,7 +41,7 @@ struct Args {
     exchanges: Option<String>,
 
     /// History window in days (from = to - days).
-    /// Default covers `bootstrap_days + max(k_fit_windows_days)` for full calibration.
+    /// Default covers `bootstrap_days + rolling_window_days` for full calibration.
     #[arg(long)]
     days: Option<i64>,
 
@@ -256,7 +256,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("no exchanges to fetch (empty config.series.pipeline.exchanges and no --exchanges)");
     }
 
-    let max_window: i64 = root.series.calibration.k_fit_windows_days.iter().max().copied().unwrap_or(180) as i64;
+    let max_window: i64 = root.series.calibration.rolling_window_days as i64;
     let default_days = root.series.pipeline.bootstrap_days + max_window;
     let days = args.days.unwrap_or(default_days);
 

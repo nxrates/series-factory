@@ -13,13 +13,12 @@
 //!      trailing range (the sigma blender itself is causal — `compute_sigma(t)`
 //!      only reads bins ≤ `t`). The σ basis matches the live producer and the
 //!      calibrator exactly (both build from real `.s10`, not idx-mid recon).
-//!   3. Build the 1-min last-mid downsample used by the binary-search
-//!      calibrator (`calibrate_mtf_with_target`).
+//!   3. Keep the FULL-TICK trailing mid path for the direct solver
+//!      (`scale_to_target_k`).
 //!   4. For each closed UTC day `D` (skip today, owned by the live producer):
-//!        a. Slice `prices` to `ts < D_start_ms`, call
-//!           `calibrate_mtf_with_target` → `k(D)`. If 0 / NaN, fall back to the
-//!           prior day's `k`, else the global geo-mean of every successful day,
-//!           else `0.075` (bootstrap k).
+//!        a. Slice `prices` to `ts < D_start_ms`, call `scale_to_target_k`
+//!           (warm-started with the prior day's `k`) → `k(D)`. If 0 / NaN,
+//!           carry the prior day's `k` (continuity bridge, NOT a hardcoded stub).
 //!        b. Apply `k(D)` to a `RenkoGenerator` whose state was carried over
 //!           from day `D-1`, and replay every tick whose `ts ∈ [D_start, D_end)`.
 //!           Bricks emitted in that window are appended to
@@ -56,7 +55,7 @@ use nxr_sdk::shard::{
     MS_PER_DAY,
 };
 use series_factory::bar_construction::{
-    build_vol_from_s10, calibrate_mtf_with_target, CalibrationConfig, S10ShardIter,
+    build_vol_from_s10, scale_to_target_k, CalibrationConfig, S10ShardIter,
 };
 use nxr_sdk::vol::{MtfVolCalculator, VolSource};
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
@@ -120,14 +119,14 @@ struct Args {
 use nxr_sdk::pipeline_config::{CalibrationYml, PipelineYml};
 
 /// Convert the shared `CalibrationYml` into the inner `CalibrationConfig` the
-/// MTF calibrator consumes.
+/// direct scale-to-target solver consumes.
 fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
     CalibrationConfig {
         target_bpd: c.target_bpd,
-        k_fit_windows_days: c.k_fit_windows_days.clone(),
+        rolling_window_days: c.rolling_window_days,
         min_window_days: c.min_window_days,
-        max_rounds: c.max_rounds,
-        tolerance: c.tolerance,
+        bracket_max_iters: c.bracket_max_iters,
+        accept_tol: c.accept_tol,
         mult_bounds: c.mult_bounds,
     }
 }
@@ -351,13 +350,7 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     // Consensus: anchor at `from_d_start`, not `to_d_end`. Same memory cost
     // on a single-day backfill, much more memory on a 2-year backfill — but
     // RAM budget allows it and correctness is non-negotiable.
-    let max_window_days = yml
-        .calibration
-        .k_fit_windows_days
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(120);
+    let max_window_days = yml.calibration.rolling_window_days;
     let from_d_start = day_start_ms(from);
     let tick_retain_from = from_d_start - (max_window_days as i64) * MS_PER_DAY;
 
@@ -609,7 +602,7 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
         let raw_k: f64 = if trailing.len() < 2 {
             prior_k // genesis days carry the seed prior
         } else {
-            let k = calibrate_mtf_with_target(
+            let k = scale_to_target_k(
                 trailing,
                 &calibration_inner(&yml.calibration),
                 &base_cfg,
@@ -617,6 +610,7 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
                 &yml.vol,
                 &sigma_cache,
                 target_bpd,
+                Some(prior_k as f32),
             ) as f64;
             if k > 0.0 && k.is_finite() {
                 k
