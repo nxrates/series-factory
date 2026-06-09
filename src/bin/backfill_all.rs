@@ -82,22 +82,18 @@ struct Args {
     /// Print plan and exit.
     #[arg(long)]
     dry_run: bool,
-    /// After successful validate, delete per-exchange `ticks/` and
-    /// `indexes/<exch>/` intermediates for the pair. Keeps composite
-    /// shards + bars shards + .vol.
+    /// SINGLE escape-hatch for raw-tick / per-provider-`.idx` purge. Default
+    /// OFF ⇒ purge-as-you-go is ON: t2i deletes each `.ticks` the instant it
+    /// folds it (file-granular) AND `cleanup_ticker_staging` drops the raw dir
+    /// + per-provider `indexes/<exch>/<BASE>-<QUOTE>.idx` once the composite is
+    /// built+validated. The composite `.idx` is self-sufficient (s10 / renko /
+    /// integrity-check all read it, never the raw staging); retaining staging
+    /// after a 31-pair × 5y backfill is what overran the data PVC.
     ///
-    /// R1 C4: default INVERTED from off→on. The composite `.idx` is
-    /// self-sufficient (s10 / renko / integrity-check all read it, never
-    /// the raw staging); keeping per-ticker staging on disk after a 31-pair
-    /// x 5y backfill is what overran the 500Gi PVC. Pass `--keep-staging`
-    /// to opt out (e.g. for forensic re-merges).
-    #[arg(long, default_value_t = true)]
-    cleanup: bool,
-    /// Opt-out for the now-default cleanup. When set, raw `ticks/<exch>` and
-    /// per-provider `indexes/<exch>/<BASE>-<QUOTE>.idx` files are kept on
-    /// disk after a successful per-ticker validate. Useful for debugging a
-    /// suspect merge or for forensic re-runs; do NOT set in production
-    /// backfill jobs (it will refill the data PVC).
+    /// Set `--keep-staging` to retain ALL raw `.ticks` + per-provider `.idx`
+    /// for forensic re-merges. It is the ONLY purge knob — the old separate
+    /// `--cleanup` flag was folded into this one (two flags gating one
+    /// behaviour was the redundancy). Do NOT set in production backfill jobs.
     #[arg(long, default_value_t = false)]
     keep_staging: bool,
     /// Skip availability probe (pre-fetch HEAD check). Useful for synthetic
@@ -998,7 +994,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             if hard_fail {
                 // P1.4: clean raw staging even on the failure path so a killed
                 // ticker doesn't orphan its raw `.ticks` forever.
-                if ctx.args.cleanup && !ctx.args.keep_staging {
+                if !ctx.args.keep_staging {
                     steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
                 }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
@@ -1041,7 +1037,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 // P1.4: sweep raw + per-exch .idx even on failure (never the
                 // composite/bars/.vol). Raw was already month-deleted; this
                 // mops up the per-provider .idx + any orphan.
-                if ctx.args.cleanup && !ctx.args.keep_staging {
+                if !ctx.args.keep_staging {
                     steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
                 }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
@@ -1060,7 +1056,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         let shard_check = validate_shards(ticker, &composite_dir, "idx");
         steps_out.push(shard_check.clone());
         if shard_check.exit_code != 0 {
-            if ctx.args.cleanup && !ctx.args.keep_staging {
+            if !ctx.args.keep_staging {
                 steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
             }
             ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
@@ -1079,12 +1075,11 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         // per-provider .idx are now fully consumed. Purge them immediately,
         // per-ticker, so a long multi-ticker backfill keeps the data volume
         // bounded instead of hoarding every ticker's raw ticks until the end.
-        // R1 C4: cleanup is on by default; `--keep-staging` opts out.
-        let do_cleanup = ctx.args.cleanup && !ctx.args.keep_staging;
-        if do_cleanup {
+        // Purge ON by default; the single `--keep-staging` flag opts out.
+        if !ctx.args.keep_staging {
             steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
         } else {
-            info!(ticker, "staging cleanup skipped (--keep-staging or --cleanup=false)");
+            info!(ticker, "staging cleanup skipped (--keep-staging)");
         }
     }
 
@@ -1105,7 +1100,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
-                if ctx.args.cleanup && !ctx.args.keep_staging {
+                if !ctx.args.keep_staging {
                     steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
                 }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
@@ -1139,7 +1134,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
-                if ctx.args.cleanup && !ctx.args.keep_staging {
+                if !ctx.args.keep_staging {
                     steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
                 }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
