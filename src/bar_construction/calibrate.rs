@@ -1544,4 +1544,110 @@ mod tests {
             "divergent folds (recent turbulence vs calm history) must trip the \
              agreement guard and reject (got k={k})");
     }
+
+    /// SYNTH SELECTOR PARITY (2026-06-09): production synth calibration
+    /// (`bin/nxr_calibrate.rs::calibrate_one_synth`) feeds an event-merged
+    /// cross price series (`leg_a / leg_b`) into the SAME
+    /// `calibrate_mtf_walkforward` the base path uses — there is NO separate
+    /// geo-mean / eval-slice selector for synths. This test pins that contract:
+    /// a SYNTH-SHAPED series (a cross reconstructed from two USDT-quoted leg
+    /// GBM paths, exactly the construction in `calibrate_one_synth`) whose SHORT
+    /// trailing walk-forward windows are all quarantine-dropped must STILL reach
+    /// the full-history log-k bisection (PART B2) and return a valid k>0 — never
+    /// fail just because the recent eval folds were killed. If a future change
+    /// re-routes synths to a non-bisection selector, this fails.
+    #[test]
+    fn synth_cross_reaches_full_history_bisection() {
+        let target_bpd = 300.0;
+        // Reconstruct a synth cross EXACTLY as `calibrate_one_synth` does:
+        // merge two leg paths and emit `mid = leg_a / leg_b` per event. Both legs
+        // share the tick grid here (same dt) so the merge is a 1:1 zip — the
+        // ratio path is itself a GBM with the two legs' vols compounded.
+        let leg_a = synth_gbm_path(40, 4000, 0.0042, 0xA11CE);   // ETH/USDT-like
+        let leg_b = synth_gbm_path(40, 4000, 0.0042, 0xB0B);     // BTC/USDT-like
+        let n = leg_a.len().min(leg_b.len());
+        let mut prices: Vec<(i64, f64)> = (0..n)
+            .map(|i| {
+                let (ts, a) = leg_a[i];
+                let (_, b) = leg_b[i];
+                (ts, a / b) // synth cross mid (worst-case-spread collapses to ratio at mid)
+            })
+            .collect();
+        // sigma_step 0.0042 per leg → ratio σ ≈ sqrt(2)*0.0042 ≈ 0.006, the same
+        // crossing density the base full-tick regression hits at k≈0.5. Sanity:
+        // ensure the merged path is non-degenerate before contaminating it.
+        assert!(prices.len() > 30_000, "merged synth path too short");
+
+        // Contaminate ONLY the trailing ~8 days (gap+spike) so every SHORT
+        // walk-forward eval fold is quarantine-killed, forcing the answer to come
+        // from the full-history bisection — same shape as
+        // `quarantined_short_windows_still_get_full_history_k`, but on a
+        // SYNTH-constructed (ratio) series.
+        let dt = prices[1].0 - prices[0].0;
+        let ticks_per_day = (MS_PER_DAY / dt) as usize;
+        let last_ts = prices.last().unwrap().0;
+        let day0 = last_ts - 8 * MS_PER_DAY;
+        prices.retain(|&(ts, _)| ts < day0);
+        let base_price = prices.last().map(|p| p.1).unwrap_or(1.0);
+        for d in 0..8i64 {
+            let day_start = day0 + d * MS_PER_DAY;
+            if d % 2 == 0 {
+                continue; // GAP day → 0-count
+            }
+            let mut p = base_price;
+            for j in 0..(ticks_per_day.max(64)) as i64 {
+                let dir = if j % 2 == 0 { 1.30 } else { 1.0 / 1.30 };
+                p *= dir;
+                prices.push((day_start + j * dt, p));
+            }
+        }
+        prices.sort_by_key(|x| x.0);
+
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1,
+            sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95],
+            winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0,
+            ..VolConfig::default()
+        };
+        let cal = CalibrationConfig {
+            target_bpd,
+            k_fit_windows_days: vec![14, 30],
+            min_window_days: 7,
+            max_rounds: 20,
+            tolerance: 0.02,
+            mult_bounds: [0.05, 4.0],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, target_bpd, 7,
+        );
+        assert!(
+            k > 0.0,
+            "synth cross with all-quarantined short folds must reach the \
+             full-history bisection and return k>0, not fail (got {k})"
+        );
+        assert!((k as f64) >= K_FLOOR, "synth k must be ≥ K_FLOOR (got {k})");
+
+        // The selected k's FULL-history median (the quantity the operator + DQ
+        // audit measure on the live synth renko) must land within accept tol —
+        // proving the synth path's selector IS the bisection, not the old
+        // eval-slice geo-mean that produced all-fail crosses.
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+        let stats = count_bars_per_day_from_prices(
+            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 },
+            &vol, &vol_cfg, &sigma_cache, first, last,
+        );
+        let rel_err = (stats.median / target_bpd - 1.0).abs();
+        assert!(
+            rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "synth full-history median {:.1} within {:.0}% of target {:.0}? rel_err={:.3}",
+            stats.median, RENKO_BPD_ACCEPT_TOL * 100.0, target_bpd, rel_err
+        );
+    }
 }
