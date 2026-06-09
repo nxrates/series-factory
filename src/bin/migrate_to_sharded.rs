@@ -41,7 +41,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use nxr_sdk::shard::{self, IdxShardWriter, ShardRecord, FLAG_HISTORICAL_BACKFILL, MS_PER_DAY};
+use nxr_sdk::shard::{
+    self, day_start_ms, today_utc, IdxShardWriter, ShardRecord, FLAG_HISTORICAL_BACKFILL,
+    MS_PER_DAY,
+};
 use nxr_sdk::{resolve_ticker_id, Bar, IndexRecord};
 
 #[derive(Parser, Debug)]
@@ -131,6 +134,17 @@ fn migrate_idx(
 ) -> Result<()> {
     let indexes = root.join("indexes");
 
+    // ⚠ LIVE-SHARD SAFETY: never write into the CURRENT UTC day's shard — it is
+    // held open by the live aggregator (`IdxShardWriter`). migrate already (a)
+    // takes the per-ticker writer-lock (skips the ticker on contention, H9
+    // below) and (b) watermarks past the live tail, but we ALSO hard-cap the
+    // feed at today's UTC midnight so no migrated record can ever land in
+    // today's live shard even if the lock/watermark path is bypassed. Only
+    // closed past-day data is migrated; today resamples after rotation.
+    // Confirmed prod incident 2026-06-10 (resample orphaned the live writer's
+    // fd into the `.idx.bak` inode). UNCONDITIONAL — `--force` does not relax it.
+    let today_start_ms = day_start_ms(today_utc());
+
     // Discover the ticker set + each ticker's source paths WITHOUT loading any
     // record bodies. Flat live file: indexes/<id>.idx. Backfill: composite/
     // <BASE-QUOTE>/ — self-identifying (read 1 record of its newest shard to
@@ -199,9 +213,9 @@ fn migrate_idx(
         } else {
             // manifest=false: skip per-rotation manifest rebuild/sha256/fsync.
             // Feeding 2y of data is ~730 daily rotations/ticker; refreshing a
-            // growing manifest.json with an fsync each time is O(n^2) churn on
-            // DRBD. The API reads via list_shards (manifest-free); a manifest can
-            // be rebuilt cheaply afterward if needed.
+            // growing manifest.json with an fsync each time is O(n^2) fsync
+            // churn on disk. The API reads via list_shards (manifest-free); a
+            // manifest can be rebuilt cheaply afterward if needed.
             //
             // R1 H9: writer-lock contention means the live aggregator currently
             // owns this ticker's stream. Migration is an offline tool — skip the
@@ -233,7 +247,9 @@ fn migrate_idx(
                         seen: &mut usize|
          -> Result<()> {
             let ts = rec.shard_ts_ms();
-            if ts < cutoff_ms || ts <= wm {
+            // LIVE-SHARD SAFETY: drop anything at/after today's UTC midnight so
+            // migration never writes into the live-open current-day shard.
+            if ts < cutoff_ms || ts <= wm || ts >= today_start_ms {
                 return Ok(());
             }
             *seen += 1;
