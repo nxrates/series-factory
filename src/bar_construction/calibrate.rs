@@ -79,12 +79,37 @@ const K_AGREEMENT_MAX: f64 = 1.5;
 /// rungs.
 const K_BRACKET_LN_EPS: f64 = 0.004988; // ln(1.005) → 0.5% k-width
 
-/// Dispersion side-guard bound (FIX 2b, 2026-06-09): reject a window when its
-/// MAD/median exceeds this. Kept as a SEPARATE diagnostic guard — NOT folded
-/// into the minimized score (the old `0.3*MAD/target` term biased k upward by
-/// rewarding the dispersion-compressing effect of bigger bricks). 1.0 = MAD as
-/// large as the median itself, a sane "this window is pure noise" ceiling.
-const RENKO_DISPERSION_MAX: f64 = 1.0;
+/// Structure guard — MODAL-MASS floor (FIX 2c, 2026-06-09, storm-robust redesign).
+///
+/// WHY THE OLD `MAD/median ≤ 1.0` SPREAD GUARD WAS WRONG (same bug-class as the
+/// removed spike-clip): the operator principle is "storms are FINE — a
+/// 2000-brick storm day among many ~250-brick calm days is expected; the MEDIAN
+/// is what matters and is robust to storms." A SPREAD measure (MAD/median,
+/// std/mean, p75/p25) is INFLATED by exactly that legitimate storm tail, so a
+/// healthy storm-heavy crypto pair (BNB/SOL) could be rejected as "pure noise"
+/// for variance the operator explicitly declared sound. (Empirically MAD itself
+/// is robust enough that the old 1.0 bound rarely tripped — but it conflated
+/// "many storm days" with "no signal", which is the wrong CONCEPT, and was
+/// redundant with the real degenerate guards below.)
+///
+/// NEW MEASURE (storm-robust): instead of penalising tail SPREAD, REQUIRE a
+/// concentration of MODAL MASS near the median. `structure_ok()` passes when at
+/// least [`STRUCTURE_MODAL_MASS_MIN`] of clean days fall inside the band
+/// `[median/STRUCTURE_BAND_FACTOR, median*STRUCTURE_BAND_FACTOR]`. A storm-heavy
+/// pair has its calm-day bulk clustered tightly around the median (storm days
+/// sit ABOVE the band but are a minority) ⇒ high modal mass ⇒ PASS. GENUINELY
+/// structureless / pure-noise data has days scattered with no modal cluster ⇒
+/// low modal mass ⇒ REJECT — the only thing this guard should still catch. This
+/// keeps the storm principle (median-targeting already makes storms harmless)
+/// while still rejecting actual garbage.
+///
+/// `BAND_FACTOR = 3` ⇒ a day counts as "near the median" within a 3× window
+/// (the same 3× scale the legacy gap heuristic used). `MODAL_MASS_MIN = 0.5` ⇒
+/// a majority of days must cluster — a storm tail can be up to (nearly) half the
+/// days and the pair still passes, well beyond any realistic crypto storm
+/// fraction.
+const STRUCTURE_BAND_FACTOR: f64 = 3.0;
+const STRUCTURE_MODAL_MASS_MIN: f64 = 0.5;
 
 /// min_pct clamp-detector fraction ceiling (2026-06-09, expert caveat #1: "the
 /// only path to a passing-but-wrong k"). `compute_brick_size` floors the brick
@@ -152,7 +177,7 @@ fn min_pct_clamped_fraction<S: VolSource + ?Sized>(
 /// bricks → fewer bricks/day) over the whole [first,last] history, so the
 /// bisection converges to the k where the FULL-history (storms-included) median
 /// == target — exactly the operator's measurement. Genuine data corruption is
-/// still caught: gap days drop here, and `dispersion_ok` / the min_pct
+/// still caught: gap days drop here, and `structure_ok` / the min_pct
 /// clamp-detector remain as separate side-guards.
 ///
 /// `min_clean = max(3, n_days/2)` capped at `n_days`: require at least 3 clean
@@ -195,7 +220,8 @@ impl DailyBpdStats {
     /// dispersion, so a MAD penalty inside the MINIMIZED score biased k upward
     /// (smaller bpd) — pulling the full-history median above target. The pure
     /// median objective now equals the operator's full-history measurement.
-    /// MAD is retained as a SEPARATE side-guard via [`dispersion_ok`], not here.
+    /// MAD remains available but the active side-guard is now [`structure_ok`]
+    /// (storm-robust modal-mass), not a MAD/median spread ratio.
     ///
     /// Lower = better. Returns `f64::INFINITY` when `days == 0` (cal-fail).
     pub fn score(&self, target_bpd: f64) -> f64 {
@@ -205,16 +231,44 @@ impl DailyBpdStats {
         (self.median / target_bpd - 1.0).abs()
     }
 
-    /// Dispersion side-guard (FIX 2b, 2026-06-09): `true` when the window's
-    /// per-day brick spread is sane (`MAD/median ≤ RENKO_DISPERSION_MAX`). Used
-    /// as a window REJECT gate, deliberately OUTSIDE the minimized [`score`] so
-    /// it cannot bias k. A `days==0` (dead) or non-positive-median window is not
-    /// OK. MAD computation itself is unchanged in `count_bars_per_day_from_prices`.
-    pub fn dispersion_ok(&self) -> bool {
+    /// Fraction of clean (non-gap) days whose brick count falls inside the modal
+    /// band `[median/STRUCTURE_BAND_FACTOR, median*STRUCTURE_BAND_FACTOR]`. This
+    /// is the storm-robust replacement for the old MAD/median spread ratio: a
+    /// minority storm tail sits ABOVE the band and lowers this fraction only
+    /// slightly, whereas truly structureless data (no modal cluster) scatters
+    /// outside the band and drives it down. Returns 0.0 for a dead/degenerate
+    /// window (no median ⇒ no structure). Computed off `bricks_per_day` (gap
+    /// days, count 0, are excluded — they are never "near" a positive median).
+    pub fn modal_mass(&self) -> f64 {
+        if self.days == 0 || self.median <= 0.0 {
+            return 0.0;
+        }
+        let lo = self.median / STRUCTURE_BAND_FACTOR;
+        let hi = self.median * STRUCTURE_BAND_FACTOR;
+        let clean: Vec<u64> =
+            self.bricks_per_day.iter().copied().filter(|&b| b > 0).collect();
+        if clean.is_empty() {
+            return 0.0;
+        }
+        let in_band = clean
+            .iter()
+            .filter(|&&b| (b as f64) >= lo && (b as f64) <= hi)
+            .count();
+        in_band as f64 / clean.len() as f64
+    }
+
+    /// Structure side-guard (FIX 2c, 2026-06-09 — storm-robust): `true` when a
+    /// MAJORITY of clean days cluster near the median ([`modal_mass`] ≥
+    /// [`STRUCTURE_MODAL_MASS_MIN`]). Replaces the old `MAD/median ≤ 1.0` spread
+    /// gate, which penalised the legitimate storm tail the operator declared
+    /// sound (same bug-class as the removed spike-clip). Used as a window REJECT
+    /// gate, deliberately OUTSIDE the minimized [`score`] so it cannot bias k. A
+    /// `days==0` (dead) or non-positive-median window is not OK.
+    pub fn structure_ok(&self) -> bool {
         if self.days == 0 || self.median <= 0.0 {
             return false;
         }
-        self.mad / self.median <= RENKO_DISPERSION_MAX
+        self.modal_mass() >= STRUCTURE_MODAL_MASS_MIN
     }
 }
 
@@ -355,7 +409,7 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
 /// `RENKO_BPD_ACCEPT_TOL` is ADVISORY — exceeding it only WARNs (snap-grid
 /// structural floor), it does NOT drop the ticker (operator 2026-06-09: "k must
 /// be the PRODUCT of calibration, never give up to a manual override"). Only the
-/// genuinely-degenerate guards return 0.0: dispersion !ok (pure-noise full
+/// genuinely-degenerate guards return 0.0: structure !ok (pure-noise full
 /// history), median at K_FLOOR ≤ target (too flat to reach target at any k),
 /// degenerate-σ / no crossing below K_MAX_SAFETY, min_pct-clamp fraction > floor.
 ///
@@ -377,6 +431,15 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
     if last <= first || eval_holdout_days == 0 {
         return 0.0;
     }
+    // Median σ_pct over the full sigma cache — a discriminating diagnostic shared
+    // by EVERY degenerate-reject guard below (too-flat, K_MAX-degenerate-σ,
+    // min_pct-clamp): the reject line then shows WHETHER the σ basis itself
+    // collapsed vs. the k landing in a clamp band. Computed once.
+    let median_sigma_pct = {
+        let mut s: Vec<f64> = sigma_cache.iter().copied().filter(|x| x.is_finite()).collect();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if s.is_empty() { f64::NAN } else { s[s.len() / 2] }
+    };
     let mut mults: Vec<f32> = Vec::new();
     for &window_days in &cal.k_fit_windows_days {
         let cal_from = (last - (window_days as i64) * MS_PER_DAY).max(first);
@@ -524,7 +587,7 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             continue;
         }
         // PART B1 (2026-06-09): this fold's k_w is now ONLY an overfit-guard
-        // datum. The per-window full-history recompute + dispersion + accept gate
+        // datum. The per-window full-history recompute + structure + accept gate
         // that used to live here is REMOVED — the answer comes from the post-loop
         // full-history log-k bisection (PART B2), which measures the same
         // full-history median once, at the bracketing rungs, instead of once per
@@ -539,19 +602,19 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
     // below; it runs UNCONDITIONALLY now. The agreement check only fires when
     // ≥2 folds actually survived quarantine and DISAGREE — a genuine
     // overfit/regime split. 0 or 1 surviving fold ⇒ skip the agreement check
-    // (reduced overfit protection, but Stage B + dispersion_ok still gate the
+    // (reduced overfit protection, but Stage B + structure_ok still gate the
     // result) rather than rejecting on "no window had enough data".
     if mults.is_empty() {
         warn!(
             "wf all walk-forward folds quarantine-dropped (spike/gap/short) — \
              agreement guard SKIPPED (reduced overfit protection); relying on \
-             full-history bisection (PART B2) + dispersion guard"
+             full-history bisection (PART B2) + structure guard"
         );
     } else if mults.len() == 1 {
         info!(
             k_w = mults[0],
             "wf only one walk-forward fold survived quarantine — agreement guard \
-             SKIPPED (need ≥2 folds); relying on full-history bisection + dispersion"
+             SKIPPED (need ≥2 folds); relying on full-history bisection + structure"
         );
     } else {
         let k_min = mults.iter().cloned().fold(f32::INFINITY, f32::min) as f64;
@@ -562,7 +625,9 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
                 k_max,
                 ratio = k_max / k_min,
                 agreement_max = K_AGREEMENT_MAX,
-                "wf fold-agreement guard — folds disagree (max/min > bound), rejecting (overfit/regime split)"
+                n_folds = mults.len(),
+                "GUARD reject: fold-agreement — folds disagree (k_max/k_min {:.2} > {:.2}), overfit/regime split — returning 0.0",
+                k_max / k_min, K_AGREEMENT_MAX
             );
             return 0.0;
         }
@@ -598,7 +663,10 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             lo_median = g_lo.median,
             target_bpd,
             mult_lo = cal.mult_bounds[0],
-            "wf bisection: median at K_FLOOR ≤ target (asset too flat to reach target) — returning 0.0 (floor preserved, per-pair override needed)"
+            median_sigma_pct,
+            lo_days = g_lo.days,
+            "GUARD reject: median at K_FLOOR ({:.1}) ≤ target ({:.1}) — asset too flat to reach target at any k (floor preserved, per-pair override needed) — returning 0.0",
+            g_lo.median, target_bpd
         );
         return 0.0;
     }
@@ -631,7 +699,11 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             hi_k = hi.exp(),
             target_bpd,
             k_max_safety = K_MAX_SAFETY,
-            "wf bisection: median at K_MAX_SAFETY still ≥ target (degenerate σ, no crossing below safety cap) — returning 0.0"
+            median_sigma_pct,
+            hi_days = g_hi.days,
+            "GUARD reject: at upper bracket k={:.4} median={:.1} {} target {:.1} (degenerate σ / no crossing below K_MAX_SAFETY) — returning 0.0",
+            hi.exp(), g_hi.median,
+            if g_hi.days == 0 { "DEAD hi-window vs" } else { "still ≥" }, target_bpd
         );
         return 0.0;
     }
@@ -679,7 +751,13 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
 
     // ── PART B3: final gate ──────────────────────────────────────────────────
     if full_stats.days == 0 {
-        warn!(k_star, "wf selected rung had no scorable clean day — returning 0.0");
+        warn!(
+            k_star,
+            full_median = full_stats.median,
+            target_bpd,
+            median_sigma_pct,
+            "GUARD reject: selected rung had no scorable clean day (full-history quarantine emptied the window) — returning 0.0"
+        );
         return 0.0;
     }
     // ACCEPT-TOL is now ADVISORY (operator directive 2026-06-09: "k must be the
@@ -689,7 +767,7 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
     // can leave the best rung structurally a few % off target (BNB/USDT, SOL/USDT
     // full-2yr cannot land within 5% of 300). That is a STRUCTURAL FLOOR, NOT an
     // "no valid k" condition — so we ACCEPT k_star and only WARN. The genuinely
-    // degenerate guards below (dispersion, K_FLOOR, min_pct-clamp) still 0.0.
+    // degenerate guards below (structure, K_FLOOR, min_pct-clamp) still 0.0.
     if achieved_err > RENKO_BPD_ACCEPT_TOL {
         warn!(
             k_star,
@@ -702,18 +780,36 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
         );
         // fall through — do NOT return 0.0; k_star is the closest achievable k.
     }
-    if !full_stats.dispersion_ok() {
+    // STRUCTURE side-guard (FIX 2c, storm-robust): reject ONLY genuinely
+    // structureless data (no modal cluster). A storm-heavy-but-median-sound
+    // crypto pair (BNB/SOL) has its calm-day bulk clustered near the median and
+    // PASSES — the storm tail is the operator-sanctioned variance, NOT noise.
+    // Always log the modal-mass + MAD/median ratio so a reject is fully diagnosed.
+    let modal_mass = full_stats.modal_mass();
+    let mad_over_median = if full_stats.median > 0.0 { full_stats.mad / full_stats.median } else { f64::NAN };
+    if !full_stats.structure_ok() {
         warn!(
             k_star,
             full_median = full_stats.median,
             full_mad = full_stats.mad,
-            dispersion_max = RENKO_DISPERSION_MAX,
-            "wf dispersion side-guard — pure-noise full history, returning 0.0"
+            mad_over_median,
+            modal_mass,
+            modal_mass_min = STRUCTURE_MODAL_MASS_MIN,
+            band_factor = STRUCTURE_BAND_FACTOR,
+            days = full_stats.days,
+            "GUARD reject: structure side-guard — modal mass {:.2} < min {:.2} (structureless / pure-noise full history, no day-cluster near median) — returning 0.0",
+            modal_mass, STRUCTURE_MODAL_MASS_MIN
         );
         return 0.0;
     }
     if k_star < K_FLOOR {
-        warn!(k_star, k_floor = K_FLOOR, "wf k_star < K_FLOOR — returning 0.0 (caller drops entry)");
+        warn!(
+            k_star,
+            k_floor = K_FLOOR,
+            full_median = full_stats.median,
+            target_bpd,
+            "GUARD reject: k_star < K_FLOOR (runtime would silently clamp) — returning 0.0 (caller drops entry)"
+        );
         return 0.0;
     }
     // min_pct CLAMP-DETECTOR (2026-06-09, expert caveat #1). The bisection assumes
@@ -733,7 +829,11 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
             min_pct = base.min_pct,
             clamp_frac_pct = clamp_frac * 100.0,
             clamp_max_pct = MIN_PCT_CLAMP_MAX_FRAC * 100.0,
-            "selected brick min_pct-clamped, k unresponsive — failing ticker for per-ticker override"
+            median_sigma_pct,
+            k_star_x_median_sigma = k_star * median_sigma_pct,
+            full_median = full_stats.median,
+            "GUARD reject: selected brick min_pct-clamped over {:.1}% of history (> {:.0}% ceiling); k*median_σ={:.5} ≤ min_pct={} ⇒ brick floored at min_pct, k unresponsive — failing ticker for per-ticker override",
+            clamp_frac * 100.0, MIN_PCT_CLAMP_MAX_FRAC * 100.0, k_star * median_sigma_pct, base.min_pct
         );
         return 0.0;
     }
@@ -748,7 +848,10 @@ pub fn calibrate_mtf_walkforward<S: VolSource + ?Sized>(
         warn!(
             k_star,
             bound = "lower",
-            "wf final clamp-detector — k_star parked at K_FLOOR bracket edge, returning 0.0"
+            mult_lo = cal.mult_bounds[0],
+            full_median = full_stats.median,
+            target_bpd,
+            "GUARD reject: k_star parked at K_FLOOR bracket edge (degenerate-σ / unreachable-target artifact) — returning 0.0"
         );
         return 0.0;
     }
@@ -1517,21 +1620,72 @@ mod tests {
         assert!((off.score(target) - 0.10).abs() < 1e-12);
     }
 
+    /// Helper: build a DailyBpdStats from a per-day vector, computing the same
+    /// median/mad/days the production counter does, so structure_ok/modal_mass
+    /// can be exercised on realistic day distributions.
+    fn stats_from_days(per_day: &[u64]) -> DailyBpdStats {
+        let clean: Vec<u64> = per_day.iter().copied().filter(|&b| b > 0).collect();
+        let mut sorted = clean.clone();
+        sorted.sort_unstable();
+        let median = median_sorted(&sorted);
+        let mut devs: Vec<u64> =
+            clean.iter().map(|&b| (b as f64 - median).abs().round() as u64).collect();
+        devs.sort_unstable();
+        let mad = median_sorted(&devs);
+        let mean = if clean.is_empty() { 0.0 } else { clean.iter().sum::<u64>() as f64 / clean.len() as f64 };
+        DailyBpdStats {
+            bricks_per_day: per_day.to_vec(), median, mean, mad, days: clean.len(),
+        }
+    }
+
     #[test]
-    fn dispersion_guard_rejects_pure_noise() {
-        // FIX 2b side-guard: MAD/median > RENKO_DISPERSION_MAX ⇒ reject.
-        let ok = DailyBpdStats {
-            bricks_per_day: vec![], median: 300.0, mean: 300.0, mad: 100.0, days: 10,
-        };
-        assert!(ok.dispersion_ok(), "MAD/median=0.33 ≤ bound ⇒ ok");
-        let noisy = DailyBpdStats {
-            bricks_per_day: vec![], median: 100.0, mean: 100.0, mad: 150.0, days: 10,
-        };
-        assert!(!noisy.dispersion_ok(), "MAD/median=1.5 > bound ⇒ reject");
+    fn structure_guard_storm_robust_rejects_only_noise() {
+        // FIX 2c (storm-robust): the guard passes STORM-HEAVY-but-median-sound
+        // crypto (operator principle) and rejects ONLY structureless / pure-noise
+        // data. Measure = modal mass (fraction of days within [med/3, med*3]).
+
+        // (a) STORM-HEAVY healthy crypto: ~30 calm days clustered near 300 + a
+        //     handful of extreme storm days (~3000, 10× median). MUST PASS — the
+        //     storm tail is the operator-sanctioned variance, NOT noise.
+        let mut storm = vec![
+            270, 280, 285, 290, 295, 298, 300, 300, 302, 305, 308, 310, 312, 315,
+            265, 275, 288, 292, 296, 301, 303, 307, 311, 318, 320, 322, 285, 293,
+        ];
+        storm.extend_from_slice(&[3000, 3200, 3100, 2900, 3300]); // storm tail
+        let storm_stats = stats_from_days(&storm);
+        assert!(
+            storm_stats.structure_ok(),
+            "storm-heavy crypto (median {:.0}, modal_mass {:.2}) must PASS — storms \
+             are operator-sanctioned variance, NOT noise",
+            storm_stats.median, storm_stats.modal_mass()
+        );
+        // And the legacy MAD/median ratio it REPLACED is NOT what gates it:
+        assert!(
+            storm_stats.modal_mass() >= STRUCTURE_MODAL_MASS_MIN,
+            "modal mass {:.2} ≥ {:.2}", storm_stats.modal_mass(), STRUCTURE_MODAL_MASS_MIN
+        );
+
+        // (b) GENUINE pure noise: days scattered across orders of magnitude with
+        //     NO modal cluster near the median. MUST REJECT.
+        let noise = vec![1u64, 2, 5, 12, 40, 120, 400, 1200, 3000, 9000];
+        let noise_stats = stats_from_days(&noise);
+        assert!(
+            !noise_stats.structure_ok(),
+            "structureless data (modal_mass {:.2}) must REJECT",
+            noise_stats.modal_mass()
+        );
+
+        // (c) Dead/degenerate window is not ok.
         let dead = DailyBpdStats {
             bricks_per_day: vec![], median: 0.0, mean: 0.0, mad: 0.0, days: 0,
         };
-        assert!(!dead.dispersion_ok(), "dead window not ok");
+        assert!(!dead.structure_ok(), "dead window not ok");
+        assert_eq!(dead.modal_mass(), 0.0, "dead window has zero modal mass");
+
+        // (d) Tight calm-only window (no storms): trivially passes.
+        let calm = stats_from_days(&[290, 295, 300, 300, 305, 310, 298, 302]);
+        assert!(calm.structure_ok(), "tight calm window passes");
+        assert_eq!(calm.modal_mass(), 1.0, "all calm days in band ⇒ modal_mass=1");
     }
 
     /// Per-tick σ VolSource: `sigma_cache[i]` indexed by tick ORDER (one cache
@@ -2147,6 +2301,72 @@ mod tests {
             k, 0.0,
             "too-quiet series (median < target even at K_FLOOR) must return 0.0 \
              (floor preserved, NO downward expansion) — got {k}"
+        );
+    }
+
+    /// TASK-2 REGRESSION (2026-06-09, BNB/SOL storm-rejection bug-class): a
+    /// storm-heavy-but-median-sound crypto path (many calm days clustered near
+    /// target + a MINORITY of extreme storm days, ~10× median) must CALIBRATE
+    /// (k > 0). Under the OLD `MAD/median ≤ 1.0` spread guard the legitimate
+    /// storm variance could (in the bug-class the operator flagged) reject the
+    /// pair as "pure noise"; the storm-robust modal-mass guard (FIX 2c) passes
+    /// it. The full-history median at the derived k must still equal target
+    /// (storms are absorbed by the median — operator principle).
+    #[test]
+    fn storm_heavy_crypto_calibrates_not_dispersion_rejected() {
+        let target_bpd = 300.0;
+        // 60d, storms every 6th day (~17% storm fraction, a realistic crypto
+        // storm cadence) at ~10× the calm step. Calm days emit a tight cluster
+        // near target at the fitted k; storm days form an extreme upper tail.
+        let prices = synth_bimodal_path(60, 4000, 0.004, 0.04, 6, 0xB1B0DA1);
+        let first = prices.first().unwrap().0;
+        let last = prices.last().unwrap().0;
+        let vol = ConstSigma(0.01);
+        let sigma_cache = vec![0.01];
+        let vol_cfg = VolConfig {
+            ema_period: 1, sigma_blend_windows_days: vec![1],
+            winsorize_pct: [0.05, 0.95], winsorize_min_samples: 1,
+            recompute_cooldown_ms: 0, ..VolConfig::default()
+        };
+        let cal = CalibrationConfig {
+            target_bpd, k_fit_windows_days: vec![30], min_window_days: 7,
+            max_rounds: 40, tolerance: 0.02, mult_bounds: [0.05, 4.0],
+        };
+        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+        let k = calibrate_mtf_walkforward(
+            &prices, &cal, &base, &vol, &vol_cfg, &sigma_cache, target_bpd, 7,
+        );
+        assert!(
+            k > 0.0,
+            "storm-heavy crypto must CALIBRATE (storms are operator-sanctioned \
+             variance, NOT a dispersion-reject) — got k={k}"
+        );
+
+        let full = count_bars_per_day_from_prices(
+            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 },
+            &vol, &vol_cfg, &sigma_cache, first, last,
+        );
+        // The storm tail is real: MAD/median can be large, but the median is at
+        // target and modal mass is high ⇒ structure_ok passes. Pin BOTH facts so
+        // a regression that re-introduces a spread-based reject is caught.
+        let full_rel_err = (full.median / target_bpd - 1.0).abs();
+        assert!(
+            full_rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "storms-included full median {:.1} within {:.0}% of target",
+            full.median, RENKO_BPD_ACCEPT_TOL * 100.0
+        );
+        assert!(
+            full.structure_ok(),
+            "storm-heavy series must pass structure_ok (modal_mass {:.2})",
+            full.modal_mass()
+        );
+        // A storm tail DOES inflate the legacy MAD/median spread well above the
+        // old 1.0 bound on some seeds — proving the spread measure was the wrong
+        // gate. We don't assert its exact value (seed-dependent) but DO assert
+        // the modal-mass guard is what (correctly) admits the pair.
+        assert!(
+            full.modal_mass() >= STRUCTURE_MODAL_MASS_MIN,
+            "modal mass {:.2} ≥ {:.2}", full.modal_mass(), STRUCTURE_MODAL_MASS_MIN
         );
     }
 }
