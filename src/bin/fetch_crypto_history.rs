@@ -45,6 +45,17 @@ struct Args {
     #[arg(long)]
     days: Option<i64>,
 
+    /// Explicit window start (YYYY-MM-DD, inclusive). When set together with
+    /// `--to-date` this overrides the `--days`-from-today window. Used by
+    /// `backfill-all`'s monthly stream-and-delete loop to fetch exactly one
+    /// calendar month at a time so raw `.ticks` never accumulate the full range.
+    #[arg(long)]
+    from_date: Option<String>,
+
+    /// Explicit window end (YYYY-MM-DD, inclusive). Pairs with `--from-date`.
+    #[arg(long)]
+    to_date: Option<String>,
+
     /// Quote asset (most crypto aggTrades archives are vs USDT).
     #[arg(long, default_value = "USDT")]
     quote: String,
@@ -249,8 +260,28 @@ async fn main() -> Result<()> {
     let default_days = root.series.pipeline.bootstrap_days + max_window;
     let days = args.days.unwrap_or(default_days);
 
-    let to = midnight_utc_today();
-    let from = to - Duration::days(days);
+    // Window resolution: explicit `--from-date`/`--to-date` (used by the
+    // monthly stream-and-delete loop) take precedence over the `--days`
+    // -from-today default. Both bounds are inclusive calendar days.
+    let (from, to) = match (args.from_date.as_deref(), args.to_date.as_deref()) {
+        (Some(f), Some(t)) => {
+            let parse_day = |s: &str| -> Result<DateTime<Utc>> {
+                let d = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .map_err(|e| anyhow::anyhow!("bad date {s:?}: {e}"))?;
+                Ok(d.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap()).and_utc())
+            };
+            let from = parse_day(f)?;
+            // `--to-date` is inclusive; `fetch_monthly_daily`'s daily loop runs
+            // `day <= config.to.date_naive()`, so the naive date of `to` must be
+            // the last day we want. Midnight of that day satisfies that.
+            let to = parse_day(t)?;
+            (from, to)
+        }
+        _ => {
+            let to = midnight_utc_today();
+            (to - Duration::days(days), to)
+        }
+    };
 
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();
     let ticks_dir = PathBuf::from(&nxr_cfg.ticks_dir);
