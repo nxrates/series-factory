@@ -62,6 +62,14 @@ struct Args {
     ///   `$NXR_DATA_INDEXES/<exchange>/<BASE>-<QUOTE>.idx`
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Delete each raw `.ticks` file the instant it has been fully folded into
+    /// the `.idx` AppendLog. This bounds the raw footprint to ~1 file per
+    /// exchange in flight (true delete-as-you-go) instead of letting a whole
+    /// fetch window of `.ticks` accumulate until a separate cleanup pass.
+    /// Off by default so plain re-runs / forensic inspection keep the raw;
+    /// the backfill orchestrator sets it for production disk-bounding.
+    #[arg(long)]
+    delete_after_convert: bool,
 }
 
 fn main() -> Result<()> {
@@ -156,7 +164,7 @@ fn main() -> Result<()> {
         }
         // Stream the file in BATCH_SIZE-tick chunks so an entire monthly
         // file (up to ~2 GiB of TickFrames) never sits resident at once.
-        if let Err(e) = stream_file_into_acc(
+        let folded = match stream_file_into_acc(
             path,
             provider_id,
             &mut acc,
@@ -170,8 +178,23 @@ fn main() -> Result<()> {
             z_threshold,
             cycle_ms,
         ) {
-            warn!(file = %path.display(), err = %e, "stream failed; continuing");
-        }
+            Ok(()) => true,
+            Err(e) => {
+                warn!(file = %path.display(), err = %e, "stream failed; continuing");
+                false
+            }
+        };
+        // Delete-as-you-go: drop this raw `.ticks` the instant it is folded so
+        // peak raw on disk never exceeds ~1 file per exchange. `flush_idx`
+        // fdatasyncs the AppendLog FIRST so every record from this file is
+        // durably on disk before its source is removed — a crash thereafter
+        // leaves the `.idx` ⊇ this file's records, and the orchestrator's
+        // fresh-build path (stale `.idx` removed → window re-fetched) keeps
+        // resume duplicate-free. Only delete on a clean fold; a failed stream
+        // keeps the raw for retry.
+        maybe_delete_folded_tick(args.delete_after_convert, folded, path, &mut |p| {
+            log.flush().with_context(|| format!("pre-delete idx flush {}", p.display()))
+        });
     }
 
     // Final flush — close out whatever is in the last partial cycle.
@@ -269,6 +292,37 @@ fn stream_file_into_acc(
     Ok(())
 }
 
+/// Delete-as-you-go gate for one folded `.ticks` file.
+///
+/// When `enabled` && `folded`, durably flush the `.idx` via `flush_idx` (so the
+/// file's records survive a crash before its source disappears) and then remove
+/// the raw file. A flush error keeps the raw (logged); a remove error is logged
+/// but non-fatal (defensive month sweep / startup sweep will catch it). Returns
+/// `true` iff the file was actually removed — exposed for unit testing the
+/// "raw count shrinks as files are folded" invariant without standing up a real
+/// AppendLog.
+fn maybe_delete_folded_tick(
+    enabled: bool,
+    folded: bool,
+    path: &Path,
+    flush_idx: &mut dyn FnMut(&Path) -> Result<()>,
+) -> bool {
+    if !(enabled && folded) {
+        return false;
+    }
+    if let Err(e) = flush_idx(path) {
+        warn!(file = %path.display(), err = %e, "pre-delete idx flush failed; keeping raw");
+        return false;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(file = %path.display(), err = %e, "delete-after-convert remove failed");
+            false
+        }
+    }
+}
+
 /// Collect every `*.ticks` file under `dir` and sort them lexicographically.
 /// Our exchange filename conventions (`YYYY-MM`, `YYYY-MM-DD`,
 /// `YYYYMMDD_NNN`) all sort in time order as plain strings.
@@ -290,4 +344,88 @@ fn discover_sorted_tick_files(dir: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     files.sort();
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, b"\0\0\0\0").unwrap();
+        p
+    }
+
+    fn count_ticks(dir: &Path) -> usize {
+        discover_sorted_tick_files(dir).unwrap().len()
+    }
+
+    /// Delete-as-you-go: simulate t2i folding a multi-file window. After each
+    /// file is folded the raw count must drop by 1, so at no point do more than
+    /// (n - i) raw files coexist — the peak per (sym,exchange) is ~1 file in
+    /// flight, never the whole window. This is the disk-bound invariant the
+    /// orchestrator relies on (replaces the prior monthly batch-delete).
+    #[test]
+    fn delete_after_convert_shrinks_raw_per_file() {
+        let tmp = std::env::temp_dir().join(format!("t2i_dag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // a fetch window landed 5 daily `.ticks` for one exchange
+        let files: Vec<PathBuf> = (1..=5)
+            .map(|d| touch(&tmp, &format!("2024-01-{:02}.ticks", d)))
+            .collect();
+        assert_eq!(count_ticks(&tmp), 5);
+
+        // fold + delete each in turn; flush stub always succeeds (records durable)
+        let flushes = AtomicUsize::new(0);
+        let mut flush = |_p: &Path| -> Result<()> {
+            flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        for (i, f) in files.iter().enumerate() {
+            let removed = maybe_delete_folded_tick(true, true, f, &mut flush);
+            assert!(removed, "folded file must be deleted as we go");
+            // INVARIANT: remaining raw == files not yet folded (never grows).
+            let remaining = count_ticks(&tmp);
+            assert_eq!(remaining, files.len() - (i + 1));
+            assert!(remaining <= files.len() - (i + 1));
+        }
+        assert_eq!(count_ticks(&tmp), 0, "all raw purged once window folded");
+        // every delete was preceded by exactly one durability flush
+        assert_eq!(flushes.load(Ordering::Relaxed), files.len());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Escape hatch: with `--delete-after-convert` OFF (i.e. `--keep-staging`
+    /// at the orchestrator) every raw file is retained for forensic re-runs.
+    #[test]
+    fn keep_staging_retains_all_raw() {
+        let tmp = std::env::temp_dir().join(format!("t2i_keep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let f = touch(&tmp, "2024-02-01.ticks");
+        let mut flush = |_p: &Path| -> Result<()> { Ok(()) };
+        // enabled=false → no delete even though folded=true
+        let removed = maybe_delete_folded_tick(false, true, &f, &mut flush);
+        assert!(!removed);
+        assert_eq!(count_ticks(&tmp), 1, "raw kept when delete-as-you-go off");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A file whose fold errored (folded=false) is NOT deleted — it stays for
+    /// retry / the defensive month sweep, never silently lost.
+    #[test]
+    fn failed_fold_keeps_raw_for_retry() {
+        let tmp = std::env::temp_dir().join(format!("t2i_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let f = touch(&tmp, "2024-03-01.ticks");
+        let mut flush = |_p: &Path| -> Result<()> { Ok(()) };
+        let removed = maybe_delete_folded_tick(true, false, &f, &mut flush);
+        assert!(!removed);
+        assert_eq!(count_ticks(&tmp), 1, "unfolded raw retained");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
