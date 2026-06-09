@@ -836,8 +836,11 @@ fn run_once(args: &Args) -> Result<()> {
     // ── Synth-pair pass (5 crosses) ──────────────────────────────────────────
     // Runs unconditionally after the base pass. Cheap (~10 pairs, mostly
     // bound by leg .idx I/O which the base pass already warmed in page
-    // cache). The clamp-detector inside `calibrate_mtf_with_target` drops
-    // degenerate windows; if all windows fail, k is NOT persisted (caller
+    // cache). Synths route through the SAME `calibrate_mtf_walkforward`
+    // selector the base pass uses (full-history log-k bisection + two-sided
+    // rung probe + accept gate, walk-forward demoted to an agreement guard —
+    // see `calibrate_one_synth`); the accept/clamp/dispersion gates inside it
+    // drop degenerate windows. If all windows fail, k is NOT persisted (caller
     // keeps prior). Phase 60.π: per-pair override or flat default per synth.
     let synth_work = resolve_synth_work(&root.synths.initial_pairs);
     info!(n_synth = synth_work.len(), "synth calibration pass starting");
