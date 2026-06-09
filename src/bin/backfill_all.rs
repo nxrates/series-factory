@@ -62,8 +62,13 @@ struct Args {
     /// Comma-separated steps to run. Default: all.
     #[arg(long, default_value = "fetch,t2i,merge,s10,renko,validate")]
     steps: String,
-    /// Parallel ticker workers.
-    #[arg(long, default_value_t = 4)]
+    /// Parallel ticker workers. Default lowered 4→2 (R-disk, 2026-06-09): each
+    /// in-flight ticker holds up to 1 month × n_exch of raw `.ticks` during its
+    /// monthly stream-and-delete loop, so the peak raw footprint scales with
+    /// this value. 2 keeps the data PVC bounded while still overlapping
+    /// download (I/O) with t2i (CPU). The HEAVY_WORK_RAM_CAP semaphore still
+    /// independently bounds concurrent heavy subprocesses for RAM.
+    #[arg(long, default_value_t = 2)]
     parallel: usize,
     /// Skip steps whose output exists and passes integrity-check.
     #[arg(long)]
@@ -173,6 +178,12 @@ fn split_csv(s: &str) -> Vec<String> {
 
 fn file_bytes(p: &Path) -> u64 {
     fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// True if `step` is in the configured step list (free-fn variant of the
+/// per-ticker `want` closure, for use in `main` before `ctx` is consumed).
+fn want_step(steps: &[String], step: &str) -> bool {
+    steps.iter().any(|s| s == step)
 }
 
 fn dir_bytes(p: &Path) -> u64 {
@@ -345,6 +356,203 @@ fn write_marker(out_dir: &Path, ticker: &str, suffix: &str) {
     if let Err(e) = fs::write(&p, &now) {
         warn!(path = %p.display(), err = %e, "progress marker write failed");
     }
+}
+
+// ── Monthly window helpers (raw-footprint bound) ───────────────────────────────
+
+/// First day of the next calendar month.
+fn next_month_start(d: NaiveDate) -> NaiveDate {
+    use chrono::Datelike;
+    if d.month() == 12 {
+        NaiveDate::from_ymd_opt(d.year() + 1, 1, 1).unwrap()
+    } else {
+        NaiveDate::from_ymd_opt(d.year(), d.month() + 1, 1).unwrap()
+    }
+}
+
+/// Split `[from, to]` (inclusive) into per-calendar-month `(start, end)` windows,
+/// both bounds inclusive. The orchestrator fetches + folds + deletes raw one
+/// window at a time so peak raw `.ticks` is bounded to ~1 month × n_exch instead
+/// of the full backfill range.
+fn month_windows(from: NaiveDate, to: NaiveDate) -> Vec<(NaiveDate, NaiveDate)> {
+    use chrono::Datelike;
+    let mut out = Vec::new();
+    let mut cur = NaiveDate::from_ymd_opt(from.year(), from.month(), 1).unwrap().max(from);
+    while cur <= to {
+        let month_end = next_month_start(cur) - chrono::Duration::days(1);
+        out.push((cur, month_end.min(to)));
+        cur = next_month_start(cur);
+    }
+    out
+}
+
+/// Delete all raw `.ticks` for a ticker across every exchange staging dir.
+/// Called immediately after each month's t2i append succeeds so the raw never
+/// accumulates beyond the current month. Touches ONLY `ticks/<exch>/<BASE><QUOTE>`;
+/// never the per-provider/composite `.idx`, bars, or `.vol`.
+fn delete_month_raw_ticks(
+    out_dir: &Path,
+    exchanges: &[String],
+    base: &str,
+    quote: &str,
+) -> u64 {
+    let mut freed = 0u64;
+    let sym_dir = format!("{}{}", base, quote);
+    for ex in exchanges {
+        let dir = out_dir.join("ticks").join(ex).join(&sym_dir);
+        if !dir.exists() {
+            continue;
+        }
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let is_tick = p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|e| e == "ticks")
+                    .unwrap_or(false)
+                    || p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.ends_with(".ticks.partial"))
+                        .unwrap_or(false);
+                if is_tick {
+                    freed += file_bytes(&p);
+                    if let Err(e) = fs::remove_file(&p) {
+                        warn!(path = %p.display(), err = %e, "month raw delete failed");
+                    }
+                }
+            }
+        }
+    }
+    freed
+}
+
+// ── Startup sweep + pre-flight disk guard (P1.4 / P1.5 / P2.2) ─────────────────
+
+/// Recursively delete every `*.ticks.partial` under `ticks/`. These are torn
+/// half-downloads left by a killed `download_and_convert` (common.rs:383) — the
+/// atomic rename never completed. They are never read by any step and otherwise
+/// orphan forever. Returns bytes freed.
+fn sweep_partial_ticks(out_dir: &Path) -> u64 {
+    fn walk(dir: &Path, freed: &mut u64) {
+        let rd = match fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, freed);
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".ticks.partial"))
+                .unwrap_or(false)
+            {
+                *freed += file_bytes(&p);
+                if let Err(e) = fs::remove_file(&p) {
+                    warn!(path = %p.display(), err = %e, "partial-ticks sweep delete failed");
+                }
+            }
+        }
+    }
+    let mut freed = 0u64;
+    walk(&out_dir.join("ticks"), &mut freed);
+    freed
+}
+
+/// Startup orphan sweep: for every planned (ticker × exchange), if the composite
+/// `indexes/<MITCH-ID>/manifest.json` already exists (the ticker is fully built),
+/// the raw `ticks/<exch>/<BASE><QUOTE>` staging is dead weight from a prior
+/// interrupted or killed run. Delete it. Never touches the composite `.idx`,
+/// bars, `.vol`, or any manifest. Returns bytes freed.
+fn sweep_orphaned_staging(out_dir: &Path, tickers: &[String], exchanges: &[String]) -> u64 {
+    let mut freed = 0u64;
+    for t in tickers {
+        let (base, quote) = match nxr_sdk::split_pair_multi(t, &['/', '-']) {
+            Some((b, q)) => (b.to_uppercase(), q.to_uppercase()),
+            None => continue,
+        };
+        let ticker_id = nxr_sdk::resolve_ticker_id(&format!("{}/{}", base, quote));
+        let manifest = nxr_sdk::shard::idx_dir(out_dir, ticker_id).join("manifest.json");
+        if !manifest.exists() {
+            continue; // ticker not yet built → its staging may be live; keep.
+        }
+        freed += delete_month_raw_ticks(out_dir, exchanges, &base, &quote);
+        // Also drop the now-redundant per-exch .idx (the composite supersedes it).
+        for ex in exchanges {
+            let per_idx = out_dir
+                .join("indexes")
+                .join(ex)
+                .join(format!("{}-{}.idx", base, quote));
+            if per_idx.exists() {
+                freed += file_bytes(&per_idx);
+                let _ = fs::remove_file(&per_idx);
+            }
+        }
+    }
+    freed
+}
+
+/// Free bytes available on the filesystem backing `path`, via `statvfs(3)`.
+/// Returns `None` if the syscall fails.
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    // Available blocks (f_bavail) for non-root × fragment size (f_frsize).
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+/// Pre-flight disk-headroom guard (P2.2). With monthly stream-and-delete the
+/// peak raw footprint is bounded to roughly
+///   1 month × n_exch × parallel × bytes_per_exchange_day × days_in_peak_month.
+/// We size the peak month at 31 days (worst case). Abort if that projection
+/// exceeds `free * headroom_safety_factor`. Knobs are YAML-sourced
+/// (`series.pipeline.backfill`), never hardcoded.
+fn preflight_disk_guard(
+    out_dir: &Path,
+    n_exch: usize,
+    parallel: usize,
+    cfg: &nxr_sdk::pipeline_config::BackfillDiskYml,
+) -> Result<()> {
+    const PEAK_DAYS: u64 = 31;
+    let projected = cfg.bytes_per_exchange_day
+        .saturating_mul(n_exch as u64)
+        .saturating_mul(parallel.max(1) as u64)
+        .saturating_mul(PEAK_DAYS);
+    let free = match free_bytes(out_dir) {
+        Some(f) => f,
+        None => {
+            warn!(out_dir = %out_dir.display(), "statvfs failed; skipping pre-flight disk guard");
+            return Ok(());
+        }
+    };
+    let budget = (free as f64 * cfg.headroom_safety_factor) as u64;
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    info!(
+        projected_peak_gib = gib(projected),
+        free_gib = gib(free),
+        budget_gib = gib(budget),
+        safety_factor = cfg.headroom_safety_factor,
+        n_exch,
+        parallel,
+        "pre-flight disk headroom check"
+    );
+    if projected > budget {
+        return Err(anyhow!(
+            "pre-flight disk guard: projected monthly raw peak {:.1} GiB > {:.1} GiB \
+             (free {:.1} GiB × safety {:.2}). Lower --parallel, free space, or tune \
+             series.pipeline.backfill.{{bytes_per_exchange_day,headroom_safety_factor}}.",
+            gib(projected), gib(budget), gib(free), cfg.headroom_safety_factor
+        ));
+    }
+    Ok(())
 }
 
 // ── Per-ticker pipeline ──────────────────────────────────────────────────────
@@ -551,7 +759,6 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     let vol_path = out_dir.join("vol").join(format!("{}-{}.vol", base, quote));
 
     let want = |s: &str| ctx.steps.iter().any(|x| x == s);
-    let days = (ctx.to - ctx.from).num_days().max(1);
 
     // 0) availability probe — drops dead exchanges before fetch
     let mut availability = Vec::new();
@@ -576,80 +783,208 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         info!(ticker, active_exchanges = ?active_exchanges, "availability check ok");
     }
 
-    // 1) fetch
-    if want("fetch") {
-        let args = vec![
-            cfg.clone(),
-            "--pairs".to_string(),
-            base.clone(),
-            "--exchanges".to_string(),
-            active_exchanges.join(","),
-            "--quote".to_string(),
-            quote.clone(),
-            "--days".to_string(),
-            days.to_string(),
-        ];
-        steps_out.push(run_step(ticker, "fetch-crypto-history", &args, None));
-        if steps_out.last().unwrap().exit_code != 0 {
-            ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-            write_marker(&ctx.args.out_dir, ticker, "failed");
-            return TickerReport {
-                ticker: ticker.to_string(),
-                status: "failed".to_string(),
-                steps: steps_out,
-                ticker_availability: availability,
-                skip_reason: None,
-            };
-        }
-    }
-
-    // 2) t2i (per exchange) — PARALLEL across exchanges (was serial; 3-exch
-    // ticker wall went from sum-of-per-exch to max-of-per-exch, typically ~2x
-    // speedup on liquid pairs where bitget/okx are smaller than binance).
-    if want("t2i") {
-        let t2i_reports: Vec<StepReport> = active_exchanges
-            .par_iter()
+    // 1+2) fetch + t2i — MONTHLY STREAM-AND-DELETE (R-disk, 2026-06-09).
+    //
+    // Previously fetch downloaded the WHOLE [from,to) range of raw `.ticks` for
+    // every exchange up-front, and t2i folded them afterwards — so for a 2y x
+    // n-exch backfill the full raw range coexisted on the PVC per ticker (peak
+    // ≈ range × n_exch). That overran the data volume.
+    //
+    // Now we drive ONE calendar month at a time:
+    //   for each month M in [from,to]:
+    //     fetch-crypto-history --from-date M.start --to-date M.end  (all exch)
+    //     ticks-to-idx <exch> ...  (APPENDS M's records into the per-exch .idx)
+    //     delete ticks/<exch>/<BASE><QUOTE>/*.ticks  (before next month)
+    // so peak raw is bounded to ~1 month × n_exch regardless of range length.
+    //
+    // t2i's AppendLog::open_buffered appends, and it discovers the .ticks files
+    // present in the dir at call time (ticks_to_idx.rs:136,275), so per-month
+    // invocation composes into one cumulative .idx. The TDWAP accumulator
+    // restarts at each month's first tick; the only artifact is that a single
+    // ≤cycle_ms aggregation cycle straddling a month boundary is split — a
+    // sub-200ms effect on contiguous months, negligible vs the disk win.
+    //
+    // --resume: if the per-exch .idx already exists + integrity-clean for all
+    // active exchanges, skip the whole fetch+t2i loop (preserves prior resume
+    // semantics via the same integrity gate). Otherwise we rebuild fresh: any
+    // stale/partial per-exch .idx is removed first so months are not appended
+    // on top of a half-built log (which would duplicate records).
+    if want("fetch") || want("t2i") {
+        let per_idx_paths: Vec<PathBuf> = active_exchanges
+            .iter()
             .map(|ex| {
-                let per_idx = out_dir
+                out_dir
                     .join("indexes")
                     .join(ex)
-                    .join(format!("{}-{}.idx", base, quote));
-                if ctx.args.resume && integrity_clean(&per_idx, "idx") {
-                    return StepReport {
-                        name: format!("ticks-to-idx[{}]", ex),
-                        duration_ms: 0,
-                        exit_code: 0,
-                        bytes: file_bytes(&per_idx),
-                        skipped: true,
-                        errors: Vec::new(),
-                    };
-                }
-                let args = vec![
-                    ex.clone(),
-                    base.clone(),
-                    quote.clone(),
-                    "--cycle-ms".to_string(),
-                    cycle_ms.clone(),
-                ];
-                let mut rep = run_step(ticker, "ticks-to-idx", &args, Some(&per_idx));
-                rep.name = format!("ticks-to-idx[{}]", ex);
-                rep
+                    .join(format!("{}-{}.idx", base, quote))
             })
             .collect();
-        let any_failed = t2i_reports.iter().any(|r| r.exit_code != 0);
-        steps_out.extend(t2i_reports);
-        if any_failed {
-            ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-            write_marker(&ctx.args.out_dir, ticker, "failed");
-            return TickerReport {
-                ticker: ticker.to_string(),
-                status: "failed".to_string(),
-                steps: steps_out,
-                ticker_availability: availability,
-                skip_reason: None,
-            };
+
+        // Resume gate: all per-exch .idx already clean ⇒ skip fetch+t2i entirely.
+        let all_clean = ctx.args.resume
+            && want("t2i")
+            && !per_idx_paths.is_empty()
+            && per_idx_paths.iter().all(|p| integrity_clean(p, "idx"));
+
+        if all_clean {
+            for (ex, p) in active_exchanges.iter().zip(&per_idx_paths) {
+                steps_out.push(StepReport {
+                    name: format!("ticks-to-idx[{}]", ex),
+                    duration_ms: 0,
+                    exit_code: 0,
+                    bytes: file_bytes(p),
+                    skipped: true,
+                    errors: Vec::new(),
+                });
+            }
+            // Defensive: drop any orphaned raw from a prior interrupted run.
+            delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
+        } else {
+            // Fresh build: remove any stale per-exch .idx so monthly appends
+            // start from empty (no record duplication on re-run).
+            if want("t2i") {
+                for p in &per_idx_paths {
+                    if p.exists() {
+                        let _ = fs::remove_file(p);
+                    }
+                }
+            }
+
+            let windows = month_windows(ctx.from, ctx.to);
+            let mut fetch_ms: u128 = 0;
+            let mut fetch_err: Vec<String> = Vec::new();
+            let mut t2i_ms: BTreeMap<String, u128> = BTreeMap::new();
+            let mut t2i_err: Vec<String> = Vec::new();
+            let mut total_freed: u64 = 0;
+            let mut hard_fail = false;
+
+            'months: for (m_start, m_end) in &windows {
+                let m_start_s = m_start.format("%Y-%m-%d").to_string();
+                let m_end_s = m_end.format("%Y-%m-%d").to_string();
+
+                // fetch this month (all active exchanges)
+                if want("fetch") {
+                    let args = vec![
+                        cfg.clone(),
+                        "--pairs".to_string(),
+                        base.clone(),
+                        "--exchanges".to_string(),
+                        active_exchanges.join(","),
+                        "--quote".to_string(),
+                        quote.clone(),
+                        "--from-date".to_string(),
+                        m_start_s.clone(),
+                        "--to-date".to_string(),
+                        m_end_s.clone(),
+                    ];
+                    let rep = run_step(ticker, "fetch-crypto-history", &args, None);
+                    fetch_ms += rep.duration_ms;
+                    // A whole-month fetch failure is non-fatal here: some
+                    // exchanges legitimately lack a given month (sparse new
+                    // pairs). t2i soft-skips empty dirs; merge uses whatever
+                    // landed. Only a hard spawn failure (exit -1) tanks.
+                    if rep.exit_code == -1 {
+                        fetch_err.extend(rep.errors.clone());
+                        hard_fail = true;
+                        break 'months;
+                    } else if rep.exit_code != 0 {
+                        fetch_err.push(format!(
+                            "{}: monthly fetch exit {}",
+                            m_start_s, rep.exit_code
+                        ));
+                    }
+                }
+
+                // fold this month into each per-exch .idx (parallel across exch)
+                if want("t2i") {
+                    let reps: Vec<(String, StepReport)> = active_exchanges
+                        .par_iter()
+                        .map(|ex| {
+                            let per_idx = out_dir
+                                .join("indexes")
+                                .join(ex)
+                                .join(format!("{}-{}.idx", base, quote));
+                            let args = vec![
+                                ex.clone(),
+                                base.clone(),
+                                quote.clone(),
+                                "--cycle-ms".to_string(),
+                                cycle_ms.clone(),
+                            ];
+                            let rep = run_step(ticker, "ticks-to-idx", &args, Some(&per_idx));
+                            (ex.clone(), rep)
+                        })
+                        .collect();
+                    for (ex, rep) in reps {
+                        *t2i_ms.entry(ex.clone()).or_insert(0) += rep.duration_ms;
+                        if rep.exit_code != 0 {
+                            t2i_err.push(format!("{} [{}]: t2i exit {}", m_start_s, ex, rep.exit_code));
+                            t2i_err.extend(rep.errors.clone());
+                            hard_fail = true;
+                        }
+                    }
+                }
+
+                // DELETE this month's raw before the next month is fetched.
+                // This is the footprint bound: at any instant only 1 month of
+                // raw `.ticks` × n_exch is resident.
+                total_freed += delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
+
+                if hard_fail {
+                    break 'months;
+                }
+            }
+
+            // Emit a single fetch + per-exch t2i StepReport summarising the loop.
+            if want("fetch") {
+                steps_out.push(StepReport {
+                    name: "fetch-crypto-history[monthly]".to_string(),
+                    duration_ms: fetch_ms,
+                    exit_code: if hard_fail && !fetch_err.is_empty() { -1 } else { 0 },
+                    bytes: total_freed,
+                    skipped: false,
+                    errors: fetch_err,
+                });
+            }
+            if want("t2i") {
+                for ex in &active_exchanges {
+                    let per_idx = out_dir
+                        .join("indexes")
+                        .join(ex)
+                        .join(format!("{}-{}.idx", base, quote));
+                    let exit_code = if t2i_err.iter().any(|e| e.contains(&format!("[{}]", ex))) {
+                        1
+                    } else {
+                        0
+                    };
+                    steps_out.push(StepReport {
+                        name: format!("ticks-to-idx[{}]", ex),
+                        duration_ms: *t2i_ms.get(ex).unwrap_or(&0),
+                        exit_code,
+                        bytes: file_bytes(&per_idx),
+                        skipped: false,
+                        errors: Vec::new(),
+                    });
+                }
+            }
+
+            if hard_fail {
+                // P1.4: clean raw staging even on the failure path so a killed
+                // ticker doesn't orphan its raw `.ticks` forever.
+                if ctx.args.cleanup && !ctx.args.keep_staging {
+                    steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+                }
+                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+                write_marker(&ctx.args.out_dir, ticker, "failed");
+                return TickerReport {
+                    ticker: ticker.to_string(),
+                    status: "failed".to_string(),
+                    steps: steps_out,
+                    ticker_availability: availability,
+                    skip_reason: None,
+                };
+            }
         }
     }
 
@@ -676,6 +1011,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
+                // P1.4: sweep raw + per-exch .idx even on failure (never the
+                // composite/bars/.vol). Raw was already month-deleted; this
+                // mops up the per-provider .idx + any orphan.
+                if ctx.args.cleanup && !ctx.args.keep_staging {
+                    steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+                }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
                 ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
                 write_marker(&ctx.args.out_dir, ticker, "failed");
@@ -692,6 +1033,9 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         let shard_check = validate_shards(ticker, &composite_dir, "idx");
         steps_out.push(shard_check.clone());
         if shard_check.exit_code != 0 {
+            if ctx.args.cleanup && !ctx.args.keep_staging {
+                steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+            }
             ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
             ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
             write_marker(&ctx.args.out_dir, ticker, "failed");
@@ -734,6 +1078,9 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
+                if ctx.args.cleanup && !ctx.args.keep_staging {
+                    steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+                }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
                 ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
                 write_marker(&ctx.args.out_dir, ticker, "failed");
@@ -765,6 +1112,9 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
+                if ctx.args.cleanup && !ctx.args.keep_staging {
+                    steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+                }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
                 ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
                 write_marker(&ctx.args.out_dir, ticker, "failed");
@@ -1029,6 +1379,54 @@ fn main() -> Result<()> {
     // ensure progress dir exists
     let _ = fs::create_dir_all(progress_dir(&args.out_dir));
 
+    // P1.5 — prune stale progress markers from prior runs. They are append-only
+    // crumbs (`<ticker>.{start,done,failed}`) that never get cleared, so they
+    // grow unbounded across re-backfills. Clear them at run start so the
+    // directory only reflects THIS run.
+    {
+        let pdir = progress_dir(&args.out_dir);
+        let mut pruned = 0usize;
+        if let Ok(rd) = fs::read_dir(&pdir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_file() && fs::remove_file(&p).is_ok() {
+                    pruned += 1;
+                }
+            }
+        }
+        if pruned > 0 {
+            info!(pruned, dir = %pdir.display(), "pruned stale progress markers");
+        }
+    }
+
+    // P1.4 — startup orphan sweep. Kill torn `*.ticks.partial` everywhere, then
+    // drop raw staging for any planned ticker whose composite manifest already
+    // exists+validates (dead weight from a prior killed run). Never touches
+    // composite/.idx/bars/.vol.
+    {
+        let part_freed = sweep_partial_ticks(&args.out_dir);
+        let orphan_freed = sweep_orphaned_staging(&args.out_dir, &tickers, &ctx.exchanges);
+        let total = part_freed + orphan_freed;
+        if total > 0 {
+            info!(
+                partial_bytes = part_freed,
+                orphan_bytes = orphan_freed,
+                total_gib = total as f64 / (1024.0 * 1024.0 * 1024.0),
+                "startup staging sweep reclaimed"
+            );
+        }
+    }
+
+    // P2.2 — pre-flight disk-headroom guard. With monthly stream-and-delete the
+    // raw peak is bounded; abort early if even that projection won't fit free
+    // space (× safety factor). Knobs are YAML-sourced (no hardcode).
+    if want_step(&ctx.steps, "fetch") {
+        let disk_cfg = nxr_sdk::pipeline_config::PipelineYml::load(&args.config)
+            .map(|y| y.series.pipeline.backfill)
+            .unwrap_or_default();
+        preflight_disk_guard(&args.out_dir, ctx.exchanges.len(), args.parallel, &disk_cfg)?;
+    }
+
     // heartbeat thread — emits every 60s while pool runs
     let heartbeat_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hb_stop = heartbeat_stop.clone();
@@ -1133,4 +1531,70 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn month_windows_full_calendar_months() {
+        // Jan 1 .. Mar 31 → 3 inclusive month windows.
+        let w = month_windows(d(2024, 1, 1), d(2024, 3, 31));
+        assert_eq!(
+            w,
+            vec![
+                (d(2024, 1, 1), d(2024, 1, 31)),
+                (d(2024, 2, 1), d(2024, 2, 29)), // 2024 is a leap year
+                (d(2024, 3, 1), d(2024, 3, 31)),
+            ]
+        );
+    }
+
+    #[test]
+    fn month_windows_partial_first_and_last() {
+        // Mid-month start + mid-month end clamp to the requested bounds.
+        let w = month_windows(d(2023, 1, 15), d(2023, 3, 10));
+        assert_eq!(
+            w,
+            vec![
+                (d(2023, 1, 15), d(2023, 1, 31)),
+                (d(2023, 2, 1), d(2023, 2, 28)),
+                (d(2023, 3, 1), d(2023, 3, 10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn month_windows_single_partial_month() {
+        let w = month_windows(d(2025, 6, 5), d(2025, 6, 9));
+        assert_eq!(w, vec![(d(2025, 6, 5), d(2025, 6, 9))]);
+    }
+
+    #[test]
+    fn month_windows_year_boundary() {
+        let w = month_windows(d(2023, 12, 1), d(2024, 1, 31));
+        assert_eq!(
+            w,
+            vec![
+                (d(2023, 12, 1), d(2023, 12, 31)),
+                (d(2024, 1, 1), d(2024, 1, 31)),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_cover_range_contiguously_no_gap_no_overlap() {
+        // Property: windows tile [from,to] exactly — each next start = prev end+1.
+        let w = month_windows(d(2022, 3, 17), d(2023, 5, 2));
+        assert_eq!(w.first().unwrap().0, d(2022, 3, 17));
+        assert_eq!(w.last().unwrap().1, d(2023, 5, 2));
+        for pair in w.windows(2) {
+            assert_eq!(pair[1].0, pair[0].1 + chrono::Duration::days(1));
+        }
+    }
 }
