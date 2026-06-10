@@ -443,9 +443,12 @@ impl LegStream {
         Ok(Self { shards: shards.into_iter(), cur: None })
     }
 
-    /// Next valid `(ts, bid, ask)` triple across all shards, or `Ok(None)` at end.
-    /// Skips records with non-finite/non-positive bid/ask (matches prior filter).
-    fn next_tick(&mut self) -> Result<Option<(i64, f64, f64)>> {
+    /// Next valid `(ts_ms, IndexRecord)` across all shards, or `Ok(None)` at end.
+    /// Skips heartbeat sentinels and records with non-finite/non-positive
+    /// bid/ask (matches prior filter). The FULL record is returned (not just
+    /// bid/ask) so the gated reconstruction (`SynthReplayState`) can read the
+    /// leg's confidence / ci / volumes — identical inputs to the backfill gate.
+    fn next_tick(&mut self) -> Result<Option<(i64, IndexRecord)>> {
         loop {
             if self.cur.is_none() {
                 match self.shards.next() {
@@ -470,7 +473,7 @@ impl LegStream {
                     let ask = rec.index.ask;
                     if !(bid.is_finite() && ask.is_finite()) { continue; }
                     if bid <= 0.0 || ask <= 0.0 { continue; }
-                    return Ok(Some((ts, bid, ask)));
+                    return Ok(Some((ts, rec)));
                 }
                 None => {
                     // End of current shard; advance to next.
@@ -508,11 +511,11 @@ fn calibrate_one_synth(
     };
 
     // Prime both legs' look-ahead slot. If either leg has zero valid ticks → skip.
-    let mut a_next: Option<(i64, f64, f64)> = match leg_a_stream.next_tick() {
+    let mut a_next: Option<(i64, IndexRecord)> = match leg_a_stream.next_tick() {
         Ok(v) => v,
         Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_a: {}", e) },
     };
-    let mut b_next: Option<(i64, f64, f64)> = match leg_b_stream.next_tick() {
+    let mut b_next: Option<(i64, IndexRecord)> = match leg_b_stream.next_tick() {
         Ok(v) => v,
         Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_b: {}", e) },
     };
@@ -530,8 +533,6 @@ fn calibrate_one_synth(
     // Each leg stream is monotone-ascending (shards sorted by date,
     // within-shard records are append-order from upstream), so the merge
     // reduces to "pick whichever side has the earlier next-ts" — no heap.
-    let mut a_last: Option<(f64, f64)> = None;
-    let mut b_last: Option<(f64, f64)> = None;
     // SEAM PARITY (R3): the synth `.vol` is built from the SAME persisted `.s10`
     // shards the live `bars_renko_synth` ring consumes (written by the synth s10
     // producer — live `bars_s10::spawn(Synth)` / offline `synth-backfill-from-idx`),
@@ -543,31 +544,43 @@ fn calibrate_one_synth(
     // (2026-06-06 brick-storm RCA): calibrate granularity MUST == apply
     // granularity; a 1-min last-mid downsample undercounts crossings → too-small
     // k → live over-emit. Each leg event emits one synth path point.
-    // PERF A2 (2026-06-09): pre-size the synth tick Vec. The event-merge emits
-    // ≤ one point per leg event (once both legs primed), so the merged length is
-    // bounded by (leg_a_ticks + leg_b_ticks). Estimate each leg's tick count from
-    // its on-disk shard bytes (56 B/IndexRecord). Upper bound — non-finite/skip
-    // records trim it — so capacity is reserved once, no push reallocation churn.
+    //
+    // §5 PARITY FIX (2026-06-10 RCA #1763): the reconstruction is now routed
+    // through the SAME gated state machine the backfill driver uses
+    // (`nxr_sdk::synth::SynthReplayState::feed_leg_tick`). Previously this loop
+    // merged the two legs UNGATED — emitting a mid for every leg event regardless
+    // of leg staleness / confidence / sanity — while backfill + live gate through
+    // `compute_synth_index` (5 s leg-TTL + conf + sanity). That fit `k` on a
+    // DENSER tick stream than it was applied to → synth-cross median bpd
+    // collapsed ~90 %. Feeding the gated state machine here (now_ms = inbound
+    // tick ts, push mid only on `Some`) restores hist==live for synths.
+    // PERF A2 (2026-06-09): pre-size the synth tick Vec. The gated emit produces
+    // ≤ one point per leg event (once both legs primed + within TTL), so the
+    // length is bounded by (leg_a_ticks + leg_b_ticks). Estimate each leg's tick
+    // count from its on-disk shard bytes (56 B/IndexRecord). Upper bound — gated
+    // drops + skip records trim it — so capacity is reserved once, no churn.
     let est_synth_ticks: usize = est_leg_ticks(idx_root, leg_a_id)
         .saturating_add(est_leg_ticks(idx_root, leg_b_id));
     // Clamp the reservation (see `MAX_PRERESERVE_TICKS`): two sentinel-heavy legs
     // (e.g. BTC) summed can exceed the budget → a single multi-GB up-front alloc.
     let mut tick_prices: Vec<(i64, f64)> = Vec::with_capacity(clamp_prereserve(est_synth_ticks));
+    // leg_a == base, leg_b == quote (see `resolve_synth_work`). Tie-break favors
+    // base on equal ts — identical to backfill's `merge_pop` (ta <= tb → base).
+    let mut merge_state = nxr_sdk::synth::SynthReplayState::new(synth_id, leg_a_id, leg_b_id);
     loop {
-        // Pick side with smaller ts (ties favor a → deterministic).
+        // Pick side with smaller ts (ties favor a/base → matches backfill merge).
         let take_a = match (&a_next, &b_next) {
             (Some(a), Some(b)) => a.0 <= b.0,
             (Some(_), None) => true,
             (None, Some(_)) => false,
             (None, None) => break,
         };
-        let (ts, b_px, a_px) = if take_a {
+        let (ts, rec) = if take_a {
             let cur = a_next.take().expect("a_next primed");
             a_next = match leg_a_stream.next_tick() {
                 Ok(v) => v,
                 Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_a: {}", e) },
             };
-            a_last = Some((cur.1, cur.2));
             cur
         } else {
             let cur = b_next.take().expect("b_next primed");
@@ -575,21 +588,16 @@ fn calibrate_one_synth(
                 Ok(v) => v,
                 Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_b: {}", e) },
             };
-            b_last = Some((cur.1, cur.2));
             cur
         };
-        let _ = (b_px, a_px); // silence unused-binding lint; consumed via *_last
 
-        // Both legs primed → emit synth tick.
-        if let (Some((ab, aa)), Some((bb, ba))) = (a_last, b_last) {
-            // Worst-case spread compounding (mirrors live kernel).
-            let synth_bid = ab / ba;
-            let synth_ask = aa / bb;
-            if !(synth_bid.is_finite() && synth_ask.is_finite()
-                && synth_bid > 0.0 && synth_ask > 0.0) {
-                continue;
-            }
-            let mid = (synth_bid + synth_ask) * 0.5;
+        // GATED reconstruction: feed the leg tick through the shared state
+        // machine with now_ms = this tick's ts (purely leg-to-leg TTL, never
+        // replay-clock drift — identical to backfill pass B). A synth tick is
+        // pushed ONLY when both legs are live, within TTL, and pass conf/sanity.
+        if let Some(synth_rec) = merge_state.feed_leg_tick(&rec, ts) {
+            let body = synth_rec.index;
+            let mid = (body.bid + body.ask) * 0.5;
             // Full-tick synth path point (the calibration tick stream). The leg
             // merge is monotone-ascending in ts (both legs are ts-ordered and we
             // always advance the earlier side), so push preserves path order.
@@ -1211,5 +1219,164 @@ mod tests {
         let bytes = MAX_PRERESERVE_TICKS * core::mem::size_of::<(i64, f64)>();
         assert_eq!(core::mem::size_of::<(i64, f64)>(), 16);
         assert!(bytes <= 1_100_000_000, "capped reservation {} B > ~1 GiB", bytes);
+    }
+
+    // ── §5 PARITY GUARD (RCA #1763) ─────────────────────────────────────────
+    // Regression test: calibrate's synth reconstruction must produce the
+    // BYTE-IDENTICAL gated synth tick sequence the backfill driver produces.
+    // Both now drive `nxr_sdk::synth::SynthReplayState::feed_leg_tick` over the
+    // same ts-ascending leg merge (tie → base), with now_ms = inbound tick ts.
+    // The historical bug: calibrate merged the legs UNGATED → it counted synth
+    // crossings during stale-leg / low-conf windows that the gated backfill
+    // stream never emits → k fit on a denser stream than applied → median bpd
+    // collapse. This test fails if the two reconstructions ever diverge again.
+
+    use mitch::header::MitchHeader;
+    use mitch::index::Index;
+
+    const T_BASE_ID: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+    const T_QUOTE_ID: u64 = 0xBBBB_BBBB_BBBB_BBBB;
+    const T_SYNTH_ID: u64 = 0xCCCC_CCCC_CCCC_CCCC;
+
+    fn mk_rec(ticker: u64, bid: f64, ask: f64, conf: u8, ts_ms: i64) -> IndexRecord {
+        let mts = timestamp::from_epoch_ms(ts_ms);
+        let header = MitchHeader::new(mitch::common::message_type::INDEX, 1, mts, 1);
+        let idx = Index {
+            ticker,
+            bid,
+            ask,
+            vbid: 100,
+            vask: 100,
+            ci: 0,
+            tick_count: 1,
+            confidence: conf,
+            accepted: conf,
+            rejected: 0,
+            flags: 0,
+        };
+        IndexRecord::new(header, idx)
+    }
+
+    /// Drive a state machine the way CALIBRATE does (in-line ts-merge of two
+    /// look-ahead slots; tie favors base; feed with now_ms = inbound ts;
+    /// collect `(ts, mid)` only on a gated `Some`). Mirrors the loop in
+    /// `calibrate_one_synth` exactly — kept in lock-step with it.
+    fn reconstruct_calibrate(base: &[IndexRecord], quote: &[IndexRecord]) -> Vec<(i64, f64)> {
+        let to_slot = |r: &IndexRecord| (timestamp::to_epoch_ms(r.header.get_timestamp()), r.clone());
+        let mut bi = base.iter();
+        let mut qi = quote.iter();
+        let mut a_next = bi.next().map(to_slot);
+        let mut b_next = qi.next().map(to_slot);
+        let mut st = nxr_sdk::synth::SynthReplayState::new(T_SYNTH_ID, T_BASE_ID, T_QUOTE_ID);
+        let mut out = Vec::new();
+        loop {
+            let take_a = match (&a_next, &b_next) {
+                (Some(a), Some(b)) => a.0 <= b.0,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let (ts, rec) = if take_a {
+                let cur = a_next.take().unwrap();
+                a_next = bi.next().map(to_slot);
+                cur
+            } else {
+                let cur = b_next.take().unwrap();
+                b_next = qi.next().map(to_slot);
+                cur
+            };
+            if let Some(s) = st.feed_leg_tick(&rec, ts) {
+                let b = s.index;
+                out.push((ts, (b.bid + b.ask) * 0.5));
+            }
+        }
+        out
+    }
+
+    /// Drive the SAME state machine the way BACKFILL pass B does: `merge_pop`
+    /// (peek both, pop older, tie → base) then `feed_leg_tick(rec, rec_ts_ms)`.
+    fn reconstruct_backfill(base: &[IndexRecord], quote: &[IndexRecord]) -> Vec<(i64, f64)> {
+        let mut bi = base.iter().peekable();
+        let mut qi = quote.iter().peekable();
+        let ts_of = |r: &IndexRecord| timestamp::to_epoch_ms(r.header.get_timestamp());
+        let mut st = nxr_sdk::synth::SynthReplayState::new(T_SYNTH_ID, T_BASE_ID, T_QUOTE_ID);
+        let mut out = Vec::new();
+        loop {
+            let rec = match (bi.peek(), qi.peek()) {
+                (None, None) => break,
+                (Some(_), None) => bi.next().unwrap(),
+                (None, Some(_)) => qi.next().unwrap(),
+                (Some(b), Some(q)) => {
+                    if ts_of(b) <= ts_of(q) { bi.next().unwrap() } else { qi.next().unwrap() }
+                }
+            };
+            let ts = ts_of(rec);
+            if let Some(s) = st.feed_leg_tick(rec, ts) {
+                let b = s.index;
+                out.push((ts, (b.bid + b.ask) * 0.5));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn calibrate_backfill_reconstruction_parity() {
+        // 16 ms grid (above mts 16 us granularity) so ms round-trips exactly.
+        let t0: i64 = 1_700_000_000_000;
+        let s: i64 = 16;
+        // Interleaved legs with a deliberate STALE window: quote goes silent
+        // from t0+2s..t0+9s (> 5 s TTL) while base keeps ticking. An ungated
+        // merge would emit a synth on every base tick in that window; the gate
+        // must drop them — and BOTH paths must drop the SAME ones.
+        let base = vec![
+            mk_rec(T_BASE_ID, 3000.0, 3001.0, 3, t0 + 1 * s),
+            mk_rec(T_BASE_ID, 3002.0, 3003.0, 3, t0 + 2_000),
+            mk_rec(T_BASE_ID, 3004.0, 3005.0, 3, t0 + 4_000), // quote stale > 5s? no (gap 2s)
+            mk_rec(T_BASE_ID, 3006.0, 3007.0, 3, t0 + 8_000), // quote (t0+1) stale by 8s ⇒ drop
+            mk_rec(T_BASE_ID, 3008.0, 3009.0, 3, t0 + 10_000),
+            // low-confidence leg → sanity/conf gate drop:
+            mk_rec(T_BASE_ID, 3010.0, 3011.0, 0, t0 + 12_000),
+            mk_rec(T_BASE_ID, 3012.0, 3013.0, 3, t0 + 14_000),
+        ];
+        let quote = vec![
+            mk_rec(T_QUOTE_ID, 60_000.0, 60_010.0, 3, t0 + 1 * s),
+            mk_rec(T_QUOTE_ID, 60_002.0, 60_012.0, 3, t0 + 2_000),
+            mk_rec(T_QUOTE_ID, 60_004.0, 60_014.0, 3, t0 + 9_000),
+            mk_rec(T_QUOTE_ID, 60_006.0, 60_016.0, 3, t0 + 11_000),
+            mk_rec(T_QUOTE_ID, 60_008.0, 60_018.0, 3, t0 + 13_000),
+            mk_rec(T_QUOTE_ID, 60_010.0, 60_020.0, 3, t0 + 15_000),
+        ];
+
+        let cal = reconstruct_calibrate(&base, &quote);
+        let bkf = reconstruct_backfill(&base, &quote);
+        assert_eq!(cal, bkf, "calibrate vs backfill gated reconstruction MUST be byte-identical");
+
+        // Guard the gate actually fired: an UNGATED merge (old calibrate bug)
+        // emits strictly MORE synth ticks than the gated path. If this ever
+        // becomes equal, the TTL/conf gate has been removed from calibrate.
+        let ungated = {
+            let mut bi = base.iter().peekable();
+            let mut qi = quote.iter().peekable();
+            let ts_of = |r: &IndexRecord| timestamp::to_epoch_ms(r.header.get_timestamp());
+            let (mut lb, mut lq): (Option<Index>, Option<Index>) = (None, None);
+            let mut n = 0usize;
+            loop {
+                let rec = match (bi.peek(), qi.peek()) {
+                    (None, None) => break,
+                    (Some(_), None) => bi.next().unwrap(),
+                    (None, Some(_)) => qi.next().unwrap(),
+                    (Some(b), Some(q)) => if ts_of(b) <= ts_of(q) { bi.next().unwrap() } else { qi.next().unwrap() },
+                };
+                if rec.index.ticker == T_BASE_ID { lb = Some(rec.index); } else { lq = Some(rec.index); }
+                if let (Some(b), Some(q)) = (lb, lq) {
+                    let bid = b.bid / q.ask;
+                    let ask = b.ask / q.bid;
+                    if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 { n += 1; }
+                }
+            }
+            n
+        };
+        assert!(ungated > cal.len(),
+            "gate must prune stale/low-conf ticks: ungated={} gated={}", ungated, cal.len());
     }
 }
