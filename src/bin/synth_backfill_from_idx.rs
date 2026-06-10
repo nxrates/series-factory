@@ -220,81 +220,10 @@ struct Args {
 // Sync replay state machines
 // ─────────────────────────────────────────────────────────────────────────
 
-/// One synth pair's leg-merge state. Sync sibling of
-/// `core::synth_kernel::PairState`.
-struct SynthReplayState {
-    synth_id: u64,
-    base_id: u64,
-    quote_id: u64,
-    last_base: Option<(Index, i64)>,
-    last_quote: Option<(Index, i64)>,
-    /// Wrapping monotonic sequence stamped on emitted synth headers.
-    seq: u16,
-    /// Counters surfaced by the side-car benchmark JSON.
-    pub emit_count: u64,
-    pub stale_drop_count: u64,
-}
-
-impl SynthReplayState {
-    fn new(synth_id: u64, base_id: u64, quote_id: u64) -> Self {
-        Self {
-            synth_id,
-            base_id,
-            quote_id,
-            last_base: None,
-            last_quote: None,
-            seq: 0,
-            emit_count: 0,
-            stale_drop_count: 0,
-        }
-    }
-
-    /// Feed one leg tick. Returns the synth `IndexRecord` if a synth emit is
-    /// warranted (both legs live, both within TTL, sanity gates pass).
-    ///
-    /// `now_ms` is the wall-clock the live kernel would have seen — for
-    /// replay we pass the tick's own `ts_ms` (so the TTL gate is purely a
-    /// function of leg-to-leg staleness, never of replay-clock drift).
-    fn feed_leg_tick(&mut self, rec: &IndexRecord, now_ms: i64) -> Option<IndexRecord> {
-        // Copy ticker out of the packed body before comparing.
-        let ticker = rec.index.ticker;
-        let is_base = ticker == self.base_id;
-        let is_quote = ticker == self.quote_id;
-        if !is_base && !is_quote {
-            return None;
-        }
-        let ts_ms = {
-            let header = rec.header;
-            timestamp::to_epoch_ms(header.get_timestamp())
-        };
-
-        if is_base {
-            self.last_base = Some((rec.index, ts_ms));
-        } else {
-            self.last_quote = Some((rec.index, ts_ms));
-        }
-
-        let (base, base_ts) = self.last_base?;
-        let (quote, quote_ts) = self.last_quote?;
-
-        // All math + gates live in `nxr_sdk::synth::replay::compute_synth_index`
-        // (single source for live kernel + offline replay — W4 consolidation).
-        // The compute helper folds TTL + sanity drops together; we count any
-        // None as a stale-drop here (matches the live kernel's semantics).
-        let synth_rec = match nxr_sdk::synth::compute_synth_index(
-            &base, &quote, base_ts, quote_ts, now_ms, self.synth_id, self.seq,
-        ) {
-            Some(r) => r,
-            None => {
-                self.stale_drop_count += 1;
-                return None;
-            }
-        };
-        self.seq = self.seq.wrapping_add(1);
-        self.emit_count += 1;
-        Some(synth_rec)
-    }
-}
+// `SynthReplayState` (the gated two-leg merge) now lives in the sdk so the
+// calibrator and this backfill driver share one byte-identical reconstruction
+// (methodology §5, hist==live). Sync sibling of `core::synth_kernel::PairState`.
+use nxr_sdk::synth::SynthReplayState;
 
 /// Sync s10 producer. Sibling of `core::bars_s10_synth::TickerState`.
 struct SynthS10State {
