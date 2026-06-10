@@ -33,11 +33,13 @@
 //! emitted leg tick, update the matching `last_base` / `last_quote` slot;
 //! if both slots are live and within the 5 s TTL gate (same rule as
 //! `synth_kernel::LEG_STALE_TTL_MS`), compute the conservative-bid/ask
-//! `IndexRecord` and feed it to two stripped-down sync state machines —
-//! one for s10 (`SynthS10State`), one for renko (`SynthRenkoState`). On
-//! UTC-day boundaries we flush the s10 bar of the closing window and let
-//! `BarShardWriter` rotate the daily shard file. The renko machine
-//! emits bricks lazily on price-cross.
+//! `IndexRecord` and feed it to a stripped-down sync s10 state machine
+//! (`SynthS10State`) in pass A, then to the SHARED `nxr_sdk::renko::
+//! RenkoGenerator` engine in pass B (σ from the canonical RS-over-s10
+//! `.vol` basis — see "σ basis" on `run_pair`). On UTC-day boundaries we
+//! flush the s10 bar of the closing window and let `BarShardWriter`
+//! rotate the daily shard file. The renko engine emits bricks lazily on
+//! price-cross.
 //!  · Memory: O(1) per pair — three `Index` snapshots, one
 //!    `BarAccumulator`, one renko state machine. Independent of total
 //!    history length.
@@ -93,12 +95,16 @@
 //! The Cargo workspace explicitly excludes `series-factory` (workspace root
 //! Cargo.toml: `exclude = ["series-factory", "mitch/impl/rust"]`). So
 //! `series-factory` *cannot* `use core::synth_kernel::PairState` even if we
-//! wanted to. The right shared home is a future `synth_replay.rs` module
-//! that lives in a crate both sides depend on (likely `nxr-sdk`). That's a
-//! separate refactor; P3's brief asks for the offline driver, not a
-//! cross-crate API redesign. The math here is a faithful — line-for-line —
-//! adaptation of `core/src/synth_kernel.rs::PairState::on_record` +
-//! `core/src/bars_renko_synth.rs::TickerState::on_record`.
+//! wanted to. The shared math now lives in crates both sides depend on:
+//! synth quote composition in `nxr_sdk::synth::compute_synth_index` (used by
+//! the live kernel AND this driver), renko brick math in
+//! `nxr_sdk::renko::RenkoGenerator` (the ONE engine: live
+//! `core/src/bars_renko.rs`, offline `renko_from_idx.rs`, calibrator, and
+//! this driver), and the σ basis in
+//! `series_factory::bar_construction::build_vol_from_s10` (RS over the
+//! persisted s10 shards — identical to `nxr_calibrate` + the live
+//! `LiveVolRing`). Only the s10 sync accumulator remains a local adaptation
+//! of `core/src/bars_s10.rs::TickerState`.
 //!
 //! ──────────────────────────────────────────────────────────────────────────
 //! Side-car σ benchmark
@@ -131,12 +137,18 @@ use mitch::index::Index;
 use mitch::timestamp;
 use nxr_sdk::bar_builder::BarAccumulator;
 use nxr_sdk::ipc::record::IndexRecord;
-use nxr_sdk::renko::{K_FLOOR, MAX_BRICKS_PER_TICK, MIN_BRICK_PCT, MULT_UPPER_BOUND};
+use nxr_sdk::renko::{
+    K_FLOOR, MAX_BRICKS_PER_TICK, MIN_BRICK_PCT, MULT_UPPER_BOUND, RenkoConfig,
+    RenkoGenerator, SIGMA_FALLBACK,
+};
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, shard_path, BarShardWriter, ShardStream,
     BAR_MS_S10 as BAR_MS, MS_PER_DAY,
 };
 use nxr_sdk::tdwap::decode_ci_ubp;
+use nxr_sdk::vol::{MtfVolCalculator, VolConfig, VolSource};
+use series_factory::bar_construction::{build_vol_from_s10, S10ShardIter};
+use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -149,9 +161,6 @@ use tracing::{info, warn};
 #[allow(unused_imports)]
 use nxr_sdk::synth::{LEG_STALE_TTL_MS, SYNTH_KERNEL_PROVIDER_ID};
 
-/// Renko σ-EMA alpha. Matches `core::bars_renko_synth::SIGMA_EMA_ALPHA`.
-const SIGMA_EMA_ALPHA: f64 = 1.0 / (28.0 * 1800.0);
-
 // ─────────────────────────────────────────────────────────────────────────
 // CLI
 // ─────────────────────────────────────────────────────────────────────────
@@ -162,7 +171,9 @@ const SIGMA_EMA_ALPHA: f64 = 1.0 / (28.0 * 1800.0);
              <data>/bars/<synth_id>/<D>.{s10,renko} shards the live synth producer writes."
 )]
 struct Args {
-    /// Path to nxrates.yml — currently unread (reserved for future overrides).
+    /// Path to nxrates.yml — supplies `series.vol` + `series.renko.min_pct`
+    /// (the σ-blend + brick-floor cfg; MUST match the calibrator's YAML) and
+    /// `synths.initial_pairs` for `--all`.
     #[arg(long)]
     config: PathBuf,
 
@@ -371,161 +382,13 @@ impl SynthS10State {
     }
 }
 
-/// Sync renko producer. Sibling of `core::bars_renko_synth::TickerState`.
-struct SynthRenkoState {
-    sigma_ema: f64,
-    k: f64,
-    brick_size: f64,
-    last_close: f64,
-    acc: BarAccumulator,
-    bar_open_ms: i64,
-    prev_mid: f64,
-    initialized: bool,
-}
-
-impl SynthRenkoState {
-    fn new(initial_k: f64, last_close: f64) -> Self {
-        let initialized = last_close > 0.0;
-        Self {
-            sigma_ema: 0.0,
-            k: initial_k,
-            brick_size: 0.0,
-            last_close,
-            acc: BarAccumulator::new(),
-            bar_open_ms: 0,
-            prev_mid: 0.0,
-            initialized,
-        }
-    }
-
-    fn recompute_brick_size(&mut self, ref_price: f64) {
-        let k_eff = self.k.max(K_FLOOR);
-        let raw_pct = k_eff * self.sigma_ema;
-        let pct = if raw_pct.is_finite() {
-            raw_pct.max(MIN_BRICK_PCT)
-        } else {
-            MIN_BRICK_PCT
-        };
-        self.brick_size = ref_price * pct;
-    }
-
-    /// Feed one synth tick. Returns the (possibly multi-brick) emit list.
-    fn feed_synth_tick(&mut self, rec: &IndexRecord) -> Vec<Bar> {
-        let body = rec.index;
-        let header = rec.header;
-        let ts_ms = timestamp::to_epoch_ms(header.get_timestamp());
-        let bid = body.bid;
-        let ask = body.ask;
-        let mid = (bid + ask) * 0.5;
-        if !mid.is_finite() || mid <= 0.0 {
-            return Vec::new();
-        }
-
-        // σ-EMA on log-returns of the synth mid (matches live).
-        if self.prev_mid > 0.0 {
-            let r = (mid / self.prev_mid).ln();
-            if r.is_finite() {
-                let abs_r = r.abs();
-                if self.sigma_ema == 0.0 {
-                    self.sigma_ema = abs_r;
-                } else {
-                    self.sigma_ema =
-                        self.sigma_ema * (1.0 - SIGMA_EMA_ALPHA) + abs_r * SIGMA_EMA_ALPHA;
-                }
-            }
-        }
-        self.prev_mid = mid;
-
-        if !self.initialized {
-            self.last_close = mid;
-            self.recompute_brick_size(mid);
-            self.initialized = true;
-            self.bar_open_ms = ts_ms;
-            self.acc.ingest(
-                bid,
-                ask,
-                body.vbid,
-                body.vask,
-                ts_ms,
-                decode_ci_ubp(body.ci),
-                body.accepted as u32,
-                body.rejected as u32,
-            );
-            return Vec::new();
-        }
-
-        if self.brick_size <= 0.0 {
-            self.recompute_brick_size(mid);
-        }
-        if self.bar_open_ms == 0 {
-            self.bar_open_ms = ts_ms;
-        }
-        self.acc.ingest(
-            bid,
-            ask,
-            body.vbid,
-            body.vask,
-            ts_ms,
-            decode_ci_ubp(body.ci),
-            body.accepted as u32,
-            body.rejected as u32,
-        );
-
-        let mut out = Vec::new();
-        let mut bricks_this_tick = 0usize;
-        loop {
-            if self.brick_size <= 0.0 || !self.brick_size.is_finite() {
-                break;
-            }
-            if bricks_this_tick >= MAX_BRICKS_PER_TICK {
-                break;
-            }
-            if mid - self.last_close >= self.brick_size {
-                let new_close = self.last_close + self.brick_size;
-                out.push(self.emit_brick(new_close, true, ts_ms));
-                self.recompute_brick_size(new_close);
-                bricks_this_tick += 1;
-                continue;
-            }
-            if self.last_close - mid >= self.brick_size {
-                let new_close = self.last_close - self.brick_size;
-                out.push(self.emit_brick(new_close, false, ts_ms));
-                self.recompute_brick_size(new_close);
-                bricks_this_tick += 1;
-                continue;
-            }
-            break;
-        }
-        out
-    }
-
-    fn emit_brick(&mut self, new_close: f64, is_up: bool, close_ms: i64) -> Bar {
-        let open = self.last_close;
-        let (high, low) = if is_up {
-            (new_close, open)
-        } else {
-            (open, new_close)
-        };
-        let mut bar = match self.acc.flush() {
-            Some(b) => b,
-            None => {
-                let mts = timestamp::from_epoch_ms(close_ms);
-                Bar::new_ohlcv(mts, mts, open, high, low, new_close, 0, 0, 0)
-            }
-        };
-        bar.open = open;
-        bar.high = high;
-        bar.low = low;
-        bar.close = new_close;
-        bar.open_ts = timestamp::encode_u48(timestamp::from_epoch_ms(self.bar_open_ms));
-        bar.close_ts = timestamp::encode_u48(timestamp::from_epoch_ms(close_ms));
-        bar.kind = BarKind::Renko as u8;
-
-        self.last_close = new_close;
-        self.bar_open_ms = close_ms;
-        bar
-    }
-}
+// NOTE (brick-storm RCA, 2026-06-10): the former `SynthRenkoState` — a local
+// per-tick |log-return| σ-EMA + hand-rolled brick loop — was DELETED. Its σ
+// basis was a per-tick-horizon estimate ~100-300× smaller than the 30-min
+// Rogers-Satchell σ the calibrator fits k against, so backfilled synth renko
+// over-emitted ~330× (33k bpd vs 100 target on every cross). The renko pass
+// now drives the SHARED `nxr_sdk::renko::RenkoGenerator` with σ from the
+// canonical RS-over-s10 `.vol` basis — see `run_pair` pass B.
 
 // ─────────────────────────────────────────────────────────────────────────
 // Two-stream event-time merge
@@ -687,6 +550,18 @@ fn ym(d: NaiveDate) -> String {
 /// from `ticker-params.json`. `None` → renko backfill is skipped for this
 /// pair (`feedback_no_k_fallback`: "skip day if calibrate fails; never
 /// bootstrap k=0.075"). The s10 pass is independent of k and still runs.
+///
+/// ## σ basis — one engine, one σ (brick-storm RCA, 2026-06-10)
+///
+/// Two passes. Pass A replays the leg merge into `.s10` shards. Pass B builds
+/// the σ basis FROM those persisted `.s10` shards via the canonical
+/// RS-over-s10 builder (`build_vol_from_s10` → `MtfVolCalculator`) — the
+/// IDENTICAL σ `nxr_calibrate::calibrate_one_synth` fits k against and the
+/// live producer's `LiveVolRing` reads (`docs/renko-methodology.md` §5) — and
+/// drives the SHARED `RenkoGenerator` engine over a second leg-merge replay.
+/// `vol_cfg` + `renko_min_pct` come from the same pipeline YAML the
+/// calibrator reads (`series.vol` / `series.renko.min_pct`).
+#[allow(clippy::too_many_arguments)]
 fn run_pair(
     data_root: &Path,
     base_sym: &str,
@@ -697,6 +572,8 @@ fn run_pair(
     bars: BarKindMask,
     force: bool,
     k: Option<f64>,
+    vol_cfg: &VolConfig,
+    renko_min_pct: f32,
 ) -> Result<PairBackfillStats> {
     let base_id = resolve_symbol(base_sym);
     let quote_id = resolve_symbol(quote_sym);
@@ -770,97 +647,77 @@ fn run_pair(
         );
     }
 
-    // ── Output writers — opened lazily once we know we'll write ─────────────
-    let mut s10_writer: Option<BarShardWriter> = if bars.s10 {
-        Some(BarShardWriter::open_with(data_root, synth_id, "s10", true)?)
-    } else {
-        None
-    };
-    let mut renko_writer: Option<BarShardWriter> = if renko_enabled {
-        Some(BarShardWriter::open_with(data_root, synth_id, "renko", true)?)
-    } else {
-        None
-    };
-
-    // ── Replay state, carried across days for sigma-EMA continuity ──────────
-    let mut merge_state = SynthReplayState::new(synth_id, base_id, quote_id);
-    let mut s10_state = SynthS10State::new(0.0);
-    // `k.unwrap_or(0.0)` is harmless ∵ renko_enabled gates writes; the state
-    // is only constructed because it carries σ-EMA continuity across days.
-    let mut renko_state = SynthRenkoState::new(k.unwrap_or(0.0), 0.0);
     let mut stats = PairBackfillStats::default();
 
-    for d in &intersect_dates {
-        let d_start = day_start_ms(*d);
-        let d_end = d_start + MS_PER_DAY;
+    // ═══ PASS A — s10 bars (+ σ-benchmark sampling) ═════════════════════════
+    // Must run BEFORE the renko pass: the renko σ basis is built from these
+    // persisted `.s10` shards (calibrator / live-producer parity).
+    if bars.s10 {
+        let mut s10_writer = BarShardWriter::open_with(data_root, synth_id, "s10", true)?;
+        let mut merge_state = SynthReplayState::new(synth_id, base_id, quote_id);
+        let mut s10_state = SynthS10State::new(0.0);
 
-        // Idempotency gate (per-day, per-bar-kind). If BOTH selected outputs
-        // already have records, skip this day unless --force.
-        let s10_path = shard_path(&bars_directory, *d, "s10");
-        let renko_path = shard_path(&bars_directory, *d, "renko");
-        let s10_already = bars.s10
-            && s10_path.exists()
-            && std::fs::metadata(&s10_path).map(|m| m.len()).unwrap_or(0) > 0;
-        let renko_already = renko_enabled
-            && renko_path.exists()
-            && std::fs::metadata(&renko_path).map(|m| m.len()).unwrap_or(0) > 0;
-        let need_s10 = bars.s10 && !s10_already;
-        let need_renko = renko_enabled && !renko_already;
-        if !force && !need_s10 && !need_renko {
-            stats.days_skipped += 1;
-            eprintln!(
-                "skip   synth={} date={} reason=existing_shards s10={} renko={}",
-                synth_sym, d, s10_already, renko_already
-            );
-            continue;
-        }
-        if force {
-            if bars.s10 && s10_path.exists() {
+        for d in &intersect_dates {
+            let d_start = day_start_ms(*d);
+            let d_end = d_start + MS_PER_DAY;
+
+            // Idempotency gate (per-day). Skip if the s10 shard already has
+            // records unless --force.
+            let s10_path = shard_path(&bars_directory, *d, "s10");
+            let s10_already = s10_path.exists()
+                && std::fs::metadata(&s10_path).map(|m| m.len()).unwrap_or(0) > 0;
+            if !force && s10_already {
+                stats.days_skipped += 1;
+                eprintln!(
+                    "skip   synth={} date={} reason=existing_s10_shard",
+                    synth_sym, d
+                );
+                continue;
+            }
+            if force && s10_path.exists() {
                 let _ = std::fs::remove_file(&s10_path);
             }
-            if renko_enabled && renko_path.exists() {
-                let _ = std::fs::remove_file(&renko_path);
-            }
-        }
 
-        // Open both legs for this day.
-        let base_path = base_shards.get(d).unwrap();
-        let quote_path = quote_shards.get(d).unwrap();
-        let mut base_stream = PeekStream::open(base_path)?;
-        let mut quote_stream = PeekStream::open(quote_path)?;
+            // Open both legs for this day.
+            let mut base_stream = PeekStream::open(base_shards.get(d).unwrap())?;
+            let mut quote_stream = PeekStream::open(quote_shards.get(d).unwrap())?;
 
-        let mut day_ticks_in_merge: u64 = 0;
-        let mut day_synth_emits: u64 = 0;
-        let mut s10_today: u64 = 0;
-        let mut renko_today: u64 = 0;
-        let mut sample_buf: BTreeMap<i64, f64> = BTreeMap::new(); // 30-min last mid
+            let mut day_ticks_in_merge: u64 = 0;
+            let mut day_synth_emits: u64 = 0;
+            let mut s10_today: u64 = 0;
+            let mut sample_buf: BTreeMap<i64, f64> = BTreeMap::new(); // 30-min last mid
 
-        loop {
-            let Some((rec, _was_base)) = merge_pop(&mut base_stream, &mut quote_stream)? else {
-                break;
-            };
-            let rec_ts_ms = {
-                let h = rec.header;
-                timestamp::to_epoch_ms(h.get_timestamp())
-            };
-            // Defensive: ignore records that escaped the per-day shard window.
-            if rec_ts_ms < d_start || rec_ts_ms >= d_end {
-                continue;
-            }
-            day_ticks_in_merge += 1;
+            loop {
+                let Some((rec, _was_base)) = merge_pop(&mut base_stream, &mut quote_stream)?
+                else {
+                    break;
+                };
+                // SEAM PARITY: skip heartbeat sentinels exactly like the live
+                // producers (bars_s10.rs / bars_renko.rs) and the calibrator's
+                // LegStream — liveness beacons, not real mid moves.
+                if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                    continue;
+                }
+                let rec_ts_ms = {
+                    let h = rec.header;
+                    timestamp::to_epoch_ms(h.get_timestamp())
+                };
+                // Defensive: ignore records that escaped the per-day shard window.
+                if rec_ts_ms < d_start || rec_ts_ms >= d_end {
+                    continue;
+                }
+                day_ticks_in_merge += 1;
 
-            let now_ms = rec_ts_ms;
-            let Some(synth_rec) = merge_state.feed_leg_tick(&rec, now_ms) else {
-                continue;
-            };
-            day_synth_emits += 1;
+                let Some(synth_rec) = merge_state.feed_leg_tick(&rec, rec_ts_ms) else {
+                    continue;
+                };
+                day_synth_emits += 1;
 
-            // 30-min last-mid sample for the σ benchmark sidecar.
-            let mid = (synth_rec.index.bid + synth_rec.index.ask) * 0.5;
-            let bin = (rec_ts_ms / 1_800_000) * 1_800_000;
-            sample_buf.insert(bin, mid);
+                // 30-min last-mid sample for the σ benchmark sidecar.
+                let mid = (synth_rec.index.bid + synth_rec.index.ask) * 0.5;
+                let bin = (rec_ts_ms / 1_800_000) * 1_800_000;
+                sample_buf.insert(bin, mid);
 
-            if need_s10 {
                 if let Some(bar) = s10_state.feed_synth_tick(&synth_rec) {
                     // Only write bars whose open_ts is in this day. The s10
                     // bucket aligns to BAR_MS, so a flushed bar can belong to
@@ -868,67 +725,217 @@ fn run_pair(
                     // start time falling inside [d_start, d_end).
                     let open_ms = bar.open_time_ms();
                     if open_ms >= d_start && open_ms < d_end {
-                        if let Some(w) = s10_writer.as_mut() {
-                            w.append(&bar)?;
-                            s10_today += 1;
-                        }
-                    }
-                }
-            }
-            if need_renko {
-                for bar in renko_state.feed_synth_tick(&synth_rec) {
-                    let open_ms = bar.open_time_ms();
-                    if open_ms >= d_start && open_ms < d_end {
-                        if let Some(w) = renko_writer.as_mut() {
-                            w.append(&bar)?;
-                            renko_today += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // End-of-day s10 flush — close the trailing bucket.
-        if need_s10 {
-            if let Some(bar) = s10_state.finalize() {
-                let open_ms = bar.open_time_ms();
-                if open_ms >= d_start && open_ms < d_end {
-                    if let Some(w) = s10_writer.as_mut() {
-                        w.append(&bar)?;
+                        s10_writer.append(&bar)?;
                         s10_today += 1;
                     }
                 }
             }
-        }
-        if let Some(w) = s10_writer.as_mut() {
-            w.flush()?;
-        }
-        if let Some(w) = renko_writer.as_mut() {
-            w.flush()?;
-        }
 
-        // Roll per-day counters into the pair-wide + monthly view.
-        stats.days_processed += 1;
-        stats.synth_ticks_emitted += day_synth_emits;
-        stats.synth_ticks_dropped_stale += merge_state.stale_drop_count;
-        merge_state.stale_drop_count = 0;
-        stats.s10_bars_written += s10_today;
-        stats.renko_bars_written += renko_today;
-        let mk = ym(*d);
-        let entry = stats.monthly.entry(mk).or_default();
-        entry.days_processed += 1;
-        entry.synth_ticks_emitted += day_synth_emits;
+            // End-of-day s10 flush — close the trailing bucket.
+            if let Some(bar) = s10_state.finalize() {
+                let open_ms = bar.open_time_ms();
+                if open_ms >= d_start && open_ms < d_end {
+                    s10_writer.append(&bar)?;
+                    s10_today += 1;
+                }
+            }
+            s10_writer.flush()?;
 
-        stats
-            .daily_30min_mids
-            .entry(*d)
-            .or_default()
-            .extend(sample_buf.values().copied());
+            // Roll per-day counters into the pair-wide + monthly view.
+            stats.days_processed += 1;
+            stats.synth_ticks_emitted += day_synth_emits;
+            stats.synth_ticks_dropped_stale += merge_state.stale_drop_count;
+            merge_state.stale_drop_count = 0;
+            stats.s10_bars_written += s10_today;
+            let entry = stats.monthly.entry(ym(*d)).or_default();
+            entry.days_processed += 1;
+            entry.synth_ticks_emitted += day_synth_emits;
 
-        eprintln!(
-            "synth  pair={} date={} ticks_in={} synth_emit={} s10={} renko={}",
-            synth_sym, d, day_ticks_in_merge, day_synth_emits, s10_today, renko_today
-        );
+            stats
+                .daily_30min_mids
+                .entry(*d)
+                .or_default()
+                .extend(sample_buf.values().copied());
+
+            eprintln!(
+                "synth  pair={} date={} ticks_in={} synth_emit={} s10={}",
+                synth_sym, d, day_ticks_in_merge, day_synth_emits, s10_today
+            );
+        }
+    }
+
+    // ═══ PASS B — renko bricks (shared engine, canonical σ) ═════════════════
+    // σ basis + brick engine are the calibrator's / live producer's — NOT a
+    // local re-implementation. Replays the leg merge a second time so the
+    // brick path is the FULL synth tick stream, the same granularity
+    // `calibrate_one_synth` fit k on (2026-06-06 brick-storm RCA).
+    if renko_enabled {
+        let s10_shards_for_vol = list_shards(&bars_directory, "s10").unwrap_or_default();
+        if s10_shards_for_vol.is_empty() {
+            warn!(
+                synth = synth_sym,
+                dir = %bars_directory.display(),
+                "no synth .s10 shards — σ basis unavailable; skipping renko pass \
+                 (run with --bars s10 first; vol basis MUST match live/calibrator)"
+            );
+        } else {
+            // Build the `.vol` from the persisted synth `.s10` shards via the
+            // canonical RS-over-s10 builder — byte-identical to
+            // `nxr_calibrate::calibrate_one_synth` + `renko_from_idx`.
+            let vol_path = bars_directory.join("_synth_backfill.vol");
+            {
+                let mut vol_writer = VolWriter::new(&vol_path)?;
+                let mut s10_iter = S10ShardIter::new(s10_shards_for_vol);
+                let n_vol = build_vol_from_s10(|| s10_iter.next_bar(), vol_cfg, &mut vol_writer)?;
+                vol_writer.finish()?;
+                info!(synth = synth_sym, vol_records = n_vol, "synth vol basis built (RS over persisted .s10)");
+            }
+            {
+                let vol_mmap = VolMmap::open(&vol_path)?;
+                let sigma_cache = {
+                    let mut calc = MtfVolCalculator::new(&vol_mmap, vol_cfg.clone());
+                    calc.precompute_sigma_cache()
+                };
+                let sigma_at = |ts_ms: i64| -> f64 {
+                    let mts = timestamp::from_epoch_ms(ts_ms);
+                    let i = vol_mmap.find_index_for_mts(mts);
+                    sigma_cache.get(i).copied().unwrap_or(SIGMA_FALLBACK)
+                };
+
+                let cfg = RenkoConfig {
+                    multiplier: k.expect("renko_enabled gates on k") as f32,
+                    min_pct: renko_min_pct,
+                };
+                cfg.validate()?;
+                let mut generator = RenkoGenerator::new(cfg)?;
+                let mut renko_writer =
+                    BarShardWriter::open_with(data_root, synth_id, "renko", true)?;
+
+                // Warm-seed brick continuity for a trailing gap-fill (live
+                // restart parity, `bars_renko.rs::TickerState::new`): only when
+                // the existing renko tail closes at/before the first day we
+                // will actually process (a mid-range gap must NOT anchor to a
+                // far-future tail).
+                if !force {
+                    let first_proc = intersect_dates.iter().find(|d| {
+                        let p = shard_path(&bars_directory, **d, "renko");
+                        !(p.exists()
+                            && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > 0)
+                    });
+                    if let (Some(first_d), Ok(Some(tail))) =
+                        (first_proc, renko_writer.last_bar())
+                    {
+                        if tail.close > 0.0
+                            && tail.close.is_finite()
+                            && tail.close_time_ms() <= day_start_ms(*first_d)
+                        {
+                            generator.seed_last_close(tail.close);
+                        }
+                    }
+                }
+
+                let mut merge_state = SynthReplayState::new(synth_id, base_id, quote_id);
+                let mut pending: Vec<Bar> = Vec::with_capacity(MAX_BRICKS_PER_TICK);
+                // When pass A already ran, day/tick stats were counted there;
+                // count here only on a renko-only invocation.
+                let count_stats = !bars.s10;
+
+                for d in &intersect_dates {
+                    let d_start = day_start_ms(*d);
+                    let d_end = d_start + MS_PER_DAY;
+                    let renko_path = shard_path(&bars_directory, *d, "renko");
+                    let renko_already = renko_path.exists()
+                        && std::fs::metadata(&renko_path).map(|m| m.len()).unwrap_or(0) > 0;
+                    if !force && renko_already {
+                        if count_stats {
+                            stats.days_skipped += 1;
+                        }
+                        eprintln!(
+                            "skip   synth={} date={} reason=existing_renko_shard",
+                            synth_sym, d
+                        );
+                        continue;
+                    }
+                    if force && renko_path.exists() {
+                        let _ = std::fs::remove_file(&renko_path);
+                    }
+
+                    let mut base_stream = PeekStream::open(base_shards.get(d).unwrap())?;
+                    let mut quote_stream = PeekStream::open(quote_shards.get(d).unwrap())?;
+                    let mut day_synth_emits: u64 = 0;
+                    let mut renko_today: u64 = 0;
+
+                    loop {
+                        let Some((rec, _was_base)) =
+                            merge_pop(&mut base_stream, &mut quote_stream)?
+                        else {
+                            break;
+                        };
+                        // SEAM PARITY: sentinel skip, mirrors live + calibrator.
+                        if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                            continue;
+                        }
+                        let rec_ts_ms = {
+                            let h = rec.header;
+                            timestamp::to_epoch_ms(h.get_timestamp())
+                        };
+                        if rec_ts_ms < d_start || rec_ts_ms >= d_end {
+                            continue;
+                        }
+                        let Some(synth_rec) = merge_state.feed_leg_tick(&rec, rec_ts_ms)
+                        else {
+                            continue;
+                        };
+                        day_synth_emits += 1;
+
+                        let body = synth_rec.index;
+                        pending.clear();
+                        let pending_ref = &mut pending;
+                        generator.feed_index_record(
+                            rec_ts_ms,
+                            body.bid,
+                            body.ask,
+                            body.vbid,
+                            body.vask,
+                            decode_ci_ubp(body.ci),
+                            body.accepted as u32,
+                            body.rejected as u32,
+                            sigma_at(rec_ts_ms),
+                            &mut |b: &Bar| {
+                                pending_ref.push(*b);
+                                Ok(())
+                            },
+                        )?;
+                        for bar in pending.drain(..) {
+                            let open_ms = bar.open_time_ms();
+                            if open_ms >= d_start && open_ms < d_end {
+                                renko_writer.append(&bar)?;
+                                renko_today += 1;
+                            }
+                        }
+                    }
+                    renko_writer.flush()?;
+
+                    stats.renko_bars_written += renko_today;
+                    if count_stats {
+                        stats.days_processed += 1;
+                        stats.synth_ticks_emitted += day_synth_emits;
+                        stats.synth_ticks_dropped_stale += merge_state.stale_drop_count;
+                        let entry = stats.monthly.entry(ym(*d)).or_default();
+                        entry.days_processed += 1;
+                        entry.synth_ticks_emitted += day_synth_emits;
+                    }
+                    merge_state.stale_drop_count = 0;
+
+                    eprintln!(
+                        "renko  pair={} date={} synth_emit={} renko={}",
+                        synth_sym, d, day_synth_emits, renko_today
+                    );
+                }
+            }
+            // Transient σ scratch — remove after the mmap scope closes.
+            let _ = std::fs::remove_file(&vol_path);
+        }
     }
 
     // Write per-month benchmark side-cars.
@@ -1076,9 +1083,32 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var("NXR_DATA_ROOT").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/data"));
     if !args.config.exists() {
-        warn!(path = %args.config.display(), "config file not found; continuing (config is reserved for future overrides)");
+        warn!(path = %args.config.display(), "config file not found; falling back to default config resolution");
     }
     let bars = parse_bar_kinds(&args.bars)?;
+
+    // Renko σ-blend + brick-floor cfg — MUST match the calibrator + live
+    // producer YAML (one engine, one σ). `--config` when present, else the
+    // standard Bin resolution, else compiled defaults w/ a loud warn.
+    let (vol_cfg, renko_min_pct): (VolConfig, f32) = {
+        let loaded = if args.config.exists() {
+            nxr_sdk::pipeline_config::PipelineYml::load(&args.config)
+        } else {
+            nxr_sdk::pipeline_config::PipelineYml::load_default(
+                nxr_sdk::pipeline_config::ConfigHint::Bin,
+            )
+        };
+        match loaded {
+            Ok(root) => (root.series.vol.clone(), root.series.renko.min_pct),
+            Err(e) => {
+                warn!(
+                    err = %e,
+                    "pipeline config load failed — using compiled VolConfig / MIN_BRICK_PCT defaults (verify they match the calibrator YAML)"
+                );
+                (VolConfig::default(), MIN_BRICK_PCT as f32)
+            }
+        }
+    };
 
     let today = Utc::now().date_naive();
     let yesterday = today.pred_opt().unwrap_or(today);
@@ -1155,7 +1185,10 @@ fn main() -> Result<()> {
         if k.is_none() {
             warn!(synth, synth_id, "no calibrated k in ticker-params.json — renko backfill will be skipped");
         }
-        match run_pair(&data_root, base, quote, synth, from, to, bars, args.force, k) {
+        match run_pair(
+            &data_root, base, quote, synth, from, to, bars, args.force, k,
+            &vol_cfg, renko_min_pct,
+        ) {
             Ok(s) => {
                 grand_emits += s.synth_ticks_emitted;
                 grand_drops += s.synth_ticks_dropped_stale;
@@ -1395,6 +1428,7 @@ mod tests {
             // The simpler hack: just pre-create the bars dir under the hashed
             // synth ID and verify writes via that path.
             date, date, bars, false, None,
+            &VolConfig::default(), MIN_BRICK_PCT as f32,
         )?;
         // We don't know the resolved id of "SYM_SYNTH" up front, but we can
         // recover it the same way the binary does.
@@ -1412,7 +1446,7 @@ mod tests {
         // doesn't panic + writes nothing.
         if s1.days_processed == 0 {
             // Empty branch: assert no shard was written either run.
-            let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false, None)?;
+            let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false, None, &VolConfig::default(), MIN_BRICK_PCT as f32)?;
             assert_eq!(s2.days_processed, 0);
             assert_eq!(s2.s10_bars_written, 0);
             let _ = std::fs::remove_dir_all(&tmp);
@@ -1420,14 +1454,14 @@ mod tests {
         }
         // Successful real-write branch: re-run, expect skip.
         let _ = s10_shard;
-        let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false, None)?;
+        let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false, None, &VolConfig::default(), MIN_BRICK_PCT as f32)?;
         assert!(
             s2.days_skipped >= 1 || s2.s10_bars_written == 0,
             "second run must skip already-written shards (skipped={}, wrote={})",
             s2.days_skipped, s2.s10_bars_written
         );
         // Force overwrites.
-        let s3 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, true, None)?;
+        let s3 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, true, None, &VolConfig::default(), MIN_BRICK_PCT as f32)?;
         assert!(
             s3.s10_bars_written > 0 || s1.s10_bars_written == 0,
             "--force should re-write (got {}, baseline {})",
@@ -1438,6 +1472,149 @@ mod tests {
         if s10_shard.exists() {
             let bars = read_shard_aligned::<Bar>(&s10_shard)?;
             assert!(!bars.is_empty());
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    /// σ-BASIS PARITY (brick-storm RCA, 2026-06-10): the backfill's renko pass
+    /// MUST size bricks from the IDENTICAL σ the calibrator fits k with — the
+    /// MTF blend over 30-min Rogers-Satchell bins built from the persisted
+    /// synth `.s10` shards — driven through the shared `RenkoGenerator`.
+    /// Rebuild the calibrator-style path by hand over the SAME legs and assert
+    /// the brick stream `run_pair` wrote is bit-identical. Guards against any
+    /// future drift back to a local per-tick σ impl (the ~330× bpd overshoot).
+    #[test]
+    fn test_renko_sigma_basis_parity_with_calibrator() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!(
+            "nxr_synth_backfill_sigma_parity_{}_{}",
+            std::process::id(),
+            nxr_sdk::now_ns()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)?;
+
+        // Leg shards must live under the ids run_pair resolves for the syms.
+        let base_id = resolve_symbol("SYMB1-USDT");
+        let quote_id = resolve_symbol("SYMQ1-USDT");
+        let synth_id = resolve_symbol("SYMB1-SYMQ1");
+
+        let date = NaiveDate::from_ymd_opt(2024, 5, 1).unwrap();
+        let d_start = day_start_ms(date);
+        // 4 s cadence (even ms ⇒ exact on the 16 µs mts grid; < the 5 s leg
+        // TTL so nearly every leg tick emits a synth tick). Trending +
+        // oscillating base ⇒ real RS σ + a healthy brick count.
+        let n: usize = 21_600; // one UTC day @ 4 s
+        let mut base_recs = Vec::with_capacity(n);
+        let mut quote_recs = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = d_start + (i as i64) * 4_000;
+            let osc = (i as f64 / 300.0).sin();
+            let bid = 3_000.0 * (1.0 + 0.002 * osc + 1e-6 * i as f64);
+            base_recs.push(mk_record(base_id, bid, bid * 1.0001, t));
+            let qbid = 60_000.0 * (1.0 + 0.0005 * (i as f64 / 700.0).sin());
+            quote_recs.push(mk_record(quote_id, qbid, qbid * 1.0001, t + 16));
+        }
+        write_idx_shard(&idx_dir(&tmp, base_id).join(format!("{}.idx", date)), &base_recs)?;
+        write_idx_shard(&idx_dir(&tmp, quote_id).join(format!("{}.idx", date)), &quote_recs)?;
+
+        let k = 0.5_f64;
+        let vol_cfg = VolConfig::default();
+        let stats = run_pair(
+            &tmp,
+            "SYMB1-USDT",
+            "SYMQ1-USDT",
+            "SYMB1-SYMQ1",
+            date,
+            date,
+            BarKindMask { s10: true, renko: true },
+            false,
+            Some(k),
+            &vol_cfg,
+            MIN_BRICK_PCT as f32,
+        )?;
+        assert!(stats.s10_bars_written > 0, "s10 pass must write bars");
+        assert!(stats.renko_bars_written > 0, "renko pass must write bricks");
+
+        // ── Calibrator-style σ basis, rebuilt independently over the SAME
+        //    persisted synth `.s10` shards (`nxr_calibrate::calibrate_one_synth`
+        //    construction, verbatim) ──────────────────────────────────────────
+        let bars_path = bars_dir(&tmp, synth_id);
+        let s10_shards = list_shards(&bars_path, "s10")?;
+        assert!(!s10_shards.is_empty(), "synth .s10 shards must exist");
+        let vol_path = tmp.join("parity.vol");
+        {
+            let mut w = VolWriter::new(&vol_path)?;
+            let mut it = S10ShardIter::new(s10_shards);
+            build_vol_from_s10(|| it.next_bar(), &vol_cfg, &mut w)?;
+            w.finish()?;
+        }
+        let vol_mmap = VolMmap::open(&vol_path)?;
+        let sigma_cache = {
+            let mut calc = MtfVolCalculator::new(&vol_mmap, vol_cfg.clone());
+            calc.precompute_sigma_cache()
+        };
+        assert!(!sigma_cache.is_empty(), "σ cache must have 30-min bins");
+        let sigma_at = |ts_ms: i64| -> f64 {
+            let i = vol_mmap.find_index_for_mts(timestamp::from_epoch_ms(ts_ms));
+            sigma_cache.get(i).copied().unwrap_or(SIGMA_FALLBACK)
+        };
+
+        // Re-merge the legs (same machinery) → drive a BARE shared engine.
+        let mut a = VecPeek::new(base_recs);
+        let mut b = VecPeek::new(quote_recs);
+        let mut merge = SynthReplayState::new(synth_id, base_id, quote_id);
+        let cfg = RenkoConfig { multiplier: k as f32, min_pct: MIN_BRICK_PCT as f32 };
+        let mut engine = RenkoGenerator::new(cfg)?;
+        let mut expected: Vec<Bar> = Vec::new();
+        while let Some((rec, _)) = merge_pop_vec(&mut a, &mut b) {
+            let ts = {
+                let h = rec.header;
+                timestamp::to_epoch_ms(h.get_timestamp())
+            };
+            let Some(srec) = merge.feed_leg_tick(&rec, ts) else { continue };
+            let body = srec.index;
+            engine.feed_index_record(
+                ts,
+                body.bid,
+                body.ask,
+                body.vbid,
+                body.vask,
+                decode_ci_ubp(body.ci),
+                body.accepted as u32,
+                body.rejected as u32,
+                sigma_at(ts),
+                &mut |bar: &Bar| {
+                    expected.push(*bar);
+                    Ok(())
+                },
+            )?;
+        }
+        let expected: Vec<Bar> = expected
+            .into_iter()
+            .filter(|bar| {
+                let o = bar.open_time_ms();
+                o >= d_start && o < d_start + MS_PER_DAY
+            })
+            .collect();
+        assert!(!expected.is_empty(), "reference path must emit bricks");
+
+        let written = read_shard_aligned::<Bar>(&shard_path(&bars_path, date, "renko"))?;
+        assert_eq!(
+            written.len(),
+            expected.len(),
+            "brick count parity (backfill={} reference={})",
+            written.len(),
+            expected.len()
+        );
+        for (i, (w, e)) in written.iter().zip(&expected).enumerate() {
+            assert_eq!(w.open.to_bits(), e.open.to_bits(), "brick {i} open diverged");
+            assert_eq!(w.close.to_bits(), e.close.to_bits(), "brick {i} close diverged");
+            assert!(
+                (w.high - e.high).abs() < 1e-9 && (w.low - e.low).abs() < 1e-9,
+                "brick {i} wick diverged"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
