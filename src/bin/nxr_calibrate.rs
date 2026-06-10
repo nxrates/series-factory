@@ -1024,6 +1024,62 @@ fn run_once(args: &Args) -> Result<()> {
     }
     info!(s_passed, s_skipped, s_failed, "calibration summary (synth)");
 
+    // ── Inferred xxx/USDC fallback (2026-06-10) ──────────────────────────────
+    // Inferred USDC-quoted tickers only materialize live `.idx` since the
+    // migration (≈2026-06-03), so their base fit fails on span for weeks and
+    // the stale-drop policy (feedback_no_k_fallback) then wipes their k —
+    // silencing live renko for pairs downstream consumers need (ETH/USDC).
+    // Until the inferred span covers the rolling window, derive k synth-style
+    // from the USDT legs — the identical math the live inference uses
+    // (xxx/USDT × 1/(USDC/USDT)). Guarded: only when the USDT leg itself
+    // calibrated this run (healthy legs), never for stable/USDC pairs (those
+    // route to overrides), and never overwriting an accepted base fit.
+    if let Ok(q) = resolve_ticker("USDC/USDT", InstrumentType::SPOT) {
+        let quote_leg_id = q.ticker.id;
+        let mut inferred_fallbacks = 0usize;
+        for (ticker_id, pair, class) in &work {
+            if renko_k.contains_key(&ticker_id.to_string()) {
+                continue;
+            }
+            let Some(base_sym) = pair.strip_suffix("/USDC") else { continue };
+            if stablecoins.iter().any(|s| s.eq_ignore_ascii_case(base_sym)) {
+                continue;
+            }
+            let leg_pair = format!("{}/USDT", base_sym);
+            let Ok(leg) = resolve_ticker(&leg_pair, InstrumentType::SPOT) else { continue };
+            if !renko_k.contains_key(&leg.ticker.id.to_string()) {
+                continue; // unhealthy leg ⇒ no basis for a derived k
+            }
+            let target = target_for_pair(cal_ext, pair, *class);
+            let prior = prior_k_for(*ticker_id);
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                calibrate_one_synth(
+                    *ticker_id, pair, leg.ticker.id, quote_leg_id,
+                    &idx_dir, &bars_root, cal_ext, target, vol_cfg, renko_yml,
+                    prior,
+                )
+            }))
+            .unwrap_or_else(|_| CalOutcome::Failed {
+                ticker_id: *ticker_id,
+                reason: "panic in inferred-USDC fallback".into(),
+            });
+            match outcome {
+                CalOutcome::Ok { ticker_id, k } => {
+                    inferred_fallbacks += 1;
+                    info!(ticker_id, pair = %pair, k, "inferred xxx/USDC k derived from USDT legs (span fallback)");
+                    renko_k.insert(ticker_id.to_string(), k);
+                }
+                CalOutcome::Skipped { ticker_id, reason } => {
+                    info!(ticker_id, pair = %pair, %reason, "inferred-USDC fallback skipped");
+                }
+                CalOutcome::Failed { ticker_id, reason } => {
+                    warn!(ticker_id, pair = %pair, %reason, "inferred-USDC fallback failed");
+                }
+            }
+        }
+        info!(inferred_fallbacks, "inferred xxx/USDC fallback pass complete");
+    }
+
     // k-STABILITY DIAGNOSTIC (2026-06-09): final distribution over ALL accepted
     // base+synth k values — the operator's at-a-glance σ-health check now that k
     // is uncapped.
