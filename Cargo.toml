@@ -8,10 +8,6 @@ name = "series_factory"
 path = "src/lib.rs"
 
 [[bin]]
-name = "optimize-renko-stats"
-path = "src/bin/optimize_renko_stats.rs"
-
-[[bin]]
 name = "fetch-crypto-history"
 path = "src/bin/fetch_crypto_history.rs"
 

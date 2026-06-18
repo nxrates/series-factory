@@ -2,7 +2,7 @@
 //!
 //! Single source of truth for the `.vol` file construction shared by every
 //! offline pipeline (`nxr-calibrate`, `generate-renko-from-ticks`,
-//! `optimize-renko-stats`, the renko-from-idx bins). The ratified vol basis
+//! the renko-from-idx bins). The ratified vol basis
 //! (2026-06): the canonical per-bin σ is the Rogers-Satchell range estimator
 //! over s10-resampled 30-min OHLC, with `offline == live` byte-for-byte.
 //!

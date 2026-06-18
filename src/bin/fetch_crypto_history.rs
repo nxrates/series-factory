@@ -4,7 +4,7 @@
 //! (pair x exchange) pair in the series pipeline config, covering
 //! `[to - days, to)` where `to` is midnight UTC of the current day.
 //!
-//! Downstream (`generate-renko-from-ticks`, `optimize-renko-stats`) read from
+//! Downstream (`generate-renko-from-ticks`) read from
 //! the same directory. Re-running is safe: the monthly/daily cache skips
 //! archives that already exist on disk.
 //!
