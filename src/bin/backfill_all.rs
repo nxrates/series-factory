@@ -1118,6 +1118,14 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     }
 
     // 5) renko → sharded bars_dir/*.renko
+    // ⚠ M2 (renko-bpd-regression): this spawns `renko-from-idx`, which applies ONE
+    // live calibrated k UNIFORMLY across all history → wrong bpd in past vol regimes
+    // (1k-15k bpd vs ~300 target). The correct tool is `renko-trailing-from-idx`
+    // (per-UTC-day CAUSAL k re-calibration — see its module doc). The swap is
+    // deferred: it needs the trailing binaryâs --config/--base/--quote contract +
+    // daily-sharded output wired here AND a verification backfill run on the cluster
+    // before trusting output (data-affecting). Until done, regenerate historical
+    // renko via `renko-trailing-from-idx` explicitly, NOT this path.
     if want("renko") {
         if ctx.args.resume && manifest_ok(&bars_dir, "renko") {
             steps_out.push(StepReport {
