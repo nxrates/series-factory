@@ -1266,8 +1266,7 @@ fn audit_ticker(
                         .filter(|s| s.is_finite() && *s > 0.0)
                         .collect();
                     if !sigmas.is_empty() {
-                        sigmas.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        let med = sigmas[sigmas.len() / 2];
+                        let med = nxr_sdk::stats::median(&sigmas);
                         let bins_per_year = 48.0_f64 * 365.0;
                         r.vol_sigma_stored = med * bins_per_year.sqrt();
                         // Compare on a log scale: flag if the two σ estimates differ
