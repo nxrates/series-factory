@@ -30,7 +30,7 @@ impl OKXSource {
             let ts = normalize_timestamp_ms(ts_raw);
             ticks.push(TickFrame::new(pid,
                 mitch::timestamp::from_epoch_ms(ts),
-                infer_tick(ticker_id, price, (size * price) as u32, is_buyer),
+                honest_tick(ticker_id, price, (size * price) as u32, is_buyer),
             ));
         }
         Ok(ticks)

@@ -33,7 +33,7 @@ use nxr_sdk::{
     ipc::append_log::AppendLog,
     ipc::record::IndexRecord,
     resolve_ticker_id,
-    shard::FLAG_HISTORICAL_BACKFILL,
+    shard::{FLAG_HISTORICAL_BACKFILL, FLAG_NO_BOOK},
     tdwap::ProviderEntry,
 };
 use series_factory::sharding::{
@@ -106,6 +106,21 @@ fn main() -> Result<()> {
     } else {
         args.exchanges.clone()
     };
+    // Hard exclusion (sdk single source): even explicit --exchange flags cannot
+    // re-introduce a denylisted venue into a composite — regenerated history
+    // must stay 100% distribution-compatible with the live blend (RCA 2026-07-04).
+    let exchanges: Vec<String> = exchanges
+        .into_iter()
+        .filter(|e| {
+            let excl = nxr_sdk::providers::get_market_provider_id_by_name(e)
+                .map(nxr_sdk::providers::is_excluded_provider)
+                .unwrap_or(false);
+            if excl {
+                eprintln!("merge-idx: SKIPPING hard-excluded provider '{e}' (EXCLUDED_PROVIDERS)");
+            }
+            !excl
+        })
+        .collect();
     if exchanges.is_empty() {
         anyhow::bail!(
             "no exchanges to merge: provide --exchange flags OR populate \
@@ -213,6 +228,12 @@ fn main() -> Result<()> {
                     // R1 H12: tag as offline-produced so consumers can tell
                     // backfilled rows apart from live aggregator output.
                     idx.flags |= FLAG_HISTORICAL_BACKFILL;
+                    // NO-SYNTHETIC-SPREAD (operator 2026-07-04): trade-derived inputs have
+                    // bid==ask (honest_tick) — no real book backs this composite. Flag it
+                    // so bar builders publish spread as ABSENT (NaN), never a constant.
+                    if idx.bid == idx.ask {
+                        idx.flags |= FLAG_NO_BOOK;
+                    }
                     let rec_out = IndexRecord { header, index: idx };
                     writer.append(boundary, &rec_out)?;
                     composites_written += 1;
@@ -250,6 +271,10 @@ fn main() -> Result<()> {
             let mut idx = composite;
             // R1 H12: tag as offline-produced (final-flush path).
             idx.flags |= FLAG_HISTORICAL_BACKFILL;
+            // NO-SYNTHETIC-SPREAD: trade-derived (bid==ask) ⇒ no real book; flag.
+            if idx.bid == idx.ask {
+                idx.flags |= FLAG_NO_BOOK;
+            }
             let rec_out = IndexRecord { header, index: idx };
             writer.append(boundary, &rec_out)?;
             composites_written += 1;

@@ -85,6 +85,15 @@ fn main() -> Result<()> {
         None => nxr_sdk::providers::get_market_provider_id_by_name(&args.exchange)
             .with_context(|| format!("unknown exchange: {}", args.exchange))?,
     };
+    // Backfill applies the SAME hard exclusion as live aggregation (sdk single
+    // source) — regenerated history must be 100% distribution-compatible with
+    // the live feed: an excluded venue must not exist in EITHER. RCA 2026-07-04.
+    anyhow::ensure!(
+        !nxr_sdk::providers::is_excluded_provider(provider_id),
+        "exchange '{}' (provider {}) is HARD-EXCLUDED from index construction \
+         (nxr_sdk::providers::EXCLUDED_PROVIDERS — fabricated L1 sizes)",
+        args.exchange, provider_id
+    );
     let ticker_id = resolve_ticker_id(&format!("{}/{}", args.base, args.quote));
 
     // --- I/O paths ---

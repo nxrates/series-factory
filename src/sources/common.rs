@@ -299,31 +299,29 @@ pub fn stamp_provider_id(frames: &mut [TickFrame], provider_id: u16) {
     }
 }
 
-// ─── Bid/ask inference ───────────────────────────────────────────────────────
+// ─── Trade → tick (NO book fabrication) ─────────────────────────────────────
 
-/// Infer bid/ask from a trade price and side.
+/// Build a tick from an EXECUTED TRADE with honest no-book semantics.
 ///
-/// Market buy → price is ask, bid inferred 1 bps below.
-/// Market sell → price is bid, ask inferred 1 bps above.
+/// Operator ruling 2026-07-04: the only truth is the executed price; order
+/// books are spoofable/partial and NOTHING may fabricate one. The retired
+/// `infer_tick` synthesized a ±0.5bp book around every archived trade, which
+/// poisoned 23 months of served `avg_spread_bps` at a constant ~1.0bp
+/// (HISTORY-V2 RCA). Here: `bid == ask == trade_px` (no invented spread) and
+/// the aggressor side carries the volume. Downstream, `ticks_to_idx` marks
+/// these records `FLAG_NO_BOOK` so bar builders exclude them from spread
+/// sampling — spread is ABSENT (NaN + flag) in trade-derived history, never
+/// a fabricated constant.
 #[inline]
-pub fn infer_tick(ticker_id: u64, price: f64, volume: u32, is_buyer: bool) -> Tick {
-    if is_buyer {
-        Tick {
-            ticker: ticker_id,
-            // 6 sig digits — matches prod forwarder tick rounding
-            bid: nxr_sdk::stats::round_to_sig_digits(price * 0.9999, 6),
-            ask: nxr_sdk::stats::round_to_sig_digits(price, 6),
-            vbid: 0,
-            vask: volume,
-        }
-    } else {
-        Tick {
-            ticker: ticker_id,
-            bid: nxr_sdk::stats::round_to_sig_digits(price, 6),
-            ask: nxr_sdk::stats::round_to_sig_digits(price * 1.0001, 6),
-            vbid: volume,
-            vask: 0,
-        }
+pub fn honest_tick(ticker_id: u64, price: f64, volume: u32, is_buyer: bool) -> Tick {
+    // 6 sig digits — matches prod forwarder tick rounding
+    let px = nxr_sdk::stats::round_to_sig_digits(price, 6);
+    Tick {
+        ticker: ticker_id,
+        bid: px,
+        ask: px,
+        vbid: if is_buyer { 0 } else { volume },
+        vask: if is_buyer { volume } else { 0 },
     }
 }
 

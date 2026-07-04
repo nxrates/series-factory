@@ -28,7 +28,7 @@ impl BinanceSource {
             let is_buyer = !r[6].eq_ignore_ascii_case("true"); // is_buyer_maker=true → seller initiated
             ticks.push(TickFrame::new(pid,
                 mitch::timestamp::from_epoch_ms(ts),
-                infer_tick(ticker_id, price, (price * qty) as u32, is_buyer),
+                honest_tick(ticker_id, price, (price * qty) as u32, is_buyer),
             ));
         }
         Ok(ticks)

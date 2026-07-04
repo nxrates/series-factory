@@ -30,7 +30,7 @@ impl BitgetSource {
             let volume: u32 = r[4].parse::<f64>().unwrap_or(0.0) as u32;
             ticks.push(TickFrame::new(pid,
                 mitch::timestamp::from_epoch_ms(ts),
-                infer_tick(ticker_id, price, volume, is_buyer),
+                honest_tick(ticker_id, price, volume, is_buyer),
             ));
         }
         Ok(ticks)

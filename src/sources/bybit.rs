@@ -35,7 +35,7 @@ impl BybitSource {
             let is_buyer = r[4].eq_ignore_ascii_case("buy");
             ticks.push(TickFrame::new(pid,
                 mitch::timestamp::from_epoch_ms(ts),
-                infer_tick(ticker_id, price, (qty * price) as u32, is_buyer),
+                honest_tick(ticker_id, price, (qty * price) as u32, is_buyer),
             ));
         }
         Ok(ticks)
