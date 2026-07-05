@@ -305,9 +305,20 @@ fn main() -> Result<()> {
 }
 
 /// Per-day AppendLog rotator. Rolls on UTC date boundary.
+///
+/// IDEMPOTENT (2026-07-05, D10): the first touch of each date within a run
+/// TRUNCATES the target shard before writing. AppendLog opens in append mode,
+/// so re-running merge over an existing dir used to APPEND a duplicate day
+/// after the previous content — the root cause of the 2026-07-05 prod
+/// append-corruption incident (60 BTC shards) and of doubled staging output.
+/// The touched-set (not blanket truncate-on-rotate) matters: a near-midnight
+/// straggler can rotate BACK to the prior date mid-run, which must append to
+/// this run's own output, not wipe it.
 struct ShardedWriter {
     out_dir: PathBuf,
     current: Option<(NaiveDate, AppendLog<IndexRecord>)>,
+    /// Dates already opened (and truncated) by THIS run.
+    touched: std::collections::HashSet<NaiveDate>,
     /// Cached `[start, end)` epoch-ms window of `current`'s UTC day. An in-window
     /// ts is provably same-day, so we skip the per-record `ts_ms_to_utc_date`
     /// chrono call and decide "no rotate" with two int compares. UTC days are
@@ -322,6 +333,7 @@ impl ShardedWriter {
         Self {
             out_dir,
             current: None,
+            touched: std::collections::HashSet::new(),
             cur_day_start_ms: i64::MAX,
             cur_day_end_ms: i64::MIN,
         }
@@ -348,6 +360,15 @@ impl ShardedWriter {
             self.cur_day_start_ms = nxr_sdk::shard::day_start_ms(date);
             self.cur_day_end_ms = self.cur_day_start_ms + nxr_sdk::shard::MS_PER_DAY;
             let path = shard_path(&self.out_dir, date, "idx");
+            // Idempotency: first touch of this date in THIS run replaces any
+            // pre-existing shard (re-runs must converge, never append-double).
+            if self.touched.insert(date) {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => tracing::info!(shard = %path.display(), "replacing existing shard (idempotent re-run)"),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("truncate shard {}", path.display())),
+                }
+            }
             // OFFLINE builder: buffered AppendLog (256 KiB BufWriter). The merge
             // output shard is not tailed by any live reader until the build is
             // done, so coalescing the per-record 56B writes is a pure win.
