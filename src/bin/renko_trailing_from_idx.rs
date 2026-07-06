@@ -112,6 +112,10 @@ struct Args {
     /// Default behaviour is resumable (idempotent): skip non-empty shards.
     #[arg(long)]
     force: bool,
+
+    /// Include today's UTC shard (live producer must be scaled to 0).
+    #[arg(long)]
+    include_today: bool,
 }
 
 // ── Config (subset of nxrates.yml) ──────────────────────────────────────────
@@ -286,7 +290,11 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     // producer). Also clip to last available shard date.
     let today = Utc::now().date_naive();
     let yesterday = today.pred_opt().unwrap_or(today);
-    let default_to = last_shard_date.min(yesterday);
+    let default_to = if args.include_today {
+        last_shard_date.min(today)
+    } else {
+        last_shard_date.min(yesterday)
+    };
 
     let from = args
         .from
