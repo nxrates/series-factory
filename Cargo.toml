@@ -40,6 +40,10 @@ name = "s10-from-idx"
 path = "src/bin/s10_from_idx.rs"
 
 [[bin]]
+name = "vol-from-s10"
+path = "src/bin/vol_from_s10.rs"
+
+[[bin]]
 name = "resample-idx"
 path = "src/bin/resample_idx.rs"
 

@@ -47,7 +47,7 @@ const REQUIRED_PAIRS: &[(&str, &str)] = &[
     ("ETH", "USDT"),
     ("BNB", "USDT"),
     ("SOL", "USDT"),
-    ("PAXG", "USDT"),
+    ("XAUT", "USDT"),
 ];
 
 const TARGET_BPD: f64 = 300.0;

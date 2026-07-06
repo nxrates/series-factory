@@ -981,7 +981,10 @@ fn run_once(args: &Args) -> Result<()> {
     // guards inside it drop degenerate windows. If the fit fails, k is NOT
     // persisted (caller keeps prior). Phase 60.π: per-pair override or flat
     // default per synth.
-    let synth_work = resolve_synth_work(&root.synths.initial_pairs);
+    let synth_work = {
+        let pairs = nxr_sdk::synth::pipeline_pairs::synth_pipeline_pairs(&root);
+        resolve_synth_work(&pairs)
+    };
     info!(n_synth = synth_work.len(), "synth calibration pass starting");
     let (mut s_passed, mut s_skipped, mut s_failed) = (0usize, 0usize, 0usize);
     for (synth_id, synth_sym, leg_a_id, leg_b_id) in synth_work {

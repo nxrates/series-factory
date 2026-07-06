@@ -33,7 +33,7 @@ use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(about = "Build renko shards from a sharded composite idx dir.")]
@@ -295,7 +295,27 @@ fn main() -> Result<()> {
         write_shard_atomic(&path, bytes)?;
         info!(date = %date, n = bars.len(), path = %path.display(), "wrote renko shard");
     }
-    // remove transient vol scratch file
+    // Persist id-keyed `.vol` so the live renko producer can prime its RS ring
+    // on restart (seam-glue; mirrors renko-trailing-from-idx).
+    {
+        let persist_path = nxr_sdk::shard::vol_path_for_id(&data_root_bars, ticker_id);
+        if let Some(parent) = persist_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let tmp = persist_path.with_extension("vol.tmp");
+        match fs::copy(&vol_path, &tmp).and_then(|_| fs::rename(&tmp, &persist_path)) {
+            Ok(_) => info!(
+                vol = %persist_path.display(),
+                vol_records = n_vol,
+                "persistent id-keyed .vol written (live-prime source)"
+            ),
+            Err(e) => warn!(
+                err = %e,
+                vol = %persist_path.display(),
+                "persistent .vol write failed (live prime will warm from ticks)"
+            ),
+        }
+    }
     let _ = fs::remove_file(&vol_path);
 
     // ═══ MANIFEST ═══
