@@ -76,6 +76,10 @@ name = "synth-backfill-from-idx"
 path = "src/bin/synth_backfill_from_idx.rs"
 
 [[bin]]
+name = "live-latency-audit"
+path = "src/bin/live_latency_audit.rs"
+
+[[bin]]
 name = "renko-continuity-check"
 path = "src/bin/renko_continuity_check.rs"
 
