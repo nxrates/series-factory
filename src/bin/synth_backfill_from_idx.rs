@@ -135,8 +135,7 @@ use mitch::common::InstrumentType;
 use mitch::header::MitchHeader;
 use mitch::index::Index;
 use mitch::timestamp;
-use nxr_sdk::bar_builder::BarAccumulator;
-use nxr_sdk::bar_builder::flat_bar;
+use nxr_sdk::bar_builder::{BarAccumulator, flat_bar, stamp_s10_grid};
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::renko::{
     K_FLOOR, MAX_BRICKS_PER_TICK, MIN_BRICK_PCT, MULT_UPPER_BOUND, RenkoConfig,
@@ -309,13 +308,12 @@ impl SynthS10State {
 
     fn flush_bucket(&mut self, cb: i64) -> Option<Bar> {
         // Prefer a real bar if we ingested any ticks, else gap-fill.
-        let mut out = if let Some(mut b) = self.acc.flush() {
+        let out = if let Some(mut b) = self.acc.flush() {
             if b.close > 0.0 && b.close.is_finite() {
                 self.last_close = b.close;
             }
-            b.open_ts = timestamp::encode_u48(timestamp::from_epoch_ms(cb));
-            b.close_ts = timestamp::encode_u48(timestamp::from_epoch_ms(cb + BAR_MS));
-            b.kind = BarKind::Kline as u8;
+            stamp_s10_grid(&mut b, cb, BAR_MS);
+            b.kind = BarKind::Kline as u8; // explicit, do not rely on zero-init
             Some(b)
         } else if self.last_close > 0.0 && self.last_close.is_finite() {
             let mut b = flat_bar(cb, self.last_close);
