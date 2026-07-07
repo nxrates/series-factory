@@ -136,6 +136,7 @@ use mitch::header::MitchHeader;
 use mitch::index::Index;
 use mitch::timestamp;
 use nxr_sdk::bar_builder::BarAccumulator;
+use nxr_sdk::bar_builder::flat_bar;
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::renko::{
     K_FLOOR, MAX_BRICKS_PER_TICK, MIN_BRICK_PCT, MULT_UPPER_BOUND, RenkoConfig,
@@ -254,22 +255,30 @@ impl SynthS10State {
         }
         let bucket = ts_ms.div_euclid(BAR_MS) * BAR_MS;
 
-        let emitted_bar = match self.cur_bucket {
-            Some(cb) if bucket > cb => {
-                // Bucket rolled over → flush the previous bucket.
-                let mut out = self.acc.flush().map(|mut b| {
-                    b.close_ts = timestamp::encode_u48(timestamp::from_epoch_ms(cb + BAR_MS));
-                    b.open_ts = timestamp::encode_u48(timestamp::from_epoch_ms(cb));
-                    b.kind = BarKind::Kline as u8;
-                    b
-                });
-                if let Some(b) = out.as_ref() {
-                    if b.close > 0.0 && b.close.is_finite() {
-                        self.last_close = b.close;
+        // Emit gap-free s10 buckets: every crossed bucket boundary produces a bar.
+        // Matches live `core/src/bars_s10.rs` behavior (flat-bar fill when no ticks).
+        const MAX_GAPFILL_BUCKETS: i64 = 360; // 1h of 10s buckets, same order as live.
+        let mut emitted_bar = None;
+        match self.cur_bucket {
+            Some(mut cb) if bucket > cb => {
+                // Bucket(s) rolled over. Emit the previous bucket and any intervening
+                // empty buckets as flat bars using last_close.
+                let mut emitted = 0_i64;
+                while cb < bucket {
+                    let out = self.flush_bucket(cb);
+                    if emitted_bar.is_none() {
+                        emitted_bar = out;
+                    }
+                    cb += BAR_MS;
+                    emitted += 1;
+                    if emitted >= MAX_GAPFILL_BUCKETS {
+                        // Skip ahead; we keep continuity from here forward.
+                        cb = bucket - MAX_GAPFILL_BUCKETS * BAR_MS;
+                        self.cur_bucket = Some(cb);
+                        break;
                     }
                 }
                 self.cur_bucket = Some(bucket);
-                out.take()
             }
             Some(cb) if bucket < cb => {
                 // Out-of-order tick — same defense as the live producer.
@@ -277,10 +286,9 @@ impl SynthS10State {
             }
             None => {
                 self.cur_bucket = Some(bucket);
-                None
             }
-            _ => None,
-        };
+            _ => {}
+        }
 
         let ci_ubp = decode_ci_ubp(body.ci);
         self.acc.ingest(
@@ -299,13 +307,35 @@ impl SynthS10State {
         emitted_bar
     }
 
+    fn flush_bucket(&mut self, cb: i64) -> Option<Bar> {
+        // Prefer a real bar if we ingested any ticks, else gap-fill.
+        let mut out = if let Some(mut b) = self.acc.flush() {
+            if b.close > 0.0 && b.close.is_finite() {
+                self.last_close = b.close;
+            }
+            b.open_ts = timestamp::encode_u48(timestamp::from_epoch_ms(cb));
+            b.close_ts = timestamp::encode_u48(timestamp::from_epoch_ms(cb + BAR_MS));
+            b.kind = BarKind::Kline as u8;
+            Some(b)
+        } else if self.last_close > 0.0 && self.last_close.is_finite() {
+            let mut b = flat_bar(cb, self.last_close);
+            b.kind = BarKind::Kline as u8;
+            Some(b)
+        } else {
+            None
+        };
+        if let Some(b) = out.as_ref() {
+            if b.close > 0.0 && b.close.is_finite() {
+                self.last_close = b.close;
+            }
+        }
+        out
+    }
+
     /// Flush the open bucket unconditionally (called at end-of-stream).
     fn finalize(&mut self) -> Option<Bar> {
         let cb = self.cur_bucket?;
-        let mut out = self.acc.flush()?;
-        out.open_ts = timestamp::encode_u48(timestamp::from_epoch_ms(cb));
-        out.close_ts = timestamp::encode_u48(timestamp::from_epoch_ms(cb + BAR_MS));
-        out.kind = BarKind::Kline as u8;
+        let out = self.flush_bucket(cb)?;
         self.cur_bucket = None;
         Some(out)
     }
@@ -546,22 +576,20 @@ fn run_pair(
         return Ok(PairBackfillStats::default());
     }
 
-    // Clip the requested range to days that BOTH legs have.
-    let intersect_dates: Vec<NaiveDate> = day_range(from, to)
-        .into_iter()
-        .filter(|d| base_shards.contains_key(d) && quote_shards.contains_key(d))
-        .collect();
-    if intersect_dates.is_empty() {
-        warn!(base = base_sym, quote = quote_sym, %from, %to, "no overlapping days");
+    // Iterate the FULL requested day range. If a leg shard is missing for a day,
+    // we still write gap-fill (flat) s10 bars once the synth has a seed close,
+    // matching live `core/src/bars_s10.rs` behavior.
+    let days: Vec<NaiveDate> = day_range(from, to);
+    if days.is_empty() {
         return Ok(PairBackfillStats::default());
     }
     info!(
         base = base_sym,
         quote = quote_sym,
         synth = synth_sym,
-        days = intersect_dates.len(),
-        first = %intersect_dates.first().unwrap(),
-        last = %intersect_dates.last().unwrap(),
+        days = days.len(),
+        first = %days.first().unwrap(),
+        last = %days.last().unwrap(),
         "day range resolved"
     );
 
@@ -584,9 +612,12 @@ fn run_pair(
     if bars.s10 {
         let mut s10_writer = BarShardWriter::open_with(data_root, synth_id, "s10", true)?;
         let mut merge_state = SynthReplayState::new(synth_id, base_id, quote_id);
-        let mut s10_state = SynthS10State::new(0.0);
+        // Seed last_close from any existing synth s10 tail so backfill is
+        // restart-safe and can gap-fill days with no synth emits.
+        let seed_close = s10_writer.last_close()?.unwrap_or(0.0);
+        let mut s10_state = SynthS10State::new(seed_close);
 
-        for d in &intersect_dates {
+        for d in &days {
             let d_start = day_start_ms(*d);
             let d_end = d_start + MS_PER_DAY;
 
@@ -607,66 +638,81 @@ fn run_pair(
                 let _ = std::fs::remove_file(&s10_path);
             }
 
-            // Open both legs for this day.
-            let mut base_stream = PeekStream::open(base_shards.get(d).unwrap())?;
-            let mut quote_stream = PeekStream::open(quote_shards.get(d).unwrap())?;
+            // Open both legs for this day if they exist; else skip tick merge
+            // and rely on gap-fill (flat) bars from the existing last_close.
+            let mut base_stream = match base_shards.get(d) {
+                Some(p) => Some(PeekStream::open(p)?),
+                None => None,
+            };
+            let mut quote_stream = match quote_shards.get(d) {
+                Some(p) => Some(PeekStream::open(p)?),
+                None => None,
+            };
 
             let mut day_ticks_in_merge: u64 = 0;
             let mut day_synth_emits: u64 = 0;
             let mut s10_today: u64 = 0;
             let mut sample_buf: BTreeMap<i64, f64> = BTreeMap::new(); // 30-min last mid
 
-            loop {
-                let Some((rec, _was_base)) = merge_pop(&mut base_stream, &mut quote_stream)?
-                else {
+            if let (Some(ref mut bs), Some(ref mut qs)) = (&mut base_stream, &mut quote_stream) {
+                loop {
+                    let Some((rec, _was_base)) = merge_pop(bs, qs)?
+                    else {
+                        break;
+                    };
+                    // SEAM PARITY: skip heartbeat sentinels exactly like the live
+                    // producers (bars_s10.rs / bars_renko.rs) and the calibrator's
+                    // LegStream — liveness beacons, not real mid moves.
+                    if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                        continue;
+                    }
+                    let rec_ts_ms = {
+                        let h = rec.header;
+                        timestamp::to_epoch_ms(h.get_timestamp())
+                    };
+                    // Defensive: ignore records that escaped the per-day shard window.
+                    if rec_ts_ms < d_start || rec_ts_ms >= d_end {
+                        continue;
+                    }
+                    day_ticks_in_merge += 1;
+
+                    let Some(synth_rec) = merge_state.feed_leg_tick(&rec, rec_ts_ms) else {
+                        continue;
+                    };
+                    day_synth_emits += 1;
+
+                    // 30-min last-mid sample for the σ benchmark sidecar.
+                    let mid = (synth_rec.index.bid + synth_rec.index.ask) * 0.5;
+                    let bin = (rec_ts_ms / 1_800_000) * 1_800_000;
+                    sample_buf.insert(bin, mid);
+
+                    if let Some(bar) = s10_state.feed_synth_tick(&synth_rec) {
+                        // Only write bars whose open_ts is in this day.
+                        let open_ms = bar.open_time_ms();
+                        if open_ms >= d_start && open_ms < d_end {
+                            s10_writer.append(&bar)?;
+                            s10_today += 1;
+                        }
+                    }
+                }
+            }
+
+            // Gap-fill: ensure the on-disk s10 series is day-complete once we have a seed close.
+            if s10_state.cur_bucket.is_none() && s10_state.last_close > 0.0 && s10_state.last_close.is_finite() {
+                s10_state.cur_bucket = Some(d_start);
+            }
+            while let Some(cb) = s10_state.cur_bucket {
+                if cb >= d_end {
                     break;
-                };
-                // SEAM PARITY: skip heartbeat sentinels exactly like the live
-                // producers (bars_s10.rs / bars_renko.rs) and the calibrator's
-                // LegStream — liveness beacons, not real mid moves.
-                if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
-                    continue;
                 }
-                let rec_ts_ms = {
-                    let h = rec.header;
-                    timestamp::to_epoch_ms(h.get_timestamp())
-                };
-                // Defensive: ignore records that escaped the per-day shard window.
-                if rec_ts_ms < d_start || rec_ts_ms >= d_end {
-                    continue;
-                }
-                day_ticks_in_merge += 1;
-
-                let Some(synth_rec) = merge_state.feed_leg_tick(&rec, rec_ts_ms) else {
-                    continue;
-                };
-                day_synth_emits += 1;
-
-                // 30-min last-mid sample for the σ benchmark sidecar.
-                let mid = (synth_rec.index.bid + synth_rec.index.ask) * 0.5;
-                let bin = (rec_ts_ms / 1_800_000) * 1_800_000;
-                sample_buf.insert(bin, mid);
-
-                if let Some(bar) = s10_state.feed_synth_tick(&synth_rec) {
-                    // Only write bars whose open_ts is in this day. The s10
-                    // bucket aligns to BAR_MS, so a flushed bar can belong to
-                    // a previous bucket; we filter by the closed-bucket's
-                    // start time falling inside [d_start, d_end).
+                if let Some(bar) = s10_state.flush_bucket(cb) {
                     let open_ms = bar.open_time_ms();
                     if open_ms >= d_start && open_ms < d_end {
                         s10_writer.append(&bar)?;
                         s10_today += 1;
                     }
                 }
-            }
-
-            // End-of-day s10 flush — close the trailing bucket.
-            if let Some(bar) = s10_state.finalize() {
-                let open_ms = bar.open_time_ms();
-                if open_ms >= d_start && open_ms < d_end {
-                    s10_writer.append(&bar)?;
-                    s10_today += 1;
-                }
+                s10_state.cur_bucket = Some(cb + BAR_MS);
             }
             s10_writer.flush()?;
 
@@ -739,6 +785,17 @@ fn run_pair(
                 let mut generator = RenkoGenerator::new(cfg)?;
                 let mut renko_writer =
                     BarShardWriter::open_with(data_root, synth_id, "renko", true)?;
+
+                // Renko requires overlapping leg `.idx` days (no cross `.idx` stored).
+                let intersect_dates: Vec<NaiveDate> = days
+                    .iter()
+                    .copied()
+                    .filter(|d| base_shards.contains_key(d) && quote_shards.contains_key(d))
+                    .collect();
+                if intersect_dates.is_empty() {
+                    warn!(base = base_sym, quote = quote_sym, %from, %to, "no overlapping leg shards for renko pass");
+                    return Ok(stats);
+                }
 
                 // Warm-seed brick continuity for a trailing gap-fill (live
                 // restart parity, `bars_renko.rs::TickerState::new`): only when
