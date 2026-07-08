@@ -650,9 +650,15 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
             // be tradeable: a price with NO size behind it is phantom liquidity.
             // SENTINELS are exempt — a FLAG_HEARTBEAT_SENTINEL re-prints the prior
             // mid as a liveness beacon and legitimately carries no fresh depth.
+            // FLAG_NO_BOOK is exempt too (2026-07-08): oracle-relay tickers
+            // (pyth price±conf) and trade-derived backfill have no book BY
+            // NATURE; the composite/backfill writers stamp the flag on
+            // zero-depth records so honest bookless feeds pass while an
+            // unexpected zero-depth book feed still errors.
             //   • vbid==0 && vask==0 → ERROR (both-sides-zero = phantom quote).
             //   • vbid==0 XOR vask==0 → WARN (one-sided book; real on some venues).
-            if !is_sentinel {
+            let is_no_book = idx_body.flags & nxr_sdk::shard::FLAG_NO_BOOK != 0;
+            if !is_sentinel && !is_no_book {
                 let vbid = idx_body.vbid;
                 let vask = idx_body.vask;
                 if vbid == 0 && vask == 0 {

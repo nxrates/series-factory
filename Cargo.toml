@@ -24,6 +24,10 @@ name = "merge-idx"
 path = "src/bin/merge_idx.rs"
 
 [[bin]]
+name = "pyth-backfill"
+path = "src/bin/pyth_backfill.rs"
+
+[[bin]]
 name = "renko-from-idx"
 path = "src/bin/renko_from_idx.rs"
 
