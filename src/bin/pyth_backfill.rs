@@ -66,6 +66,12 @@ struct Args {
     rate_ms: u64,
     #[arg(long)]
     data_root: Option<String>,
+    /// Synthetic cross backfill: OUT=NUM:DEN (repeatable), e.g.
+    /// TUSD/USDC=TUSD/USD:USDC/USD - fetches both legs' 1-min series and
+    /// writes ratio bars to OUT's shards (mirrors the live triangulator
+    /// STABLE/USDC = STABLE/USD x (USDC/USD)^-1 rules).
+    #[arg(long = "cross")]
+    crosses: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -170,8 +176,154 @@ fn main() -> Result<()> {
             }
         }
     }
+    // Synthetic crosses: OUT = NUM/DEN ratio of two TV series.
+    let sym_to_tv: BTreeMap<String, String> = feeds
+        .iter()
+        .filter_map(|(sym, fid)| Some((sym.clone(), id_to_tv.get(fid)?.clone())))
+        .collect();
+    for spec in &args.crosses {
+        match backfill_cross(&args, &agent, spec, &sym_to_tv, data_root, from, to) {
+            Ok(v) => summary.push(v),
+            Err(e) => {
+                warn!(%spec, err = %e, "cross backfill failed");
+                summary.push(serde_json::json!({"cross": spec, "error": e.to_string()}));
+            }
+        }
+    }
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
+}
+
+/// OUT=NUM:DEN ratio-bar backfill. OHLC of the ratio is approximated
+/// per-minute as (o1/o2, h1/h2, l1/l2, c1/c2) - exact only if the legs move
+/// monotonically together within the bar, but for ~1.0-pegged stable legs the
+/// error is sub-bp and range is preserved, which is what s10/renko/vol need.
+fn backfill_cross(
+    args: &Args,
+    agent: &ureq::Agent,
+    spec: &str,
+    sym_to_tv: &BTreeMap<String, String>,
+    data_root: &Path,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<serde_json::Value> {
+    let (out_sym, legs) = spec.split_once('=').context("cross spec: OUT=NUM:DEN")?;
+    let (num_sym, den_sym) = legs.split_once(':').context("cross spec: OUT=NUM:DEN")?;
+    let norm = |s: &str| s.trim().to_uppercase().replace('-', "/");
+    let (out_sym, num_sym, den_sym) = (norm(out_sym), norm(num_sym), norm(den_sym));
+    let num_tv = sym_to_tv
+        .get(&num_sym)
+        .with_context(|| format!("cross leg {num_sym} not among configured oracle symbols"))?;
+    let den_tv = sym_to_tv
+        .get(&den_sym)
+        .with_context(|| format!("cross leg {den_sym} not among configured oracle symbols"))?;
+    let Some(ticker_id) = nxr_sdk::try_resolve_ticker_id(&out_sym) else {
+        bail!("unresolvable cross symbol {out_sym}");
+    };
+
+    let dir = idx_dir(data_root, ticker_id);
+    std::fs::create_dir_all(&dir)?;
+    let existing: BTreeSet<NaiveDate> = if args.overwrite {
+        BTreeSet::new()
+    } else {
+        list_shards(&dir, "idx")?.into_iter().map(|(d, _)| d).collect()
+    };
+    let mut missing: Vec<NaiveDate> = Vec::new();
+    let mut d = from;
+    while d <= to {
+        if !existing.contains(&d) {
+            missing.push(d);
+        }
+        d += ChronoDuration::days(1);
+    }
+    if missing.is_empty() {
+        info!(sym = %out_sym, "nothing to do (all dates covered)");
+        return Ok(serde_json::json!({"symbol": out_sym, "ticker_id": ticker_id.to_string(), "days": 0}));
+    }
+
+    let mut writer = ShardedWriter::new(dir.clone());
+    let mut total_bars = 0usize;
+    let mut run_start = 0usize;
+    while run_start < missing.len() {
+        let mut run_end = run_start;
+        while run_end + 1 < missing.len()
+            && missing[run_end + 1] == missing[run_end] + ChronoDuration::days(1)
+        {
+            run_end += 1;
+        }
+        let mut chunk_start = missing[run_start];
+        let run_last = missing[run_end];
+        while chunk_start <= run_last {
+            let chunk_end = (chunk_start + ChronoDuration::days(CHUNK_DAYS - 1)).min(run_last);
+            let from_ts = chunk_start.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+            let to_ts = chunk_end.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp();
+            let num = fetch_history(agent, &args.benchmarks_url, num_tv, from_ts, to_ts)?;
+            std::thread::sleep(std::time::Duration::from_millis(args.rate_ms));
+            let den = fetch_history(agent, &args.benchmarks_url, den_tv, from_ts, to_ts)?;
+            std::thread::sleep(std::time::Duration::from_millis(args.rate_ms));
+            if num.s == "ok" && den.s == "ok" && !num.t.is_empty() && !den.t.is_empty() {
+                let den_by_ts: BTreeMap<i64, usize> =
+                    den.t.iter().enumerate().map(|(i, t)| (*t, i)).collect();
+                for i in 0..num.t.len() {
+                    let Some(&j) = den_by_ts.get(&num.t[i]) else { continue };
+                    let bar_ts_ms = num.t[i] * 1000;
+                    for (k, n_px, d_px) in [
+                        (0i64, num.o[i], den.o[j]),
+                        (15_000, num.h[i], den.h[j]),
+                        (30_000, num.l[i], den.l[j]),
+                        (45_000, num.c[i], den.c[j]),
+                    ] {
+                        if !(n_px.is_finite() && n_px > 0.0 && d_px.is_finite() && d_px > 0.0) {
+                            continue;
+                        }
+                        let px = n_px / d_px;
+                        let ts_ms = bar_ts_ms + k;
+                        let index = Index {
+                            ticker: ticker_id,
+                            bid: px,
+                            ask: px,
+                            vbid: 0,
+                            vask: 0,
+                            ci: 0,
+                            tick_count: 1,
+                            confidence: 0,
+                            accepted: 2, // two legs, mirrors triangulate_into
+                            rejected: 0,
+                            flags: FLAG_HISTORICAL_BACKFILL | FLAG_NO_BOOK,
+                        };
+                        let header = MitchHeader::new(
+                            message_type::INDEX,
+                            0,
+                            mitch::timestamp::from_epoch_ms(ts_ms),
+                            1,
+                        );
+                        writer.append(ts_ms, &IndexRecord { header, index })?;
+                    }
+                    total_bars += 1;
+                }
+            }
+            chunk_start = chunk_end + ChronoDuration::days(1);
+        }
+        run_start = run_end + 1;
+    }
+    writer.close()?;
+
+    let shards = list_shards(&dir, "idx")?;
+    let mut entries = Vec::with_capacity(shards.len());
+    for (date, path) in &shards {
+        entries.push(shard_entry_for_idx(*date, path)?);
+    }
+    let mpath = manifest_path(&dir);
+    let mut manifest = Manifest::new(out_sym.clone(), ticker_id, "idx");
+    manifest.set_shards_batch(entries);
+    write_manifest(&mpath, &manifest)?;
+
+    info!(sym = %out_sym, ticker_id, bars = total_bars, "cross backfill complete");
+    Ok(serde_json::json!({
+        "symbol": out_sym,
+        "ticker_id": ticker_id.to_string(),
+        "bars": total_bars,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
