@@ -62,6 +62,12 @@ struct Args {
     /// Default: `$NXR_DATA_BARS/<MITCH_ID>/`.
     #[arg(long = "out-dir")]
     out_dir: Option<PathBuf>,
+    /// Only process input shards dated <= this UTC date (YYYY-MM-DD).
+    /// Offline regen over a LIVE ticker must pass yesterday here: today's
+    /// .s10 is owned by the live bars_s10 producer, and an atomic rewrite
+    /// would leave its writer appending to an unlinked inode.
+    #[arg(long = "to-date")]
+    to_date: Option<chrono::NaiveDate>,
 }
 
 fn main() -> Result<()> {
@@ -108,6 +114,10 @@ fn main() -> Result<()> {
     );
 
     let shards = list_shards(&in_dir, "idx")?;
+    let shards: Vec<_> = match args.to_date {
+        Some(cutoff) => shards.into_iter().filter(|(d, _)| *d <= cutoff).collect(),
+        None => shards,
+    };
     if shards.is_empty() {
         anyhow::bail!("no input shards in {}", in_dir.display());
     }
