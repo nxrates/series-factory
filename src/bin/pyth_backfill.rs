@@ -39,7 +39,7 @@ use tracing::{info, warn};
 /// TV-shim empirical max ≈ 7200 bars/request (10 d returns empty) - 5 d is
 /// the safe chunk.
 const CHUNK_DAYS: i64 = 5;
-const FETCH_RETRIES: u32 = 3;
+const FETCH_RETRIES: u32 = 6;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -61,8 +61,9 @@ struct Args {
     overwrite: bool,
     #[arg(long, default_value = "https://benchmarks.pyth.network")]
     benchmarks_url: String,
-    /// Sleep between HTTP requests (public infra politeness)
-    #[arg(long, default_value_t = 300)]
+    /// Sleep between HTTP requests (public infra politeness). Benchmarks
+    /// 429s aggressive callers; ~1 req/2s sustains.
+    #[arg(long, default_value_t = 2000)]
     rate_ms: u64,
     #[arg(long)]
     data_root: Option<String>,
@@ -473,9 +474,16 @@ fn fetch_history(
                 }
                 last_err = Some(anyhow::anyhow!("history status {}", h.s));
             }
+            // 429 = benchmarks rate limit: back off HARD (30s, 60s, 90s...)
+            // or the whole run burns its retries in seconds.
+            Err(ureq::Error::Status(429, _)) => {
+                last_err = Some(anyhow::anyhow!("status 429 (rate limited)"));
+                std::thread::sleep(std::time::Duration::from_secs(30 * (attempt as u64 + 1)));
+                continue;
+            }
             Err(e) => last_err = Some(e.into()),
         }
-        std::thread::sleep(std::time::Duration::from_millis(1000 * (attempt as u64 + 1)));
+        std::thread::sleep(std::time::Duration::from_millis(2000 * (attempt as u64 + 1)));
     }
     Err(last_err.unwrap())
 }
