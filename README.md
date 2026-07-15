@@ -1,543 +1,224 @@
 <div align="center">
-  <img border-radius="25px" max-height="250px" src="./banner.png" />
+  <img border-radius="25px" max-height="250px" src="./banner.svg" />
   <h1>Series Factory</h1>
   <p>
-    <strong>Adaptive Renko bar generation and historical time series aggregator</strong>
+    <strong>Historical market time-series ingestion, aggregation, and validation toolkit</strong>
   </p>
   <p>
-    <em>Primary role: live <code>processor</code> service in the NX Rates pipeline. Converts time bars into adaptive Renko <code>mitch::Bar</code> files (96B, mmap) consumed by BTR optimizers.<br/>
-    Secondary role: offline historical data ingestion from CEX trade archives for backtesting.</em>
-  </p>
-  <p>
-    <!-- <a href="https://btr.supply/docs"><img alt="Docs" src="https://img.shields.io/badge/Docs-212121?style=flat-square&logo=readthedocs&logoColor=white" width="auto"/></a> -->
     <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-000000?style=flat-square&logo=open-source-initiative&logoColor=white&labelColor=4c9c3d" width="auto"/></a>
-    <a href="https://t.me/BTRSupply"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-24b3e3?style=flat-square&logo=telegram&logoColor=white" width="auto"/></a>
-    <a href="https://twitter.com/BTRSupply"><img alt="X (Twitter)" src="https://img.shields.io/badge/@BTRSupply-000000?style=flat-square&logo=x&logoColor=white" width="auto"/></a>
-    </p>
+    <a href="https://nxrates.com"><img alt="Site" src="https://img.shields.io/badge/nxrates.com-212121?style=flat-square&logo=googlechrome&logoColor=white" width="auto"/></a>
+    <a href="https://twitter.com/nxrates"><img alt="X (Twitter)" src="https://img.shields.io/badge/@nxrates-000000?style=flat-square&logo=x&logoColor=white" width="auto"/></a>
+  </p>
 </div>
 
-Fetch data from high quality data sources or generate fresh test data using stochastic models, cleanse and aggregate at speed.
-
----
-
-## Production Use: Adaptive Renko Pipeline
-
-In production this binary is the `processor` service in the `nxr` Kubernetes namespace. It runs continuously, reading mmap time-bar files written by the `sink`, and emitting adaptive Renko `mitch::Bar` files consumed by BTR optimizers and executors.
-
-```
-mmap time bars (sink output)
-        │
-        ▼
-   series-factory (processor binary)
-        ├── adaptive_renko.rs : brick size = price * clamp(m * σ_blend, b_min, b_max)
-        ├── vol_bin.rs        : zero-copy VolMmap (Parkinson σ values)
-        └── stats.rs          : J_stats: stationarity + IID + homogeneity + normality + robustness
-        │
-        ▼
-   *.bars files (mitch::Bar, 96B mmap)
-   → consumed by btr-ml and btr-runtime
-```
-
-Key production binaries:
-
-| Binary | Purpose |
-|--------|---------|
-| `generate-renko-from-ticks` | Offline: raw ticks → .bars files (backtesting) |
-| `series-factory` | Time/tick aggregation to MITCH `.bars` (96B mmap, non-renko) |
-
-**Architecture docs:** [NX Rates Architecture](../docs/architecture.md) | [Cluster Architecture](../docs/cluster-architecture.md)
+Rust library and CLI toolkit for building research-grade market data series from raw CEX trade archives: download, replay into composite index streams, aggregate into time and adaptive Renko bars, and certify data quality. Includes stochastic model generators (GBM, FBM, Heston, jump-diffusion) for synthetic test series.
 
 ---
 
 ## Table of Contents
-- [Features](#features)
-- [Installation](#installation)
+- [Pipeline](#pipeline)
+- [Binaries](#binaries)
 - [Data Sources](#data-sources)
-- [Generative Models](#generative-models)
+- [Synthetic Models](#synthetic-models)
+- [File Formats](#file-formats)
 - [Usage](#usage)
-- [Series Aggregation Methodology](#series-aggregation-methodology)
-- [Performance](#performance)
-- [Output Format](#output-format)
-- [Caching Strategy](#caching-strategy)
-- [Architecture](#architecture)
-- [Examples](#examples)
+- [Renko Calibration](#renko-calibration)
+- [Library Modules](#library-modules)
+- [Testing](#testing)
+- [Production Role](#production-role)
+- [License](#license)
 
-## Features
+## Pipeline
 
-- **Multiple Data Sources**: Support for 5+ CEX exchanges and synthetic generators.
-- **Aggregation Methods**: Time-based and tick-based aggregation with customizable parameters.
-- **Advanced Analytics**: Realized variance, bipower variance (jump-robust), drift, OFI, spread-bps, and max abs return per aggregate.
-- **Generative Models**: GBM, FBM, Heston, NJDM, and DEJDM for synthetic data generation.
-- **High Performance**: Multi-threaded processing with async I/O, targeting <60s for 1 month of data.
-- **Intelligent Caching**: Three-tier caching system for optimal performance.
-- **Data Quality**: Automatic filtering of stale and deviated ticks.
-- **MITCH Binary Output**: Zero-copy `.bars` files (96 B `mitch::Bar`, mmap-ready), consumed directly by btr-ml / btr-runtime.
+```
+CEX trade archives (ZIP/GZIP CSV)
+        │  fetch-crypto-history
+        ▼
+raw .ticks files (per exchange, MITCH Tick)
+        │  ticks-to-idx        200 ms replay of the live forwarder loop
+        ▼
+per-provider .idx AppendLogs (56 B IndexRecord)
+        │  merge-idx           time-decay-weighted average (TDWAP) across providers
+        ▼
+composite daily-sharded .idx   <root>/indexes/<MITCH_ID>/<YYYY-MM-DD>.idx
+        │  s10-from-idx · renko-from-idx
+        ▼
+daily-sharded bars             <root>/bars/<MITCH_ID>/<YYYY-MM-DD>.{s10,renko}
+        │  integrity-check · glue-check · data-quality-audit
+        ▼
+PASS/FAIL certification
+```
+
+`backfill-all` orchestrates the full chain for many tickers in parallel, with resume logic, availability probing, and a JSON report.
+
+## Binaries
+
+### Ingestion and merge
+
+| Binary | Purpose |
+|--------|---------|
+| `fetch-crypto-history` | Download aggTrades/tick archives per (pair, exchange) into `.ticks` files; `--probe` mode HEAD-checks archive coverage |
+| `ticks-to-idx` | Replay raw `.ticks` into a per-provider `.idx` AppendLog (200 ms cycle, z-score outlier gate) |
+| `merge-idx` | TDWAP-merge per-provider `.idx` files into a composite daily-sharded `.idx` directory |
+| `backfill-all` | Orchestrator: fetch, ticks-to-idx, merge, s10, renko, validate; parallel tickers, resume, JSON report |
+| `synth-backfill-from-idx` | Rebuild synthetic cross-pair bars (e.g. ETH-BTC) from the two leg `.idx` streams |
+
+### Bar construction
+
+| Binary | Purpose |
+|--------|---------|
+| `s10-from-idx` | Uniform 10 s OHLC bars (96 B `mitch::Bar`, full microstructure section) from composite `.idx` |
+| `renko-from-idx` | Adaptive Renko bricks; brick size re-calibrated every 30 min from a Rogers-Satchell sigma `.vol` file |
+| `renko-trailing-from-idx` | Walk-forward Renko backfill: per-day `k(D)` calibrated only on data before day `D` (no look-ahead) |
+| `vol-from-s10` | Build an id-keyed `.vol` sigma file from persisted `.s10` shards |
+
+### Calibration
+
+| Binary | Purpose |
+|--------|---------|
+| `nxr-calibrate` | Daily offline calibration of the Renko brick multiplier per ticker (MTF binary search on a target bricks/day) |
+| `window-sweep` | Walk-forward sweep answering which `rolling_window_days` minimizes bricks/day calibration error |
+
+### Validation and maintenance
+
+| Binary | Purpose |
+|--------|---------|
+| `integrity-check` | Structural validation of `.idx`, `.s10`, `.bars`, `.vol` files; CI smoke gate and post-pipeline assertion |
+| `glue-check` | Seam validator for the backfill/live `.idx` join: monotonicity, cross-shard continuity, gap bounds |
+| `data-quality-audit` | Per-ticker PASS/FAIL certifier: zero unexplained gaps, microstructure invariants, statistical fingerprint |
+| `renko-continuity-check` | Cross-shard brick continuity, bricks/day median and MAD, s10 grid continuity |
+| `live-latency-audit` | Wall-clock lag of live shard tips vs SLA budgets |
+| `resample-idx` | Down-sample `.idx` shards to a coarser cadence (last-in-bucket, e.g. 100 ms to 200 ms) |
+| `migrate-to-sharded` | One-time migration of flat/composite legacy layouts into the MITCH-ID daily-sharded layout |
+| `heal-idx` | Repair sharded `.idx` in place: sort, resample, re-shard |
 
 ## Data Sources
 
-### Supported Exchanges
+| Exchange | Format | History from | Notes |
+|----------|--------|--------------|-------|
+| Binance | ZIP/CSV | 2017 (monthly), 2021 (daily) | Monthly archives for completed months, daily for the current month |
+| Bybit | GZIP/CSV | 2019 | Monthly plus daily for the current month |
+| OKX | ZIP/CSV | 2021 | Daily files, dash-separated symbols (BTC-USDT) |
+| Bitget | ZIP/CSV | 2021 | Daily files, sequential chunks (001-N) |
 
-| Exchange | ID | Data Format | History From | Notes |
-|----------|----|-------------|--------------|-------|
-| Binance | `binance` | ZIP/CSV | 2017 (monthly), 2021 (daily) | Monthly files for completed months, daily for current month |
-| Bybit | `bybit` | GZIP/CSV | 2019 | Monthly files for completed months, daily for current month |
-| Bitget | `bitget` | ZIP/CSV | 2021 | Daily files, sequential chunks (001-N) |
-| OKX | `okx` | ZIP/CSV | 2021 | Daily files, dash-separated symbols (BTC-USDT) |
-| KuCoin | `kucoin` | ZIP/CSV | 2020 | Daily files |
+Archive URL templates are YAML-driven (`cexs.exchanges.<name>.archive_url_template` in the pipeline config); no URLs are hardcoded. Sources convert trades to ticks pessimistically: market sells set the bid, market buys set the ask, and the other side is forward-filled.
 
-### Exchange Comparison
+## Synthetic Models
 
-<div align="center">
-  <img src="assets/exchange_spreads_comparison.png" alt="Exchange Spread Comparison" width="100%">
-</div>
+The `sources::synthetic` module implements `TickSource` for five stochastic processes (500 ms tick epoch, parameters annualized):
 
-The chart above shows price spread, realized-variance spread, and drift spread across 5 major CEX exchanges for BTC-USDT with 10-second aggregation.
+| Model | Parameters |
+|-------|------------|
+| Geometric Brownian Motion | `mu, sigma, base` |
+| Fractional Brownian Motion | `mu, sigma, hurst, base` |
+| Heston stochastic volatility | `mu, sigma, kappa, theta, xi, rho, base` |
+| Normal jump-diffusion (Merton) | `mu, sigma, lambda, mu_jump, sigma_jump, base` |
+| Double-exponential jump-diffusion (Kou) | `mu, sigma, lambda, mu_pos, mu_neg, p_neg, base` |
 
-## Installation
+Construct via the library: `create_source(&DataSource::Synthetic(GenerativeModel::GBM { mu, sigma, base }))`. Each synthetic instance gets a distinct provider id, so multiple synthetic sources feed the aggregator as independent providers.
+
+## File Formats
+
+All on-disk types are MITCH protocol structs: `#[repr(C, packed)]`, `bytemuck::Pod`, read via mmap and zero-copy cast. Timestamps are MITCH `mts`, a 6-byte u48 LE counting 16 microsecond ticks since 2010-01-01 UTC.
+
+| Extension | Record | Size | Content |
+|-----------|--------|------|---------|
+| `.ticks` | `mitch::Tick` | 32 B (+16 B header) | timestamp, bid, ask, vbid, vask |
+| `.idx` | `IndexRecord` | 56 B | composite index: mid, confidence, volumes, flags |
+| `.s10` | `mitch::Bar` | 96 B | 10 s OHLC kline, 64 B OHLCV + 32 B microstructure |
+| `.renko` | `mitch::Bar` | 96 B | adaptive Renko brick, same layout |
+| `.vol` | `VolRecord` | 14 B | (mts, Rogers-Satchell sigma) per 30-min bin, EMA-smoothed |
+
+Per-bar microstructure section: realized variance, bipower variance (jump-robust, Barndorff-Nielsen and Shephard 2004), OLS drift, signed volume imbalance (OFI), average spread in bps, max absolute return, quality metadata.
+
+Sharded layout (single source of truth in `nxr_sdk::shard`):
+
+```
+<root>/indexes/<MITCH_ID>/<YYYY-MM-DD>.idx
+<root>/bars/<MITCH_ID>/<YYYY-MM-DD>.{s10,renko}   + manifest.json
+```
+
+Files are headerless append-only streams; record count = file size / record size.
+
+## Usage
+
+Build (requires the sibling `mitch` and `sdk` checkouts of the parent nx-rates repository, referenced as path dependencies):
 
 ```bash
 cargo build --release
 ```
 
-## Usage
-
-### Basic Syntax
+Fetch one year of BTC and ETH history from two exchanges:
 
 ```bash
-./target/release/series-factory [OPTIONS]
+fetch-crypto-history config.yml --pairs BTC,ETH --exchanges binance,bybit --days 365
 ```
 
-### CLI Parameters
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--base` | Base asset (e.g., "BTC") | "BTC" |
-| `--quote` | Quote asset (e.g., "USDT") | "USDT" |
-| `--sources` | Pipe-separated data sources (e.g., "binance\|bybit") or generative model | "binance" |
-| `--from` | Start date (YYYY-MM-DD) | Required |
-| `--to` | End date (YYYY-MM-DD or "now") | Required |
-| `--agg-mode` | Aggregation method ("time" or "tick") | "time" |
-| `--agg-step` | Aggregation step (ms for time, ratio for tick) | Required |
-| `--agg-fields` | Pipe-separated fields to include in output | All fields |
-| `--weight-mode` | Weighting mode ("static", "volume", or "mixed") | "static" |
-| `--weights` | Pipe-separated static weights (auto-normalized) | Equal weights |
-| `--tick-ttl` | Tick time-to-live in milliseconds for staleness check | 100 |
-| `--tick-max-deviation` | Maximum tick deviation ratio for outlier filtering. | 0.001 (0.1%) |
-| `--cache-dir` | Cache directory. | "./cache" |
-| `--output-dir` | Output directory. | "./output" |
-
-### Aggregation Step Interpretation
-
-- **Time mode**: `agg_step` is in milliseconds (e.g., 1000 = 1 second aggregation)
-- **Tick mode**: `agg_step` is a price ratio (e.g., 0.0001 = 0.01% price movement triggers new aggregate)
-
-## Series Aggregation Methodology
-
-The process of creating aggregated series involves several steps, from raw trade data to final analyzed aggregates.
-
-### Step 1: Trades to Tick Conversion
-
-#### 1.1 Raw Trades to Aggregated Trades
-Most trusted data sources (e.g., Binance) provide pre-aggregated trades. For sources providing only raw trades, an initial aggregation step sums all trades that lead to a price change. This repository currently relies on sources that provide aggregated trades or ticks.
-
-#### 1.2 Aggregate Trades to Ticks
-Aggregate trades are converted to ticks using the following logic:
-- **Market sells** (buyer maker): Price becomes bid, previous ask is forward-filled
-- **Market buys**: Price becomes ask, previous bid is forward-filled
-This method is a pessimistic but reliable reading of the spread, ensuring better model robustness.
-
-The resulting tick structure:
-```rust
-Tick {
-    timestamp: i64,  // milliseconds since epoch
-    bid: f64,        // bid price
-    ask: f64,        // ask price
-    vbid: u32,       // volume at bid in USD*
-    vask: u32,       // volume at ask in USD*
-}
-```
-
-**Note**: When using multiple data sources (e.g., `--sources="binance|bybit"`), each source's ticks are aggregated separately and then merged at the aggregate level. Source identity is tracked implicitly through separate aggregation pipelines, not stored on individual ticks.
-
-### Step 2: Optional Triangular Re-basing
-
-For synthetic pairs (e.g., BTC-ETH), the system uses the most liquid USDT denominated pairs to construct the series.
-
-#### 2.1 Data Source Characteristics
-
-All supported exchanges provide downloadable historical trade data via public data lakes:
-
-- **Binance**: Monthly ZIP files from 2017, daily files from 2021. Automatically uses daily data for the current/ongoing month since monthly files are not yet available.
-- **Bybit**: Monthly GZIP files from 2019, with daily files for the current month
-- **OKX**: Daily ZIP files from 2021, dash-separated symbols (BTC-USDT)
-- **KuCoin**: Daily ZIP files from 2020
-- **Bitget**: Daily ZIP files from 2021, sequential chunks (001-N)
-
-#### 2.2 Triangulation
-Time-based forward filling is used to merge the USDT pairs into a single intermediate synthetic series.
-
-#### 2.3 Volume Re-basing
-To make volumes comparable, they are denominated in USD*. For synthetic pairs, the volume is estimated using the arithmetic mean of the constituent pair volumes to avoid overstating liquidity.
-
-### Step 3: Ticks to Aggregates
-
-The final step is to compute aggregates from the intermediate ticks. An aggregate is a bucket of ticks, created based on either time or price movement.
-
-```rust
-Aggregate {
-    open_ts / close_ts: u48 MITCH mts (16 us ticks since 2010)
-    open, high, low, close: f64  // OHLC mid prices
-    vbid, vask: u32              // cumulative bid / ask volume (same units as Index.vbid/vask)
-    tick_count: u32              // # ingested Index messages in bar
-    // microstructure section (32 B, f32 unless noted):
-    realized_var, bipower_var, drift, vol_imbalance,
-    avg_spread_bps, max_abs_return,
-    avg_ci_ubp: u16, reject_rate: u16,
-    kind: u8,  // 0=kline, 1=renko, 2=dib, 3=tib
-}
-```
-
-#### Aggregation Modes
-
-##### Time-Based Aggregation (Candles)
-- **Trigger**: A new aggregate bucket is created when `timestamp >= prev_timestamp + agg_step`
-- **Behavior**: Creates traditional OHLC candlesticks with fixed time intervals
-- **Use Case**: Standard time-series analysis, consistent sampling rate
-- **Gap Handling**: Empty buckets create flat candles at the last known price
-
-##### Price-Based Aggregation (Renko-like Bricks)
-- **Trigger**: A new aggregate bucket is created when price moves beyond `prev_close * (1 ± agg_step)`
-- **Behavior**: Creates bricks similar to Renko charts but with wicks (high/low)
-- **Use Case**: Noise reduction, trend following, volatility-normalized analysis
-- **OHLC Interpretation**: Shows the price path taken to trigger the brick close
-
-#### Data Quality Filtering
-- **Stale Ticks**: Ticks older than `tick_ttl` are excluded from the aggregate's mid-price and spread calculations.
-- **Deviated Ticks**: Ticks with a mid-price deviating more than `tick_max_deviation` from the current aggregate mid-price are filtered out.
-- **Volume Integrity**: To avoid double-counting and lookahead bias, only the volumes of ticks within the current aggregate bucket are counted towards `vask` and `vbid`. Prices can be forward-filled from previous ticks (if not stale), but volumes are not.
-
-### Step 4: Aggregate Analytics
-
-For each bar, the following microstructure features are computed in a single
-streaming pass. All are canonical HF estimators; no derivable quantity is
-stored (e.g., `log_volume` is not stored since it is `ln(vbid + vask + 1)`).
-
-#### 4.1 Realized Variance
-```
-realized_var = Σ (log(mid_t / mid_{t-1}))²
-```
-Canonical high-frequency volatility estimator. Unlike CV / dispersion, it is
-defined directly on returns and is scale-invariant.
-
-#### 4.2 Drift
-Normalized OLS slope over the bar:
-```
-slope = cov(x, mid) / var(x)     # x = seconds since first tick
-drift = slope * duration_seconds / close
-```
-Dimensionless; positive = upward trend.
-
-#### 4.3 Average Spread (bps of mid)
-```
-avg_spread_bps = mean((ask - bid) / mid) * 1e4
-```
-
-#### 4.4 Volume Imbalance (signed OFI)
-```
-vol_imbalance = Σ sign(r_t) * (vbid_t + vask_t) / total_vol
-```
-Range `[-1, 1]`. VPIN primitive; positive = net buying pressure.
-
-#### 4.5 Bipower Variance
-```
-bipower_var = (π/2) · Σ |r_t|·|r_{t-1}|
-```
-Jump-robust volatility estimator (Barndorff-Nielsen & Shephard 2004). Pair with
-`realized_var` to decompose: `jump_var ≈ max(realized_var - bipower_var, 0)`.
-
-#### 4.6 Max Absolute Return
-```
-max_abs_return = max_t |log(mid_t / mid_{t-1})|
-```
-Single-tick jump / tail indicator. Useful as a direct feature or for jump filtering.
-
-#### 4.7 Quality Features (inherited from Index)
-- `avg_ci_ubp`: mean `Index.ci_ubp`, sqrt-compressed u16.
-- `reject_rate`: `Σ rejected / Σ (accepted + rejected) × 65535`.
-
-Both default to zero when built from raw ticks without Index-level quality
-metadata.
-
-## Generative Models
-
-The factory can generate synthetic series using several stochastic process models. The model and its parameters are passed as a string to the `--sources` argument.
-
-**IMPORTANT**: All synthetic data uses a fixed 500ms epoch (one tick every 500 milliseconds). All time-related parameters are specified on a **yearly basis** and automatically converted to per-epoch values by the system.
-
-### Available Models
-
-| Model | ID | Parameters | Description |
-|-------|----|------------|-------------|
-| Geometric Brownian Motion | `gbm(...)` | `mu, sigma, base` | Continuous stochastic process with drift |
-| Fractional Brownian Motion | `fbm(...)` | `mu, sigma, hurst, base` | BM with long-range dependence (Hurst parameter) |
-| Heston Stochastic Volatility | `hm(...)` | `mu, sigma, kappa, theta, xi, rho, base` | Volatility follows mean-reverting process |
-| Normal Jump-Diffusion | `njdm(...)` | `mu, sigma, lambda, mu_jump, sigma_jump, base` | GBM + normally distributed jumps |
-| Double Exp. Jump-Diffusion | `dejdm(...)` | `mu, sigma, lambda, mu_pos, mu_neg, p_neg, base` | GBM + asymmetric exponential jumps |
-
-### Model Comparison
-
-<div align="center">
-  <img src="assets/synthetic_models_comparison.png" alt="Synthetic Models Comparison" width="100%">
-</div>
-
-### Time Parameters Conversion
-- **Epochs per year**: ~63,115,200 (calculated as 365.25 × 24 × 60 × 60 × 1000 ÷ 500)
-- **Parameter conversion**:
-  - Drift rates: `yearly_mu / epochs_per_year`
-  - Volatilities: `yearly_sigma / sqrt(epochs_per_year)`
-  - Frequencies: `yearly_lambda / epochs_per_year`
-
-### Geometric Brownian Motion (GBM)
-A continuous-time stochastic process where the logarithm of the randomly varying quantity follows a Brownian motion with drift.
-```
-gbm(mu, sigma, base)
-```
-- `mu`: **Yearly** drift rate (e.g., 0.05 for 5% annual drift)
-- `sigma`: **Yearly** volatility (e.g., 0.2 for 20% annual volatility)
-- `base`: Starting price
-
-Example: `gbm(0.05,0.2,100.0)`
-
-### Fractional Brownian Motion (FBM)
-An extension of Brownian motion with a Hurst parameter `h` that models long-range dependence.
-```
-fbm(mu, sigma, hurst, base)
-```
-- `mu`: **Yearly** drift rate
-- `sigma`: **Yearly** volatility magnitude
-- `hurst`: Hurst parameter (0-1)
-  - `h = 0.5`: Standard Brownian motion
-  - `h > 0.5`: Persistent behavior (trends)
-  - `h < 0.5`: Anti-persistent behavior (mean-reverting)
-- `base`: Starting price
-
-Example: `fbm(0.05,0.2,0.75,100.0)`
-
-### Heston Stochastic Volatility Model
-Volatility itself follows a random process, mean-reverting to a long-term average.
-```
-hm(mu, sigma, kappa, theta, xi, rho, base)
-```
-- `mu`: **Yearly** drift rate
-- `sigma`: **Yearly** initial volatility
-- `kappa`: Mean reversion speed for volatility
-- `theta`: Long-term average volatility
-- `xi`: Volatility of volatility
-- `rho`: Price-vol correlation (-1 to 1)
-- `base`: Starting price
-
-Example: `hm(0.05,0.2,1000,0.04,0.3,-0.75,100.0)`
-
-### Normal Jump-Diffusion Model (NJDM)
-Combines GBM with discrete jumps at random intervals (normally distributed jump sizes).
-```
-njdm(mu, sigma, lambda, mu_jump, sigma_jump, base)
-```
-- `mu`: **Yearly** drift rate
-- `sigma`: **Yearly** diffusion volatility
-- `lambda`: **Yearly** jump frequency (jumps per year)
-- `mu_jump`: Mean jump size (as fraction)
-- `sigma_jump`: Jump size standard deviation
-- `base`: Starting price
-
-Example: `njdm(0.05,0.2,10,0.01,0.05,100.0)`
-
-### Double Exponential Jump-Diffusion Model (DEJDM)
-GBM with asymmetric positive/negative jumps (exponentially distributed).
-```
-dejdm(mu, sigma, lambda, mu_pos_jump, mu_neg_jump, p_neg_jump, base)
-```
-- `mu`: **Yearly** drift rate
-- `sigma`: **Yearly** diffusion volatility
-- `lambda`: **Yearly** jump frequency
-- `mu_pos_jump`: Mean positive jump size
-- `mu_neg_jump`: Mean negative jump size (negative value)
-- `p_neg_jump`: Probability of negative jump (0-1)
-- `base`: Starting price
-
-Example: `dejdm(0.05,0.2,10,0.02,-0.03,0.4,100.0)`
-
-## Performance
-
-### Requirements
-- Process 1 month of tick data (500M-1B ticks) in under 60 seconds.
-- Memory usage < 2GB for processing 1 month of data.
-- Support for future real-time streaming mode.
-
-### Optimizations
-- **Concurrency**: Tokio for async I/O, Rayon for parallel CPU-bound tasks.
-- **Parallelism**: Concurrent processing of multiple data sources.
-- **Streaming**: Process data in configurable monthly batches to optimize memory.
-- **Memory efficiency**: No full dataset loading, lazy evaluation where possible.
-- **Lock-free structures**: Used where possible for efficient inter-thread communication.
-
-## Output Format
-
-### `.bars` Binary Schema
-
-Files are a packed stream of `mitch::Bar` records (96 B each, `#[repr(C, packed)]`, `Pod + Zeroable`). Layout is authoritative in [`../mitch/model/bar.md`](../mitch/model/bar.md) (64B OHLCV + 32B microstructure); the same format is what `btr/prime/crates/ml/src/barfile.rs` memory-maps, enabling zero-copy mmap reads downstream. Field-level offsets, types, and microstructure semantics live in the canonical spec - this README does not duplicate them.
-
-**Timestamps are MITCH `mts`:** 6-byte u48 LE, encoded as 16 µs ticks since 2010-01-01 UTC. Use `mitch::timestamp::{from_epoch_ms, to_epoch_ms}` (or `Bar::open_time_ms()` / `Bar::close_time_ms()`) to convert to/from Unix milliseconds. The on-disk bytes are never raw epoch seconds/ms.
-
-**File header:** none. Record count = `file_size / 96`. Append-only; readers use `mmap` + `bytemuck::cast_slice::<u8, Bar>` for zero-copy iteration.
-
-### File Naming
-```
-{base}-{quote}_{sources}_{from}-{to}_{agg_mode}-{agg_step}.bars
-```
-Example: `btc-usdt_binance_20250720-20250721_time-5000.bars`
-
-Generation parameters live in the filename; no in-file metadata header (the file is a raw `&[Bar]` slice, so `len / 96` == bar count).
-
-### Data Preview
-The application automatically displays a formatted table showing the first and last 10 rows of generated data:
-- **Timestamp format**: YYYYMMDD HH:MM:SS.fff (e.g., 20250720 14:30:15.500)
-- **Microstructure metrics**: Realized variance, drift, OFI and spread-bps displayed per bar
-- **Summary statistics**: Average price, spread, and total volume
-- **Data quality**: First tick always has non-zero bid and ask values
-
-## Caching Strategy
-
-A three-tier caching system is used to minimize redundant computations and data downloads.
-
-### Three-Tier Cache Hierarchy
-
-#### 1. Raw Data Cache (`./cache/raw/`)
-- Stores originally downloaded exchange data files (e.g., ZIP/CSV).
-- Structure: `{exchange}/{symbol}/{year}/{month}/`
-- Default retention: 30 days.
-
-#### 2. Tick Cache (`./cache/ticks/`)
-- Stores raw data converted to a unified tick format (MITCH `.ticks` binary, 48 B per record).
-- Structure: `{exchange}/{symbol}/{year}/{month}/`
-- Schema: MitchHeader (16 B) + Tick (32 B): timestamp, bid, ask, vbid, vask.
-
-#### 3. Aggregate Cache (`./cache/aggregates/`)
-- Stores pre-computed aggregates for common parameter sets.
-- Structure: `{sources_hash}/{params_hash}/{year}/{month}/`
-- Allows rapid regeneration of output when only output fields change.
-
-### Cache Management
-- Content-based hashing (SHA-256) for cache keys ensures integrity.
-- Automatic cleanup of stale cache entries.
-- Configurable cache size limits with LRU eviction policy.
-
-## Architecture
-
-### Module Structure
-- `sources/`: Data source implementations (Binance, synthetic models).
-- `aggregation/`: Core aggregation engine.
-- `cache/`: Three-tier caching system.
-- `output/`: MITCH `.bars` binary writer (zero-copy `bytemuck::cast_slice`).
-- `types/`: Core data structures (re-exports `mitch::TickFrame`, `mitch::bar::Bar`).
-- `cli/`: Command-line interface parsing and handling.
-
-### Key Design Principles
-- **Modular**: Easily extensible for new data sources and models.
-- **Memory Safe**: Zero-copy operations and careful memory management.
-- **Error Handling**: Comprehensive error types with context via `thiserror`.
-- **Async/Await**: Non-blocking I/O operations for network and file access.
-- **Type Safety**: Strong typing throughout the application to prevent errors.
-
-## Examples
-
-### Exchange Data with Time Aggregation
-```bash
-# Fetch BTC/USDT from Binance with 5-second aggregation
-./target/release/series-factory \
-    --sources="binance" \
-    --from="2025-07-20" \
-    --to="2025-07-21" \
-    --agg-mode="time" \
-    --agg-step=5000
-```
-
-### Synthetic Data Generation
-```bash
-# Generate Heston model data aggregated into 1-minute buckets
-./target/release/series-factory \
-    --sources="hm(0.0001,0.001,1000,0.001,0.001,-0.75,100.0)" \
-    --from="2025-01-01" \
-    --to="2025-12-31" \
-    --agg-mode="time" \
-    --agg-step=60000
-```
-
-### Tick-Based Aggregation
-```bash
-# Aggregate on 0.1% price movements
-./target/release/series-factory \
-    --sources="binance" \
-    --from="2025-07-20" \
-    --to="2025-07-21" \
-    --agg-mode="tick" \
-    --agg-step=0.001
-```
-
-### Multiple Sources (Combined Data)
-
-Fetch from multiple exchanges simultaneously. All ticks are combined and sorted chronologically.
+Replay raw ticks into a per-provider index, then merge providers into a composite:
 
 ```bash
-# Combine data from Bybit and OKX
-./target/release/series-factory \
-    --sources="bybit|okx" \
-    --from="2025-01-11" \
-    --to="2025-01-12" \
-    --agg-mode="time" \
-    --agg-step=10000
-
-# Combine all 5 supported exchanges
-./target/release/series-factory \
-    --sources="binance|bybit|okx|kucoin|bitget" \
-    --from="2025-01-11" \
-    --to="2025-01-12" \
-    --agg-mode="time" \
-    --agg-step=10000
+ticks-to-idx binance BTC USDT --cycle-ms 200 --z 6.0
+merge-idx BTC USDT --exchange binance --exchange bybit --weight binance=40 --weight bybit=30
 ```
 
-**Note**: When combining multiple sources, use `--weights` to assign custom weights. Weights are auto-normalized so they don't need to sum to 1.0. For example, `--weights="2|1"` gives the first source 2x the influence of the second.
+Build bars from the composite:
+
+```bash
+s10-from-idx config.yml BTC-USDT
+renko-from-idx config.yml BTC USDT
+```
+
+Or run the whole chain for a ticker set:
+
+```bash
+backfill-all config.yml --tickers BTC-USDT,ETH-USDT --from 2024-01-01 --resume
+```
+
+Validate:
+
+```bash
+integrity-check dir /data --parallel 4
+glue-check --all --data-root /data
+data-quality-audit --data-root /data --json
+```
+
+Paths default to the standard environment (`$NXR_DATA_TICKS`, `$NXR_DATA_INDEXES`, `$NXR_DATA_BARS`); every offline binary accepts explicit overrides.
+
+## Renko Calibration
+
+Adaptive Renko brick size is `price * clamp(m * sigma_blend, b_min, b_max)`, where `sigma_blend` is the EMA-smoothed Rogers-Satchell sigma over 30-min OHLC bins built from gapless `.s10` bars. The multiplier `m` is calibrated per ticker against a target brick density (bricks/day, default 300) by direct binary search (`scale_to_target_k`).
+
+Two calibration regimes:
+
+- `nxr-calibrate`: daily cron; fits `m` on a trailing window, writes `ticker-params.json` atomically.
+- `renko-trailing-from-idx`: historical backfill; re-fits `k(D)` for every UTC day `D` using only data with `ts < D_start`, so backtests on the output contain no look-ahead. Calibration granularity matches apply granularity (full ticks, not downsampled), which matters: a 1-min downsample biases `k` 3-5x small.
+
+`window-sweep` selects the rolling window length empirically by walk-forward error rather than judgment.
+
+## Library Modules
+
+- `sources/`: exchange archive downloaders (Binance, Bybit, OKX, Bitget) + synthetic generators, all behind the `TickSource` trait.
+- `bar_construction/`: `.vol` builder (Rogers-Satchell sigma over s10 OHLC) and Renko multiplier calibration (`scale_to_target_k`).
+- `sharding.rs`: thin re-export of the canonical `nxr_sdk::shard` daily-shard primitives.
+- `seam.rs`: cross-shard continuity invariants shared by tests and checker binaries.
+- `idx_heal.rs`: in-place `.idx` repair (sort, resample, re-shard).
+- `vol_bin.rs`: zero-copy `.vol` mmap reader/writer.
+- `types.rs`: config plus re-exports of `mitch::TickFrame` and `mitch::bar::Bar`.
+
+Streaming Renko engine, sigma blending, OHLC rollup, and TDWAP live in the shared `nxr-sdk` crate; this repo holds the offline tooling.
 
 ## Testing
 
-Run the test suite:
 ```bash
-./test.sh
+cargo test
 ```
 
-This validates both synthetic data generation and exchange data fetching.
+Integration tests cover seam continuity between offline and live shards (`seam_joint_offline_live`), sentinel-aware gap handling (`seam_sentinel_skip`), integrity-check smoke (`integrity_smoke`), and a bricks/day acceptance gate (`bpd_acceptance`, `--ignored`, requires real shards; asserts the per-ticker median is within 15% of target).
 
-## Dependencies
+## Production Role
 
-- `tokio`: Async runtime for I/O operations
-- `rayon`: Data parallelism for CPU-intensive tasks
-- `mitch` + `bytemuck`: Binary `.bars` layout and zero-copy casts
-- `reqwest`: HTTP client for data downloads
-- `chrono`: Date/time handling
-- `clap`: CLI argument parsing
-- `nalgebra`: Linear algebra operations
-- `statrs`: Statistical functions
+These binaries run in the NX Rates pipeline: `backfill-all` and the checkers run as Kubernetes Jobs/CronJobs against the live data volume, `nxr-calibrate` refreshes Renko multipliers daily, and the bar-construction code paths are byte-for-byte identical to the live s10/renko producers, so offline history and the live stream join without seams. Offline defaults (200 ms cycle, z-gate 6.0, TDWAP weights) deliberately mirror the live aggregator configuration.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details on:
-- How to submit bug reports and feature requests
-- Development setup and guidelines
-- Code style and testing requirements
-- Pull request process
-
-For major changes, please open an issue first to discuss what you would like to change.
+MIT. See [LICENSE](LICENSE).
