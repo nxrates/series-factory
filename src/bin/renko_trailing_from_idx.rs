@@ -63,7 +63,7 @@ use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
 // Launch symbol set sourced from YAML `series.pipeline.pairs` × default
-// USDT quote. Operator mandate 2026-05-30: NO hardcoded lists in code.
+// USDT quote; symbol lists are never hardcoded.
 // Helper builds (base, quote) tuples from the loaded PipelineYml when
 // `--all` is set.
 fn launch_pairs_from_yaml(pl: &nxr_sdk::pipeline_config::PipelineYml) -> Vec<(String, String)> {
@@ -82,7 +82,7 @@ fn launch_pairs_from_yaml(pl: &nxr_sdk::pipeline_config::PipelineYml) -> Vec<(St
     about = "Walk-forward renko backfill (per-day k, no future leakage). Writes <data>/bars/<id>/<D>.renko."
 )]
 struct Args {
-    /// Path to nxrates.yml — reads `series.{renko,vol,calibration,pipeline}`.
+    /// Path to config.yml; reads `series.{renko,vol,calibration,pipeline}`.
     #[arg(long)]
     config: PathBuf,
 
@@ -118,7 +118,7 @@ struct Args {
     include_today: bool,
 }
 
-// ── Config (subset of nxrates.yml) ──────────────────────────────────────────
+// ── Config (subset of config.yml) ───────────────────────────────────────────
 
 use nxr_sdk::pipeline_config::{CalibrationYml, PipelineYml};
 

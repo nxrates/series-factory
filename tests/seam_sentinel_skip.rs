@@ -1,6 +1,6 @@
 //! SEAM-8: heartbeat-sentinel skip parity (offline == live).
 //!
-//! The live producers (`core/src/bars_s10.rs`, `core/src/bars_renko.rs`) skip
+//! The live producers (the s10 and renko bar builders) skip
 //! every `IndexRecord` carrying `FLAG_HEARTBEAT_SENTINEL` — they are liveness
 //! beacons with stale bid/ask that would poison the s10 OHLC / vol ring / renko
 //! micros. The offline generators (`s10_from_idx.rs`, `renko_from_idx.rs`) just

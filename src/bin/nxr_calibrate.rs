@@ -47,7 +47,7 @@ use tracing::{info, warn};
 /// vs the last `DRIFT_SUBWINDOW_DAYS` of the rolling window; `k_drift =
 /// |k_end−k_start|/k_start`. `k_drift > DRIFT_GATE_MAX` ⇒ WARN "needs
 /// point-in-time rebuild" (does NOT block — just surfaces the single-latest-k
-/// look-ahead bound, `docs/renko-methodology.md` §6).
+/// look-ahead bound).
 const DRIFT_SUBWINDOW_DAYS: i64 = 90;
 const DRIFT_GATE_MAX: f64 = 0.05;
 
@@ -98,7 +98,7 @@ struct Args {
     parallel: usize,
 }
 
-// ── Config (subset of nxrates.yml) ───────────────────────────────────────────
+// ── Config (subset of config.yml) ────────────────────────────────────────────
 
 use nxr_sdk::pipeline_config::{CalibrationYml, PipelineYml};
 
@@ -115,7 +115,7 @@ fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
     }
 }
 
-/// Drift gate (`docs/renko-methodology.md` §6): fit k on the FIRST vs the LAST
+/// Drift gate: fit k on the FIRST vs the LAST
 /// `DRIFT_SUBWINDOW_DAYS` of the (already window-trimmed) `prices`, log
 /// `k_drift = |k_end−k_start|/k_start` at INFO, and WARN (does NOT block) when it
 /// exceeds `DRIFT_GATE_MAX` — flagging the ticker for point-in-time rebuild. A
@@ -262,7 +262,7 @@ fn calibrate_one(
     // Pass 1: stream every .idx shard in date order → FULL-TICK mid path for the
     // in-memory calibration walk-forward. CRITICAL (2026-06-06 brick-storm RCA):
     // the calibrator MUST fit/measure k on the SAME granularity the applier
-    // (`renko_from_idx.rs`) and the live producer (`core/src/bars_renko.rs`)
+    // (`renko_from_idx.rs`) and the live renko producer
     // emit bricks from — the full ~100ms idx mid stream — NOT a 1-min last-mid
     // downsample. A renko brick forms on each price-level crossing along the
     // PATH; 1-min last-mid discards all intra-minute extremes → the calibrator
@@ -483,8 +483,8 @@ fn trailing_window(prices: &[(i64, f64)], window_days: usize) -> &[(i64, f64)] {
 // `ticker-params.json` alongside base entries; live `bars_renko_synth`
 // picks it up via the existing weights hot-reload path.
 //
-// **Why NOT persist a synth `.idx`:** the kernel design (see audit doc
-// `synth-pipeline-design-2026-05-26.md`) keeps synth on the wire only —
+// **Why NOT persist a synth `.idx`:** the kernel design keeps synth on the
+// wire only —
 // disk has bars + σ, never synth ticks. Calibration is the one place we
 // reconstruct ticks transiently in memory.
 //
@@ -1001,8 +1001,7 @@ fn run_once(args: &Args) -> Result<()> {
     // Prior-day k seeds (warm start for the direct scale-to-target solver), read
     // from the existing weights file BEFORE it is mutated. Keyed by ticker_id
     // string. Absent ⇒ the solver uses its k0=0.5 cold-start default. This is a
-    // SEARCH SEED only — never an emit fallback (renko_k starts empty;
-    // feedback_no_k_fallback).
+    // SEARCH SEED only — never an emit fallback (renko_k starts empty).
     let prior_k_map: BTreeMap<String, f64> = weights_file.renko_k_per_ticker.clone();
     let prior_k_for =
         |id: u64| -> Option<f32> { prior_k_map.get(&id.to_string()).map(|&k| k as f32) };
@@ -1090,10 +1089,9 @@ fn run_once(args: &Args) -> Result<()> {
     // Tally.
     let outcomes = results.into_inner().unwrap();
     let (mut passed, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-    // EMERGENCY 2026-06-01 fix (per docs/EMERGENCY-2026-06-01.md P0.4 + memory
-    // feedback_no_k_fallback): start renko_k EMPTY. Only Ok outcomes populate.
+    // Start renko_k EMPTY. Only Ok outcomes populate.
     // Failed/Skipped tickers are NOT carried over from the prior weights file.
-    // Operator policy is "skip day if calibrate fails; never bootstrap". Carrying
+    // Policy: skip the day when calibration fails; never bootstrap a k. Carrying
     // forward stale k corrupts the live renko engine for tickers whose σ regime
     // has shifted since last successful calibration (renko_k cohort 2026-06-01
     // found 91 % of base tickers using prior-run k due to today's pass=17/188).
@@ -1125,7 +1123,7 @@ fn run_once(args: &Args) -> Result<()> {
         prior_entries = prior_count,
         kept_entries = renko_k.len(),
         dropped_stale = prior_count.saturating_sub(renko_k.len()),
-        "calibration summary (base; stale entries dropped per feedback_no_k_fallback)"
+        "calibration summary (base; stale entries dropped, never carried forward)"
     );
 
     // k-STABILITY DIAGNOSTIC (2026-06-09): log the DISTRIBUTION of accepted k
@@ -1158,7 +1156,7 @@ fn run_once(args: &Args) -> Result<()> {
         }
     }
 
-    // SLA-CRITICAL (phase60.η): write ticker-params.json AFTER base pass so
+    // SLA-CRITICAL: write ticker-params.json AFTER base pass so
     // renko emission unblocks for base tickers even if synth pass hangs/fails.
     // Synth pass below re-writes with synth k's added.
     weights_file.renko_k_per_ticker = renko_k.clone();
@@ -1266,7 +1264,7 @@ fn run_once(args: &Args) -> Result<()> {
     // ── Inferred xxx/USDC fallback (2026-06-10) ──────────────────────────────
     // Inferred USDC-quoted tickers only materialize live `.idx` since the
     // migration (≈2026-06-03), so their base fit fails on span for weeks and
-    // the stale-drop policy (feedback_no_k_fallback) then wipes their k —
+    // the stale-drop policy (no stale-k carry-over) then wipes their k —
     // silencing live renko for pairs downstream consumers need (ETH/USDC).
     // Until the inferred span covers the rolling window, derive k synth-style
     // from the USDT legs — the identical math the live inference uses

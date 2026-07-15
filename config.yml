@@ -1,1 +1,192 @@
-../config.yml
+# series-factory pipeline configuration.
+# Only the sections read by the binaries in this repo are present:
+#   cexs    - exchange metadata (merge weights, archive URLs, asset classes)
+#   network - replay cadence (must match the live aggregator)
+#   series  - renko/vol/calibration/pipeline knobs
+# Data paths come from env vars (NXR_DATA_TICKS / NXR_DATA_INDEXES /
+# NXR_DATA_BARS); they are not configured here.
+
+# ── Exchange metadata ────────────────────────────────────────────────────────
+cexs:
+  # Stablecoins recognized by asset-class detection: a pair with both legs in
+  # this list classifies as crypto_stable and inherits the low bpd target.
+  stablecoins:
+    - USDT
+    - USDC
+    - FDUSD
+    - BUSD
+    - TUSD
+    - DAI
+    - PYUSD
+    - USDD
+    - USDS
+    - USD1
+    - USDE
+    - GHO
+    - CRVUSD
+    - USYC
+    - BUIDL
+    - USDF
+    - RLUSD
+    - USDY
+    - USDTB
+    - USD0
+    - SATUSD
+    - USDAI
+    - AUSD
+    - USX
+    - USDG
+    - EURC
+
+  # FX majors: both legs in this list classify as fx_major, else fx_cross.
+  fx_majors:
+    - USD
+    - EUR
+    - JPY
+    - GBP
+    - CAD
+    - AUD
+    - CHF
+
+  # Top-cap crypto symbols: major-vs-alt split within the crypto class.
+  crypto_majors:
+    - BTC
+    - ETH
+    - SOL
+    - BNB
+    - XRP
+    - XAUT
+
+  # Per-exchange metadata for the archive sources implemented in this repo.
+  #   weight               - TDWAP merge weight (merge-idx); relative units.
+  #   archive_url_template - historical archive URL stems; each field is the
+  #                          URL up to the trailing '/', with {sym}, {y:04},
+  #                          {m:02}, {ds}, {seq:03} interpolated by the source.
+  exchanges:
+    binance:
+      weight: 30
+      archive_url_template:
+        monthly: https://data.binance.vision/data/spot/monthly/aggTrades/{sym}/
+        daily: https://data.binance.vision/data/spot/daily/aggTrades/{sym}/
+        probe: https://data.binance.vision/data/spot/monthly/aggTrades/{sym}/{sym}-aggTrades-{y:04}-{m:02}.zip
+    bybit:
+      weight: 15
+      archive_url_template:
+        monthly: https://public.bybit.com/spot/{sym}/
+        daily: https://public.bybit.com/spot/{sym}/
+        probe: https://public.bybit.com/trading/{sym}/{sym}{y:04}-{m:02}.csv.gz
+    bitget:
+      weight: 10
+      archive_url_template:
+        monthly: ''
+        daily: https://img.bitgetimg.com/online/trades/SPBL/{sym}/
+        probe: https://img.bitgetimg.com/online/trades/SPBL/{sym}/{ds}_{seq:03}.zip
+    okx:
+      weight: 10
+      archive_url_template:
+        monthly: https://static.okx.com/cdn/okex/traderecords/trades/monthly/{y:04}{m:02}/
+        daily: https://static.okx.com/cdn/okex/traderecords/trades/daily/{ds}/
+        probe: https://static.okx.com/cdn/okex/traderecords/trades/monthly/{y:04}{m:02}/{sym}-trades-{y:04}-{m:02}.zip
+
+# ── Network ──────────────────────────────────────────────────────────────────
+network:
+  # Aggregation cycle (ms). Offline replay MUST match the live aggregator
+  # cadence: a finer value over-samples intra-cycle and skews renko bpd.
+  aggregation_interval_ms: 200
+
+# ── Series factory (renko pipeline, vol extraction) ──────────────────────────
+series:
+
+  renko:
+    min_pct: 0.0001                      # brick-size safety floor (0.01% of price)
+    # No max_pct: a ceiling biases the calibrator's search downward on
+    # high-sigma days; k(sigma) stays honest without one.
+
+  vol:
+    # Per-bin sigma = Rogers-Satchell over s10-resampled 30-min OHLC
+    # (offline == live). The estimator kernel is fixed in code; only the
+    # smoothing/blend knobs are configurable.
+    ema_period: 28                       # EMA smoothing (28 x 30 min = 14 h)
+    sigma_blend_windows_days: [14, 60, 180]  # inverse-variance weighted blend
+    winsorize_pct: [0.05, 0.95]          # clip percentiles for outlier robustness
+    winsorize_min_samples: 5             # skip winsorization below this
+    recompute_cooldown_ms: 43200000      # 12 h recalibration cooldown (.vol -> .k)
+
+    # Spike-responsive sigma: sigma_eff = max(sigma_blend, sigma_fast) where
+    # sigma_fast is a short-halflife EWMA of the trailing per-bin sigma. The
+    # slow blend is the floor; sigma_fast only raises sigma during a sudden
+    # vol spike, so brick size grows and brick-storm days are damped. On a
+    # calm day the max is a no-op.
+    spike_responsive: true
+    spike_fast_halflife_bins: 3.0        # EWMA halflife in 30-min bins (3 = 90 min)
+    spike_fast_max_ratio: 8.0            # cap sigma_fast/sigma_blend (glitch guard); <=1.0 disables
+
+  calibration:
+    target_bpd: 300                      # default target bricks/day
+    rolling_window_days: 730             # single trailing window: the per-UTC-day
+                                         # brick-count MEDIAN over the last 730 d
+                                         # is driven to target_bpd by the direct
+                                         # scale-to-target solver.
+    min_window_days: 7                   # min trailing days required to attempt a fit
+    accept_tol: 0.05                     # accept when |median/target - 1| <= tol;
+                                         # also the advisory achieved-err warn
+                                         # threshold (not a ticker-drop gate).
+    bracket_max_iters: 12                # iteration cap for the bounded log-k
+                                         # bracket fallback (engages only when the
+                                         # warm start lands on a wrong staircase tread).
+    mult_bounds: [0.05, 4.0]             # solver bracket seeds (log-space).
+                                         # [0] is a hard floor (must equal the
+                                         # code K_FLOOR); [1] is the initial upper
+                                         # hint only; the bisection auto-expands
+                                         # upward as needed.
+    # Per-class bpd targets: pegged pairs are range-bound, so a lower target
+    # reflects their regime. Resolution: per-pair override -> per-class
+    # default -> flat target_bpd.
+    target_bpd_by_class:
+      crypto_stable: 50    # both legs in cexs.stablecoins
+    target_bpd_overrides:
+      # Stable/stable pairs (peg +/- 50 bps)
+      "USDC/USDT": 50
+      "USD1/USDT": 50
+      "USDE/USDT": 50
+      "USDS/USDT": 50
+      "USDG/USDT": 50
+      "PYUSD/USDT": 50
+      "RLUSD/USDT": 50
+      "USD1/USDC": 50
+      "PYUSD/USDC": 50
+      "USDE/USDC": 50
+      "USDG/USDC": 50
+      "PYUSD/USDS": 50
+      # STABLE/USD pegs classify as FX cross, so they need explicit overrides
+      # to avoid the flat 300 bpd default.
+      "USD1/USD": 50
+      "USDE/USD": 50
+      "PYUSD/USD": 50
+      "RLUSD/USD": 50
+      "TUSD/USD": 50
+      "USDD/USD": 50
+      "USDS/USD": 50
+      "DAI/USD": 50
+      "FDUSD/USD": 50
+      "GHO/USD": 50
+      "SUSDE/USD": 50
+    # Per-pair forced renko-k escape hatch (pair -> k). When present and within
+    # bounds, the calibrator emits this k directly and skips the fit. Reserved
+    # for structural-floor tickers where the discrete brick grid prevents the
+    # fit from landing within accept_tol; leave empty otherwise.
+    renko_k_overrides: {}
+
+  pipeline:
+    bootstrap_days: 27                   # discard first N days (vol warmup)
+    max_bars: 5000000                    # safety limit
+    max_mem_gb: 6                        # memory cap
+    exchanges: [binance, bybit, bitget, okx]
+    pairs: [BTC, ETH, SOL, BNB, AVAX, HYPE, XRP, TRX, BCH, LTC, ZEC, XMR, XAUT, USDC, PYUSD, USD1, USDE, USDS, USDG, RLUSD]
+    # Disk-footprint guard for backfill-all. The orchestrator streams raw
+    # .ticks one calendar month at a time and deletes each month's raw before
+    # the next, so peak raw usage is about 1 month x n_exchanges. These knobs
+    # drive the pre-flight headroom guard.
+    backfill:
+      bytes_per_exchange_day: 73400320   # ~70 MiB/exchange/day upper bound (liquid pair)
+      headroom_safety_factor: 0.8        # abort unless projected_peak <= free * 0.8

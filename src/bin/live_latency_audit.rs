@@ -1,7 +1,7 @@
 //! Real-time live pipeline latency audit: idx → s10 (klines) → renko.
 //!
 //! Reads today's on-disk shard tips for pipeline primaries and compares wall-clock
-//! lag against SLA budgets from `docs/scope.md`.
+//! lag against SLA budgets.
 //!
 //! Exit 0 = all pass, 1 = warn, 2 = fail.
 

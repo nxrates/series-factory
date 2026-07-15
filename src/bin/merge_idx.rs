@@ -5,7 +5,7 @@
 //! have one `ProviderEntry` per active provider (built from the last Index
 //! each file delivered), feed that slice to `compute_vwap_at`, and emit the
 //! resulting composite Index to the daily shard keyed by
-//! `boundary_ts.utc_date()`. Per spec (`docs/sharding-spec.md`) all
+//! `boundary_ts.utc_date()`. All
 //! artifacts are sharded by `open_ts.date_utc()` — daily granularity.
 //!
 //! Default weights (locked in for the BTC/USDT offline replay):
@@ -47,10 +47,10 @@ use std::path::PathBuf;
 use coarsetime::{Duration, Instant};
 use tracing::{info, warn};
 
-// Default offline TDWAP weights now sourced from YAML (`cexs.exchanges.<name>.weight`
-// in `config.yml`, the SAME field that the live aggregator's nxr-weights
-// CronJob ultimately reflects via volume scraping). Operator mandate
-// 2026-05-30: NO hardcoded vars in code. Fallback constant kept only as
+// Default offline TDWAP weights are sourced from YAML
+// (`cexs.exchanges.<name>.weight` in `config.yml`, the SAME field the live
+// aggregator's weight scraper reflects via volume scraping); weight lists
+// are never hardcoded. Fallback constant kept only as
 // audit-safe last resort + unit tests; production loads from YAML via
 // `nxr_sdk::pipeline_config::PipelineYml`.
 //
@@ -105,7 +105,7 @@ fn main() -> Result<()> {
     };
     // Hard exclusion (sdk single source): even explicit --exchange flags cannot
     // re-introduce a denylisted venue into a composite — regenerated history
-    // must stay 100% distribution-compatible with the live blend (RCA 2026-07-04).
+    // must stay 100% distribution-compatible with the live blend.
     let exchanges: Vec<String> = exchanges
         .into_iter()
         .filter(|e| {
@@ -229,7 +229,7 @@ fn main() -> Result<()> {
                     // R1 H12: tag as offline-produced so consumers can tell
                     // backfilled rows apart from live aggregator output.
                     idx.flags |= FLAG_HISTORICAL_BACKFILL;
-                    // NO-SYNTHETIC-SPREAD (operator 2026-07-04): trade-derived inputs have
+                    // NO-SYNTHETIC-SPREAD: trade-derived inputs have
                     // bid==ask (honest_tick) — no real book backs this composite. Flag it
                     // so bar builders publish spread as ABSENT (NaN), never a constant.
                     if idx.bid == idx.ask {

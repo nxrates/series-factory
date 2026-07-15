@@ -42,7 +42,7 @@ use tracing::{error, info, warn};
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Backfill orchestrator: fetch → t2i → merge → s10 → renko → validate.")]
 struct Args {
-    /// Path to nxrates.yml (forwarded to fetch-crypto-history).
+    /// Path to config.yml (forwarded to fetch-crypto-history).
     config: PathBuf,
     /// Start date (YYYY-MM-DD). Default: 1 year ago.
     #[arg(long)]
@@ -62,7 +62,7 @@ struct Args {
     /// Comma-separated steps to run. Default: all.
     #[arg(long, default_value = "fetch,t2i,merge,s10,renko,validate")]
     steps: String,
-    /// Parallel ticker workers. Default lowered 4→2 (R-disk, 2026-06-09): each
+    /// Parallel ticker workers. Default 2: each
     /// in-flight ticker holds up to 1 month × n_exch of raw `.ticks` during its
     /// monthly stream-and-delete loop, so the peak raw footprint scales with
     /// this value. 2 keeps the data PVC bounded while still overlapping
@@ -762,7 +762,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         .unwrap_or(200)
         .to_string();
     let out_dir = &ctx.args.out_dir;
-    // Sharded paths — MITCH-ID keyed (canonical). See `docs/sharding-spec.md`.
+    // Sharded paths — MITCH-ID keyed (canonical).
     let ticker_id = nxr_sdk::resolve_ticker_id(&format!("{}/{}", base, quote));
     let composite_dir = nxr_sdk::shard::idx_dir(out_dir, ticker_id);
     let bars_dir = nxr_sdk::shard::bars_dir(out_dir, ticker_id);
@@ -793,14 +793,14 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         info!(ticker, active_exchanges = ?active_exchanges, "availability check ok");
     }
 
-    // 1+2) fetch + t2i — DELETE-AS-YOU-GO at FILE granularity (R-disk, 2026-06-09).
+    // 1+2) fetch + t2i — DELETE-AS-YOU-GO at FILE granularity.
     //
     // Previously fetch downloaded the WHOLE [from,to) range of raw `.ticks` for
     // every exchange up-front, and t2i folded them afterwards — so for a 2y x
     // n-exch backfill the full raw range coexisted on the PVC per ticker (peak
     // ≈ range × n_exch). That overran the data volume. A first fix bounded it
-    // to ~1 month via a per-month batch delete; the operator (correctly) asked
-    // why we batch at all — we should delete as we go.
+    // to ~1 month via a per-month batch delete; deleting as we go removes even
+    // that batch-level peak.
     //
     // We still iterate per calendar month so fetch never runs more than ~1
     // month ahead of t2i, but the disk bound is now FILE-granular: t2i runs

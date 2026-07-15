@@ -1,5 +1,5 @@
 //! Offline calibration of the Renko `multiplier` (k) to a target `bars_per_day`
-//! (bpd). LEAN solver (2026-06-10, `docs/renko-methodology.md`): the multi-fold
+//! (bpd). LEAN solver: the multi-fold
 //! MTF log-k bisection + guard tangle is replaced by ONE direct
 //! SCALE-TO-TARGET solver, [`scale_to_target_k`].
 //!
@@ -290,7 +290,7 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
     }
 }
 
-/// Direct SCALE-TO-TARGET k solver (2026-06-10, `docs/renko-methodology.md` §4).
+/// Direct SCALE-TO-TARGET k solver.
 /// Replaces `calibrate_mtf_walkforward` + the multi-fold log-k bisection.
 ///
 /// Objective: MEDIAN over the trailing `cal.rolling_window_days` of per-UTC-day

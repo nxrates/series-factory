@@ -38,7 +38,7 @@ use tracing::{info, warn};
 #[derive(Parser, Debug)]
 #[command(about = "Build renko shards from a sharded composite idx dir.")]
 struct Args {
-    /// Path to nxrates.yml (reads `series.{renko,vol,calibration,pipeline}`).
+    /// Path to config.yml (reads `series.{renko,vol,calibration,pipeline}`).
     config: PathBuf,
     /// Base asset symbol (e.g. BTC).
     base: String,
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
         while let Some(chunk) = stream.next_chunk()? {
             for rec in chunk {
                 // SEAM PARITY: skip heartbeat-sentinel records exactly like the live
-                // producers (core/src/bars_renko.rs:528, bars_s10.rs:198). Sentinels
+                // producers (renko and s10 bar builders). Sentinels
                 // carry stale bid/ask liveness beacons; ingesting them offline (but
                 // not live) poisons the σ basis → hist↔live seam drift.
                 if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
@@ -160,7 +160,7 @@ fn main() -> Result<()> {
     // k values into `ticker-params.json`, and this offline emitter must
     // honour them.
     //
-    // Per durable rule `feedback_no_k_fallback` we ABORT when no calibrated k
+    // We ABORT when no calibrated k
     // exists rather than bootstrapping a degenerate 0.075. Skipping is the
     // right call: a missing entry means nxr-calibrate has not yet processed
     // this ticker (new ticker, fresh deploy, or calibrator failed for the
@@ -359,7 +359,7 @@ fn main() -> Result<()> {
 ///
 /// Returns `(None, _)` and logs a single warning if the file is missing,
 /// malformed, or has no entry for this ticker — callers ABORT the renko build
-/// (no bootstrap-k fallback, per `feedback_no_k_fallback`). The second tuple
+/// (no bootstrap-k fallback). The second tuple
 /// element is the `calibrated_at` epoch-seconds (`None` for pre-calibration /
 /// legacy files); it is recorded even when k resolves so the cert can compare
 /// it against the *current* ticker-params `calibrated_at` to detect staleness.

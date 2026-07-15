@@ -87,7 +87,7 @@ fn main() -> Result<()> {
     };
     // Backfill applies the SAME hard exclusion as live aggregation (sdk single
     // source) — regenerated history must be 100% distribution-compatible with
-    // the live feed: an excluded venue must not exist in EITHER. RCA 2026-07-04.
+    // the live feed: an excluded venue must not exist in EITHER.
     anyhow::ensure!(
         !nxr_sdk::providers::is_excluded_provider(provider_id),
         "exchange '{}' (provider {}) is HARD-EXCLUDED from index construction \

@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 /// Grid-stamp a flushed s10 bar's open/close timestamps to the bucket boundary,
-/// mirroring `core/src/bars_s10.rs::stamp_s10_bucket` so the offline series is
+/// mirroring the live producer's `stamp_s10_bucket` so the offline series is
 /// byte-identical (10s-grid-aligned) to the live producer. `BarAccumulator`
 /// stamps the raw first/last-tick ts; without this re-stamp the on-disk
 /// `close_ts` deltas jitter off the bucket grid, tripping the integrity-check
@@ -47,7 +47,7 @@ fn stamp_grid(bar: &mut Bar, bucket_open: i64, bucket_ms: i64) {
 #[derive(Parser, Debug)]
 #[command(about = "Build sharded 10s OHLC .s10 from a sharded composite idx dir.")]
 struct Args {
-    /// Path to nxrates.yml (reserved for future overrides; not currently read).
+    /// Path to config.yml (reserved for future overrides; not currently read).
     config: PathBuf,
     /// `BASE-QUOTE` pair (e.g. `BTC-USDT`).
     pair: String,
@@ -129,7 +129,7 @@ fn main() -> Result<()> {
     let mut cur_bucket: Option<i64> = None;
     // Last emitted close — seeds `flat_bar` for empty (zero-tick) buckets so the
     // offline series is GAPLESS, byte-identical to the live `bars_s10` producer
-    // (core/src/bars_s10.rs flush_all). Without this, quiet windows drop buckets
+    // (its flush_all cursor loop). Without this, quiet windows drop buckets
     // and offline-s10-resampled vol diverges from live on those windows.
     let mut last_close: f64 = 0.0;
     let mut n_input: u64 = 0;
@@ -279,7 +279,7 @@ mod tests {
 
     /// LIVE-path stamper, expressed by calling the SAME canonical symbol the
     /// live producer now delegates to. Post-Task-3 the live
-    /// `core/src/bars_s10.rs::stamp_s10_bucket` is a thin wrapper over
+    /// `stamp_s10_bucket` is a thin wrapper over
     /// `nxr_sdk::bar_builder::stamp_s10_grid(bar, bucket_open, BAR_MS)`; calling
     /// that real symbol here (instead of a hand-copied body) means any future
     /// change to the live grid stamp recompiles + re-exercises this test

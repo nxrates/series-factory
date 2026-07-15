@@ -1,13 +1,13 @@
 <div align="center">
-  <img border-radius="25px" max-height="250px" src="./banner.svg" />
+  <img style="border-radius: 25px; max-height: 250px;" src="./banner.svg" />
   <h1>Series Factory</h1>
   <p>
     <strong>Historical market time-series ingestion, aggregation, and validation toolkit</strong>
   </p>
   <p>
-    <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-000000?style=flat-square&logo=open-source-initiative&logoColor=white&labelColor=4c9c3d" width="auto"/></a>
-    <a href="https://nxrates.com"><img alt="Site" src="https://img.shields.io/badge/nxrates.com-212121?style=flat-square&logo=googlechrome&logoColor=white" width="auto"/></a>
-    <a href="https://twitter.com/nxrates"><img alt="X (Twitter)" src="https://img.shields.io/badge/@nxrates-000000?style=flat-square&logo=x&logoColor=white" width="auto"/></a>
+    <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-000000?style=flat-square&logo=open-source-initiative&logoColor=white&labelColor=4c9c3d"/></a>
+    <a href="https://nxrates.com"><img alt="Site" src="https://img.shields.io/badge/nxrates.com-212121?style=flat-square&logo=googlechrome&logoColor=white"/></a>
+    <a href="https://twitter.com/nxrates"><img alt="X (Twitter)" src="https://img.shields.io/badge/@nxrates-000000?style=flat-square&logo=x&logoColor=white"/></a>
   </p>
 </div>
 
@@ -113,7 +113,7 @@ The `sources::synthetic` module implements `TickSource` for five stochastic proc
 | Fractional Brownian Motion | `mu, sigma, hurst, base` |
 | Heston stochastic volatility | `mu, sigma, kappa, theta, xi, rho, base` |
 | Normal jump-diffusion (Merton) | `mu, sigma, lambda, mu_jump, sigma_jump, base` |
-| Double-exponential jump-diffusion (Kou) | `mu, sigma, lambda, mu_pos, mu_neg, p_neg, base` |
+| Double-exponential jump-diffusion (Kou) | `mu, sigma, lambda, mu_pos_jump, mu_neg_jump, p_neg_jump, base` |
 
 Construct via the library: `create_source(&DataSource::Synthetic(GenerativeModel::GBM { mu, sigma, base }))`. Each synthetic instance gets a distinct provider id, so multiple synthetic sources feed the aggregator as independent providers.
 
@@ -123,7 +123,7 @@ All on-disk types are MITCH protocol structs: `#[repr(C, packed)]`, `bytemuck::P
 
 | Extension | Record | Size | Content |
 |-----------|--------|------|---------|
-| `.ticks` | `mitch::Tick` | 32 B (+16 B header) | timestamp, bid, ask, vbid, vask |
+| `.ticks` | `mitch::TickFrame` | 48 B | 16 B MITCH header + 32 B tick: timestamp, bid, ask, vbid, vask |
 | `.idx` | `IndexRecord` | 56 B | composite index: mid, confidence, volumes, flags |
 | `.s10` | `mitch::Bar` | 96 B | 10 s OHLC kline, 64 B OHLCV + 32 B microstructure |
 | `.renko` | `mitch::Bar` | 96 B | adaptive Renko brick, same layout |
@@ -138,7 +138,7 @@ Sharded layout (single source of truth in `nxr_sdk::shard`):
 <root>/bars/<MITCH_ID>/<YYYY-MM-DD>.{s10,renko}   + manifest.json
 ```
 
-Files are headerless append-only streams; record count = file size / record size.
+Files are append-only streams with no file-level header (each `.ticks` record embeds its own 16 B MITCH header); record count = file size / record size from the table above.
 
 ## Usage
 

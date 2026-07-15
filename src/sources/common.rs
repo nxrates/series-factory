@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
 
-// ─── HTTP Agent ───────────────────────────��──────────────────────────────────
+// ─── HTTP Agent ───────────────────────────────────────────────────────────────
 
 /// Create a shared HTTP agent with 10-min timeout (large monthly archives can be 300MB+).
 pub fn http_agent() -> Arc<ureq::Agent> {
@@ -284,7 +284,7 @@ pub async fn download_to_file_retry(
     Err(last_err.unwrap())
 }
 
-// ─── Tick file I/O (native TickFrame) ───────────────────────────────────��────
+// ─── Tick file I/O (native TickFrame) ─────────────────────────────────────────
 
 /// Read .ticks file as Vec<TickFrame> (mmap + bytemuck zero-copy).
 pub fn read_tick_file(path: &Path) -> Result<Vec<TickFrame>> {
@@ -344,11 +344,11 @@ pub fn honest_tick(ticker_id: u64, price: f64, volume: u32, is_buyer: bool) -> T
     }
 }
 
-// ─── Batch sending ─────────────────────────────���─────────────────────────────
+// ─── Batch sending ─────────────────────────────────────────────────────────────
 
 const BATCH_SIZE: usize = 10_000;
 
-// ─── Date helpers ────────────────────────────���───────────────────────────────
+// ─── Date helpers ──────────────────────────────────────────────────────────────
 
 /// First day of the next month.
 #[inline]
@@ -378,7 +378,7 @@ pub fn month_ranges(from: NaiveDate, to: NaiveDate) -> Vec<(NaiveDate, NaiveDate
     ranges
 }
 
-// ─── Timestamp normalization ────────────────────────────────────��────────────
+// ─── Timestamp normalization ──────────────────────────────────────────────────
 
 /// Normalize a timestamp to milliseconds (handles microsecond timestamps).
 #[inline]
@@ -390,7 +390,7 @@ pub fn normalize_timestamp_ms(ts: i64) -> i64 {
     }
 }
 
-// ─── Filesystem helpers ──────────���───────────────────��──────────────────────
+// ─── Filesystem helpers ────────────────────────────────────────────────────────
 
 pub fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {

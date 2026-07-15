@@ -8,7 +8,7 @@
 //! the same directory. Re-running is safe: the monthly/daily cache skips
 //! archives that already exist on disk.
 //!
-//! Usage: fetch-crypto-history <nxrates.yml> [--pairs BTC,ETH] [--exchanges binance,bybit]
+//! Usage: fetch-crypto-history <config.yml> [--pairs BTC,ETH] [--exchanges binance,bybit]
 //!                              [--days 545] [--quote USDT] [--parallelism 4]
 //!
 //! FX has no public historical source, so calibration is crypto-only. Run this
@@ -29,7 +29,7 @@ use tracing::{error, info, warn};
 #[derive(Parser, Debug)]
 #[command(about = "Fetch historical crypto ticks for renko calibration.")]
 struct Args {
-    /// Path to nxrates.yml (reads `series.pipeline.{pairs,exchanges}`).
+    /// Path to config.yml (reads `series.pipeline.{pairs,exchanges}`).
     config: PathBuf,
 
     /// Comma-separated pairs (override config).
@@ -341,7 +341,7 @@ async fn main() -> Result<()> {
                 to,
                 agg_mode: AggregationMode::Time,
                 agg_step: 60_000.0,
-                cycle_ms: 100,
+                cycle_ms: 200,
                 stale_secs: 30.0,
                 z_threshold: 6.0,
                 ticks_dir: ticks_dir.clone(),

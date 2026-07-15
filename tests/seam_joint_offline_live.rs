@@ -11,7 +11,7 @@
 //!     `nxr_sdk::bar_builder::stamp_s10_grid`, with GAPLESS `flat_bar` fill for
 //!     empty buckets between observed buckets. (Mirrors
 //!     `series-factory/src/bin/s10_from_idx.rs`.)
-//!   * **LIVE** — the `core/src/bars_s10.rs::flush_all` cursor loop: one
+//!   * **LIVE** — the live producer's `flush_all` cursor loop: one
 //!     `BarAccumulator` per in-flight bucket, drained in ascending order on
 //!     each flush, falling back to `flat_bar(cursor, last_close)` for empty
 //!     buckets, stamped through the SAME shared `stamp_s10_grid`. (Mirrors the
@@ -40,7 +40,7 @@
 //!     emitted-bar FORMAT. The fixed stream here never trips the reject gate
 //!     (OHLC is always well-formed) and never exceeds the gap cap, so those
 //!     branches are out of scope by construction.
-//!   * The live producer reads `core::bars_s10` (a binary crate) — its private
+//!   * The live producer lives in a binary crate — its private
 //!     `flush_all` cannot be imported across the crate boundary, so the live
 //!     side is a faithful replica of that loop. The grid stamp is NOT replicated
 //!     though: both paths call the real shared `stamp_s10_grid` that the live
@@ -167,7 +167,7 @@ fn run_offline(recs: &[IndexRecord]) -> Vec<Bar> {
     out
 }
 
-/// LIVE producer — replica of `core/src/bars_s10.rs::{ingest, flush_all}`. One
+/// LIVE producer — replica of the live `{ingest, flush_all}` loop. One
 /// accumulator per in-flight bucket; flush drains buckets in ascending order,
 /// flat-filling empties, up to (and including) the highest fully-closed bucket.
 /// Drives the SAME shared `stamp_s10_grid` the live producer delegates to.

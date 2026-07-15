@@ -1,4 +1,4 @@
-//! Daily-shard helpers. See `docs/sharding-spec.md`.
+//! Daily-shard helpers.
 //!
 //! Canonical shard primitives live in `nxr_sdk::shard` — single source of
 //! truth for path math (MITCH-ID keyed), atomic writers, sha256, and manifest
@@ -9,8 +9,7 @@
 //! - bars:    `<root>/bars/<MITCH_ID>/<YYYY-MM-DD>.<ext>`  (sdk `bars_dir`)
 //!
 //! The legacy `composite/<BASE>-<QUOTE>/` + `<BASE>/<BASE><QUOTE>/` pair-keyed
-//! directories are REMOVED (operator mandate 2026-05-27: composite/ "should
-//! not even exist"). All call sites use `nxr_sdk::shard::{idx_dir,bars_dir}`
+//! directories are REMOVED. All call sites use `nxr_sdk::shard::{idx_dir,bars_dir}`
 //! with `nxr_sdk::resolve_ticker_id(<sym>)`.
 
 // Re-export the canonical primitives so existing call sites keep compiling

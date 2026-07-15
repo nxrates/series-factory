@@ -1,11 +1,11 @@
 //! Offline backfill driver for the synthetic-pair pipeline.
 //!
 //! Replays paired leg `.idx` files into the same `<data>/bars/<synth_id>/<D>.{s10,renko}`
-//! shard paths that the live `core/src/bars_{s10,renko}_synth.rs` producers
+//! shard paths that the live synth s10/renko producers
 //! write. The point: re-build the synth bar history from scratch — or fill a
 //! gap — without ever having persisted the synth `.idx` tick stream
-//! (`docs/internal/synth-pipeline-design-2026-05-26.md` decision 3: don't
-//! persist synth ticks; reconstruct on demand from the leg streams).
+//! (design decision: don't persist synth ticks; reconstruct on demand from
+//! the leg streams).
 //!
 //! ──────────────────────────────────────────────────────────────────────────
 //! CLI
@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! synth-backfill-from-idx \
-//!     --config /etc/nxr/config.yml \
+//!     --config config.yml \
 //!     --base-pair ETH-USDT --quote-pair BTC-USDT --synth-pair ETH-BTC \
 //!     --from 2024-05-24 --to 2026-05-26 \
 //!     [--data-root /data] [--bars s10,renko] [--force]
@@ -23,7 +23,7 @@
 //! SOL/BTC, BNB/BTC, BNB/ETH, SOL/ETH) sequentially.
 //!
 //! ──────────────────────────────────────────────────────────────────────────
-//! Design alternatives (operator directive — cross-validation panel)
+//! Design alternatives
 //! ──────────────────────────────────────────────────────────────────────────
 //!
 //! **Design 1 (CHOSEN — event-time merge + sync state machines).**
@@ -99,12 +99,12 @@
 //! synth quote composition in `nxr_sdk::synth::compute_synth_index` (used by
 //! the live kernel AND this driver), renko brick math in
 //! `nxr_sdk::renko::RenkoGenerator` (the ONE engine: live
-//! `core/src/bars_renko.rs`, offline `renko_from_idx.rs`, calibrator, and
+//! the live renko producer, offline `renko_from_idx.rs`, calibrator, and
 //! this driver), and the σ basis in
 //! `series_factory::bar_construction::build_vol_from_s10` (RS over the
 //! persisted s10 shards — identical to `nxr_calibrate` + the live
 //! `LiveVolRing`). Only the s10 sync accumulator remains a local adaptation
-//! of `core/src/bars_s10.rs::TickerState`.
+//! of the live s10 producer's accumulator state.
 //!
 //! ──────────────────────────────────────────────────────────────────────────
 //! Side-car σ benchmark
@@ -172,7 +172,7 @@ use nxr_sdk::synth::{LEG_STALE_TTL_MS, SYNTH_KERNEL_PROVIDER_ID};
              <data>/bars/<synth_id>/<D>.{s10,renko} shards the live synth producer writes."
 )]
 struct Args {
-    /// Path to nxrates.yml — supplies `series.vol` + `series.renko.min_pct`
+    /// Path to config.yml; supplies `series.vol` + `series.renko.min_pct`
     /// (the σ-blend + brick-floor cfg; MUST match the calibrator's YAML) and
     /// `synths.initial_pairs` for `--all`.
     #[arg(long)]
@@ -226,7 +226,7 @@ struct Args {
 // (methodology §5, hist==live). Sync sibling of `core::synth_kernel::PairState`.
 use nxr_sdk::synth::SynthReplayState;
 
-/// Sync s10 producer. Sibling of `core::bars_s10_synth::TickerState`.
+/// Sync s10 producer. Sibling of the live synth s10 producer state.
 struct SynthS10State {
     acc: BarAccumulator,
     /// Window left edge (inclusive) in epoch ms, snapped to BAR_MS grid.
@@ -256,7 +256,7 @@ impl SynthS10State {
         let bucket = ts_ms.div_euclid(BAR_MS) * BAR_MS;
 
         // Emit gap-free s10 buckets: every crossed bucket boundary produces a bar.
-        // Matches live `core/src/bars_s10.rs` behavior (flat-bar fill when no ticks).
+        // Matches the live s10 producer behavior (flat-bar fill when no ticks).
         const MAX_GAPFILL_BUCKETS: i64 = 360; // 1h of 10s buckets, same order as live.
         let mut emitted_bar = None;
         match self.cur_bucket {
@@ -449,7 +449,7 @@ fn resolve_symbol(sym: &str) -> u64 {
 /// Look up the calibrated Renko multiplier for `ticker_id` from
 /// `$NXR_TICKER_PARAMS_PATH` (default `/data/config/ticker-params.json`).
 /// Returns `None` when the file is missing/malformed or has no entry for the
-/// ticker. Per `feedback_no_k_fallback`, callers MUST treat `None` as "skip
+/// ticker. Callers MUST treat `None` as "skip
 /// renko backfill" — never substitute a default. Sibling of the same helper
 /// in `renko_from_idx.rs`.
 fn load_calibrated_k(ticker_id: u64) -> Option<f64> {
@@ -508,8 +508,8 @@ fn ym(d: NaiveDate) -> String {
 ///
 /// `k`: Calibrated multiplier_k for this synth pair, sourced by the caller
 /// from `ticker-params.json`. `None` → renko backfill is skipped for this
-/// pair (`feedback_no_k_fallback`: "skip day if calibrate fails; never
-/// bootstrap k=0.075"). The s10 pass is independent of k and still runs.
+/// pair (skip the day when calibration failed; never bootstrap a default
+/// k). The s10 pass is independent of k and still runs.
 ///
 /// ## σ basis — one engine, one σ (brick-storm RCA, 2026-06-10)
 ///
@@ -517,7 +517,7 @@ fn ym(d: NaiveDate) -> String {
 /// the σ basis FROM those persisted `.s10` shards via the canonical
 /// RS-over-s10 builder (`build_vol_from_s10` → `MtfVolCalculator`) — the
 /// IDENTICAL σ `nxr_calibrate::calibrate_one_synth` fits k against and the
-/// live producer's `LiveVolRing` reads (`docs/renko-methodology.md` §5) — and
+/// live producer's `LiveVolRing` reads — and
 /// drives the SHARED `RenkoGenerator` engine over a second leg-merge replay.
 /// `vol_cfg` + `renko_min_pct` come from the same pipeline YAML the
 /// calibrator reads (`series.vol` / `series.renko.min_pct`).
@@ -579,7 +579,7 @@ fn run_pair(
 
     // Iterate the FULL requested day range. If a leg shard is missing for a day,
     // we still write gap-fill (flat) s10 bars once the synth has a seed close,
-    // matching live `core/src/bars_s10.rs` behavior.
+    // matching the live s10 producer behavior.
     let days: Vec<NaiveDate> = day_range(from, to);
     if days.is_empty() {
         return Ok(PairBackfillStats::default());
@@ -594,8 +594,8 @@ fn run_pair(
         "day range resolved"
     );
 
-    // ── Renko bars require an explicit calibrated k (no fallback per
-    //    `feedback_no_k_fallback`). Disable renko output if the caller had no
+    // ── Renko bars require an explicit calibrated k (no default fallback).
+    //    Disable renko output if the caller had no
     //    k for this pair — s10 still runs since it doesn't depend on k.
     let renko_enabled = bars.renko && k.is_some();
     if bars.renko && k.is_none() {
