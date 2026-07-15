@@ -1,6 +1,5 @@
 # Rust
 target/
-Cargo.lock
 
 # Output directories (only root level)
 /cache/
