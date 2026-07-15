@@ -151,7 +151,9 @@ fn migrate_idx(
     // get the ticker_id).
     let mut flat: BTreeMap<u64, PathBuf> = BTreeMap::new();
     if indexes.is_dir() {
-        for e in fs::read_dir(&indexes).with_context(|| format!("read_dir {}", indexes.display()))? {
+        for e in
+            fs::read_dir(&indexes).with_context(|| format!("read_dir {}", indexes.display()))?
+        {
             let p = e?.path();
             if !p.is_file() {
                 continue;
@@ -204,7 +206,10 @@ fn migrate_idx(
             Some(p) => shard::read_shard_aligned::<IndexRecord>(p)?,
             None => Vec::new(),
         };
-        let live_start = flat_recs.first().map(|r| r.shard_ts_ms()).unwrap_or(i64::MAX);
+        let live_start = flat_recs
+            .first()
+            .map(|r| r.shard_ts_ms())
+            .unwrap_or(i64::MAX);
 
         // Open writer once per ticker (report_only: simulate the gate inline so
         // we never write). The writer seeds last_bid/ask from the tail (idempotent).
@@ -268,10 +273,13 @@ fn migrate_idx(
                 // Replicate IdxShardWriter gate for the dry-run count.
                 let date = shard::ts_ms_to_utc_date(ts);
                 let body = rec.index;
-                let (bid, ask, vbid, vask, ci) = (body.bid, body.ask, body.vbid, body.vask, body.ci);
+                let (bid, ask, vbid, vask, ci) =
+                    (body.bid, body.ask, body.vbid, body.vask, body.ci);
                 let new_day = sim_date != Some(date);
                 let changed = sim_last
-                    .map(|(b, a, vb, va, c)| bid != b || ask != a || vbid != vb || vask != va || ci != c)
+                    .map(|(b, a, vb, va, c)| {
+                        bid != b || ask != a || vbid != vb || vask != va || ci != c
+                    })
                     .unwrap_or(true);
                 if changed || new_day {
                     *written += 1;
@@ -308,8 +316,10 @@ fn migrate_idx(
         }
     }
     let verb = if report_only { "would write" } else { "wrote" };
-    println!("[idx] total: {total_seen} in-window, {verb} {total_written} (delta-gated, ~{:.1} MiB)",
-        (total_written * 56) as f64 / 1_048_576.0);
+    println!(
+        "[idx] total: {total_seen} in-window, {verb} {total_written} (delta-gated, ~{:.1} MiB)",
+        (total_written * 56) as f64 / 1_048_576.0
+    );
     Ok(())
 }
 
@@ -401,7 +411,10 @@ fn migrate_bars(
                 }
             }
             if !report_only {
-                println!("  [bars] {sym}→{id}: shards re-keyed to {}", dst_dir.display());
+                println!(
+                    "  [bars] {sym}→{id}: shards re-keyed to {}",
+                    dst_dir.display()
+                );
             }
         }
     }

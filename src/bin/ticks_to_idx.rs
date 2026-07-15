@@ -22,8 +22,8 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use mitch::header::MitchHeader;
 use mitch::common::message_type;
+use mitch::header::MitchHeader;
 use nxr_sdk::{
     agg::{RunningStats, TickAccumulator},
     ipc::append_log::AppendLog,
@@ -92,7 +92,8 @@ fn main() -> Result<()> {
         !nxr_sdk::providers::is_excluded_provider(provider_id),
         "exchange '{}' (provider {}) is HARD-EXCLUDED from index construction \
          (nxr_sdk::providers::EXCLUDED_PROVIDERS — fabricated L1 sizes)",
-        args.exchange, provider_id
+        args.exchange,
+        provider_id
     );
     let ticker_id = resolve_ticker_id(&format!("{}/{}", args.base, args.quote));
 
@@ -202,7 +203,8 @@ fn main() -> Result<()> {
         // resume duplicate-free. Only delete on a clean fold; a failed stream
         // keeps the raw for retry.
         maybe_delete_folded_tick(args.delete_after_convert, folded, path, &mut |p| {
-            log.flush().with_context(|| format!("pre-delete idx flush {}", p.display()))
+            log.flush()
+                .with_context(|| format!("pre-delete idx flush {}", p.display()))
         });
     }
 
@@ -251,7 +253,7 @@ fn stream_file_into_acc(
     if len == 0 {
         return Ok(());
     }
-    // mmap + zero-copy cast (mirror generate_renko_from_ticks::mmap_tick_file).
+    // mmap + zero-copy cast.
     // Replaces the old 480 KiB chunked-read loop: the kernel pages the file in
     // on demand, so resident memory stays O(1) without an explicit batch buffer.
     let mmap = unsafe { memmap2::Mmap::map(&file)? };

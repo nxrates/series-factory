@@ -1,5 +1,5 @@
-use crate::types::{Config, GenerativeModel, TickFrame};
 use crate::sources::{next_synthetic_id, TickSource};
+use crate::types::{Config, GenerativeModel, TickFrame};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use mitch::Tick;
@@ -27,7 +27,10 @@ pub struct SyntheticSource {
 
 impl SyntheticSource {
     pub fn new(model: GenerativeModel) -> Self {
-        Self { model, provider_id: next_synthetic_id() }
+        Self {
+            model,
+            provider_id: next_synthetic_id(),
+        }
     }
 
     fn generate_ticks(&self, config: &Config) -> Result<Vec<TickFrame>> {
@@ -39,18 +42,14 @@ impl SyntheticSource {
         const EPOCHS_PER_YEAR: f64 = (365.25 * 24.0 * 60.0 * 60.0 * 1000.0) / SYNTHETIC_EPOCH_MS; // ~63,115,200 epochs per year
 
         // Get ticker ID for synthetic data
-        let ticker_id = nxr_sdk::resolve_ticker_id(
-            &format!("{}{}", config.base, config.quote)
-        );
+        let ticker_id = nxr_sdk::resolve_ticker_id(&format!("{}{}", config.base, config.quote));
 
         // Calculate number of ticks to generate based on time range.
         // Guard against inverted or zero ranges which would silently cast to a huge usize.
         let from_ms = config.from.timestamp_millis();
         let to_ms = config.to.timestamp_millis();
         if to_ms <= from_ms {
-            anyhow::bail!(
-                "synthetic range is empty or inverted: from={from_ms}, to={to_ms}"
-            );
+            anyhow::bail!("synthetic range is empty or inverted: from={from_ms}, to={to_ms}");
         }
         let duration_ms = (to_ms - from_ms) as f64;
         let num_ticks = (duration_ms / SYNTHETIC_EPOCH_MS) as usize;
@@ -77,15 +76,32 @@ impl SyntheticSource {
 
                     let bid = price - spread / 2.0;
                     let ask = price + spread / 2.0;
-                    let vbid = if is_buy { 0 } else { clamp_vol(rng.gen::<f64>() * 10000.0) };
-                    let vask = if is_buy { clamp_vol(rng.gen::<f64>() * 10000.0) } else { 0 };
+                    let vbid = if is_buy {
+                        0
+                    } else {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    };
+                    let vask = if is_buy {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    } else {
+                        0
+                    };
 
-                    ticks.push(TickFrame::new(self.provider_id, mitch::timestamp::from_epoch_ms(timestamp), Tick::new_unchecked(ticker_id, bid, ask, vbid, vask)));
+                    ticks.push(TickFrame::new(
+                        self.provider_id,
+                        mitch::timestamp::from_epoch_ms(timestamp),
+                        Tick::new_unchecked(ticker_id, bid, ask, vbid, vask),
+                    ));
 
                     timestamp += SYNTHETIC_EPOCH_MS as i64;
                 }
             }
-            GenerativeModel::FBM { mu, sigma, hurst, base } => {
+            GenerativeModel::FBM {
+                mu,
+                sigma,
+                hurst,
+                base,
+            } => {
                 let mut price = *base;
                 let normal = Normal::new(0.0, 1.0).context("synthetic: Normal(0,1) params")?;
 
@@ -107,15 +123,35 @@ impl SyntheticSource {
 
                     let bid = price - spread / 2.0;
                     let ask = price + spread / 2.0;
-                    let vbid = if is_buy { 0 } else { clamp_vol(rng.gen::<f64>() * 10000.0) };
-                    let vask = if is_buy { clamp_vol(rng.gen::<f64>() * 10000.0) } else { 0 };
+                    let vbid = if is_buy {
+                        0
+                    } else {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    };
+                    let vask = if is_buy {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    } else {
+                        0
+                    };
 
-                    ticks.push(TickFrame::new(self.provider_id, mitch::timestamp::from_epoch_ms(timestamp), Tick::new_unchecked(ticker_id, bid, ask, vbid, vask)));
+                    ticks.push(TickFrame::new(
+                        self.provider_id,
+                        mitch::timestamp::from_epoch_ms(timestamp),
+                        Tick::new_unchecked(ticker_id, bid, ask, vbid, vask),
+                    ));
 
                     timestamp += SYNTHETIC_EPOCH_MS as i64;
                 }
             }
-            GenerativeModel::Heston { mu, sigma, kappa, theta, xi, rho, base } => {
+            GenerativeModel::Heston {
+                mu,
+                sigma,
+                kappa,
+                theta,
+                xi,
+                rho,
+                base,
+            } => {
                 let mut price = *base;
                 let mut volatility = *sigma;
                 let normal = Normal::new(0.0, 1.0).context("synthetic: Normal(0,1) params")?;
@@ -132,7 +168,9 @@ impl SyntheticSource {
 
                     // Heston volatility dynamics
                     let kappa_per_epoch = kappa / EPOCHS_PER_YEAR;
-                    volatility = volatility + kappa_per_epoch * (theta - volatility) + xi * volatility.sqrt() * z_v / EPOCHS_PER_YEAR.sqrt();
+                    volatility = volatility
+                        + kappa_per_epoch * (theta - volatility)
+                        + xi * volatility.sqrt() * z_v / EPOCHS_PER_YEAR.sqrt();
                     volatility = volatility.max(0.0001);
 
                     // Price dynamics with stochastic volatility
@@ -146,15 +184,34 @@ impl SyntheticSource {
 
                     let bid = price - spread / 2.0;
                     let ask = price + spread / 2.0;
-                    let vbid = if is_buy { 0 } else { clamp_vol(rng.gen::<f64>() * 10000.0) };
-                    let vask = if is_buy { clamp_vol(rng.gen::<f64>() * 10000.0) } else { 0 };
+                    let vbid = if is_buy {
+                        0
+                    } else {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    };
+                    let vask = if is_buy {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    } else {
+                        0
+                    };
 
-                    ticks.push(TickFrame::new(self.provider_id, mitch::timestamp::from_epoch_ms(timestamp), Tick::new_unchecked(ticker_id, bid, ask, vbid, vask)));
+                    ticks.push(TickFrame::new(
+                        self.provider_id,
+                        mitch::timestamp::from_epoch_ms(timestamp),
+                        Tick::new_unchecked(ticker_id, bid, ask, vbid, vask),
+                    ));
 
                     timestamp += SYNTHETIC_EPOCH_MS as i64;
                 }
             }
-            GenerativeModel::NormalJumpDiffusion { mu, sigma, lambda, mu_jump, sigma_jump, base } => {
+            GenerativeModel::NormalJumpDiffusion {
+                mu,
+                sigma,
+                lambda,
+                mu_jump,
+                sigma_jump,
+                base,
+            } => {
                 let mut price = *base;
                 let normal = Normal::new(0.0, 1.0).context("synthetic: Normal(0,1) params")?;
                 let poisson = Poisson::new(*lambda / EPOCHS_PER_YEAR)
@@ -186,15 +243,35 @@ impl SyntheticSource {
 
                     let bid = price - spread / 2.0;
                     let ask = price + spread / 2.0;
-                    let vbid = if is_buy { 0 } else { clamp_vol(rng.gen::<f64>() * 10000.0) };
-                    let vask = if is_buy { clamp_vol(rng.gen::<f64>() * 10000.0) } else { 0 };
+                    let vbid = if is_buy {
+                        0
+                    } else {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    };
+                    let vask = if is_buy {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    } else {
+                        0
+                    };
 
-                    ticks.push(TickFrame::new(self.provider_id, mitch::timestamp::from_epoch_ms(timestamp), Tick::new_unchecked(ticker_id, bid, ask, vbid, vask)));
+                    ticks.push(TickFrame::new(
+                        self.provider_id,
+                        mitch::timestamp::from_epoch_ms(timestamp),
+                        Tick::new_unchecked(ticker_id, bid, ask, vbid, vask),
+                    ));
 
                     timestamp += SYNTHETIC_EPOCH_MS as i64;
                 }
             }
-            GenerativeModel::DoubleExpJumpDiffusion { mu, sigma, lambda, mu_pos_jump, mu_neg_jump, p_neg_jump, base } => {
+            GenerativeModel::DoubleExpJumpDiffusion {
+                mu,
+                sigma,
+                lambda,
+                mu_pos_jump,
+                mu_neg_jump,
+                p_neg_jump,
+                base,
+            } => {
                 let mut price = *base;
                 let normal = Normal::new(0.0, 1.0).context("synthetic: Normal(0,1) params")?;
                 let poisson = Poisson::new(*lambda / EPOCHS_PER_YEAR)
@@ -234,10 +311,22 @@ impl SyntheticSource {
 
                     let bid = price - spread / 2.0;
                     let ask = price + spread / 2.0;
-                    let vbid = if is_buy { 0 } else { clamp_vol(rng.gen::<f64>() * 10000.0) };
-                    let vask = if is_buy { clamp_vol(rng.gen::<f64>() * 10000.0) } else { 0 };
+                    let vbid = if is_buy {
+                        0
+                    } else {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    };
+                    let vask = if is_buy {
+                        clamp_vol(rng.gen::<f64>() * 10000.0)
+                    } else {
+                        0
+                    };
 
-                    ticks.push(TickFrame::new(self.provider_id, mitch::timestamp::from_epoch_ms(timestamp), Tick::new_unchecked(ticker_id, bid, ask, vbid, vask)));
+                    ticks.push(TickFrame::new(
+                        self.provider_id,
+                        mitch::timestamp::from_epoch_ms(timestamp),
+                        Tick::new_unchecked(ticker_id, bid, ask, vbid, vask),
+                    ));
 
                     timestamp += SYNTHETIC_EPOCH_MS as i64;
                 }
@@ -250,11 +339,7 @@ impl SyntheticSource {
 
 #[async_trait]
 impl TickSource for SyntheticSource {
-    async fn fetch_ticks(
-        &self,
-        config: &Config,
-        tx: mpsc::Sender<Vec<TickFrame>>,
-    ) -> Result<()> {
+    async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
         info!("Generating synthetic data using {:?}", self.model);
 
         let ticks = self.generate_ticks(config)?;

@@ -202,8 +202,12 @@ struct FileReport {
 }
 
 impl FileReport {
-    fn ok(&self) -> bool { self.errors.is_empty() && self.warnings.is_empty() }
-    fn clean(&self) -> bool { self.errors.is_empty() }
+    fn ok(&self) -> bool {
+        self.errors.is_empty() && self.warnings.is_empty()
+    }
+    fn clean(&self) -> bool {
+        self.errors.is_empty()
+    }
 }
 
 // ── Optional renko bounds from config.yml ──────────────────────────────────
@@ -211,13 +215,11 @@ impl FileReport {
 /// Load `min_pct` from `config.yml`, falling back to `0.0001`.
 /// Reads via the canonical [`nxr_sdk::pipeline_config::PipelineYml::load_default`]
 /// resolver (single source of truth for config discovery — was a divergent
-/// 3-candidate shim until phase 59.R3.C3.O7, 2026-05-30).
+/// 3-candidate shim until 2026-05-30).
 ///
-/// Debate (Aoife ↔ Tomás): post-2026-05-24 max_pct is gone; integrity_check
-/// loses its upper-bound enforcement. Aoife: "Replace with anomaly log only."
-/// Tomás: "Floor still matters — a brick < min_pct means generator math
-/// underflowed and the bar is invalid storage-wise." Consensus: keep floor
-/// check, drop ceiling.
+/// `max_pct` was removed 2026-05-24, so there is no upper-bound check; the
+/// floor check stays because a brick < min_pct means the generator math
+/// underflowed and the bar is invalid on disk.
 fn load_renko_bounds() -> f64 {
     use nxr_sdk::pipeline_config::{ConfigHint, PipelineYml};
     PipelineYml::load_default(ConfigHint::Bin)
@@ -534,7 +536,11 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
             if mt != message_type::INDEX {
                 errors.push(Finding {
                     record_ix: Some(i),
-                    msg: format!("header.message_type=0x{:02x} != INDEX (0x{:02x})", mt, message_type::INDEX),
+                    msg: format!(
+                        "header.message_type=0x{:02x} != INDEX (0x{:02x})",
+                        mt,
+                        message_type::INDEX
+                    ),
                 });
             }
 
@@ -734,12 +740,20 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                 if ci_price.is_finite() && ci_price > mid * CI_MAX_FRAC {
                     let msg = format!(
                         "ci_price {:.6} > mid*{} = {:.6} (degenerate interval)",
-                        ci_price, CI_MAX_FRAC, mid * CI_MAX_FRAC
+                        ci_price,
+                        CI_MAX_FRAC,
+                        mid * CI_MAX_FRAC
                     );
                     if strict {
-                        errors.push(Finding { record_ix: Some(i), msg });
+                        errors.push(Finding {
+                            record_ix: Some(i),
+                            msg,
+                        });
                     } else {
-                        warnings.push(Finding { record_ix: Some(i), msg });
+                        warnings.push(Finding {
+                            record_ix: Some(i),
+                            msg,
+                        });
                     }
                 }
 
@@ -762,9 +776,15 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                                     JUMP_PCT * 100.0
                                 );
                                 if strict {
-                                    errors.push(Finding { record_ix: Some(i), msg });
+                                    errors.push(Finding {
+                                        record_ix: Some(i),
+                                        msg,
+                                    });
                                 } else {
-                                    warnings.push(Finding { record_ix: Some(i), msg });
+                                    warnings.push(Finding {
+                                        record_ix: Some(i),
+                                        msg,
+                                    });
                                 }
                             }
                         }
@@ -809,9 +829,15 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                             f, CONF_FRESHNESS_FLOOR
                         );
                         if strict {
-                            errors.push(Finding { record_ix: Some(i), msg });
+                            errors.push(Finding {
+                                record_ix: Some(i),
+                                msg,
+                            });
                         } else {
-                            warnings.push(Finding { record_ix: Some(i), msg });
+                            warnings.push(Finding {
+                                record_ix: Some(i),
+                                msg,
+                            });
                         }
                     }
                 }
@@ -822,8 +848,12 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                     s.n_finite += 1;
                 }
                 s.sum_spread_bps += spread_bps;
-                if spread_bps > s.max_spread_bps { s.max_spread_bps = spread_bps; }
-                if spread_bps > 500.0 { s.n_wide += 1; }
+                if spread_bps > s.max_spread_bps {
+                    s.max_spread_bps = spread_bps;
+                }
+                if spread_bps > 500.0 {
+                    s.n_wide += 1;
+                }
             }
         },
         |s: IdxState, _n, errors, warnings, stats| {
@@ -847,17 +877,22 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                     s.max_identical_run, STUCK_RUN
                 );
                 if strict {
-                    errors.push(Finding { record_ix: None, msg });
+                    errors.push(Finding {
+                        record_ix: None,
+                        msg,
+                    });
                 } else {
-                    warnings.push(Finding { record_ix: None, msg });
+                    warnings.push(Finding {
+                        record_ix: None,
+                        msg,
+                    });
                 }
             }
             // FIX #7: denominator is the NON-sentinel finite count (matches the
             // sentinel-excluded `distinct_mids`), so a sentinel-dense quiet feed
             // is not falsely flagged by an artificially depressed fraction.
             if s.n_nonsentinel_finite >= STUCK_MIN_SAMPLE {
-                let distinct_frac =
-                    s.distinct_mids.len() as f64 / s.n_nonsentinel_finite as f64;
+                let distinct_frac = s.distinct_mids.len() as f64 / s.n_nonsentinel_finite as f64;
                 if distinct_frac < STUCK_MIN_DISTINCT_FRAC {
                     let msg = format!(
                         "stuck feed: only {} distinct mids over {} non-sentinel finite ({:.4} < {})",
@@ -867,9 +902,15 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                         STUCK_MIN_DISTINCT_FRAC
                     );
                     if strict {
-                        errors.push(Finding { record_ix: None, msg });
+                        errors.push(Finding {
+                            record_ix: None,
+                            msg,
+                        });
                     } else {
-                        warnings.push(Finding { record_ix: None, msg });
+                        warnings.push(Finding {
+                            record_ix: None,
+                            msg,
+                        });
                     }
                 }
             }
@@ -980,10 +1021,7 @@ fn check_bars(path: &Path, strict: bool) -> Result<FileReport> {
                 if brick < renko_min_pct {
                     errors.push(Finding {
                         record_ix: Some(i),
-                        msg: format!(
-                            "renko brick {:.6} below floor {}",
-                            brick, renko_min_pct
-                        ),
+                        msg: format!("renko brick {:.6} below floor {}", brick, renko_min_pct),
                     });
                 }
             }
@@ -1299,14 +1337,22 @@ fn check_vol(path: &Path, _strict: bool) -> Result<FileReport> {
             }
 
             s.sum_sigma += sigma;
-            if sigma < s.vol_stats.min_sigma_pct { s.vol_stats.min_sigma_pct = sigma; }
-            if sigma > s.vol_stats.max_sigma_pct { s.vol_stats.max_sigma_pct = sigma; }
+            if sigma < s.vol_stats.min_sigma_pct {
+                s.vol_stats.min_sigma_pct = sigma;
+            }
+            if sigma > s.vol_stats.max_sigma_pct {
+                s.vol_stats.max_sigma_pct = sigma;
+            }
         },
         |mut s: VolState, n, _errors, _warnings, stats| {
             if n > 0 {
                 s.vol_stats.mean_sigma_pct = s.sum_sigma / n as f64;
-                if !s.vol_stats.min_sigma_pct.is_finite() { s.vol_stats.min_sigma_pct = 0.0; }
-                if !s.vol_stats.max_sigma_pct.is_finite() { s.vol_stats.max_sigma_pct = 0.0; }
+                if !s.vol_stats.min_sigma_pct.is_finite() {
+                    s.vol_stats.min_sigma_pct = 0.0;
+                }
+                if !s.vol_stats.max_sigma_pct.is_finite() {
+                    s.vol_stats.max_sigma_pct = 0.0;
+                }
             }
 
             stats.vol_stats = Some(s.vol_stats);
@@ -1362,7 +1408,17 @@ fn emit_report(r: &FileReport, json: bool) {
 fn exit_code(reports: &[FileReport], strict: bool) -> i32 {
     let any_err = reports.iter().any(|r| !r.clean());
     let any_warn = reports.iter().any(|r| !r.ok());
-    if any_err { 2 } else if any_warn { if strict { 2 } else { 1 } } else { 0 }
+    if any_err {
+        2
+    } else if any_warn {
+        if strict {
+            2
+        } else {
+            1
+        }
+    } else {
+        0
+    }
 }
 
 // ── Directory walk ──────────────────────────────────────────────────────────
@@ -1435,7 +1491,11 @@ fn scan_orphaned_bak(root: &Path, heal: bool) -> Vec<OrphanBakFinding> {
     let indexes = root.join("indexes");
     // Accept either an `indexes/` root or a root that already IS the indexes
     // dir (each child = a ticker-id dir).
-    let scan_root = if indexes.is_dir() { indexes } else { root.to_path_buf() };
+    let scan_root = if indexes.is_dir() {
+        indexes
+    } else {
+        root.to_path_buf()
+    };
 
     let mut out = Vec::new();
     let read = match std::fs::read_dir(&scan_root) {
@@ -1486,7 +1546,11 @@ fn scan_orphaned_bak(root: &Path, heal: bool) -> Vec<OrphanBakFinding> {
         out.push(OrphanBakFinding {
             idx: idx.display().to_string(),
             bak: bak.display().to_string(),
-            idx_mtime: if im == SystemTime::UNIX_EPOCH { "MISSING".into() } else { fmt(im) },
+            idx_mtime: if im == SystemTime::UNIX_EPOCH {
+                "MISSING".into()
+            } else {
+                fmt(im)
+            },
             bak_mtime: fmt(bm),
             promoted,
         });
@@ -1515,7 +1579,12 @@ struct AggregateSummary {
     total_bytes: u64,
 }
 
-fn check_dir(root: &Path, parallel: usize, strict: bool, heal_orphaned_bak: bool) -> Result<AggregateReport> {
+fn check_dir(
+    root: &Path,
+    parallel: usize,
+    strict: bool,
+    heal_orphaned_bak: bool,
+) -> Result<AggregateReport> {
     let files = collect_files(root);
     info!(root = %root.display(), n = files.len(), "integrity-check dir");
 
@@ -1605,7 +1674,12 @@ fn main() -> Result<()> {
             emit_report(&r, json);
             std::process::exit(exit_code(std::slice::from_ref(&r), strict));
         }
-        Cmd::S10 { path, strict, json, bucket_ms } => {
+        Cmd::S10 {
+            path,
+            strict,
+            json,
+            bucket_ms,
+        } => {
             let r = check_s10(&path, strict, bucket_ms)?;
             emit_report(&r, json);
             std::process::exit(exit_code(std::slice::from_ref(&r), strict));
@@ -1688,8 +1762,15 @@ mod tests {
         let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
         let index = Index::new(
             0xDEAD_BEEF_u64,
-            bid, ask, 100, /*ci*/ 1_000, /*vbid*/ 1_000, /*vask*/ 10, /*tick_count*/
-            1, /*confidence*/ 1, /*accepted*/ 0, /*rejected*/
+            bid,
+            ask,
+            100,
+            /*ci*/ 1_000,
+            /*vbid*/ 1_000,
+            /*vask*/ 10, /*tick_count*/
+            1,
+            /*confidence*/ 1,
+            /*accepted*/ 0, /*rejected*/
         );
         IndexRecord::new(header, index)
     }
@@ -1711,25 +1792,41 @@ mod tests {
         let bak = id_dir.join(format!("{today}.idx.bak"));
 
         // Write idx first, then bak — bak ends up with the newer mtime → orphan.
-        std::fs::File::create(&idx).unwrap().write_all(b"OLD-FROZEN").unwrap();
+        std::fs::File::create(&idx)
+            .unwrap()
+            .write_all(b"OLD-FROZEN")
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::File::create(&bak).unwrap().write_all(b"LIVE-FRESH").unwrap();
+        std::fs::File::create(&bak)
+            .unwrap()
+            .write_all(b"LIVE-FRESH")
+            .unwrap();
 
         // Detect-only: reports the orphan, does NOT promote.
         let found = scan_orphaned_bak(&root, false);
         assert_eq!(found.len(), 1, "orphan detected");
         assert!(!found[0].promoted, "detect-only must not promote");
-        assert!(bak.exists() && idx.exists(), "files untouched in detect mode");
+        assert!(
+            bak.exists() && idx.exists(),
+            "files untouched in detect mode"
+        );
 
         // Heal: promote .bak → .idx (live data recovered).
         let healed = scan_orphaned_bak(&root, true);
         assert_eq!(healed.len(), 1);
         assert!(healed[0].promoted, "promoted");
         assert!(!bak.exists(), ".bak consumed by rename");
-        assert_eq!(std::fs::read(&idx).unwrap(), b"LIVE-FRESH", ".idx now holds live data");
+        assert_eq!(
+            std::fs::read(&idx).unwrap(),
+            b"LIVE-FRESH",
+            ".idx now holds live data"
+        );
 
         // A SECOND scan is clean (idx now fresh, no bak).
-        assert!(scan_orphaned_bak(&root, false).is_empty(), "healthy after heal");
+        assert!(
+            scan_orphaned_bak(&root, false).is_empty(),
+            "healthy after heal"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1758,19 +1855,25 @@ mod tests {
 
     fn write_idx(name: &str, recs: &[IndexRecord]) -> PathBuf {
         let mut buf = Vec::with_capacity(recs.len() * std::mem::size_of::<IndexRecord>());
-        for r in recs { buf.extend_from_slice(bytes_of(r)); }
+        for r in recs {
+            buf.extend_from_slice(bytes_of(r));
+        }
         write_tmp(name, &buf)
     }
 
     fn write_vol(name: &str, recs: &[VolRecord]) -> PathBuf {
         let mut buf = Vec::with_capacity(recs.len() * std::mem::size_of::<VolRecord>());
-        for r in recs { buf.extend_from_slice(bytes_of(r)); }
+        for r in recs {
+            buf.extend_from_slice(bytes_of(r));
+        }
         write_tmp(name, &buf)
     }
 
     fn write_bars(name: &str, bars: &[mitch::bar::Bar]) -> PathBuf {
         let mut buf = Vec::with_capacity(bars.len() * std::mem::size_of::<mitch::bar::Bar>());
-        for b in bars { buf.extend_from_slice(bytes_of(b)); }
+        for b in bars {
+            buf.extend_from_slice(bytes_of(b));
+        }
         write_tmp(name, &buf)
     }
 
@@ -1778,8 +1881,7 @@ mod tests {
     fn s10_bar(open_ms: i64, close_ms: i64, px: f64) -> mitch::bar::Bar {
         let open_mts = timestamp::from_epoch_ms(open_ms);
         let close_mts = timestamp::from_epoch_ms(close_ms);
-        let mut b =
-            mitch::bar::Bar::new_ohlcv(open_mts, close_mts, px, px, px, px, 0, 0, 1);
+        let mut b = mitch::bar::Bar::new_ohlcv(open_mts, close_mts, px, px, px, px, 0, 0, 1);
         b.kind = mitch::bar::BarKind::Kline as u8;
         b
     }
@@ -1790,7 +1892,18 @@ mod tests {
     fn fresh_record(epoch_ms: i64, bid: f64, ask: f64, conf_byte: u8) -> IndexRecord {
         let mts = timestamp::from_epoch_ms(epoch_ms);
         let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
-        let mut index = Index::new(0xDEAD_BEEF_u64, bid, ask, 100, 1_000, 1_000, 10, conf_byte, 1, 0);
+        let mut index = Index::new(
+            0xDEAD_BEEF_u64,
+            bid,
+            ask,
+            100,
+            1_000,
+            1_000,
+            10,
+            conf_byte,
+            1,
+            0,
+        );
         index.flags |= nxr_sdk::shard::FLAG_CONF_FRESHNESS;
         IndexRecord::new(header, index)
     }
@@ -1825,7 +1938,11 @@ mod tests {
         let rec = good_record(T0, 5e-10, 6e-10);
         let p = write_idx("g1-subfloor.idx", &[rec]);
         let r = check_idx(&p, false).unwrap();
-        assert!(has_err(&r, "price floor"), "sub-floor px must ERROR: {:?}", r.errors);
+        assert!(
+            has_err(&r, "price floor"),
+            "sub-floor px must ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -1834,7 +1951,11 @@ mod tests {
         let rec = good_record(T0, 100.0, 100.1);
         let p = write_idx("g1-ok.idx", &[rec]);
         let r = check_idx(&p, false).unwrap();
-        assert!(!has_err(&r, "price floor"), "normal px must not ERROR: {:?}", r.errors);
+        assert!(
+            !has_err(&r, "price floor"),
+            "normal px must not ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -1853,7 +1974,11 @@ mod tests {
         let rec = IndexRecord::new(header, index);
         let p = write_idx("g6-minmts.idx", &[rec]);
         let r = check_idx(&p, false).unwrap();
-        assert!(!has_err(&r, "outside sane epoch"), "min mts must not ERROR: {:?}", r.errors);
+        assert!(
+            !has_err(&r, "outside sane epoch"),
+            "min mts must not ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -1864,7 +1989,11 @@ mod tests {
         let rec = good_record(future_ms, 100.0, 100.1);
         let p = write_idx("g6-future.idx", &[rec]);
         let r = check_idx(&p, false).unwrap();
-        assert!(has_err(&r, "outside sane epoch"), "future ts must ERROR: {:?}", r.errors);
+        assert!(
+            has_err(&r, "outside sane epoch"),
+            "future ts must ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -1876,12 +2005,25 @@ mod tests {
         let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
         // accepted = MAX+1 → metadata corruption.
         let index = Index::new(
-            0xDEAD_BEEF, 100.0, 100.1, 100, 1, 1, 1, 1, MAX_ACCEPTED_PROVIDERS + 1, 0,
+            0xDEAD_BEEF,
+            100.0,
+            100.1,
+            100,
+            1,
+            1,
+            1,
+            1,
+            MAX_ACCEPTED_PROVIDERS + 1,
+            0,
         );
         let rec = IndexRecord::new(header, index);
         let p = write_idx("g8-accepted.idx", &[rec]);
         let r = check_idx(&p, false).unwrap();
-        assert!(has_err(&r, "exceeds sane max"), "absurd accepted must ERROR: {:?}", r.errors);
+        assert!(
+            has_err(&r, "exceeds sane max"),
+            "absurd accepted must ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -1899,7 +2041,16 @@ mod tests {
         let mts = timestamp::from_epoch_ms(epoch_ms);
         let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
         let index = Index::new(
-            0xDEAD_BEEF, 100.0, 100.1, 100, vbid, vask, 1, 1, accepted, rejected,
+            0xDEAD_BEEF,
+            100.0,
+            100.1,
+            100,
+            vbid,
+            vask,
+            1,
+            1,
+            accepted,
+            rejected,
         );
         IndexRecord::new(header, index)
     }
@@ -1924,7 +2075,11 @@ mod tests {
         let bid_zero = depth_record(T0, 0, 50, 1, 0);
         let p = write_idx("g10-one-sided.idx", &[bid_zero]);
         let r = check_idx(&p, false).unwrap();
-        assert!(has_warn(&r, "one-sided depth"), "one-sided depth must WARN: {:?}", r.warnings);
+        assert!(
+            has_warn(&r, "one-sided depth"),
+            "one-sided depth must WARN: {:?}",
+            r.warnings
+        );
         assert!(
             !has_err(&r, "zero-depth/phantom quote"),
             "one-sided must NOT ERROR: {:?}",
@@ -1936,7 +2091,11 @@ mod tests {
         let ask_zero = depth_record(T0, 50, 0, 1, 0);
         let p2 = write_idx("g10-one-sided-ask.idx", &[ask_zero]);
         let r2 = check_idx(&p2, false).unwrap();
-        assert!(has_warn(&r2, "one-sided depth"), "ask-side one-sided must WARN: {:?}", r2.warnings);
+        assert!(
+            has_warn(&r2, "one-sided depth"),
+            "ask-side one-sided must WARN: {:?}",
+            r2.warnings
+        );
         std::fs::remove_file(&p2).ok();
     }
 
@@ -1945,8 +2104,16 @@ mod tests {
         let rec = depth_record(T0, 100, 100, 1, 0);
         let p = write_idx("g10-healthy.idx", &[rec]);
         let r = check_idx(&p, false).unwrap();
-        assert!(!has_err(&r, "zero-depth"), "healthy depth must not ERROR: {:?}", r.errors);
-        assert!(!has_warn(&r, "one-sided depth"), "healthy depth must not WARN: {:?}", r.warnings);
+        assert!(
+            !has_err(&r, "zero-depth"),
+            "healthy depth must not ERROR: {:?}",
+            r.errors
+        );
+        assert!(
+            !has_warn(&r, "one-sided depth"),
+            "healthy depth must not WARN: {:?}",
+            r.warnings
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -1977,8 +2144,16 @@ mod tests {
         let rec = depth_record(T0, 100, 100, 2, 5);
         let p = write_idx("g11-reject-dom.idx", &[rec]);
         let r = check_idx(&p, false).unwrap();
-        assert!(has_warn(&r, "reject-dominant"), "reject-dominant must WARN: {:?}", r.warnings);
-        assert!(!has_err(&r, "reject-dominant"), "reject dominance must not ERROR: {:?}", r.errors);
+        assert!(
+            has_warn(&r, "reject-dominant"),
+            "reject-dominant must WARN: {:?}",
+            r.warnings
+        );
+        assert!(
+            !has_err(&r, "reject-dominant"),
+            "reject dominance must not ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -1988,7 +2163,11 @@ mod tests {
         let rec = depth_record(T0, 100, 100, 8, 1);
         let p = write_idx("g11-reject-ok.idx", &[rec]);
         let r = check_idx(&p, false).unwrap();
-        assert!(!has_warn(&r, "reject-dominant"), "healthy reject ratio must not WARN: {:?}", r.warnings);
+        assert!(
+            !has_warn(&r, "reject-dominant"),
+            "healthy reject ratio must not WARN: {:?}",
+            r.warnings
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2022,11 +2201,23 @@ mod tests {
         let p = write_idx("g5-jump.idx", &recs);
 
         let r = check_idx(&p, false).unwrap();
-        assert!(has_warn(&r, "mid jump"), "jump must WARN (non-strict): {:?}", r.warnings);
-        assert!(!has_err(&r, "mid jump"), "jump must NOT ERROR (non-strict): {:?}", r.errors);
+        assert!(
+            has_warn(&r, "mid jump"),
+            "jump must WARN (non-strict): {:?}",
+            r.warnings
+        );
+        assert!(
+            !has_err(&r, "mid jump"),
+            "jump must NOT ERROR (non-strict): {:?}",
+            r.errors
+        );
 
         let r2 = check_idx(&p, true).unwrap();
-        assert!(has_err(&r2, "mid jump"), "jump must ERROR (strict): {:?}", r2.errors);
+        assert!(
+            has_err(&r2, "mid jump"),
+            "jump must ERROR (strict): {:?}",
+            r2.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2038,7 +2229,11 @@ mod tests {
         ];
         let p = write_idx("g5-nojump.idx", &recs);
         let r = check_idx(&p, false).unwrap();
-        assert!(!has_warn(&r, "mid jump"), "small move must not WARN: {:?}", r.warnings);
+        assert!(
+            !has_warn(&r, "mid jump"),
+            "small move must not WARN: {:?}",
+            r.warnings
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2050,17 +2245,33 @@ mod tests {
         let mts = timestamp::from_epoch_ms(T0);
         let header = MitchHeader::new(message_type::INDEX, 1, mts, 1);
         let index = Index::new(
-            0xDEAD_BEEF, 100.0, 100.1, 60_000, /*ci near u16 sat → very wide*/
-            1, 1, 1, 1, 1, 0,
+            0xDEAD_BEEF,
+            100.0,
+            100.1,
+            60_000, /*ci near u16 sat → very wide*/
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
         );
         let rec = IndexRecord::new(header, index);
         let p = write_idx("g3-ci.idx", &[rec]);
 
         let r = check_idx(&p, false).unwrap();
-        assert!(has_warn(&r, "degenerate interval"), "wide CI must WARN: {:?}", r.warnings);
+        assert!(
+            has_warn(&r, "degenerate interval"),
+            "wide CI must WARN: {:?}",
+            r.warnings
+        );
 
         let r2 = check_idx(&p, true).unwrap();
-        assert!(has_err(&r2, "degenerate interval"), "wide CI must ERROR (strict): {:?}", r2.errors);
+        assert!(
+            has_err(&r2, "degenerate interval"),
+            "wide CI must ERROR (strict): {:?}",
+            r2.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2072,7 +2283,11 @@ mod tests {
         let recs = [vol_record(T0, VOL_MAX + 1.0)];
         let p = write_vol("vol-absurd.vol", &recs);
         let r = check_vol(&p, false).unwrap();
-        assert!(has_err(&r, "sane band"), "absurd sigma must ERROR: {:?}", r.errors);
+        assert!(
+            has_err(&r, "sane band"),
+            "absurd sigma must ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2081,7 +2296,11 @@ mod tests {
         let recs = [vol_record(T0, 0.02), vol_record(T0 + 1_000, 0.03)];
         let p = write_vol("vol-ok.vol", &recs);
         let r = check_vol(&p, false).unwrap();
-        assert!(r.errors.is_empty(), "normal vol must be clean: {:?}", r.errors);
+        assert!(
+            r.errors.is_empty(),
+            "normal vol must be clean: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2098,11 +2317,23 @@ mod tests {
         let p = write_idx("g9-frozen.idx", &recs);
 
         let r = check_idx(&p, false).unwrap();
-        assert!(has_warn(&r, "stuck feed"), "frozen feed must WARN: {:?}", r.warnings);
-        assert!(!has_err(&r, "stuck feed"), "frozen feed must NOT ERROR (non-strict): {:?}", r.errors);
+        assert!(
+            has_warn(&r, "stuck feed"),
+            "frozen feed must WARN: {:?}",
+            r.warnings
+        );
+        assert!(
+            !has_err(&r, "stuck feed"),
+            "frozen feed must NOT ERROR (non-strict): {:?}",
+            r.errors
+        );
 
         let r2 = check_idx(&p, true).unwrap();
-        assert!(has_err(&r2, "stuck feed"), "frozen feed must ERROR (strict): {:?}", r2.errors);
+        assert!(
+            has_err(&r2, "stuck feed"),
+            "frozen feed must ERROR (strict): {:?}",
+            r2.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2120,9 +2351,17 @@ mod tests {
         let p = write_idx("g9-moving.idx", &recs);
 
         let r = check_idx(&p, false).unwrap();
-        assert!(!has_warn(&r, "stuck feed"), "moving feed must not WARN: {:?}", r.warnings);
+        assert!(
+            !has_warn(&r, "stuck feed"),
+            "moving feed must not WARN: {:?}",
+            r.warnings
+        );
         let r2 = check_idx(&p, true).unwrap();
-        assert!(!has_err(&r2, "stuck feed"), "moving feed must not ERROR (strict): {:?}", r2.errors);
+        assert!(
+            !has_err(&r2, "stuck feed"),
+            "moving feed must not ERROR (strict): {:?}",
+            r2.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2135,8 +2374,16 @@ mod tests {
             .collect();
         let p = write_idx("g9-smoke-shape.idx", &recs);
         let r = check_idx(&p, true).unwrap();
-        assert!(!has_err(&r, "stuck feed"), "small constant sample must not ERROR (strict): {:?}", r.errors);
-        assert!(!has_warn(&r, "stuck feed"), "small constant sample must not WARN: {:?}", r.warnings);
+        assert!(
+            !has_err(&r, "stuck feed"),
+            "small constant sample must not ERROR (strict): {:?}",
+            r.errors
+        );
+        assert!(
+            !has_warn(&r, "stuck feed"),
+            "small constant sample must not WARN: {:?}",
+            r.warnings
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2193,8 +2440,16 @@ mod tests {
             .collect();
         let p = write_idx("fix7-all-sentinel.idx", &recs);
         let r = check_idx(&p, true).unwrap();
-        assert!(!has_err(&r, "stuck feed"), "all-sentinel run must not ERROR stuck: {:?}", r.errors);
-        assert!(!has_warn(&r, "stuck feed"), "all-sentinel run must not WARN stuck: {:?}", r.warnings);
+        assert!(
+            !has_err(&r, "stuck feed"),
+            "all-sentinel run must not ERROR stuck: {:?}",
+            r.errors
+        );
+        assert!(
+            !has_warn(&r, "stuck feed"),
+            "all-sentinel run must not WARN stuck: {:?}",
+            r.warnings
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2232,7 +2487,11 @@ mod tests {
         recs.push(good_record(T0 + 600, 105.0, 105.1)); // 5% from the real 100
         let p = write_idx("fix7-sentinel-baseline.idx", &recs);
         let r = check_idx(&p, false).unwrap();
-        assert!(!has_warn(&r, "mid jump"), "5% real-to-real move must not WARN: {:?}", r.warnings);
+        assert!(
+            !has_warn(&r, "mid jump"),
+            "5% real-to-real move must not WARN: {:?}",
+            r.warnings
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2263,10 +2522,18 @@ mod tests {
         let p = write_idx("g4-stale.idx", &[rec]);
 
         let r = check_idx(&p, false).unwrap();
-        assert!(has_warn(&r, "confidence freshness"), "stale freshness must WARN: {:?}", r.warnings);
+        assert!(
+            has_warn(&r, "confidence freshness"),
+            "stale freshness must WARN: {:?}",
+            r.warnings
+        );
 
         let r2 = check_idx(&p, true).unwrap();
-        assert!(has_err(&r2, "confidence freshness"), "stale freshness must ERROR (strict): {:?}", r2.errors);
+        assert!(
+            has_err(&r2, "confidence freshness"),
+            "stale freshness must ERROR (strict): {:?}",
+            r2.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2276,8 +2543,16 @@ mod tests {
         let fresh = fresh_record(T0, 100.0, 100.1, 255);
         let p = write_idx("g4-fresh.idx", &[fresh]);
         let r = check_idx(&p, true).unwrap();
-        assert!(!has_err(&r, "confidence freshness"), "full freshness must not ERROR: {:?}", r.errors);
-        assert!(!has_warn(&r, "confidence freshness"), "full freshness must not WARN: {:?}", r.warnings);
+        assert!(
+            !has_err(&r, "confidence freshness"),
+            "full freshness must not ERROR: {:?}",
+            r.errors
+        );
+        assert!(
+            !has_warn(&r, "confidence freshness"),
+            "full freshness must not WARN: {:?}",
+            r.warnings
+        );
         std::fs::remove_file(&p).ok();
 
         // (b) flag CLEAR + low conf byte → legacy provider-count semantics,
@@ -2285,8 +2560,16 @@ mod tests {
         let legacy = good_record(T0, 100.0, 100.1); // confidence=1, flag clear
         let p2 = write_idx("g4-legacy.idx", &[legacy]);
         let r2 = check_idx(&p2, true).unwrap();
-        assert!(!has_err(&r2, "confidence freshness"), "legacy conf must not ERROR: {:?}", r2.errors);
-        assert!(!has_warn(&r2, "confidence freshness"), "legacy conf must not WARN: {:?}", r2.warnings);
+        assert!(
+            !has_err(&r2, "confidence freshness"),
+            "legacy conf must not ERROR: {:?}",
+            r2.errors
+        );
+        assert!(
+            !has_warn(&r2, "confidence freshness"),
+            "legacy conf must not WARN: {:?}",
+            r2.warnings
+        );
         std::fs::remove_file(&p2).ok();
     }
 
@@ -2299,7 +2582,11 @@ mod tests {
         let bar = s10_bar(off, off + 10_000, 100.0);
         let p = write_bars("k2-misaligned.s10", &[bar]);
         let r = check_s10(&p, false, 10_000).unwrap();
-        assert!(has_err(&r, "off-grid"), "misaligned s10 open must ERROR: {:?}", r.errors);
+        assert!(
+            has_err(&r, "off-grid"),
+            "misaligned s10 open must ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2310,7 +2597,11 @@ mod tests {
         let b2 = s10_bar(T0 + 10_000, T0 + 20_000, 100.0);
         let p = write_bars("k2-aligned.s10", &[b1, b2]);
         let r = check_s10(&p, false, 10_000).unwrap();
-        assert!(!has_err(&r, "off-grid"), "aligned s10 must not ERROR: {:?}", r.errors);
+        assert!(
+            !has_err(&r, "off-grid"),
+            "aligned s10 must not ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2322,8 +2613,16 @@ mod tests {
         let recs = [vol_record(T0, 0.02), vol_record(T0 + 120_000, 0.03)];
         let p = write_vol("vol-gap.vol", &recs);
         let r = check_vol(&p, false).unwrap();
-        assert!(has_warn(&r, "vol gap"), "vol gap must WARN: {:?}", r.warnings);
-        assert!(r.errors.is_empty(), "vol gap must not ERROR: {:?}", r.errors);
+        assert!(
+            has_warn(&r, "vol gap"),
+            "vol gap must WARN: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.errors.is_empty(),
+            "vol gap must not ERROR: {:?}",
+            r.errors
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -2332,7 +2631,11 @@ mod tests {
         let recs = [vol_record(T0, 0.02), vol_record(T0 + 1_000, 0.03)];
         let p = write_vol("vol-nogap.vol", &recs);
         let r = check_vol(&p, false).unwrap();
-        assert!(!has_warn(&r, "vol gap"), "tight spacing must not WARN: {:?}", r.warnings);
+        assert!(
+            !has_warn(&r, "vol gap"),
+            "tight spacing must not WARN: {:?}",
+            r.warnings
+        );
         std::fs::remove_file(&p).ok();
     }
 }

@@ -8,10 +8,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
-pub struct BybitSource { agent: Arc<ureq::Agent> }
+pub struct BybitSource {
+    agent: Arc<ureq::Agent>,
+}
 
 impl BybitSource {
-    pub fn new() -> Self { Self { agent: http_agent() } }
+    pub fn new() -> Self {
+        Self {
+            agent: http_agent(),
+        }
+    }
 
     fn parse_csv(csv_data: &[u8], ticker_id: u64) -> Result<Vec<TickFrame>> {
         // Header-tolerant: `has_headers(false)` + parse-or-skip on the first
@@ -28,12 +34,22 @@ impl BybitSource {
         let mut r = csv::StringRecord::new();
         while rdr.read_record(&mut r)? {
             // Bybit: id, timestamp, price, volume, side, [rpi]
-            let ts_raw: i64 = match r[1].parse() { Ok(v) => v, Err(_) => continue };
-            let price: f64 = match r[2].parse() { Ok(v) => v, Err(_) => continue };
-            let qty: f64 = match r[3].parse() { Ok(v) => v, Err(_) => continue };
+            let ts_raw: i64 = match r[1].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let price: f64 = match r[2].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let qty: f64 = match r[3].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             let ts = normalize_timestamp_ms(ts_raw);
             let is_buyer = r[4].eq_ignore_ascii_case("buy");
-            ticks.push(TickFrame::new(pid,
+            ticks.push(TickFrame::new(
+                pid,
                 mitch::timestamp::from_epoch_ms(ts),
                 honest_tick(ticker_id, price, (qty * price) as u32, is_buyer),
             ));
@@ -46,18 +62,28 @@ impl BybitSource {
 impl TickSource for BybitSource {
     async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
         // Uppercase symbol for URL + dir consistency (see binance.rs).
-        let sym = format!("{}{}", config.base.to_uppercase(), config.quote.to_uppercase());
+        let sym = format!(
+            "{}{}",
+            config.base.to_uppercase(),
+            config.quote.to_uppercase()
+        );
         let tid = nxr_sdk::resolve_ticker_id(&sym);
         info!("Fetching Bybit data for {}", sym);
         let parse: fn(&[u8], u64) -> Result<Vec<TickFrame>> = Self::parse_csv;
         // Archive URL prefixes sourced from YAML
-        // `cexs.exchanges.bybit.archive_url_template.{monthly,daily}`
-        // (phase 59.R3.C2.O4, 2026-05-30).
+        // `cexs.exchanges.bybit.archive_url_template.{monthly,daily}`.
         let urls = crate::sources::common::archive_urls("bybit");
         let monthly_prefix = urls.monthly.clone();
         let daily_prefix = urls.daily.clone();
         let files = fetch_monthly_daily(
-            &self.agent, config, "bybit", &sym, &sym, tid, ".csv.gz", Compression::Gzip,
+            &self.agent,
+            config,
+            "bybit",
+            &sym,
+            &sym,
+            tid,
+            ".csv.gz",
+            Compression::Gzip,
             |s, y, m| {
                 let f = format!("{}-{:04}-{:02}.csv.gz", s, y, m);
                 let url = format!("{}{}", monthly_prefix.replace("{sym}", s), f);
@@ -69,7 +95,8 @@ impl TickSource for BybitSource {
                 (url, f)
             },
             &parse,
-        ).await?;
+        )
+        .await?;
         info!("Processing {} tick files", files.len());
         fetch_cached_ticks(&files, provider_id_for("bybit"), tx).await;
         Ok(())

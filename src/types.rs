@@ -1,11 +1,10 @@
-//! Core types for series-factory
-//! Now using MITCH protocol Tick format (shared with BTR)
+//! Core types for series-factory. Re-exports the MITCH protocol Tick/Bar formats.
 
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
-pub use mitch::TickFrame;
 pub use mitch::bar::Bar;
+pub use mitch::TickFrame;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggregationMode {
@@ -49,8 +48,17 @@ pub enum DataSource {
 
 #[derive(Debug, Clone)]
 pub enum GenerativeModel {
-    GBM { mu: f64, sigma: f64, base: f64 },
-    FBM { mu: f64, sigma: f64, hurst: f64, base: f64 },
+    GBM {
+        mu: f64,
+        sigma: f64,
+        base: f64,
+    },
+    FBM {
+        mu: f64,
+        sigma: f64,
+        hurst: f64,
+        base: f64,
+    },
     Heston {
         mu: f64,
         sigma: f64,
@@ -58,7 +66,7 @@ pub enum GenerativeModel {
         theta: f64,
         xi: f64,
         rho: f64,
-        base: f64
+        base: f64,
     },
     NormalJumpDiffusion {
         mu: f64,
@@ -78,4 +86,3 @@ pub enum GenerativeModel {
         base: f64,
     },
 }
-

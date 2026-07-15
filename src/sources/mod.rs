@@ -7,18 +7,14 @@ pub mod bybit;
 pub mod okx;
 
 use crate::types::{Config, DataSource, TickFrame};
-use async_trait::async_trait;
 use anyhow::Result;
+use async_trait::async_trait;
 use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::sync::mpsc;
 
 #[async_trait]
 pub trait TickSource: Send + Sync {
-    async fn fetch_ticks(
-        &self,
-        config: &Config,
-        tx: mpsc::Sender<Vec<TickFrame>>,
-    ) -> Result<()>;
+    async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()>;
 }
 
 /// Resolve the canonical MITCH provider id for an exchange name.
@@ -44,15 +40,14 @@ pub fn next_synthetic_id() -> u16 {
 
 /// Construct a historical tick source by enum tag.
 ///
-/// **Closed-set by design (phase 59.R3.C2.O6, 2026-05-30 — A2-LOW
-/// ACCEPTED):** each historical source has distinct API + parse logic
+/// **Closed-set by design (2026-05-30):** each historical source has distinct API + parse logic
 /// (Binance aggTrades CSV vs Bybit per-trade CSV vs OKX zipped JSON vs
 /// Bitget per-symbol path conventions) that can't be YAML-driven without
 /// trait-object infrastructure that doesn't currently exist (a registry of
 /// `fn(&Config) -> Box<dyn TickSource>` constructors keyed by name). The
 /// match arm itself is a thin dispatcher; the per-source URL/template
-/// data has already been hoisted to YAML (phase 59.R3.C2.O4
-/// `archive_url_template`). Deferred to a future refactor if a 5th
+/// data has already been hoisted to YAML (`archive_url_template`).
+/// Deferred to a future refactor if a 5th
 /// historical source is added.
 pub async fn create_source(source: &DataSource) -> Result<Box<dyn TickSource>> {
     match source {
@@ -61,8 +56,13 @@ pub async fn create_source(source: &DataSource) -> Result<Box<dyn TickSource>> {
             "bitget" => Ok(Box::new(bitget::BitgetSource::new())),
             "bybit" => Ok(Box::new(bybit::BybitSource::new())),
             "okx" => Ok(Box::new(okx::OKXSource::new())),
-            _ => anyhow::bail!("Unsupported exchange: {} (available: binance, bybit, bitget, okx)", name),
+            _ => anyhow::bail!(
+                "Unsupported exchange: {} (available: binance, bybit, bitget, okx)",
+                name
+            ),
         },
-        DataSource::Synthetic(model) => Ok(Box::new(synthetic::SyntheticSource::new(model.clone()))),
+        DataSource::Synthetic(model) => {
+            Ok(Box::new(synthetic::SyntheticSource::new(model.clone())))
+        }
     }
 }

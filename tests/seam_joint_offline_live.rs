@@ -213,9 +213,9 @@ fn run_live(recs: &[IndexRecord]) -> Vec<Bar> {
     let mut cursor = first_bucket;
     while cursor <= last_observed_bucket {
         let bar = match accs.remove(&cursor) {
-            Some(mut acc) if acc.count() > 0 => {
-                acc.flush().unwrap_or_else(|| flat_bar(cursor, last_emitted_close))
-            }
+            Some(mut acc) if acc.count() > 0 => acc
+                .flush()
+                .unwrap_or_else(|| flat_bar(cursor, last_emitted_close)),
             _ if last_emitted_close > 0.0 => flat_bar(cursor, last_emitted_close),
             _ => {
                 cursor += BAR_MS;
@@ -264,7 +264,11 @@ fn assert_bar_eq(i: usize, a: &Bar, b: &Bar) {
     plain_eq!(close_ts);
     // Grid-stamped epoch ms must agree exactly (same encoding input).
     assert_eq!(a.open_time_ms(), b.open_time_ms(), "bar {i} open_time_ms");
-    assert_eq!(a.close_time_ms(), b.close_time_ms(), "bar {i} close_time_ms");
+    assert_eq!(
+        a.close_time_ms(),
+        b.close_time_ms(),
+        "bar {i} close_time_ms"
+    );
     // Microstructure section produced by the shared BarAccumulator::flush.
     plain_eq!(vbid);
     plain_eq!(vask);
@@ -309,7 +313,11 @@ fn seam_joint_offline_matches_live_s10_byte_for_byte() {
     }
 
     // Anchor: first bar opens at the base bucket; last at base + 4*BAR_MS.
-    assert_eq!(offline[0].open_time_ms(), base, "first bar open != base bucket");
+    assert_eq!(
+        offline[0].open_time_ms(),
+        base,
+        "first bar open != base bucket"
+    );
     assert_eq!(
         offline[4].open_time_ms(),
         base + 4 * BAR_MS,

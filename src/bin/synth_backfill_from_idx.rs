@@ -1,4 +1,4 @@
-//! Offline backfill driver for the synthetic-pair pipeline (Phase 3).
+//! Offline backfill driver for the synthetic-pair pipeline.
 //!
 //! Replays paired leg `.idx` files into the same `<data>/bars/<synth_id>/<D>.{s10,renko}`
 //! shard paths that the live `core/src/bars_{s10,renko}_synth.rs` producers
@@ -133,17 +133,18 @@ use mitch::bar::{Bar, BarKind};
 use mitch::common::InstrumentType;
 #[cfg(test)]
 use mitch::header::MitchHeader;
+#[cfg(test)]
 use mitch::index::Index;
 use mitch::timestamp;
-use nxr_sdk::bar_builder::{BarAccumulator, flat_bar, stamp_s10_grid};
+use nxr_sdk::bar_builder::{flat_bar, stamp_s10_grid, BarAccumulator};
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::renko::{
-    K_FLOOR, MAX_BRICKS_PER_TICK, MIN_BRICK_PCT, MULT_UPPER_BOUND, RenkoConfig,
-    RenkoGenerator, SIGMA_FALLBACK,
+    RenkoConfig, RenkoGenerator, K_FLOOR, MAX_BRICKS_PER_TICK, MIN_BRICK_PCT, MULT_UPPER_BOUND,
+    SIGMA_FALLBACK,
 };
 use nxr_sdk::shard::{
-    bars_dir, idx_dir, list_shards, shard_path, BarShardWriter, ShardStream,
-    BAR_MS_S10 as BAR_MS, MS_PER_DAY,
+    bars_dir, idx_dir, list_shards, shard_path, BarShardWriter, ShardStream, BAR_MS_S10 as BAR_MS,
+    MS_PER_DAY,
 };
 use nxr_sdk::tdwap::decode_ci_ubp;
 use nxr_sdk::vol::{MtfVolCalculator, VolConfig, VolSource};
@@ -400,7 +401,9 @@ fn merge_pop(base: &mut PeekStream, quote: &mut PeekStream) -> Result<Option<(In
 // Date helpers
 // ─────────────────────────────────────────────────────────────────────────
 
-use nxr_sdk::shard::{day_start_ms, day_range_inclusive as day_range, parse_utc_date as parse_date};
+use nxr_sdk::shard::{
+    day_range_inclusive as day_range, day_start_ms, parse_utc_date as parse_date,
+};
 
 // ─────────────────────────────────────────────────────────────────────────
 // Per-pair driver
@@ -622,8 +625,8 @@ fn run_pair(
             // Idempotency gate (per-day). Skip if the s10 shard already has
             // records unless --force.
             let s10_path = shard_path(&bars_directory, *d, "s10");
-            let s10_already = s10_path.exists()
-                && std::fs::metadata(&s10_path).map(|m| m.len()).unwrap_or(0) > 0;
+            let s10_already =
+                s10_path.exists() && std::fs::metadata(&s10_path).map(|m| m.len()).unwrap_or(0) > 0;
             if !force && s10_already {
                 stats.days_skipped += 1;
                 eprintln!(
@@ -654,8 +657,7 @@ fn run_pair(
 
             if let (Some(ref mut bs), Some(ref mut qs)) = (&mut base_stream, &mut quote_stream) {
                 loop {
-                    let Some((rec, _was_base)) = merge_pop(bs, qs)?
-                    else {
+                    let Some((rec, _was_base)) = merge_pop(bs, qs)? else {
                         break;
                     };
                     // SEAM PARITY: skip heartbeat sentinels exactly like the live
@@ -696,7 +698,10 @@ fn run_pair(
             }
 
             // Gap-fill: ensure the on-disk s10 series is day-complete once we have a seed close.
-            if s10_state.cur_bucket.is_none() && s10_state.last_close > 0.0 && s10_state.last_close.is_finite() {
+            if s10_state.cur_bucket.is_none()
+                && s10_state.last_close > 0.0
+                && s10_state.last_close.is_finite()
+            {
                 s10_state.cur_bucket = Some(d_start);
             }
             while let Some(cb) = s10_state.cur_bucket {
@@ -761,7 +766,11 @@ fn run_pair(
                 let mut s10_iter = S10ShardIter::new(s10_shards_for_vol);
                 let n_vol = build_vol_from_s10(|| s10_iter.next_bar(), vol_cfg, &mut vol_writer)?;
                 vol_writer.finish()?;
-                info!(synth = synth_sym, vol_records = n_vol, "synth vol basis built (RS over persisted .s10)");
+                info!(
+                    synth = synth_sym,
+                    vol_records = n_vol,
+                    "synth vol basis built (RS over persisted .s10)"
+                );
             }
             {
                 let vol_mmap = VolMmap::open(&vol_path)?;
@@ -803,12 +812,9 @@ fn run_pair(
                 if !force {
                     let first_proc = intersect_dates.iter().find(|d| {
                         let p = shard_path(&bars_directory, **d, "renko");
-                        !(p.exists()
-                            && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > 0)
+                        !(p.exists() && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > 0)
                     });
-                    if let (Some(first_d), Ok(Some(tail))) =
-                        (first_proc, renko_writer.last_bar())
-                    {
+                    if let (Some(first_d), Ok(Some(tail))) = (first_proc, renko_writer.last_bar()) {
                         if tail.close > 0.0
                             && tail.close.is_finite()
                             && tail.close_time_ms() <= day_start_ms(*first_d)
@@ -866,8 +872,7 @@ fn run_pair(
                         if rec_ts_ms < d_start || rec_ts_ms >= d_end {
                             continue;
                         }
-                        let Some(synth_rec) = merge_state.feed_leg_tick(&rec, rec_ts_ms)
-                        else {
+                        let Some(synth_rec) = merge_state.feed_leg_tick(&rec, rec_ts_ms) else {
                             continue;
                         };
                         day_synth_emits += 1;
@@ -1011,7 +1016,11 @@ fn write_benchmark_sidecars(
             0.0
         };
 
-        let ratio = if sigma_a > 0.0 { sigma_b / sigma_a } else { 0.0 };
+        let ratio = if sigma_a > 0.0 {
+            sigma_b / sigma_a
+        } else {
+            0.0
+        };
         // Calibrated k surrogate: invert the empirical relation
         // brick_pct ≈ k · σ → k ≈ target_pct / σ. Target = MIN_BRICK_PCT
         // floor (the live producer's clamp) — gives a usable lower-bound
@@ -1044,8 +1053,8 @@ fn write_benchmark_sidecars(
             "ratio_b_over_a": ratio,
         });
         let out_path = bars_dir_path.join(format!("{}.benchmark.json", month));
-        let mut f = File::create(&out_path)
-            .with_context(|| format!("create {}", out_path.display()))?;
+        let mut f =
+            File::create(&out_path).with_context(|| format!("create {}", out_path.display()))?;
         f.write_all(serde_json::to_string_pretty(&sidecar)?.as_bytes())?;
         info!(path = %out_path.display(), %month, sigma_a, sigma_b, ratio, "benchmark sidecar written");
     }
@@ -1155,11 +1164,23 @@ fn main() -> Result<()> {
         let synth_id = resolve_symbol(synth);
         let k = load_calibrated_k(synth_id);
         if k.is_none() {
-            warn!(synth, synth_id, "no calibrated k in ticker-params.json — renko backfill will be skipped");
+            warn!(
+                synth,
+                synth_id, "no calibrated k in ticker-params.json — renko backfill will be skipped"
+            );
         }
         match run_pair(
-            &data_root, base, quote, synth, from, to, bars, args.force, k,
-            &vol_cfg, renko_min_pct,
+            &data_root,
+            base,
+            quote,
+            synth,
+            from,
+            to,
+            bars,
+            args.force,
+            k,
+            &vol_cfg,
+            renko_min_pct,
         ) {
             Ok(s) => {
                 grand_emits += s.synth_ticks_emitted;
@@ -1388,19 +1409,30 @@ mod tests {
         write_idx_shard(&base_idx, &base_recs)?;
         write_idx_shard(&quote_idx, &quote_recs)?;
 
-        let bars = BarKindMask { s10: true, renko: false };
+        let bars = BarKindMask {
+            s10: true,
+            renko: false,
+        };
         // First run — should write a shard. `k=None` is fine here because
         // bars.renko=false (s10-only test path).
         let s1 = run_pair(
-            &tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH",
+            &tmp,
+            "SYM_BASE",
+            "SYM_QUOTE",
+            "SYM_SYNTH",
             // resolve_symbol fallback will hash these, but we want our specific
             // ids — so monkey-patch by passing the resolved ids through the
             // public path. The cleanest hook: pre-place empty shards keyed by
             // the *resolved* ids so the test still exercises the real flow.
             // The simpler hack: just pre-create the bars dir under the hashed
             // synth ID and verify writes via that path.
-            date, date, bars, false, None,
-            &VolConfig::default(), MIN_BRICK_PCT as f32,
+            date,
+            date,
+            bars,
+            false,
+            None,
+            &VolConfig::default(),
+            MIN_BRICK_PCT as f32,
         )?;
         // We don't know the resolved id of "SYM_SYNTH" up front, but we can
         // recover it the same way the binary does.
@@ -1418,7 +1450,19 @@ mod tests {
         // doesn't panic + writes nothing.
         if s1.days_processed == 0 {
             // Empty branch: assert no shard was written either run.
-            let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false, None, &VolConfig::default(), MIN_BRICK_PCT as f32)?;
+            let s2 = run_pair(
+                &tmp,
+                "SYM_BASE",
+                "SYM_QUOTE",
+                "SYM_SYNTH",
+                date,
+                date,
+                bars,
+                false,
+                None,
+                &VolConfig::default(),
+                MIN_BRICK_PCT as f32,
+            )?;
             assert_eq!(s2.days_processed, 0);
             assert_eq!(s2.s10_bars_written, 0);
             let _ = std::fs::remove_dir_all(&tmp);
@@ -1426,18 +1470,44 @@ mod tests {
         }
         // Successful real-write branch: re-run, expect skip.
         let _ = s10_shard;
-        let s2 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, false, None, &VolConfig::default(), MIN_BRICK_PCT as f32)?;
+        let s2 = run_pair(
+            &tmp,
+            "SYM_BASE",
+            "SYM_QUOTE",
+            "SYM_SYNTH",
+            date,
+            date,
+            bars,
+            false,
+            None,
+            &VolConfig::default(),
+            MIN_BRICK_PCT as f32,
+        )?;
         assert!(
             s2.days_skipped >= 1 || s2.s10_bars_written == 0,
             "second run must skip already-written shards (skipped={}, wrote={})",
-            s2.days_skipped, s2.s10_bars_written
+            s2.days_skipped,
+            s2.s10_bars_written
         );
         // Force overwrites.
-        let s3 = run_pair(&tmp, "SYM_BASE", "SYM_QUOTE", "SYM_SYNTH", date, date, bars, true, None, &VolConfig::default(), MIN_BRICK_PCT as f32)?;
+        let s3 = run_pair(
+            &tmp,
+            "SYM_BASE",
+            "SYM_QUOTE",
+            "SYM_SYNTH",
+            date,
+            date,
+            bars,
+            true,
+            None,
+            &VolConfig::default(),
+            MIN_BRICK_PCT as f32,
+        )?;
         assert!(
             s3.s10_bars_written > 0 || s1.s10_bars_written == 0,
             "--force should re-write (got {}, baseline {})",
-            s3.s10_bars_written, s1.s10_bars_written
+            s3.s10_bars_written,
+            s1.s10_bars_written
         );
 
         // Sanity: any written shard parses as a Bar stream.
@@ -1488,8 +1558,14 @@ mod tests {
             let qbid = 60_000.0 * (1.0 + 0.0005 * (i as f64 / 700.0).sin());
             quote_recs.push(mk_record(quote_id, qbid, qbid * 1.0001, t + 16));
         }
-        write_idx_shard(&idx_dir(&tmp, base_id).join(format!("{}.idx", date)), &base_recs)?;
-        write_idx_shard(&idx_dir(&tmp, quote_id).join(format!("{}.idx", date)), &quote_recs)?;
+        write_idx_shard(
+            &idx_dir(&tmp, base_id).join(format!("{}.idx", date)),
+            &base_recs,
+        )?;
+        write_idx_shard(
+            &idx_dir(&tmp, quote_id).join(format!("{}.idx", date)),
+            &quote_recs,
+        )?;
 
         let k = 0.5_f64;
         let vol_cfg = VolConfig::default();
@@ -1500,7 +1576,10 @@ mod tests {
             "SYMB1-SYMQ1",
             date,
             date,
-            BarKindMask { s10: true, renko: true },
+            BarKindMask {
+                s10: true,
+                renko: true,
+            },
             false,
             Some(k),
             &vol_cfg,
@@ -1537,7 +1616,10 @@ mod tests {
         let mut a = VecPeek::new(base_recs);
         let mut b = VecPeek::new(quote_recs);
         let mut merge = SynthReplayState::new(synth_id, base_id, quote_id);
-        let cfg = RenkoConfig { multiplier: k as f32, min_pct: MIN_BRICK_PCT as f32 };
+        let cfg = RenkoConfig {
+            multiplier: k as f32,
+            min_pct: MIN_BRICK_PCT as f32,
+        };
         let mut engine = RenkoGenerator::new(cfg)?;
         let mut expected: Vec<Bar> = Vec::new();
         while let Some((rec, _)) = merge_pop_vec(&mut a, &mut b) {
@@ -1545,7 +1627,9 @@ mod tests {
                 let h = rec.header;
                 timestamp::to_epoch_ms(h.get_timestamp())
             };
-            let Some(srec) = merge.feed_leg_tick(&rec, ts) else { continue };
+            let Some(srec) = merge.feed_leg_tick(&rec, ts) else {
+                continue;
+            };
             let body = srec.index;
             engine.feed_index_record(
                 ts,
@@ -1581,8 +1665,16 @@ mod tests {
             expected.len()
         );
         for (i, (w, e)) in written.iter().zip(&expected).enumerate() {
-            assert_eq!(w.open.to_bits(), e.open.to_bits(), "brick {i} open diverged");
-            assert_eq!(w.close.to_bits(), e.close.to_bits(), "brick {i} close diverged");
+            assert_eq!(
+                w.open.to_bits(),
+                e.open.to_bits(),
+                "brick {i} open diverged"
+            );
+            assert_eq!(
+                w.close.to_bits(),
+                e.close.to_bits(),
+                "brick {i} close diverged"
+            );
             assert!(
                 (w.high - e.high).abs() < 1e-9 && (w.low - e.low).abs() < 1e-9,
                 "brick {i} wick diverged"

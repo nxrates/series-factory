@@ -188,16 +188,22 @@ fn audit_pair(data_root: &Path, base: &str, quote: &str, now_ms: i64) -> Result<
         status = level_max(status, Level::Fail);
     } else if let Some(lag) = renko_lag_ms {
         if lag > RENKO_STALE_FAIL_MS {
-            notes.push(format!("renko tip stale {lag}ms > fail {RENKO_STALE_FAIL_MS}ms"));
+            notes.push(format!(
+                "renko tip stale {lag}ms > fail {RENKO_STALE_FAIL_MS}ms"
+            ));
             status = level_max(status, Level::Fail);
         } else if lag > RENKO_STALE_WARN_MS {
-            notes.push(format!("renko tip stale {lag}ms > warn {RENKO_STALE_WARN_MS}ms"));
+            notes.push(format!(
+                "renko tip stale {lag}ms > warn {RENKO_STALE_WARN_MS}ms"
+            ));
             status = level_max(status, Level::Warn);
         }
     }
 
-    if let (Some(drift), Some(_)) = (mid_to_renko_close_bps, idx_lag_ms.filter(|&l| l < IDX_WARN_MS))
-    {
+    if let (Some(drift), Some(_)) = (
+        mid_to_renko_close_bps,
+        idx_lag_ms.filter(|&l| l < IDX_WARN_MS),
+    ) {
         if drift > RENKO_PRICE_DRIFT_BPS {
             notes.push(format!(
                 "mid vs last renko close {drift:.1}bps > {RENKO_PRICE_DRIFT_BPS}bps (awaiting brick cross)"
@@ -333,7 +339,8 @@ fn main() -> Result<()> {
     if let Some(parent) = report_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&report_path, &json).with_context(|| format!("write {}", report_path.display()))?;
+    std::fs::write(&report_path, &json)
+        .with_context(|| format!("write {}", report_path.display()))?;
 
     match worst {
         Level::Ok => Ok(()),

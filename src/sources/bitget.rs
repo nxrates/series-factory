@@ -8,27 +8,42 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-pub struct BitgetSource { agent: Arc<ureq::Agent> }
+pub struct BitgetSource {
+    agent: Arc<ureq::Agent>,
+}
 
 impl BitgetSource {
-    pub fn new() -> Self { Self { agent: http_agent() } }
+    pub fn new() -> Self {
+        Self {
+            agent: http_agent(),
+        }
+    }
 
     fn parse_csv(csv_data: &[u8], ticker_id: u64) -> Result<Vec<TickFrame>> {
         // Header-tolerant: `has_headers(false)` + parse-or-skip on the
         // numeric columns, so streaming chunks work regardless of whether
         // the chunk begins on the header row.
-        let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(Cursor::new(csv_data));
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(Cursor::new(csv_data));
         let mut ticks = Vec::new();
         let pid = provider_id_for("bitget");
         // Reuse one StringRecord across rows (no per-row alloc).
         let mut r = csv::StringRecord::new();
         while rdr.read_record(&mut r)? {
             // Bitget: trade_id, timestamp, price, side, volume_quote, size_base
-            let ts: i64 = match r[1].parse() { Ok(v) => v, Err(_) => continue };
-            let price: f64 = match r[2].parse() { Ok(v) => v, Err(_) => continue };
+            let ts: i64 = match r[1].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let price: f64 = match r[2].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             let is_buyer = r[3].eq_ignore_ascii_case("buy");
             let volume: u32 = r[4].parse::<f64>().unwrap_or(0.0) as u32;
-            ticks.push(TickFrame::new(pid,
+            ticks.push(TickFrame::new(
+                pid,
                 mitch::timestamp::from_epoch_ms(ts),
                 honest_tick(ticker_id, price, volume, is_buyer),
             ));
@@ -41,7 +56,11 @@ impl BitgetSource {
 impl TickSource for BitgetSource {
     async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
         // Uppercase symbol for URL + dir consistency (see binance.rs).
-        let sym = format!("{}{}", config.base.to_uppercase(), config.quote.to_uppercase());
+        let sym = format!(
+            "{}{}",
+            config.base.to_uppercase(),
+            config.quote.to_uppercase()
+        );
         let tid = nxr_sdk::resolve_ticker_id(&sym);
         info!("Fetching Bitget data for {}", sym);
 
@@ -51,8 +70,7 @@ impl TickSource for BitgetSource {
         let end = config.to.date_naive();
 
         // Daily-only archive URL prefix sourced from YAML
-        // `cexs.exchanges.bitget.archive_url_template.daily`
-        // (phase 59.R3.C3.O1, 2026-05-30).
+        // `cexs.exchanges.bitget.archive_url_template.daily`.
         let urls = crate::sources::common::archive_urls("bitget");
         let daily_prefix = urls.daily.replace("{sym}", &sym);
 
@@ -63,15 +81,38 @@ impl TickSource for BitgetSource {
                 let filename = format!("{}_{:03}.zip", ds, seq);
                 let cache_path = ticks_dir.join(filename.replace(".zip", ".ticks"));
                 if cache_path.exists() {
-                    files.push(cache_path); seq += 1; continue;
+                    files.push(cache_path);
+                    seq += 1;
+                    continue;
                 }
                 let url = format!("{}{}", daily_prefix, filename);
-                match download_and_convert(&self.agent, &url, &cache_path, tid, Compression::Zip, 1, &Self::parse_csv).await {
+                match download_and_convert(
+                    &self.agent,
+                    &url,
+                    &cache_path,
+                    tid,
+                    Compression::Zip,
+                    1,
+                    &Self::parse_csv,
+                )
+                .await
+                {
                     // Zero-tick seq file: drop the empty cache and stop scanning
                     // this day's sequence (an empty member means no more trades).
-                    Ok(0) => { let _ = std::fs::remove_file(&cache_path); break; }
-                    Ok(_) => { files.push(cache_path); seq += 1; }
-                    Err(_) => { if seq == 1 { debug!("No Bitget data for {}", ds); } break; }
+                    Ok(0) => {
+                        let _ = std::fs::remove_file(&cache_path);
+                        break;
+                    }
+                    Ok(_) => {
+                        files.push(cache_path);
+                        seq += 1;
+                    }
+                    Err(_) => {
+                        if seq == 1 {
+                            debug!("No Bitget data for {}", ds);
+                        }
+                        break;
+                    }
                 }
             }
             day += chrono::Duration::days(1);

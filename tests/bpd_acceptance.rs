@@ -21,13 +21,10 @@
 //! bpd_acceptance -- --ignored` on the same node to read the generated
 //! `.renko` shards and confirm bpd convergence.
 //!
-//! Debate (Aoife HFT-quant ↔ Bjørn quant-validation):
-//!   - Aoife: "Median is more robust than mean — single weird day (Trump
-//!     post, FOMC surprise) won't break the gate."
-//!   - Bjørn: "But median hides bimodal failure. We should ALSO log p10/p90
-//!     for visibility, even if we only assert on median."
-//!   - Consensus: assert median ∈ [255, 345]; print p10/p50/p90 + count
-//!     for forensic post-mortem if it fails.
+//! Gate design: assert median ∈ [255, 345] — the median is robust to a
+//! single anomalous day (news spike, FOMC surprise) — but ALSO print
+//! p10/p50/p90 + count, because the median alone can hide bimodal failure;
+//! the percentiles give the forensic trail when the gate trips.
 //!
 //! Stablecoin classes are skipped (matches `class_for_pair` behaviour).
 
@@ -59,10 +56,7 @@ fn data_root() -> Option<PathBuf> {
 
 /// Count bars in a single `.renko` shard via byte-length / sizeof(Bar).
 fn count_bars(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .map(|m| m.len())
-        .unwrap_or(0)
-        / std::mem::size_of::<Bar>() as u64
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) / std::mem::size_of::<Bar>() as u64
 }
 
 #[derive(Debug, Default)]
@@ -145,7 +139,11 @@ fn launch_symbols_median_bpd_within_tolerance() {
         }
     }
 
-    eprintln!("\n── BPD acceptance report (target={:.0} ±{:.0}%) ──", TARGET_BPD, TOLERANCE * 100.0);
+    eprintln!(
+        "\n── BPD acceptance report (target={:.0} ±{:.0}%) ──",
+        TARGET_BPD,
+        TOLERANCE * 100.0
+    );
     for line in &report {
         eprintln!("  {}", line);
     }

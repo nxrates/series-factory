@@ -1,6 +1,6 @@
 //! Glue/join validator for the backfill ↔ live `.idx` seam.
 //!
-//! ## Sharded mode (post-U4 layout)
+//! ## Sharded mode
 //!
 //! - One ticker_id → many `<data_root>/indexes/<ticker_id>/<YYYY-MM-DD>.idx` shards.
 //! - Validates:
@@ -25,10 +25,8 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
 use clap::Parser;
-use nxr_sdk::shard::{
-    idx_dir, list_shards, read_shard_aligned, ShardRecord, SENTINEL_INTERVAL_MS,
-};
 use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::shard::{idx_dir, list_shards, read_shard_aligned, ShardRecord, SENTINEL_INTERVAL_MS};
 use serde::Serialize;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -136,7 +134,9 @@ fn run_sharded(args: &Args) -> Result<()> {
         return Ok(());
     }
     let id = args.ticker_id.ok_or_else(|| {
-        anyhow!("missing --ticker-id (or pass --all); use --legacy-flat for the old flat-file layout")
+        anyhow!(
+            "missing --ticker-id (or pass --all); use --legacy-flat for the old flat-file layout"
+        )
     })?;
     let report = check_sharded_safe(id, &args.common.data_root);
     if args.json {
@@ -218,11 +218,19 @@ fn check_sharded_safe(ticker_id: u64, data_root: &std::path::Path) -> TickerRepo
     }));
     match res {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => mk_err(&ticker_id.to_string(), Some(ticker_id), format!("error: {}", e)),
+        Ok(Err(e)) => mk_err(
+            &ticker_id.to_string(),
+            Some(ticker_id),
+            format!("error: {}", e),
+        ),
         Err(panic) => {
             let msg = downcast_panic(&panic);
             warn!(ticker_id, panic = %msg, "check panicked");
-            mk_err(&ticker_id.to_string(), Some(ticker_id), format!("panic: {}", msg))
+            mk_err(
+                &ticker_id.to_string(),
+                Some(ticker_id),
+                format!("panic: {}", msg),
+            )
         }
     }
 }
@@ -269,8 +277,8 @@ fn check_sharded(ticker_id: u64, data_root: &std::path::Path) -> Result<TickerRe
     let mut global_ix: usize = 0;
     let mut total_records: usize = 0;
     for (_date, path) in &shards {
-        let recs: Vec<IndexRecord> = read_shard_aligned(path)
-            .with_context(|| format!("read shard {}", path.display()))?;
+        let recs: Vec<IndexRecord> =
+            read_shard_aligned(path).with_context(|| format!("read shard {}", path.display()))?;
         for r in &recs {
             let t = r.shard_ts_ms();
             if let Some(p) = prev_ts {

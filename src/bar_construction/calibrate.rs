@@ -21,18 +21,14 @@
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use nxr_sdk::mitch::timestamp;
 use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, K_FLOOR, K_MAX_SAFETY, SIGMA_FALLBACK};
 use nxr_sdk::vol::{VolConfig, VolSource};
-use nxr_sdk::mitch::timestamp;
 
 /// Resolve σ_pct for a given epoch-ms timestamp via the precomputed cache.
 /// Used in hot loops where the engine no longer owns the σ source.
 #[inline]
-fn sigma_for_ts<S: VolSource + ?Sized>(
-    ts_ms: i64,
-    vol_source: &S,
-    sigma_cache: &[f64],
-) -> f64 {
+fn sigma_for_ts<S: VolSource + ?Sized>(ts_ms: i64, vol_source: &S, sigma_cache: &[f64]) -> f64 {
     let mts = timestamp::from_epoch_ms(ts_ms);
     let i = vol_source.find_index_for_mts(mts);
     sigma_cache.get(i).copied().unwrap_or(SIGMA_FALLBACK)
@@ -224,12 +220,20 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
     let mut gen = match RenkoGenerator::new(*config) {
         Ok(g) => g,
         Err(_) => {
-            return DailyBpdStats { bricks_per_day: Vec::new(), median: 0.0, days: 0 };
+            return DailyBpdStats {
+                bricks_per_day: Vec::new(),
+                median: 0.0,
+                days: 0,
+            };
         }
     };
 
     if to_ts <= from_ts {
-        return DailyBpdStats { bricks_per_day: Vec::new(), median: 0.0, days: 0 };
+        return DailyBpdStats {
+            bricks_per_day: Vec::new(),
+            median: 0.0,
+            days: 0,
+        };
     }
     let n_days = ((to_ts - from_ts) / MS_PER_DAY).max(1) as usize;
     let mut per_day: Vec<u64> = vec![0; n_days];
@@ -266,7 +270,11 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
     let Some(clean) = clean_stats else {
         // Dead window — insufficient clean days. days=0 ⇒ the solver treats it
         // as unfittable (no fit on contaminated data).
-        return DailyBpdStats { bricks_per_day: per_day, median: 0.0, days: 0 };
+        return DailyBpdStats {
+            bricks_per_day: per_day,
+            median: 0.0,
+            days: 0,
+        };
     };
 
     let mut sorted = clean.clone();
@@ -275,7 +283,11 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
 
     // `days` reflects the count of CLEAN days actually scored, so a degenerate
     // (gappy) window surfaces as days==0.
-    DailyBpdStats { bricks_per_day: per_day, median, days: clean.len() }
+    DailyBpdStats {
+        bricks_per_day: per_day,
+        median,
+        days: clean.len(),
+    }
 }
 
 /// Direct SCALE-TO-TARGET k solver (2026-06-10, `docs/renko-methodology.md` §4).
@@ -331,7 +343,10 @@ pub fn scale_to_target_k<S: VolSource + ?Sized>(
     let last = prices.last().map(|p| p.0).unwrap_or(0);
     if last <= first || target_bpd <= 0.0 {
         warn!(
-            n = prices.len(), first, last, target_bpd,
+            n = prices.len(),
+            first,
+            last,
+            target_bpd,
             "scale_to_target_k early-return: degenerate window or non-positive target"
         );
         return 0.0;
@@ -340,9 +355,17 @@ pub fn scale_to_target_k<S: VolSource + ?Sized>(
     // Median σ_pct over the σ cache — a discriminating diagnostic shared by the
     // degenerate-reject log lines (too-flat / no-crossing / min_pct-clamp).
     let median_sigma_pct = {
-        let mut s: Vec<f64> = sigma_cache.iter().copied().filter(|x| x.is_finite()).collect();
+        let mut s: Vec<f64> = sigma_cache
+            .iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .collect();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        if s.is_empty() { f64::NAN } else { s[s.len() / 2] }
+        if s.is_empty() {
+            f64::NAN
+        } else {
+            s[s.len() / 2]
+        }
     };
 
     // The ONE counter the solver calls: storms-included, gap-quarantined median
@@ -350,8 +373,15 @@ pub fn scale_to_target_k<S: VolSource + ?Sized>(
     let median_bpd = |k: f64| -> DailyBpdStats {
         count_bars_per_day_from_prices(
             prices,
-            &RenkoConfig { multiplier: k as f32, min_pct: base.min_pct },
-            vol_source, vol_config, sigma_cache, first, last,
+            &RenkoConfig {
+                multiplier: k as f32,
+                min_pct: base.min_pct,
+            },
+            vol_source,
+            vol_config,
+            sigma_cache,
+            first,
+            last,
         )
     };
 
@@ -468,9 +498,21 @@ pub fn scale_to_target_k<S: VolSource + ?Sized>(
         let large_k = hi.exp();
         let s_small = median_bpd(small_k);
         let s_large = median_bpd(large_k);
-        let err_small = if s_small.days == 0 { f64::INFINITY } else { (s_small.median / target_bpd - 1.0).abs() };
-        let err_large = if s_large.days == 0 { f64::INFINITY } else { (s_large.median / target_bpd - 1.0).abs() };
-        k_star = Some(if err_small <= err_large { small_k } else { large_k });
+        let err_small = if s_small.days == 0 {
+            f64::INFINITY
+        } else {
+            (s_small.median / target_bpd - 1.0).abs()
+        };
+        let err_large = if s_large.days == 0 {
+            f64::INFINITY
+        } else {
+            (s_large.median / target_bpd - 1.0).abs()
+        };
+        k_star = Some(if err_small <= err_large {
+            small_k
+        } else {
+            large_k
+        });
     }
 
     let mut k_star = k_star.expect("k_star set by warm-start or bracket fallback");
@@ -483,7 +525,11 @@ pub fn scale_to_target_k<S: VolSource + ?Sized>(
         let step = K_BRACKET_LN_EPS.exp(); // ×1.005
         let probe = |k: f64| -> f64 {
             let s = median_bpd(k);
-            if s.days == 0 { f64::INFINITY } else { (s.median / target_bpd - 1.0).abs() }
+            if s.days == 0 {
+                f64::INFINITY
+            } else {
+                (s.median / target_bpd - 1.0).abs()
+            }
         };
         let center = probe(k_star);
         let up_k = (k_star * step).min(K_MAX_SAFETY);
@@ -509,8 +555,10 @@ pub fn scale_to_target_k<S: VolSource + ?Sized>(
     }
     let achieved_err = (full_stats.median / target_bpd - 1.0).abs();
     info!(
-        k_star, achieved_err_pct = achieved_err * 100.0,
-        full_median = full_stats.median, target_bpd,
+        k_star,
+        achieved_err_pct = achieved_err * 100.0,
+        full_median = full_stats.median,
+        target_bpd,
         accept_tol_pct = cal.accept_tol * 100.0,
         "scale_to_target_k result (achieved_err = structural floor)"
     );
@@ -544,7 +592,13 @@ pub fn scale_to_target_k<S: VolSource + ?Sized>(
     // (NOT a median-σ comparison). If > MIN_PCT_CLAMP_MAX_FRAC of the window is
     // clamped, the k is unresponsive → drop → per-ticker renko_k_overrides.
     let clamp_frac = min_pct_clamped_fraction(
-        prices, k_star, base.min_pct, vol_source, sigma_cache, first, last,
+        prices,
+        k_star,
+        base.min_pct,
+        vol_source,
+        sigma_cache,
+        first,
+        last,
     );
     if clamp_frac > MIN_PCT_CLAMP_MAX_FRAC {
         warn!(
@@ -573,8 +627,8 @@ mod tests {
         // 10 days: 8 ~100/day, one gap (0), one storm (1000). n_days=10 →
         // min_clean = max(3,5) = 5; 9 non-gap days survive.
         let per_day = vec![100, 98, 102, 0, 101, 99, 1000, 100, 103, 97];
-        let clean = quarantine_clean_days(&per_day, per_day.len())
-            .expect("9 non-gap days >= min_clean(5)");
+        let clean =
+            quarantine_clean_days(&per_day, per_day.len()).expect("9 non-gap days >= min_clean(5)");
         assert_eq!(clean.len(), 9, "only gap(0) excluded; storm(1000) KEPT");
         assert!(clean.contains(&1000), "storm day retained in objective");
         let mut s = clean.clone();
@@ -600,7 +654,9 @@ mod tests {
     fn quarantine_objective_is_storms_included_median() {
         // STORM-robust median objective: gap-only quarantine keeps all 12
         // (no gaps), storms included.
-        let per_day = vec![118u64, 122, 900, 119, 950, 121, 880, 120, 910, 123, 117, 124];
+        let per_day = vec![
+            118u64, 122, 900, 119, 950, 121, 880, 120, 910, 123, 117, 124,
+        ];
         let n = per_day.len();
         let clean = quarantine_clean_days(&per_day, n).expect("non-empty");
         assert_eq!(clean.len(), 12, "no gap days ⇒ all kept, storms included");
@@ -609,13 +665,23 @@ mod tests {
         let kept_median = median_sorted(&cs);
         let mut all = per_day.clone();
         all.sort_unstable();
-        assert_eq!(kept_median, median_sorted(&all), "kept median == full-set median");
+        assert_eq!(
+            kept_median,
+            median_sorted(&all),
+            "kept median == full-set median"
+        );
         // A legacy [median/3, median*3] clip would have dropped the 4 storm days
         // → a strictly different (calm-only) median. The fix keeps storms.
         let (clo, chi) = (kept_median / 3.0, kept_median * 3.0);
-        let clipped: Vec<u64> = per_day.iter().copied()
-            .filter(|&b| (b as f64) >= clo && (b as f64) <= chi).collect();
-        assert!(clipped.len() < per_day.len(), "legacy clip drops the storm days");
+        let clipped: Vec<u64> = per_day
+            .iter()
+            .copied()
+            .filter(|&b| (b as f64) >= clo && (b as f64) <= chi)
+            .collect();
+        assert!(
+            clipped.len() < per_day.len(),
+            "legacy clip drops the storm days"
+        );
     }
 
     // ── Synthetic price paths ────────────────────────────────────────────────
@@ -624,17 +690,30 @@ mod tests {
     /// bpd on a fixed path.
     struct ConstSigma(f64);
     impl VolSource for ConstSigma {
-        fn len(&self) -> usize { 1 }
-        fn sigma_pct(&self, _i: usize) -> f64 { self.0 }
-        fn find_index_for_mts(&self, _mts: u64) -> usize { 0 }
+        fn len(&self) -> usize {
+            1
+        }
+        fn sigma_pct(&self, _i: usize) -> f64 {
+            self.0
+        }
+        fn find_index_for_mts(&self, _mts: u64) -> usize {
+            0
+        }
     }
 
     /// Deterministic GBM-ish full-tick path (xorshift64* LCG, reproducible).
-    fn synth_gbm_path(n_days: usize, ticks_per_day: usize, sigma_step: f64, seed: u64) -> Vec<(i64, f64)> {
+    fn synth_gbm_path(
+        n_days: usize,
+        ticks_per_day: usize,
+        sigma_step: f64,
+        seed: u64,
+    ) -> Vec<(i64, f64)> {
         let dt_ms = (MS_PER_DAY / ticks_per_day as i64).max(1);
         let mut state = seed;
         let mut next_u = || {
-            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
             ((state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64) / ((1u64 << 53) as f64)
         };
         let total = n_days * ticks_per_day;
@@ -651,20 +730,30 @@ mod tests {
 
     /// Deterministic BIMODAL path: storm day every `storm_every`-th day.
     fn synth_bimodal_path(
-        n_days: usize, ticks_per_day: usize, sigma_calm: f64, sigma_storm: f64,
-        storm_every: usize, seed: u64,
+        n_days: usize,
+        ticks_per_day: usize,
+        sigma_calm: f64,
+        sigma_storm: f64,
+        storm_every: usize,
+        seed: u64,
     ) -> Vec<(i64, f64)> {
         let dt_ms = (MS_PER_DAY / ticks_per_day as i64).max(1);
         let mut state = seed;
         let mut next_u = || {
-            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
             ((state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64) / ((1u64 << 53) as f64)
         };
         let mut out = Vec::with_capacity(n_days * ticks_per_day);
         let mut price = 100.0f64;
         let t0: i64 = 1_700_000_000_000;
         for d in 0..n_days {
-            let sigma_step = if storm_every > 0 && d % storm_every == 0 { sigma_storm } else { sigma_calm };
+            let sigma_step = if storm_every > 0 && d % storm_every == 0 {
+                sigma_storm
+            } else {
+                sigma_calm
+            };
             for j in 0..ticks_per_day {
                 let z = next_u() - 0.5;
                 price *= (sigma_step * z).exp();
@@ -683,7 +772,9 @@ mod tests {
         for &(ts, mid) in prices {
             let bucket = (ts / 60_000) * 60_000;
             let e = m.entry(bucket).or_insert((ts, mid));
-            if ts >= e.0 { *e = (ts, mid); }
+            if ts >= e.0 {
+                *e = (ts, mid);
+            }
         }
         m.into_iter().map(|(_, (ts, mid))| (ts, mid)).collect()
     }
@@ -724,26 +815,47 @@ mod tests {
         let vol = ConstSigma(0.01);
         let sigma_cache = vec![0.01];
         let vc = vol_cfg();
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.0,
+        };
 
-        let k = scale_to_target_k(&prices, &cal(target_bpd), &base, &vol, &vc, &sigma_cache, target_bpd, None);
+        let k = scale_to_target_k(
+            &prices,
+            &cal(target_bpd),
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            None,
+        );
         assert!(k > 0.0, "calibration must produce a valid k (got {k})");
 
-        let applied = RenkoConfig { multiplier: k, min_pct: 0.0 };
-        let stats = count_bars_per_day_from_prices(&prices, &applied, &vol, &vc, &sigma_cache, first, last);
+        let applied = RenkoConfig {
+            multiplier: k,
+            min_pct: 0.0,
+        };
+        let stats =
+            count_bars_per_day_from_prices(&prices, &applied, &vol, &vc, &sigma_cache, first, last);
         let rel_err = (stats.median / target_bpd - 1.0).abs();
         assert!(
             rel_err <= RENKO_BPD_ACCEPT_TOL,
             "full-tick apply median {:.1} within {:.0}% of target {:.0}? rel_err={:.3}",
-            stats.median, RENKO_BPD_ACCEPT_TOL * 100.0, target_bpd, rel_err
+            stats.median,
+            RENKO_BPD_ACCEPT_TOL * 100.0,
+            target_bpd,
+            rel_err
         );
 
         let coarse = downsample_1min_last(&prices);
-        let coarse_stats = count_bars_per_day_from_prices(&coarse, &applied, &vol, &vc, &sigma_cache, first, last);
+        let coarse_stats =
+            count_bars_per_day_from_prices(&coarse, &applied, &vol, &vc, &sigma_cache, first, last);
         assert!(
             coarse_stats.median < stats.median,
             "1-min downsample must undercount bricks vs full-tick (coarse {:.1} < full {:.1})",
-            coarse_stats.median, stats.median
+            coarse_stats.median,
+            stats.median
         );
     }
 
@@ -759,22 +871,60 @@ mod tests {
         let vol = ConstSigma(0.01);
         let sigma_cache = vec![0.01];
         let vc = vol_cfg();
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.0,
+        };
 
-        let k = scale_to_target_k(&prices, &cal(target_bpd), &base, &vol, &vc, &sigma_cache, target_bpd, None);
-        assert!(k > 0.0, "storming ticker must calibrate, NOT return 0.0 (got {k})");
+        let k = scale_to_target_k(
+            &prices,
+            &cal(target_bpd),
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            None,
+        );
+        assert!(
+            k > 0.0,
+            "storming ticker must calibrate, NOT return 0.0 (got {k})"
+        );
         assert!((k as f64) >= K_FLOOR, "k ≥ K_FLOOR (got {k})");
 
         let full = count_bars_per_day_from_prices(
-            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 }, &vol, &vc, &sigma_cache, first, last);
+            &prices,
+            &RenkoConfig {
+                multiplier: k,
+                min_pct: 0.0,
+            },
+            &vol,
+            &vc,
+            &sigma_cache,
+            first,
+            last,
+        );
         let rel_err = (full.median / target_bpd - 1.0).abs();
-        assert!(rel_err <= RENKO_BPD_ACCEPT_TOL,
-            "storms-included full median {:.1} within tol? rel_err={:.3}", full.median, rel_err);
+        assert!(
+            rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "storms-included full median {:.1} within tol? rel_err={:.3}",
+            full.median,
+            rel_err
+        );
         // Reported median is the storms-INCLUDED (unclipped) median.
-        let nonzero: Vec<u64> = full.bricks_per_day.iter().copied().filter(|&b| b > 0).collect();
+        let nonzero: Vec<u64> = full
+            .bricks_per_day
+            .iter()
+            .copied()
+            .filter(|&b| b > 0)
+            .collect();
         let mut nz = nonzero.clone();
         nz.sort_unstable();
-        assert_eq!(full.median, median_sorted(&nz), "reported median is storms-included");
+        assert_eq!(
+            full.median,
+            median_sorted(&nz),
+            "reported median is storms-included"
+        );
     }
 
     // ── (a) NEW: convergence in ≤3 counts within accept_tol ──────────────────
@@ -791,24 +941,73 @@ mod tests {
         let vol = ConstSigma(0.01);
         let sigma_cache = vec![0.01];
         let vc = vol_cfg();
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.0,
+        };
 
         // Seed prior_k near the true k so the warm start converges immediately.
-        let k = scale_to_target_k(&prices, &cal(target_bpd), &base, &vol, &vc, &sigma_cache, target_bpd, Some(0.5));
+        let k = scale_to_target_k(
+            &prices,
+            &cal(target_bpd),
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            Some(0.5),
+        );
         assert!(k > 0.0 && (k as f64) >= K_FLOOR, "valid k (got {k})");
         let stats = count_bars_per_day_from_prices(
-            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 }, &vol, &vc, &sigma_cache, first, last);
+            &prices,
+            &RenkoConfig {
+                multiplier: k,
+                min_pct: 0.0,
+            },
+            &vol,
+            &vc,
+            &sigma_cache,
+            first,
+            last,
+        );
         let rel_err = (stats.median / target_bpd - 1.0).abs();
-        assert!(rel_err <= RENKO_BPD_ACCEPT_TOL,
+        assert!(
+            rel_err <= RENKO_BPD_ACCEPT_TOL,
             "converged median {:.1} within {:.0}% of target {:.0}? rel_err={:.3}",
-            stats.median, RENKO_BPD_ACCEPT_TOL * 100.0, target_bpd, rel_err);
+            stats.median,
+            RENKO_BPD_ACCEPT_TOL * 100.0,
+            target_bpd,
+            rel_err
+        );
 
         // No prior (k0=0.5 default) must also converge — exercises the cold path.
-        let k_cold = scale_to_target_k(&prices, &cal(target_bpd), &base, &vol, &vc, &sigma_cache, target_bpd, None);
+        let k_cold = scale_to_target_k(
+            &prices,
+            &cal(target_bpd),
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            None,
+        );
         let cold = count_bars_per_day_from_prices(
-            &prices, &RenkoConfig { multiplier: k_cold, min_pct: 0.0 }, &vol, &vc, &sigma_cache, first, last);
-        assert!((cold.median / target_bpd - 1.0).abs() <= RENKO_BPD_ACCEPT_TOL,
-            "cold-start median {:.1} within tol", cold.median);
+            &prices,
+            &RenkoConfig {
+                multiplier: k_cold,
+                min_pct: 0.0,
+            },
+            &vol,
+            &vc,
+            &sigma_cache,
+            first,
+            last,
+        );
+        assert!(
+            (cold.median / target_bpd - 1.0).abs() <= RENKO_BPD_ACCEPT_TOL,
+            "cold-start median {:.1} within tol",
+            cold.median
+        );
     }
 
     // ── (b) NEW: 1/k staircase / homogeneity departure ───────────────────────
@@ -824,17 +1023,34 @@ mod tests {
         let target_bpd = 50.0;
         // High price level (~84k) so snap_to_25_grid rungs are RELATIVELY coarse.
         let mut prices = synth_gbm_path(60, 2000, 0.004, 0xBADC0DE);
-        for p in prices.iter_mut() { p.1 *= 840.0; } // ~100 → ~84k
+        for p in prices.iter_mut() {
+            p.1 *= 840.0;
+        } // ~100 → ~84k
         let first = prices.first().unwrap().0;
         let last = prices.last().unwrap().0;
         let vol = ConstSigma(0.01);
         let sigma_cache = vec![0.01];
         let vc = vol_cfg();
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0001 };
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.0001,
+        };
 
-        let mb = |k: f64| count_bars_per_day_from_prices(
-            &prices, &RenkoConfig { multiplier: k as f32, min_pct: 0.0001 },
-            &vol, &vc, &sigma_cache, first, last).median;
+        let mb = |k: f64| {
+            count_bars_per_day_from_prices(
+                &prices,
+                &RenkoConfig {
+                    multiplier: k as f32,
+                    min_pct: 0.0001,
+                },
+                &vol,
+                &vc,
+                &sigma_cache,
+                first,
+                last,
+            )
+            .median
+        };
         let k0 = 0.5_f64;
         let m_k0 = mb(k0);
         let m_2k0 = mb(2.0 * k0);
@@ -843,20 +1059,37 @@ mod tests {
         // on the coarse grid the realized median differs by a measurable amount.
         let analytic = m_k0 / 2.0;
         let departure = (m_2k0 - analytic).abs() / analytic.max(1.0);
-        assert!(departure > 0.0,
-            "staircase departs from exact 1/k (m(2k0)={} vs analytic {})", m_2k0, analytic);
+        assert!(
+            departure > 0.0,
+            "staircase departs from exact 1/k (m(2k0)={} vs analytic {})",
+            m_2k0,
+            analytic
+        );
 
         // Despite the staircase, the solver still lands the best achievable rung
         // (k>0); achieved_err is the structural floor (may exceed accept_tol).
-        let k = scale_to_target_k(&prices, &cal(target_bpd), &base, &vol, &vc, &sigma_cache, target_bpd, None);
-        assert!(k > 0.0 && (k as f64) >= K_FLOOR,
-            "warm-start + fallback converges to a valid rung k (got {k})");
+        let k = scale_to_target_k(
+            &prices,
+            &cal(target_bpd),
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            None,
+        );
+        assert!(
+            k > 0.0 && (k as f64) >= K_FLOOR,
+            "warm-start + fallback converges to a valid rung k (got {k})"
+        );
         // The returned k is the closest rung: neither ±1 grid neighbour beats it.
         let err = |kk: f64| (mb(kk) / target_bpd - 1.0).abs();
         let step = K_BRACKET_LN_EPS.exp();
         let e0 = err(k as f64);
-        assert!(e0 <= err(k as f64 * step) + 1e-9 && e0 <= err(k as f64 / step) + 1e-9,
-            "returned k sits on the optimal rung (e0={e0})");
+        assert!(
+            e0 <= err(k as f64 * step) + 1e-9 && e0 <= err(k as f64 / step) + 1e-9,
+            "returned k sits on the optimal rung (e0={e0})"
+        );
     }
 
     // ── (c) NEW: zero/cliff guard ────────────────────────────────────────────
@@ -875,19 +1108,33 @@ mod tests {
         let vol = ConstSigma(0.01);
         let sigma_cache = vec![0.01];
         let vc = vol_cfg();
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.0,
+        };
 
         // Seed a LARGE prior so a naive m0/target scale (m0≈0) would collapse k —
         // the guard instead brackets from K_FLOOR upward.
-        let k = scale_to_target_k(&prices, &cal(target_bpd), &base, &vol, &vc, &sigma_cache, target_bpd, Some(2.0));
+        let k = scale_to_target_k(
+            &prices,
+            &cal(target_bpd),
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            Some(2.0),
+        );
         // Too-flat to reach target even at K_FLOOR ⇒ legitimately 0.0 (floor
         // preserved). The KEY invariant: k is NEVER a runaway near K_MAX_SAFETY.
         assert!(
             k == 0.0 || ((k as f64) >= K_FLOOR && (k as f64) < 1000.0),
             "zero/cliff window must drop (0.0) or return a sane k — never runaway to K_MAX_SAFETY (got {k})"
         );
-        assert!((k as f64) < K_MAX_SAFETY as f64 * 0.001,
-            "k must not approach K_MAX_SAFETY ({k})");
+        assert!(
+            (k as f64) < K_MAX_SAFETY as f64 * 0.001,
+            "k must not approach K_MAX_SAFETY ({k})"
+        );
     }
 
     /// FLOOR PRESERVED: a too-quiet series whose median is below target even at
@@ -899,10 +1146,24 @@ mod tests {
         let vol = ConstSigma(0.01);
         let sigma_cache = vec![0.01];
         let vc = vol_cfg();
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
-        let k = scale_to_target_k(&prices, &cal(target_bpd), &base, &vol, &vc, &sigma_cache, target_bpd, None);
-        assert_eq!(k, 0.0,
-            "too-quiet series (median < target even at K_FLOOR) → 0.0 (floor preserved) — got {k}");
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.0,
+        };
+        let k = scale_to_target_k(
+            &prices,
+            &cal(target_bpd),
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            None,
+        );
+        assert_eq!(
+            k, 0.0,
+            "too-quiet series (median < target even at K_FLOOR) → 0.0 (floor preserved) — got {k}"
+        );
     }
 
     // ── No upper cap: storming series auto-expands upward ────────────────────
@@ -921,14 +1182,43 @@ mod tests {
         // warm start lands below tol-fail so the bracket engages.
         let mut c = cal(target_bpd);
         c.mult_bounds = [0.05, 0.5];
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
-        let k = scale_to_target_k(&prices, &c, &base, &vol, &vc, &sigma_cache, target_bpd, Some(0.05));
-        assert!(k > 0.0, "storming series must auto-expand and calibrate (got {k})");
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.0,
+        };
+        let k = scale_to_target_k(
+            &prices,
+            &c,
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            Some(0.05),
+        );
+        assert!(
+            k > 0.0,
+            "storming series must auto-expand and calibrate (got {k})"
+        );
         let stats = count_bars_per_day_from_prices(
-            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 }, &vol, &vc, &sigma_cache, first, last);
+            &prices,
+            &RenkoConfig {
+                multiplier: k,
+                min_pct: 0.0,
+            },
+            &vol,
+            &vc,
+            &sigma_cache,
+            first,
+            last,
+        );
         let rel_err = (stats.median / target_bpd - 1.0).abs();
-        assert!(rel_err <= RENKO_BPD_ACCEPT_TOL,
-            "auto-expanded k median {:.1} within tol? rel_err={:.3}", stats.median, rel_err);
+        assert!(
+            rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "auto-expanded k median {:.1} within tol? rel_err={:.3}",
+            stats.median,
+            rel_err
+        );
     }
 
     /// Dead hi-seed bracket: a slow cross emits ZERO bricks/day at the
@@ -946,16 +1236,45 @@ mod tests {
         let vol = ConstSigma(0.01);
         let sigma_cache = vec![0.01];
         let vc = vol_cfg();
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.0,
+        };
         // Prior k parked at the (dead) hi seed: m0 has days==0 → zero/cliff
         // guard → bracket fallback with g_hi dead at mult_bounds[1]=4.0.
-        let k = scale_to_target_k(&prices, &cal(target_bpd), &base, &vol, &vc, &sigma_cache, target_bpd, Some(4.0));
-        assert!(k > 0.0, "dead-hi-seed series must bisect, not reject (got {k})");
+        let k = scale_to_target_k(
+            &prices,
+            &cal(target_bpd),
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            Some(4.0),
+        );
+        assert!(
+            k > 0.0,
+            "dead-hi-seed series must bisect, not reject (got {k})"
+        );
         let stats = count_bars_per_day_from_prices(
-            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 }, &vol, &vc, &sigma_cache, first, last);
+            &prices,
+            &RenkoConfig {
+                multiplier: k,
+                min_pct: 0.0,
+            },
+            &vol,
+            &vc,
+            &sigma_cache,
+            first,
+            last,
+        );
         let rel_err = (stats.median / target_bpd - 1.0).abs();
-        assert!(rel_err <= RENKO_BPD_ACCEPT_TOL,
-            "bisected k median {:.1} off target, rel_err={:.3}", stats.median, rel_err);
+        assert!(
+            rel_err <= RENKO_BPD_ACCEPT_TOL,
+            "bisected k median {:.1} off target, rel_err={:.3}",
+            stats.median,
+            rel_err
+        );
     }
 
     /// ADVISORY accept-tol: when the snap-grid staircase leaves the best rung
@@ -972,15 +1291,43 @@ mod tests {
         let vc = vol_cfg();
         let mut c = cal(target_bpd);
         c.mult_bounds = [0.05, 0.65];
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.0 };
-        let k = scale_to_target_k(&prices, &c, &base, &vol, &vc, &sigma_cache, target_bpd, None);
-        assert!(k > 0.0, "best rung off-target by >5% must return closest k, NOT 0.0 (got {k})");
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.0,
+        };
+        let k = scale_to_target_k(
+            &prices,
+            &c,
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            target_bpd,
+            None,
+        );
+        assert!(
+            k > 0.0,
+            "best rung off-target by >5% must return closest k, NOT 0.0 (got {k})"
+        );
         assert!((k as f64) >= K_FLOOR, "k ≥ K_FLOOR (got {k})");
         let stats = count_bars_per_day_from_prices(
-            &prices, &RenkoConfig { multiplier: k, min_pct: 0.0 }, &vol, &vc, &sigma_cache, first, last);
+            &prices,
+            &RenkoConfig {
+                multiplier: k,
+                min_pct: 0.0,
+            },
+            &vol,
+            &vc,
+            &sigma_cache,
+            first,
+            last,
+        );
         let achieved_err = (stats.median / target_bpd - 1.0).abs();
-        assert!(achieved_err > RENKO_BPD_ACCEPT_TOL,
-            "must exercise the >5%-off advisory branch (err {:.3})", achieved_err);
+        assert!(
+            achieved_err > RENKO_BPD_ACCEPT_TOL,
+            "must exercise the >5%-off advisory branch (err {:.3})",
+            achieved_err
+        );
     }
 
     #[test]
@@ -994,10 +1341,16 @@ mod tests {
     // ── min_pct clamp-detector (KEPT) ────────────────────────────────────────
 
     /// Per-tick σ VolSource: `sigma_cache[i]` indexed by tick ORDER.
-    struct PerTickSigma { mts: Vec<u64> }
+    struct PerTickSigma {
+        mts: Vec<u64>,
+    }
     impl VolSource for PerTickSigma {
-        fn len(&self) -> usize { self.mts.len() }
-        fn sigma_pct(&self, i: usize) -> f64 { i as f64 }
+        fn len(&self) -> usize {
+            self.mts.len()
+        }
+        fn sigma_pct(&self, i: usize) -> f64 {
+            i as f64
+        }
         fn find_index_for_mts(&self, mts: u64) -> usize {
             self.mts.partition_point(|&m| m <= mts).saturating_sub(1)
         }
@@ -1006,10 +1359,17 @@ mod tests {
     #[test]
     fn min_pct_clamped_fraction_detector_arithmetic() {
         // 10 ticks: first 8 LOW σ (0.001), last 2 HIGH σ (0.02).
-        let sigma_cache = vec![0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.02, 0.02];
+        let sigma_cache = vec![
+            0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.02, 0.02,
+        ];
         let t0: i64 = 1_700_000_000_000;
-        let prices: Vec<(i64, f64)> = (0..sigma_cache.len() as i64).map(|i| (t0 + i * 1000, 100.0)).collect();
-        let mts: Vec<u64> = prices.iter().map(|&(ts, _)| timestamp::from_epoch_ms(ts)).collect();
+        let prices: Vec<(i64, f64)> = (0..sigma_cache.len() as i64)
+            .map(|i| (t0 + i * 1000, 100.0))
+            .collect();
+        let mts: Vec<u64> = prices
+            .iter()
+            .map(|&(ts, _)| timestamp::from_epoch_ms(ts))
+            .collect();
         let vol = PerTickSigma { mts };
         let first = prices.first().unwrap().0;
         let last = prices.last().unwrap().0;
@@ -1018,7 +1378,8 @@ mod tests {
         assert!((frac - 0.8).abs() < 1e-9, "8/10 ticks clamped (got {frac})");
         assert!(frac > MIN_PCT_CLAMP_MAX_FRAC, "0.8 > 0.5 ⇒ gate rejects");
         // k=10 ⇒ clamp when σ ≤ 0.0002 ⇒ none ⇒ accept.
-        let frac_ok = min_pct_clamped_fraction(&prices, 10.0, 0.002, &vol, &sigma_cache, first, last);
+        let frac_ok =
+            min_pct_clamped_fraction(&prices, 10.0, 0.002, &vol, &sigma_cache, first, last);
         assert_eq!(frac_ok, 0.0, "no tick clamped at large k ⇒ accept");
     }
 
@@ -1031,8 +1392,23 @@ mod tests {
         let sigma_cache = vec![0.0008];
         let vc = vol_cfg();
         // min_pct = 1% — far above k·σ for any k ∈ [0.05,4]·0.0008.
-        let base = RenkoConfig { multiplier: 0.075, min_pct: 0.01 };
-        let k = scale_to_target_k(&prices, &cal(300.0), &base, &vol, &vc, &sigma_cache, 300.0, None);
-        assert_eq!(k, 0.0, "min_pct-dominated series must FAIL (→ per-ticker override), not ship a clamped k");
+        let base = RenkoConfig {
+            multiplier: 0.075,
+            min_pct: 0.01,
+        };
+        let k = scale_to_target_k(
+            &prices,
+            &cal(300.0),
+            &base,
+            &vol,
+            &vc,
+            &sigma_cache,
+            300.0,
+            None,
+        );
+        assert_eq!(
+            k, 0.0,
+            "min_pct-dominated series must FAIL (→ per-ticker override), not ship a clamped k"
+        );
     }
 }

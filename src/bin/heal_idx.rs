@@ -6,7 +6,6 @@
 use anyhow::Result;
 use clap::Parser;
 use series_factory::idx_heal::heal_ticker_shards;
-use std::path::PathBuf;
 use tracing::info;
 
 #[derive(Parser, Debug)]

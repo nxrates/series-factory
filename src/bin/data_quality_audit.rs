@@ -59,13 +59,13 @@ use chrono::{Duration, NaiveDate, Utc};
 use clap::Parser;
 use serde::Serialize;
 
+use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::ohlc::{rollup, Ohlc};
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, manifest_path, read_manifest, read_shard_aligned,
     ts_ms_to_utc_date, vol_path_for_id, ShardRecord, BAR_MS_S10, FLAG_CONF_FRESHNESS,
     FLAG_HEARTBEAT_SENTINEL, MS_PER_DAY,
 };
-use nxr_sdk::ipc::record::IndexRecord;
-use nxr_sdk::ohlc::{rollup, Ohlc};
 use nxr_sdk::stats as sdk_stats;
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::Bar;
@@ -327,19 +327,12 @@ struct Cli {
 
     /// `dt` (ms) tolerated for a sentinel-covered / pre-rollout quiet gap.
     ///
-    /// R1 C6: default lowered from 300_000 → 0 until sentinels ship widely
-    /// across all live shards. With 0 tolerance the audit correctly fails
-    /// any gap > `max_gap_ms`; auto-quieting 2-5 min outages was masking
-    /// real producer downtime. After the sentinel-writing build (R1 C2)
-    /// has been live for ≥1 day across every ticker AND the audit confirms
-    /// sentinels are present in fresh shards, raise this to 60_000
-    /// (1 min slack above SENTINEL_INTERVAL_MS) so a single missed
-    /// sentinel doesn't trip a false alarm.
-    // Default 60s (= sentinel interval + slack): a single missed heartbeat
-    // sentinel must NOT register as an OUTAGE. The live 45d run flagged OUTAGE on
-    // 529/529 tickers with tolerance 0 — normal quiet periods, not real downtime.
-    // Real outages (sustained > max_gap_ms beyond this slack) + missing UTC days
-    // still FAIL. Override to 0 for the strictest sentinel-coverage audit.
+    /// Default 60 s (= sentinel interval + slack): a single missed heartbeat
+    /// sentinel must NOT register as an OUTAGE. A live 45 d run flagged OUTAGE
+    /// on 529/529 tickers with tolerance 0 — normal quiet periods, not real
+    /// downtime. Real outages (sustained > `max_gap_ms` beyond this slack) and
+    /// missing UTC days still FAIL. Override to 0 for the strictest
+    /// sentinel-coverage audit.
     #[arg(long, default_value_t = 60_000)]
     quiet_tolerance_ms: i64,
 
@@ -391,8 +384,8 @@ struct TickerReport {
     // a FAIL — markets do go briefly stale. NEVER a `confidence > accepted` FAIL.
     conf_stale_advisories: u64,
     // Quote DEPTH (FIX depth): vbid/vask backing-size validation.
-    zero_depth_violations: u64,   // HARD FAIL: vbid==0 && vask==0 (phantom liquidity)
-    one_sided_depth_warns: u64,   // WARN: vbid==0 XOR vask==0 (one-sided book)
+    zero_depth_violations: u64, // HARD FAIL: vbid==0 && vask==0 (phantom liquidity)
+    one_sided_depth_warns: u64, // WARN: vbid==0 XOR vask==0 (one-sided book)
     // Reject dominance (FIX reject): per-record + window reject-rate signal.
     reject_dominant_records: u64, // WARN: records where rejected > accepted
     reject_rate: f64,             // window Σrejected / (Σrejected+Σaccepted); WARN > 0.5
@@ -403,54 +396,54 @@ struct TickerReport {
     cusum_alarms: u64,
     sigma_park_ann: f64,
     crypto_stable: bool,
-    zero_return_frac: f64,              // fraction of zero log-returns (flatline proxy)
-    longest_flat_run: u64,             // longest run of identical mids (stuck-feed proxy)
-    stuck_feed: bool,                  // WARN: near-constant feed, NOT a known stable pair
+    zero_return_frac: f64, // fraction of zero log-returns (flatline proxy)
+    longest_flat_run: u64, // longest run of identical mids (stuck-feed proxy)
+    stuck_feed: bool,      // WARN: near-constant feed, NOT a known stable pair
     // vol↔idx reconciliation (.vol stored sigma vs idx/s10-derived Parkinson)
     vol_present: bool,
-    vol_sigma_stored: f64,             // median stored sigma_pct from .vol, annualized
-    vol_sigma_divergence: bool,        // WARN: stored vol grossly diverges from derived
+    vol_sigma_stored: f64,      // median stored sigma_pct from .vol, annualized
+    vol_sigma_divergence: bool, // WARN: stored vol grossly diverges from derived
     // kline rollup-parity (s10 → 1m/1h via sdk ohlc::rollup)
-    rollup_violations: u64,            // OHLC monoid / alignment / tick-sum breaks
+    rollup_violations: u64, // OHLC monoid / alignment / tick-sum breaks
     rollup_samples: Vec<String>,
     // Renko
     renko_bpd: f64,
     renko_days: u64,
     renko_ratio: f64,
-    renko_target_bpd: f64,               // R4: per-ticker calibration target (! flat CLI)
-    renko_target_unresolved: bool,       // FIX #5 WARN: pair/target unresolvable → bpd-band SKIP
+    renko_target_bpd: f64, // R4: per-ticker calibration target (! flat CLI)
+    renko_target_unresolved: bool, // FIX #5 WARN: pair/target unresolvable → bpd-band SKIP
     renko_skipped_stable: bool,
     // Renko parity checks (vs .idx 6.5/10 target)
-    renko_b03_violations: u64,          // R1 cross-shard continuity breaks
-    renko_brick_floor_violations: u64,  // R3 |Δ|/open < min_pct
-    renko_k_present: bool,              // R4 calibrated k exists in ticker-params
-    renko_uncalibrated: bool,           // R4 CRIT: shards but no k
-    renko_inferred_bpd: f64,            // R4 realized bricks/day
-    renko_bpd_off_band: bool,           // R4 |inferred/target-1| > accept tol
-    renko_bpd_median: f64,              // R2 per-day distribution
+    renko_b03_violations: u64,         // R1 cross-shard continuity breaks
+    renko_brick_floor_violations: u64, // R3 |Δ|/open < min_pct
+    renko_k_present: bool,             // R4 calibrated k exists in ticker-params
+    renko_uncalibrated: bool,          // R4 CRIT: shards but no k
+    renko_inferred_bpd: f64,           // R4 realized bricks/day
+    renko_bpd_off_band: bool,          // R4 |inferred/target-1| > accept tol
+    renko_bpd_median: f64,             // R2 per-day distribution
     renko_bpd_mad: f64,
     renko_bpd_min_day: u64,
-    renko_dist_drift: bool,             // R2 WARN: MAD > 0.5*median or min < 0.33*median
-    renko_dist_fail: bool,              // R2 FAIL: a single day's k transiently wrong (hard)
+    renko_dist_drift: bool, // R2 WARN: MAD > 0.5*median or min < 0.33*median
+    renko_dist_fail: bool,  // R2 FAIL: a single day's k transiently wrong (hard)
     // R4 provenance: prove shards were built with the CURRENT k (manifest stamp)
-    renko_k_used: Option<f64>,          // manifest.renko_k_used (k shards were built with)
-    renko_k_stale: bool,                // R4 FAIL: |used/current-1| > tol → regenerate shards
-    renko_k_implausible: bool,          // FIX #6 FAIL: k outside sane per-class envelope
-    renko_k_clamped_warn: bool,         // FIX #6 WARN: k pinned at calibrator mult ceiling
+    renko_k_used: Option<f64>, // manifest.renko_k_used (k shards were built with)
+    renko_k_stale: bool,       // R4 FAIL: |used/current-1| > tol → regenerate shards
+    renko_k_implausible: bool, // FIX #6 FAIL: k outside sane per-class envelope
+    renko_k_clamped_warn: bool, // FIX #6 WARN: k pinned at calibrator mult ceiling
     renko_shards_behind_calibration: bool, // R4 WARN: shards predate latest calibrated_at
-    renko_provenance_missing: bool,     // R4 WARN: pre-provenance manifest (no renko_k_used)
-    renko_samples: Vec<String>,         // dated violation provenance
+    renko_provenance_missing: bool, // R4 WARN: pre-provenance manifest (no renko_k_used)
+    renko_samples: Vec<String>, // dated violation provenance
     // s10 kline
     s10_bars: u64,
     s10_violations: u64,
     s10_samples: Vec<String>,
     // s10 parity checks
-    s10_b03_violations: u64,            // K1 cross-shard off-grid boundary
-    s10_b03_gaps: u64,                  // K1 multi-bucket gap at boundary (WARN)
-    s10_misaligned: u64,                // K2 open_time_ms % 10_000 != 0
-    s10_coverage_pct: f64,              // K3 bars/day vs 8640
-    s10_coverage_fail: bool,            // K3 < 0.5
-    s10_coverage_warn: bool,            // K3 0.5..0.8
+    s10_b03_violations: u64, // K1 cross-shard off-grid boundary
+    s10_b03_gaps: u64,       // K1 multi-bucket gap at boundary (WARN)
+    s10_misaligned: u64,     // K2 open_time_ms % 10_000 != 0
+    s10_coverage_pct: f64,   // K3 bars/day vs 8640
+    s10_coverage_fail: bool, // K3 < 0.5
+    s10_coverage_warn: bool, // K3 0.5..0.8
     // Verdict
     verdict: String, // "PASS" | "FAIL" | "NO_DATA"
     fail_reasons: Vec<String>,
@@ -632,7 +625,10 @@ fn check_rollup_parity(
             why = Some(format!("ts {} not aligned to {}", b.ts, dst_tf_ms));
         } else if let Some(a) = exp.get(&b.ts) {
             if a.ticks != b.tick_count as u64 {
-                why = Some(format!("tick_count {} != Σ src {} over bucket", b.tick_count, a.ticks));
+                why = Some(format!(
+                    "tick_count {} != Σ src {} over bucket",
+                    b.tick_count, a.ticks
+                ));
             } else if a.vbid != b.vbid {
                 why = Some(format!("vbid {} != Σ src {} over bucket", b.vbid, a.vbid));
             } else if a.vask != b.vask {
@@ -679,7 +675,7 @@ struct InvariantOutcome {
     /// composites are a PRICE+CONFIDENCE feed, NOT an order-book depth feed:
     /// `triangulator.rs:143` sets `vbid:0, vask:0` for ALL inferred/triangulated
     /// pairs (the prime USDC crosses BTCUSDC/ETHUSDC/BNBUSDC are inferred → 0
-    /// depth BY DESIGN), and volume-less providers (FX/MT4) also yield 0. A real
+    /// depth BY DESIGN), and volume-less FX providers also yield 0. A real
     /// 45d run showed 1M+ zero-depth on single healthy tickers. Reported as a
     /// pure count (`zero_depth_count`) that NEVER affects the verdict — no ERROR,
     /// no `reason`. The field is retained ONLY so the report can surface the count.
@@ -727,16 +723,34 @@ fn class_band(class: nxr_sdk::asset_class::AssetClassBucket) -> ClassBand {
     match class {
         // Deep, liquid majors: a real spread is a few bps; >150 bps is corrupt
         // or a flash dislocation. 5% per-tick jump is already extreme here.
-        CryptoMajor => ClassBand { spread_ceiling_bps: 150.0, jump_frac: 0.05 },
+        CryptoMajor => ClassBand {
+            spread_ceiling_bps: 150.0,
+            jump_frac: 0.05,
+        },
         // Stable/stable: spread should be a handful of bps; cap tight.
-        CryptoStable => ClassBand { spread_ceiling_bps: 100.0, jump_frac: 0.02 },
+        CryptoStable => ClassBand {
+            spread_ceiling_bps: 100.0,
+            jump_frac: 0.02,
+        },
         // FX majors: extremely tight institutional spreads.
-        FxMajor => ClassBand { spread_ceiling_bps: 50.0, jump_frac: 0.03 },
+        FxMajor => ClassBand {
+            spread_ceiling_bps: 50.0,
+            jump_frac: 0.03,
+        },
         // Alts / crypto-crosses: thinner books, wider real spreads + jumps.
-        CryptoAlt | CryptoCross => ClassBand { spread_ceiling_bps: 800.0, jump_frac: 0.15 },
-        FxCross => ClassBand { spread_ceiling_bps: 300.0, jump_frac: 0.08 },
+        CryptoAlt | CryptoCross => ClassBand {
+            spread_ceiling_bps: 800.0,
+            jump_frac: 0.15,
+        },
+        FxCross => ClassBand {
+            spread_ceiling_bps: 300.0,
+            jump_frac: 0.08,
+        },
         // Synth / unknown: widest band — never false-flag a thin synthetic pair.
-        Default => ClassBand { spread_ceiling_bps: 2000.0, jump_frac: 0.25 },
+        Default => ClassBand {
+            spread_ceiling_bps: 2000.0,
+            jump_frac: 0.25,
+        },
     }
 }
 
@@ -761,7 +775,7 @@ fn eval_invariant(
     let is_freshness = (flags & FLAG_CONF_FRESHNESS) != 0;
     // DEPTH SIGNAL — count metric ONLY, NEVER a verdict input. NXR composites are
     // a price+confidence feed: inferred/triangulated pairs (triangulator.rs:143)
-    // and volume-less FX/MT4 providers carry vbid=vask=0 BY DESIGN. So zero/
+    // and volume-less FX providers carry vbid=vask=0 BY DESIGN. So zero/
     // one-sided depth is NOT in the `reason` (hard-FAIL) chain below.
     let zero_depth = vbid == 0 && vask == 0;
     let depth_one_sided = (vbid == 0) ^ (vask == 0);
@@ -794,9 +808,8 @@ fn eval_invariant(
     // Spread WARN/metric (NEVER a verdict input). A positive spread above the
     // per-class envelope is surfaced as a count; majors keep a tighter band so
     // the WARN still flags a dislocated major, but it never FAILs a ticker.
-    let spread_out_of_band = spread_bps.is_finite()
-        && spread_bps > band.spread_ceiling_bps
-        && reason.is_none();
+    let spread_out_of_band =
+        spread_bps.is_finite() && spread_bps > band.spread_ceiling_bps && reason.is_none();
     // FIX #1 (G4 parity, advisory): freshness-flagged + structurally-OK records
     // whose decoded freshness is below the floor are a stale composite. WARN-only.
     let conf_stale = is_freshness
@@ -962,8 +975,8 @@ fn audit_ticker(
         r.suspect_gaps += 1;
         let a_flags = a.index.flags;
         let b_flags = b.index.flags;
-        let endpoint_sentinel = (a_flags & FLAG_HEARTBEAT_SENTINEL) != 0
-            || (b_flags & FLAG_HEARTBEAT_SENTINEL) != 0;
+        let endpoint_sentinel =
+            (a_flags & FLAG_HEARTBEAT_SENTINEL) != 0 || (b_flags & FLAG_HEARTBEAT_SENTINEL) != 0;
         // "quiet" if a sentinel covers an endpoint, OR the whole stream predates
         // sentinel rollout (no sentinels anywhere) — but only within tolerance.
         let excused = endpoint_sentinel || !any_sentinel;
@@ -1197,7 +1210,11 @@ fn audit_ticker(
         let zeros = returns.iter().filter(|&&x| x == 0.0).count();
         zero_return_frac = zeros as f64 / returns.len() as f64;
     }
-    r.zero_return_frac = if returns.is_empty() { f64::NAN } else { zero_return_frac };
+    r.zero_return_frac = if returns.is_empty() {
+        f64::NAN
+    } else {
+        zero_return_frac
+    };
 
     // Longest run of identical consecutive mids (cheap stuck-feed proxy). A live
     // feed jitters tick-to-tick; a frozen forwarder repeats the exact mid.
@@ -1229,11 +1246,7 @@ fn audit_ticker(
     // from the volatility-inferred `crypto_stable` flag — which would let a
     // flatline excuse itself). A genuine non-stable pair frozen at one quote is
     // a dead/stale forwarder, not legitimately quiet.
-    if !returns.is_empty()
-        && zero_return_frac > 0.99
-        && !is_known_stable
-        && !r.crypto_stable
-    {
+    if !returns.is_empty() && zero_return_frac > 0.99 && !is_known_stable && !r.crypto_stable {
         r.stuck_feed = true;
         if r.s10_samples.len() < 10 {
             r.s10_samples.push(format!(
@@ -1362,9 +1375,7 @@ fn audit_ticker(
             r.renko_bpd_median = med;
             r.renko_bpd_mad = mad;
             r.renko_bpd_min_day = per_day.values().copied().min().unwrap_or(0);
-            if med > 0.0
-                && (mad > 0.5 * med || (r.renko_bpd_min_day as f64) < 0.33 * med)
-            {
+            if med > 0.0 && (mad > 0.5 * med || (r.renko_bpd_min_day as f64) < 0.33 * med) {
                 r.renko_dist_drift = true;
             }
             // R2 hard FAIL: a single shard built with a transiently-wrong k is
@@ -1556,7 +1567,8 @@ fn audit_ticker(
                 if let Some(w) = why {
                     r.s10_violations += 1;
                     if r.s10_samples.len() < 10 {
-                        r.s10_samples.push(format!("[{}] ts={} {}", date, open_ms, w));
+                        r.s10_samples
+                            .push(format!("[{}] ts={} {}", date, open_ms, w));
                     }
                 }
 
@@ -1690,7 +1702,7 @@ fn audit_ticker(
     }
     // DEPTH IS METRIC-ONLY, NEVER A VERDICT INPUT. NXR composites are a
     // price+confidence feed: inferred/triangulated pairs (triangulator.rs:143)
-    // and volume-less FX/MT4 providers carry vbid=vask=0 BY DESIGN. The empirical
+    // and volume-less FX providers carry vbid=vask=0 BY DESIGN. The empirical
     // 45d run flagged 1M+ "phantom" quotes on healthy majors — a false positive.
     // zero_depth_violations / one_sided_depth_warns are surfaced as counts in the
     // report (printed below) but do not gate the verdict.
@@ -1699,7 +1711,11 @@ fn audit_ticker(
     }
     // Renko cadence: only gate non-stable pairs with renko data. Tolerance ±50%.
     // FIX #5: skip when the target was unresolved (ratio is vs the flat fallback).
-    if !r.crypto_stable && !r.renko_target_unresolved && r.renko_days > 0 && r.renko_ratio.is_finite() {
+    if !r.crypto_stable
+        && !r.renko_target_unresolved
+        && r.renko_days > 0
+        && r.renko_ratio.is_finite()
+    {
         if r.renko_ratio < 0.5 || r.renko_ratio > 2.0 {
             reasons.push(format!(
                 "renko bpd off calibration (ratio {:.2})",
@@ -1737,7 +1753,8 @@ fn audit_ticker(
     // FIX #6 (CRIT): calibrated k outside the sane per-asset-class envelope — a
     // self-consistent-but-absurd k (the SOL=3.995 stablecoin-sentinel bug).
     if r.renko_k_implausible {
-        reasons.push("renko_k_implausible: calibrated k outside sane envelope (FIX #6)".to_string());
+        reasons
+            .push("renko_k_implausible: calibrated k outside sane envelope (FIX #6)".to_string());
     }
     // R4 (HIGH): realized bpd outside calibrator accept band (skip stable pairs).
     if r.renko_bpd_off_band {
@@ -1757,7 +1774,10 @@ fn audit_ticker(
     }
     // K2 (HIGH): s10 bucket misalignment to UTC grid (the s10-from-idx regression).
     if r.s10_misaligned > 0 {
-        reasons.push(format!("{} s10 misaligned bucket(s) (K2)", r.s10_misaligned));
+        reasons.push(format!(
+            "{} s10 misaligned bucket(s) (K2)",
+            r.s10_misaligned
+        ));
     }
     // K3 (HIGH): s10 coverage < 50% of expected 8640 bars/day.
     if r.s10_coverage_fail {
@@ -1824,7 +1844,10 @@ fn print_human(report: &AuditReport) {
     }
 
     for t in &report.tickers {
-        println!("\n── ticker {} ──────────────────────────────────────────────", t.ticker_id);
+        println!(
+            "\n── ticker {} ──────────────────────────────────────────────",
+            t.ticker_id
+        );
         if !t.has_data {
             println!("   NO DATA in window.");
             continue;
@@ -1885,10 +1908,7 @@ fn print_human(report: &AuditReport) {
             "   anomalies            : mad_outliers={} (worst |z|={:.2}) cusum_alarms={}",
             t.mad_outliers, t.worst_mad_z, t.cusum_alarms
         );
-        println!(
-            "   sigma_park (ann)     : {}",
-            fmt_sigma(t.sigma_park_ann)
-        );
+        println!("   sigma_park (ann)     : {}", fmt_sigma(t.sigma_park_ann));
         println!(
             "   feed health          : zero_ret_frac={} longest_flat_run={}{}",
             fmt_sigma(t.zero_return_frac),
@@ -1900,7 +1920,11 @@ fn print_human(report: &AuditReport) {
                 "   vol↔idx recon        : stored_sigma_ann={} parkinson_ann={}{}",
                 fmt_sigma(t.vol_sigma_stored),
                 fmt_sigma(t.sigma_park_ann),
-                if t.vol_sigma_divergence { " [DIVERGENCE]" } else { "" }
+                if t.vol_sigma_divergence {
+                    " [DIVERGENCE]"
+                } else {
+                    ""
+                }
             );
         }
         if t.crypto_stable {
@@ -1912,7 +1936,11 @@ fn print_human(report: &AuditReport) {
                 t.renko_bpd,
                 t.renko_days,
                 t.renko_ratio,
-                if t.renko_skipped_stable { " [skipped: stable]" } else { "" }
+                if t.renko_skipped_stable {
+                    " [skipped: stable]"
+                } else {
+                    ""
+                }
             );
             println!(
                 "   renko calib (R4)     : inferred_bpd={:.1} target={:.1} (per-ticker) k_present={}{}{}{}",
@@ -1925,12 +1953,30 @@ fn print_human(report: &AuditReport) {
             );
             println!(
                 "   renko provenance (R4): k_used={}{}{}{}{}{}",
-                t.renko_k_used.map(|k| format!("{:.6}", k)).unwrap_or_else(|| "none".to_string()),
+                t.renko_k_used
+                    .map(|k| format!("{:.6}", k))
+                    .unwrap_or_else(|| "none".to_string()),
                 if t.renko_k_stale { " [STALE]" } else { "" },
-                if t.renko_k_implausible { " [IMPLAUSIBLE-K]" } else { "" },
-                if t.renko_k_clamped_warn { " [WARN: k clamped at ceiling]" } else { "" },
-                if t.renko_shards_behind_calibration { " [WARN: behind-calibration]" } else { "" },
-                if t.renko_provenance_missing { " [WARN: provenance-missing]" } else { "" }
+                if t.renko_k_implausible {
+                    " [IMPLAUSIBLE-K]"
+                } else {
+                    ""
+                },
+                if t.renko_k_clamped_warn {
+                    " [WARN: k clamped at ceiling]"
+                } else {
+                    ""
+                },
+                if t.renko_shards_behind_calibration {
+                    " [WARN: behind-calibration]"
+                } else {
+                    ""
+                },
+                if t.renko_provenance_missing {
+                    " [WARN: provenance-missing]"
+                } else {
+                    ""
+                }
             );
             println!(
                 "   renko cont/floor     : R1_disc={} R3_floor_viol={}",
@@ -1981,7 +2027,10 @@ fn print_human(report: &AuditReport) {
             println!("     {}", s);
         }
         if t.rollup_violations > 0 {
-            println!("   kline rollup-parity  : {} violation(s)", t.rollup_violations);
+            println!(
+                "   kline rollup-parity  : {} violation(s)",
+                t.rollup_violations
+            );
             for s in &t.rollup_samples {
                 println!("     {}", s);
             }
@@ -1998,7 +2047,16 @@ fn print_human(report: &AuditReport) {
     println!("──────────────────────────────────────────────────────────────────────");
     println!(
         " {:>12} {:>10} {:>7} {:>7} {:>7} {:>7} {:>7} {:>12} {:>9} {:>7}",
-        "ticker", "records", "outage", "missday", "invviol", "madout", "cusum", "sigma_ann", "renkobpd", "verdict"
+        "ticker",
+        "records",
+        "outage",
+        "missday",
+        "invviol",
+        "madout",
+        "cusum",
+        "sigma_ann",
+        "renkobpd",
+        "verdict"
     );
     for t in &report.tickers {
         println!(
@@ -2220,12 +2278,25 @@ mod tests {
     /// (rejected=0) defaults, so tests targeting the freshness/price chain don't
     /// have to spell out the new args. Depth/reject tests call `eval_invariant`
     /// directly to vary those bytes.
-    fn eval_inv(bid: f64, ask: f64, flags: u8, confidence: u8, accepted: u8, spread_bps: f64)
-        -> InvariantOutcome
-    {
+    fn eval_inv(
+        bid: f64,
+        ask: f64,
+        flags: u8,
+        confidence: u8,
+        accepted: u8,
+        spread_bps: f64,
+    ) -> InvariantOutcome {
         eval_invariant(
-            bid, ask, flags, confidence, accepted, /*rejected*/ 0, /*vbid*/ 100, /*vask*/ 100,
-            spread_bps, test_band(),
+            bid,
+            ask,
+            flags,
+            confidence,
+            accepted,
+            /*rejected*/ 0,
+            /*vbid*/ 100,
+            /*vask*/ 100,
+            spread_bps,
+            test_band(),
         )
     }
 
@@ -2247,8 +2318,12 @@ mod tests {
         // pair is non-grid (≈2 ms) and would have tripped OffGrid.
         let prev_close = prev_open + (S10_BUCKET_MS - 1) - 1; // open+9998 round-trip
         let old_close_delta = open - prev_close;
-        assert_ne!(old_close_delta % S10_BUCKET_MS, 0,
-            "old close-grid delta {} IS off-grid → false CRIT (the bug)", old_close_delta);
+        assert_ne!(
+            old_close_delta % S10_BUCKET_MS,
+            0,
+            "old close-grid delta {} IS off-grid → false CRIT (the bug)",
+            old_close_delta
+        );
         // New open-grid delta is a clean multiple → no false CRIT.
         assert_eq!((open - prev_open) % S10_BUCKET_MS, 0);
     }
@@ -2266,7 +2341,10 @@ mod tests {
     fn k1_off_grid_open_is_fail() {
         let prev_open = 1_700_000_000_000i64;
         let open = prev_open + S10_BUCKET_MS + 3; // 10_003 ms forward
-        assert_eq!(classify_s10_open_delta(prev_open, open), S10Boundary::OffGrid);
+        assert_eq!(
+            classify_s10_open_delta(prev_open, open),
+            S10Boundary::OffGrid
+        );
     }
 
     /// Non-advancing (duplicate / overlap) is ignored by K1 (handled elsewhere).
@@ -2291,22 +2369,35 @@ mod tests {
     #[test]
     fn r4_uses_per_ticker_target_not_flat() {
         // Pegged pair: real target = 50. 300 realized is 6× over → off-band.
-        assert!(renko_bpd_off_band(300.0, 50.0), "300 bpd vs 50 target must be off-band");
+        assert!(
+            renko_bpd_off_band(300.0, 50.0),
+            "300 bpd vs 50 target must be off-band"
+        );
         // Correct k on the same pair: 48 realized vs 50 target → within ±20%.
-        assert!(!renko_bpd_off_band(48.0, 50.0), "48 bpd vs 50 target is in-band");
+        assert!(
+            !renko_bpd_off_band(48.0, 50.0),
+            "48 bpd vs 50 target is in-band"
+        );
         // The OLD flat-300 anchor would have judged 300 realized as a perfect
         // match (ratio 1.0) → FALSE PASS. Prove the flat anchor masks it.
-        assert!(!renko_bpd_off_band(300.0, 300.0),
-            "flat-300 anchor false-passes the wrong-k pegged pair (the bug)");
+        assert!(
+            !renko_bpd_off_band(300.0, 300.0),
+            "flat-300 anchor false-passes the wrong-k pegged pair (the bug)"
+        );
     }
 
     /// An override pair (target 800) with a correct ~800 k must PASS, where the
     /// flat-300 anchor would FALSE-FAIL it (800/300-1 = 1.67 > 0.20).
     #[test]
     fn r4_override_pair_passes_on_per_ticker_target() {
-        assert!(!renko_bpd_off_band(800.0, 800.0), "800 vs 800 target in-band");
-        assert!(renko_bpd_off_band(800.0, 300.0),
-            "flat-300 anchor false-fails the high-target override pair (the bug)");
+        assert!(
+            !renko_bpd_off_band(800.0, 800.0),
+            "800 vs 800 target in-band"
+        );
+        assert!(
+            renko_bpd_off_band(800.0, 300.0),
+            "flat-300 anchor false-fails the high-target override pair (the bug)"
+        );
     }
 
     // ── R4 provenance: shards built with the CURRENT k (manifest stamp) ───────
@@ -2352,7 +2443,10 @@ mod tests {
         // build-time stamp → behind-calibration WARN (advisory, not FAIL).
         let cur_at = 1_700_000_500_i64;
         let built_at = fresh.renko_calibrated_at.expect("calibrated_at stamped");
-        assert!(cur_at > built_at, "recalibration after build → behind-calibration WARN");
+        assert!(
+            cur_at > built_at,
+            "recalibration after build → behind-calibration WARN"
+        );
     }
 
     // ── FIX #1: fresh-record confidence>accepted must NOT false-FAIL ─────────
@@ -2367,8 +2461,15 @@ mod tests {
         const FRESH: u8 = FLAG_CONF_FRESHNESS;
         // confidence=200 (>accepted=6) but freshness-flagged → must NOT FAIL.
         let o = eval_inv(100.0, 100.1, FRESH, 200, 6, 0.999_0 /*~spread bps*/);
-        assert!(o.reason.is_none(), "fresh record must not FAIL invariant: {:?}", o.reason);
-        assert!(!o.conf_stale, "freshness 200/255 ≈ 0.78 is above floor → no advisory");
+        assert!(
+            o.reason.is_none(),
+            "fresh record must not FAIL invariant: {:?}",
+            o.reason
+        );
+        assert!(
+            !o.conf_stale,
+            "freshness 200/255 ≈ 0.78 is above floor → no advisory"
+        );
 
         // Same numbers WITHOUT the flag = legacy semantics → confidence>accepted FAIL.
         let legacy = eval_inv(100.0, 100.1, 0, 200, 6, 0.999_0);
@@ -2381,7 +2482,11 @@ mod tests {
         // Freshness-flagged BUT stale (byte 5/255 ≈ 0.0196 < 0.05 floor) → advisory
         // WARN only, still NOT an invariant FAIL.
         let stale = eval_inv(100.0, 100.1, FRESH, 5, 6, 0.999_0);
-        assert!(stale.reason.is_none(), "stale-fresh record must not FAIL: {:?}", stale.reason);
+        assert!(
+            stale.reason.is_none(),
+            "stale-fresh record must not FAIL: {:?}",
+            stale.reason
+        );
         assert!(stale.conf_stale, "freshness below floor → advisory WARN");
     }
 
@@ -2399,7 +2504,11 @@ mod tests {
         );
         // Normal price → no floor FAIL.
         let ok = eval_inv(100.0, 100.1, 0, 1, 1, 9.99);
-        assert!(ok.reason.is_none(), "normal price must not FAIL: {:?}", ok.reason);
+        assert!(
+            ok.reason.is_none(),
+            "normal price must not FAIL: {:?}",
+            ok.reason
+        );
         // Crossed quote → explicit FAIL.
         let crossed = eval_inv(100.5, 100.0, 0, 1, 1, 0.0);
         assert_eq!(crossed.reason, Some("crossed quote (ask < bid)"));
@@ -2415,20 +2524,63 @@ mod tests {
         // DEPTH IS METRIC-ONLY for NXR's price+confidence model. vbid==0 && vask==0
         // is BY DESIGN for inferred pairs (triangulator.rs:143) + volume-less FX:
         // it sets the `zero_depth` count flag but is NEVER a `reason` (verdict input).
-        let both = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 0, /*vask*/ 0, 9.99, test_band());
-        assert!(both.reason.is_none(), "both-zero depth must NOT FAIL: {:?}", both.reason);
-        assert!(both.zero_depth, "zero_depth metric flag still set (for counting)");
+        let both = eval_invariant(
+            100.0,
+            100.1,
+            0,
+            1,
+            1,
+            0,
+            /*vbid*/ 0,
+            /*vask*/ 0,
+            9.99,
+            test_band(),
+        );
+        assert!(
+            both.reason.is_none(),
+            "both-zero depth must NOT FAIL: {:?}",
+            both.reason
+        );
+        assert!(
+            both.zero_depth,
+            "zero_depth metric flag still set (for counting)"
+        );
         assert!(!both.depth_one_sided, "both-zero is NOT one-sided");
 
         // One-sided zero → metric flag, no FAIL.
-        let bid_side = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 0, /*vask*/ 50, 9.99, test_band());
+        let bid_side = eval_invariant(
+            100.0,
+            100.1,
+            0,
+            1,
+            1,
+            0,
+            /*vbid*/ 0,
+            /*vask*/ 50,
+            9.99,
+            test_band(),
+        );
         assert!(bid_side.reason.is_none(), "one-sided depth must NOT FAIL");
         assert!(bid_side.depth_one_sided, "one-sided depth metric flag set");
         assert!(!bid_side.zero_depth, "one-sided is NOT zero_depth");
 
         // Healthy two-sided depth → no depth signal at all.
-        let ok = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 10, /*vask*/ 10, 9.99, test_band());
-        assert!(!ok.zero_depth && !ok.depth_one_sided, "healthy depth → no signal");
+        let ok = eval_invariant(
+            100.0,
+            100.1,
+            0,
+            1,
+            1,
+            0,
+            /*vbid*/ 10,
+            /*vask*/ 10,
+            9.99,
+            test_band(),
+        );
+        assert!(
+            !ok.zero_depth && !ok.depth_one_sided,
+            "healthy depth → no signal"
+        );
         assert!(ok.reason.is_none());
     }
 
@@ -2440,9 +2592,27 @@ mod tests {
     #[test]
     fn reject_dominant_is_warn_not_fail() {
         // 5 rejected vs 2 accepted → dominant WARN, no FAIL.
-        let dom = eval_invariant(100.0, 100.1, 0, 1, /*accepted*/ 2, /*rejected*/ 5, 100, 100, 9.99, test_band());
-        assert!(dom.reject_dominant, "rejected>accepted → reject_dominant WARN");
-        assert!(dom.reason.is_none(), "reject dominance is WARN, not FAIL: {:?}", dom.reason);
+        let dom = eval_invariant(
+            100.0,
+            100.1,
+            0,
+            1,
+            /*accepted*/ 2,
+            /*rejected*/ 5,
+            100,
+            100,
+            9.99,
+            test_band(),
+        );
+        assert!(
+            dom.reject_dominant,
+            "rejected>accepted → reject_dominant WARN"
+        );
+        assert!(
+            dom.reason.is_none(),
+            "reject dominance is WARN, not FAIL: {:?}",
+            dom.reason
+        );
 
         // Equal → NOT dominant (strictly greater required).
         let eq = eval_invariant(100.0, 100.1, 0, 1, 3, 3, 100, 100, 9.99, test_band());
@@ -2478,7 +2648,14 @@ mod tests {
         let mut src = Vec::new();
         for k in 0..6i64 {
             let ts = 1_700_000_000_000 + k * BAR_MS_S10; // grid-aligned at 10s & 60s
-            src.push(ohlc_row(ts, 100.0, 10 + k as u64, 20 + k as u64, 1 + k as u32, 8 + k as u16));
+            src.push(ohlc_row(
+                ts,
+                100.0,
+                10 + k as u64,
+                20 + k as u64,
+                1 + k as u32,
+                8 + k as u16,
+            ));
         }
         let mut samples = Vec::new();
         let viol = check_rollup_parity("1m", &src, 60_000, 10, &mut samples);
@@ -2518,15 +2695,27 @@ mod tests {
     fn fix6_k_plausibility_band() {
         let (lo, hi) = (0.05f64, 4.0f64);
         // Out of band → implausible.
-        assert!(!(10.0f64 >= lo && 10.0 <= hi), "k=10 outside [0.05,4.0] → FAIL");
-        assert!(!(0.001f64 >= lo && 0.001 <= hi), "k=0.001 below floor → FAIL");
+        assert!(
+            !(10.0f64 >= lo && 10.0 <= hi),
+            "k=10 outside [0.05,4.0] → FAIL"
+        );
+        assert!(
+            !(0.001f64 >= lo && 0.001 <= hi),
+            "k=0.001 below floor → FAIL"
+        );
         // In band, mid → clean (no clamp WARN).
         let k_mid = 0.334f64; // observed BTC k
         assert!(k_mid >= lo && k_mid <= hi, "mid-band k in envelope");
-        assert!((k_mid / hi - 1.0).abs() >= 0.01, "mid-band k not at ceiling → no clamp WARN");
+        assert!(
+            (k_mid / hi - 1.0).abs() >= 0.01,
+            "mid-band k not at ceiling → no clamp WARN"
+        );
         // SOL sentinel k=3.995 → in band but within 1% of ceiling → clamp WARN.
         let k_sol = 3.995f64;
         assert!(k_sol >= lo && k_sol <= hi, "3.995 is within [0.05,4.0]");
-        assert!((k_sol / hi - 1.0).abs() < 0.01, "3.995 within 1% of 4.0 ceiling → clamp WARN");
+        assert!(
+            (k_sol / hi - 1.0).abs() < 0.01,
+            "3.995 within 1% of 4.0 ceiling → clamp WARN"
+        );
     }
 }

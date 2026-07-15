@@ -8,11 +8,13 @@ use chrono::NaiveDate;
 use mitch::common::message_type;
 use mitch::header::MitchHeader;
 use mitch::index::Index;
-use mitch::timestamp::{from_epoch_ms, to_epoch_ms};
+use mitch::timestamp::from_epoch_ms;
 use nxr_sdk::ipc::record::IndexRecord;
+#[cfg(test)]
+use nxr_sdk::shard::FLAG_RENKO_SYNTHETIC_BRICK;
 use nxr_sdk::shard::{
     idx_dir, list_shards, read_shard_aligned, shard_path, today_utc, ts_ms_to_utc_date,
-    write_shard_atomic, FLAG_IDX_HEALED, FLAG_RENKO_SYNTHETIC_BRICK, ShardRecord,
+    write_shard_atomic, ShardRecord, FLAG_IDX_HEALED,
 };
 use nxr_sdk::tdwap::{decode_ci_ubp, encode_ci_ubp};
 use std::collections::BTreeMap;
@@ -176,7 +178,11 @@ pub fn heal_ticker_shards(
     let shards_out = touched_dates.len();
 
     if misrouted_dropped > 0 {
-        warn!(ticker_id, dropped = misrouted_dropped, "removed mis-routed records");
+        warn!(
+            ticker_id,
+            dropped = misrouted_dropped,
+            "removed mis-routed records"
+        );
     }
 
     if dry_run {
@@ -199,14 +205,20 @@ pub fn heal_ticker_shards(
     if let Some(src) = &today_src {
         let date = today;
         let dst = shard_path(&staging, date, "idx");
-        fs::copy(src, &dst)
-            .with_context(|| format!("passthrough live shard {} → {}", src.display(), dst.display()))?;
+        fs::copy(src, &dst).with_context(|| {
+            format!(
+                "passthrough live shard {} → {}",
+                src.display(),
+                dst.display()
+            )
+        })?;
         info!(date = %date, "copied live current-day shard into staging verbatim (passthrough)");
     }
 
     if commit {
-        let _lock = nxr_sdk::shard::acquire_idx_writer_lock(&dir)
-            .context("cannot commit heal while live idx writer holds lock — scale nxr to 0 first")?;
+        let _lock = nxr_sdk::shard::acquire_idx_writer_lock(&dir).context(
+            "cannot commit heal while live idx writer holds lock — scale nxr to 0 first",
+        )?;
         let bak = dir.with_extension(format!(
             "bak-{}",
             chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
@@ -432,7 +444,12 @@ fn merge_chunk(chunk: &[IndexRecord], target_ms: i64) -> Result<IndexRecord> {
         chunk.iter().map(|r| r.index.ci).max().unwrap_or(0)
     };
 
-    let mut header = MitchHeader::new(message_type::INDEX, provider_id, bin_mts, input_count.max(1));
+    let mut header = MitchHeader::new(
+        message_type::INDEX,
+        provider_id,
+        bin_mts,
+        input_count.max(1),
+    );
     // Sequence is re-stamped to HEALED_SEQUENCE (0) by the caller after ts-routing;
     // value here is irrelevant. See HEALED_SEQUENCE for why healed seq is sentinel.
     header.set_sequence(HEALED_SEQUENCE);
@@ -459,7 +476,9 @@ mod tests {
     use super::*;
     use mitch::header::MitchHeader;
     use nxr_sdk::ipc::record::IndexRecord;
-    use nxr_sdk::shard::{list_shards, read_shard_aligned, shard_path, write_shard_atomic, ShardRecord};
+    use nxr_sdk::shard::{
+        list_shards, read_shard_aligned, shard_path, write_shard_atomic, ShardRecord,
+    };
 
     fn rec(ts: i64, bid: f64) -> IndexRecord {
         let id = nxr_sdk::resolve_ticker_id("BTC/USDT");
@@ -545,7 +564,11 @@ mod tests {
         heal_ticker_shards(&root, id, 100, false, true).unwrap();
         let shards = list_shards(&idx_dir(&root, id), "idx").unwrap();
         // Two distinct day-shards expected.
-        assert_eq!(shards.len(), 2, "record past midnight must land in next day's shard");
+        assert_eq!(
+            shards.len(),
+            2,
+            "record past midnight must land in next day's shard"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -586,12 +609,18 @@ mod tests {
 
         let rep = heal_ticker_shards(&root, id, 100, false, true).unwrap();
         // Only the past shard's records were healed (today's excluded).
-        assert_eq!(rep.records_in, 2, "today's shard not read into the heal pass");
+        assert_eq!(
+            rep.records_in, 2,
+            "today's shard not read into the heal pass"
+        );
 
         let shards = list_shards(&idx_dir(&root, id), "idx").unwrap();
         let dates: Vec<NaiveDate> = shards.iter().map(|(d, _)| *d).collect();
         assert!(dates.contains(&past), "past-day shard healed + present");
-        assert!(dates.contains(&today), "today's live shard carried through swap");
+        assert!(
+            dates.contains(&today),
+            "today's live shard carried through swap"
+        );
 
         // Today's shard is byte-identical to the original live data (verbatim
         // passthrough — NOT healed, NOT flagged).

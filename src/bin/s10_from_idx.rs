@@ -21,10 +21,10 @@ use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
 use nxr_sdk::bar_builder::flat_bar;
 use nxr_sdk::shard::ShardStream;
-use nxr_sdk::{BarAccumulator, resolve_ticker_id};
+use nxr_sdk::{resolve_ticker_id, BarAccumulator};
 use series_factory::sharding::{
-    bars_dir, idx_dir, list_shards, manifest_path, read_manifest, shard_path,
-    ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
+    bars_dir, idx_dir, list_shards, manifest_path, read_manifest, shard_path, ts_ms_to_utc_date,
+    write_manifest, write_shard_atomic, Manifest,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -165,64 +165,64 @@ fn main() -> Result<()> {
         info!(date = %date, path = %path.display(), "reading input shard");
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
         while let Some(chunk) = stream.next_chunk()? {
-          for rec in chunk {
-            // SEAM PARITY: skip heartbeat sentinels (mirror live bars_s10.rs:198).
-            // Sentinels carry stale bid/ask; ingesting offline (but not live)
-            // poisons the s10 OHLC → vol-ring σ → hist↔live seam drift.
-            if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
-                n_skipped += 1;
-                continue;
-            }
-            let ts_ms = timestamp::to_epoch_ms(rec.header.get_timestamp());
-            let idx = rec.index;
-            let bid = idx.bid;
-            let ask = idx.ask;
-            let mid = (bid + ask) * 0.5;
-            if !(mid.is_finite() && mid > 0.0) {
-                n_skipped += 1;
-                continue;
-            }
-            n_input += 1;
-
-            let bucket = ts_ms.div_euclid(args.bucket_ms) * args.bucket_ms;
-            match cur_bucket {
-                None => {
-                    cur_bucket = Some(bucket);
-                }
-                Some(cb) if bucket > cb => {
-                    if let Some(mut bar) = accum.flush() {
-                        bar.kind = BarKind::Kline as u8;
-                        // Grid-snap to the closed bucket `cb` (offline == live).
-                        stamp_grid(&mut bar, cb, args.bucket_ms);
-                        if bar.close > 0.0 && bar.close.is_finite() {
-                            last_close = bar.close;
-                        }
-                        flush_bar(&mut bars_by_date, bar);
-                    }
-                    // GAPLESS fill: emit a flat bar for each empty bucket strictly
-                    // between the just-closed bucket and the new one.
-                    fill_gap(&mut bars_by_date, cb, bucket, last_close, &mut n_flat);
-                    cur_bucket = Some(bucket);
-                }
-                Some(cb) if bucket < cb => {
+            for rec in chunk {
+                // SEAM PARITY: skip heartbeat sentinels (mirror live bars_s10.rs:198).
+                // Sentinels carry stale bid/ask; ingesting offline (but not live)
+                // poisons the s10 OHLC → vol-ring σ → hist↔live seam drift.
+                if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
                     n_skipped += 1;
                     continue;
                 }
-                _ => {}
-            }
+                let ts_ms = timestamp::to_epoch_ms(rec.header.get_timestamp());
+                let idx = rec.index;
+                let bid = idx.bid;
+                let ask = idx.ask;
+                let mid = (bid + ask) * 0.5;
+                if !(mid.is_finite() && mid > 0.0) {
+                    n_skipped += 1;
+                    continue;
+                }
+                n_input += 1;
 
-            let ci_ubp = nxr_sdk::tdwap::decode_ci_ubp(idx.ci);
-            accum.ingest(
-                bid,
-                ask,
-                idx.vbid,
-                idx.vask,
-                ts_ms,
-                ci_ubp,
-                idx.accepted as u32,
-                idx.rejected as u32,
-            );
-          }
+                let bucket = ts_ms.div_euclid(args.bucket_ms) * args.bucket_ms;
+                match cur_bucket {
+                    None => {
+                        cur_bucket = Some(bucket);
+                    }
+                    Some(cb) if bucket > cb => {
+                        if let Some(mut bar) = accum.flush() {
+                            bar.kind = BarKind::Kline as u8;
+                            // Grid-snap to the closed bucket `cb` (offline == live).
+                            stamp_grid(&mut bar, cb, args.bucket_ms);
+                            if bar.close > 0.0 && bar.close.is_finite() {
+                                last_close = bar.close;
+                            }
+                            flush_bar(&mut bars_by_date, bar);
+                        }
+                        // GAPLESS fill: emit a flat bar for each empty bucket strictly
+                        // between the just-closed bucket and the new one.
+                        fill_gap(&mut bars_by_date, cb, bucket, last_close, &mut n_flat);
+                        cur_bucket = Some(bucket);
+                    }
+                    Some(cb) if bucket < cb => {
+                        n_skipped += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                let ci_ubp = nxr_sdk::tdwap::decode_ci_ubp(idx.ci);
+                accum.ingest(
+                    bid,
+                    ask,
+                    idx.vbid,
+                    idx.vask,
+                    ts_ms,
+                    ci_ubp,
+                    idx.accepted as u32,
+                    idx.rejected as u32,
+                );
+            }
         }
     }
     // flush final open bucket (no trailing gap-fill: gapless only spans
@@ -312,9 +312,9 @@ mod tests {
         // All bands are post-2010 (the mitch epoch); pre-epoch inputs saturate
         // to 0 in `from_epoch_ms`, which is irrelevant to live↔offline parity.
         let bands: [i64; 3] = [
-            1_300_000_000_000,       // ~2011-03 (just past the mitch epoch)
-            1_700_000_000_000,       // ~2023-11
-            4_100_000_000_000,       // ~2099
+            1_300_000_000_000, // ~2011-03 (just past the mitch epoch)
+            1_700_000_000_000, // ~2023-11
+            4_100_000_000_000, // ~2099
         ];
         let mut checked = 0u64;
         for &base in &bands {
@@ -358,6 +358,9 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 15_000, "SEAM-4 must sweep ≥15k boundaries, got {checked}");
+        assert!(
+            checked >= 15_000,
+            "SEAM-4 must sweep ≥15k boundaries, got {checked}"
+        );
     }
 }

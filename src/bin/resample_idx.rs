@@ -108,7 +108,9 @@ use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
-#[command(about = "Down-sample sharded MITCH .idx AppendLogs to a coarser cadence (last-in-bucket).")]
+#[command(
+    about = "Down-sample sharded MITCH .idx AppendLogs to a coarser cadence (last-in-bucket)."
+)]
 struct Args {
     /// `indexes/` root containing `<ticker_id>/<YYYY-MM-DD>.idx` shards.
     #[arg(long)]
@@ -304,7 +306,9 @@ fn collect_shards(root: &Path, only: Option<&str>) -> Result<Vec<ShardRef>> {
             });
         }
     }
-    out.sort_by(|a, b| (a.ticker.as_str(), a.date.as_str()).cmp(&(b.ticker.as_str(), b.date.as_str())));
+    out.sort_by(|a, b| {
+        (a.ticker.as_str(), a.date.as_str()).cmp(&(b.ticker.as_str(), b.date.as_str()))
+    });
     Ok(out)
 }
 
@@ -465,7 +469,9 @@ fn is_already_target(records: &[IndexRecord], target_ms: i64) -> bool {
     if records.len() < 2 {
         return false;
     }
-    let all_healed = records.iter().all(|r| (r.index.flags & FLAG_IDX_HEALED) != 0);
+    let all_healed = records
+        .iter()
+        .all(|r| (r.index.flags & FLAG_IDX_HEALED) != 0);
     all_healed && median_spacing(records) == target_ms
 }
 
@@ -538,9 +544,9 @@ fn verify_invariants(
     //     preserved (we never set or clear it). Every new row's flag bit must
     //     have come from some old row (last-in-bucket copies verbatim) — i.e.
     //     if NO old row had it set, no new row may have it set.
-    let old_any_fresh = old.iter().any(|r| {
-        (r.index.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0
-    });
+    let old_any_fresh = old
+        .iter()
+        .any(|r| (r.index.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0);
     if !old_any_fresh {
         if let Some(bad) = new
             .iter()
@@ -746,7 +752,10 @@ mod tests {
             .map(|i| rec(ticker, t0 + i * 100, 50.0 + i as f64, 3, 0))
             .collect();
         let once = resample_last_in_bucket(&first, 200);
-        assert!(is_already_target(&once, 200), "post-pass shard is at target");
+        assert!(
+            is_already_target(&once, 200),
+            "post-pass shard is at target"
+        );
         let twice = resample_last_in_bucket(&once, 200);
         assert_eq!(once.len(), twice.len(), "re-run count stable");
         for (a, b) in once.iter().zip(&twice) {
@@ -763,10 +772,7 @@ mod tests {
     fn plan_excludes_today_includes_past() {
         use nxr_sdk::shard::{date_stem, idx_dir, shard_path, today_utc, write_shard_atomic};
 
-        let root = std::env::temp_dir().join(format!(
-            "resample_skip_today_{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("resample_skip_today_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let ticker_id: u64 = 42;
         let dir = idx_dir(&root, ticker_id);
@@ -797,7 +803,11 @@ mod tests {
             !dates.contains(&date_stem(today).as_str()),
             "today's live-open shard must be EXCLUDED from the plan: {dates:?}"
         );
-        assert_eq!(plan.len(), 1, "exactly the one past-day shard, today skipped");
+        assert_eq!(
+            plan.len(),
+            1,
+            "exactly the one past-day shard, today skipped"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

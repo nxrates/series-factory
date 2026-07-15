@@ -58,8 +58,8 @@ pub struct VolWriter {
 
 impl VolWriter {
     pub fn new(path: &Path) -> Result<Self> {
-        let log = AppendLog::open(path)
-            .with_context(|| format!("open vol file: {}", path.display()))?;
+        let log =
+            AppendLog::open(path).with_context(|| format!("open vol file: {}", path.display()))?;
         Ok(Self { log })
     }
 
@@ -93,7 +93,9 @@ unsafe impl Sync for VolMmap {}
 
 impl nxr_sdk::vol::VolSource for VolMmap {
     #[inline]
-    fn len(&self) -> usize { self.records.len() }
+    fn len(&self) -> usize {
+        self.records.len()
+    }
 
     #[inline]
     fn sigma_pct(&self, i: usize) -> f64 {
@@ -117,8 +119,8 @@ impl nxr_sdk::vol::VolSource for VolMmap {
 
 impl VolMmap {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)
-            .with_context(|| format!("open vol file: {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("open vol file: {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file)? };
 
         let rec_size = std::mem::size_of::<VolRecord>();
@@ -132,16 +134,20 @@ impl VolMmap {
         }
         let n = mmap.len() / rec_size;
 
-        let records: &[VolRecord] = unsafe {
-            std::slice::from_raw_parts(mmap.as_ptr() as *const VolRecord, n)
-        };
+        let records: &[VolRecord] =
+            unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const VolRecord, n) };
         let records: &'static [VolRecord] = unsafe { &*(records as *const [VolRecord]) };
 
-        Ok(Self { _mmap: mmap, records })
+        Ok(Self {
+            _mmap: mmap,
+            records,
+        })
     }
 
     /// Underlying vol records (timestamp + sigma).
-    pub fn records(&self) -> &[VolRecord] { self.records }
+    pub fn records(&self) -> &[VolRecord] {
+        self.records
+    }
 }
 
 #[cfg(test)]

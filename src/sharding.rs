@@ -4,7 +4,7 @@
 //! truth for path math (MITCH-ID keyed), atomic writers, sha256, and manifest
 //! read/write/merge. This module is now a re-export-only thin wrapper.
 //!
-//! Layout (canonical, post-U3/U4):
+//! Layout (canonical):
 //! - indexes: `<root>/indexes/<MITCH_ID>/<YYYY-MM-DD>.idx`  (sdk `idx_dir`)
 //! - bars:    `<root>/bars/<MITCH_ID>/<YYYY-MM-DD>.<ext>`  (sdk `bars_dir`)
 //!
@@ -16,7 +16,7 @@
 // Re-export the canonical primitives so existing call sites keep compiling
 // unchanged. These are the single source of truth in `nxr_sdk::shard`.
 pub use nxr_sdk::shard::{
-    date_stem, idx_dir, bars_dir, list_shards, manifest_path, read_manifest, sha256_file,
+    bars_dir, date_stem, idx_dir, list_shards, manifest_path, read_manifest, sha256_file,
     shard_path, ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest, ShardEntry,
 };
 
@@ -42,7 +42,11 @@ mod tests {
         let id = nxr_sdk::resolve_ticker_id("BTC/USDT");
         let ticker_dir = idx_dir(&tmp_root, id);
         std::fs::create_dir_all(&ticker_dir).unwrap();
-        let p = shard_path(&ticker_dir, NaiveDate::from_ymd_opt(2024, 5, 21).unwrap(), "idx");
+        let p = shard_path(
+            &ticker_dir,
+            NaiveDate::from_ymd_opt(2024, 5, 21).unwrap(),
+            "idx",
+        );
         write_shard_atomic(&p, b"hello").unwrap();
         let bytes = fs::read(&p).unwrap();
         assert_eq!(bytes, b"hello");
@@ -50,8 +54,7 @@ mod tests {
     }
 }
 
-// ── Shared offline .idx shard writing (extracted from merge_idx 2026-07-08;
-// used by merge-idx + pyth-backfill) ─────────────────────────────────────────
+// ── Shared offline .idx shard writing (extracted from merge_idx 2026-07-08) ──
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -96,10 +99,7 @@ impl ShardedWriter {
 
     pub fn append(&mut self, ts_ms: i64, rec: &IndexRecord) -> Result<()> {
         // Same-day fast path: in-window ts ⇒ no rotation, no chrono conversion.
-        if ts_ms >= self.cur_day_start_ms
-            && ts_ms < self.cur_day_end_ms
-            && self.current.is_some()
-        {
+        if ts_ms >= self.cur_day_start_ms && ts_ms < self.cur_day_end_ms && self.current.is_some() {
             self.current.as_mut().unwrap().1.append(rec)?;
             return Ok(());
         }
@@ -119,9 +119,13 @@ impl ShardedWriter {
             // pre-existing shard (re-runs must converge, never append-double).
             if self.touched.insert(date) {
                 match std::fs::remove_file(&path) {
-                    Ok(()) => tracing::info!(shard = %path.display(), "replacing existing shard (idempotent re-run)"),
+                    Ok(()) => {
+                        tracing::info!(shard = %path.display(), "replacing existing shard (idempotent re-run)")
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e).with_context(|| format!("truncate shard {}", path.display())),
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("truncate shard {}", path.display()))
+                    }
                 }
             }
             // OFFLINE builder: buffered AppendLog (256 KiB BufWriter). The merge
@@ -149,7 +153,11 @@ pub fn shard_entry_for_idx(date: NaiveDate, path: &Path) -> Result<ShardEntry> {
     use std::io::Read;
     let rec_size = core::mem::size_of::<IndexRecord>();
     let size_bytes = std::fs::metadata(path)?.len();
-    let n_records = if rec_size == 0 { 0 } else { size_bytes / rec_size as u64 };
+    let n_records = if rec_size == 0 {
+        0
+    } else {
+        size_bytes / rec_size as u64
+    };
     let mut f = std::fs::File::open(path)?;
     let mut first_ts: i64 = i64::MAX;
     let mut last_ts: i64 = i64::MIN;

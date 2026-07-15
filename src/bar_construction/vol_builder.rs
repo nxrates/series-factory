@@ -1,8 +1,7 @@
 //! Canonical 30-min Rogers-Satchell sigma builder over s10 OHLC.
 //!
 //! Single source of truth for the `.vol` file construction shared by every
-//! offline pipeline (`nxr-calibrate`, `generate-renko-from-ticks`,
-//! the renko-from-idx bins). The ratified vol basis
+//! offline pipeline (`nxr-calibrate` and the renko-from-idx bins). The ratified vol basis
 //! (2026-06): the canonical per-bin σ is the Rogers-Satchell range estimator
 //! over s10-resampled 30-min OHLC, with `offline == live` byte-for-byte.
 //!
@@ -120,8 +119,12 @@ where
         let key = (ts / BAR_MS_S10) * BAR_MS_S10;
         s10.entry(key)
             .and_modify(|o| {
-                if mid > o.high { o.high = mid; }
-                if mid < o.low { o.low = mid; }
+                if mid > o.high {
+                    o.high = mid;
+                }
+                if mid < o.low {
+                    o.low = mid;
+                }
                 o.close = mid;
                 o.tick_count = o.tick_count.saturating_add(1);
             })

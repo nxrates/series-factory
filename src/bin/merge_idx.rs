@@ -24,25 +24,22 @@
 //!         + `$NXR_DATA_INDEXES/<MITCH_ID>/manifest.json`
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
 use clap::Parser;
 use mitch::common::message_type;
 use mitch::header::MitchHeader;
 use nxr_sdk::{
     compute_vwap_at,
-    ipc::append_log::AppendLog,
     ipc::record::IndexRecord,
     resolve_ticker_id,
     shard::{FLAG_HISTORICAL_BACKFILL, FLAG_NO_BOOK},
     tdwap::ProviderEntry,
 };
 use series_factory::sharding::{
-    list_shards, manifest_path, shard_entry_for_idx, shard_path, ts_ms_to_utc_date, Manifest,
-    ShardedWriter, write_manifest,
+    list_shards, manifest_path, shard_entry_for_idx, write_manifest, Manifest, ShardedWriter,
 };
 use std::collections::BinaryHeap;
-use std::path::{Path, PathBuf};
-// Δ1.C: `ProviderEntry::last_update` is now `coarsetime::Instant` (u64,
+use std::path::PathBuf;
+// `ProviderEntry::last_update` is `coarsetime::Instant` (u64,
 // `Copy`). The offline merger still wants a simulated clock anchored at the
 // earliest record, so we keep the `anchor + offset` pattern but switch the
 // underlying clock type. `coarsetime::Duration::from_millis` and
@@ -127,7 +124,8 @@ fn main() -> Result<()> {
              cexs.exchanges in config.yml (path={})",
             nxr_sdk::pipeline_config::PipelineYml::resolve_path(
                 nxr_sdk::pipeline_config::ConfigHint::Bin
-            ).display()
+            )
+            .display()
         );
     }
 
@@ -136,7 +134,7 @@ fn main() -> Result<()> {
     let ticker_str = format!("{}-{}", base_uc, quote_uc);
     let ticker_id = resolve_ticker_id(&format!("{}/{}", base_uc, quote_uc));
     let indexes_dir = PathBuf::from(&cfg.indexes_dir);
-    // shard root = <indexes_dir>/<MITCH_ID>/  (canonical MITCH-keyed, U3/U4)
+    // shard root = <indexes_dir>/<MITCH_ID>/  (canonical MITCH-keyed)
     let out_dir = args
         .out_dir
         .clone()
@@ -202,7 +200,10 @@ fn main() -> Result<()> {
     let mut composites_written: u64 = 0;
     let mut updates: u64 = 0;
 
-    while let Some(HeapEntry { ts_ms, source_idx, .. }) = heap.pop() {
+    while let Some(HeapEntry {
+        ts_ms, source_idx, ..
+    }) = heap.pop()
+    {
         let rec = sources[source_idx].pop().unwrap();
         updates += 1;
         let now = sim_now(ts_ms);
@@ -304,8 +305,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-
-
 fn resolve_weights(args: &Args) -> Result<std::collections::BTreeMap<String, f64>> {
     let mut m: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
 
@@ -320,9 +319,15 @@ fn resolve_weights(args: &Args) -> Result<std::collections::BTreeMap<String, f64
     );
     if let Ok(s) = std::fs::read_to_string(&cfg_path) {
         if let Ok(v) = serde_yml::from_str::<serde_yml::Value>(&s) {
-            if let Some(ex) = v.get("cexs").and_then(|c| c.get("exchanges")).and_then(|e| e.as_mapping()) {
+            if let Some(ex) = v
+                .get("cexs")
+                .and_then(|c| c.get("exchanges"))
+                .and_then(|e| e.as_mapping())
+            {
                 for (k, body) in ex {
-                    if let (Some(name), Some(w)) = (k.as_str(), body.get("weight").and_then(|x| x.as_f64())) {
+                    if let (Some(name), Some(w)) =
+                        (k.as_str(), body.get("weight").and_then(|x| x.as_f64()))
+                    {
                         m.insert(name.to_string(), w);
                     }
                 }
@@ -343,7 +348,10 @@ fn resolve_weights(args: &Args) -> Result<std::collections::BTreeMap<String, f64
         let (k, v) = spec
             .split_once('=')
             .with_context(|| format!("bad --weight spec {:?}; expected name=number", spec))?;
-        let w: f64 = v.trim().parse().with_context(|| format!("bad weight {:?}", v))?;
+        let w: f64 = v
+            .trim()
+            .parse()
+            .with_context(|| format!("bad weight {:?}", v))?;
         m.insert(k.trim().to_string(), w);
     }
     Ok(m)
@@ -428,7 +436,11 @@ impl SourceStream {
             return Ok(());
         }
         if filled % rec_size != 0 {
-            anyhow::bail!("short read {} not aligned to IndexRecord {}", filled, rec_size);
+            anyhow::bail!(
+                "short read {} not aligned to IndexRecord {}",
+                filled,
+                rec_size
+            );
         }
         let slice: &[IndexRecord] = bytemuck::cast_slice(&self.raw[..filled]);
         self.buf.clear();

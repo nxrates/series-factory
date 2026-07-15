@@ -93,7 +93,11 @@ fn seam8_sentinel_skip_offline_matches_sentinel_free() {
         s_with.len(),
         s_clean.len()
     );
-    assert_eq!(s_clean.len(), 2_000, "expected exactly the real ticks to survive");
+    assert_eq!(
+        s_clean.len(),
+        2_000,
+        "expected exactly the real ticks to survive"
+    );
 
     for (i, (a, b)) in s_with.iter().zip(&s_clean).enumerate() {
         assert_eq!(a.0, b.0, "SEAM-8 ts divergence @ {i}: {} != {}", a.0, b.0);

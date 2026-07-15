@@ -126,7 +126,9 @@ fn skip_if_no_bin() -> bool {
 
 #[test]
 fn idx_good_file_clean() {
-    if skip_if_no_bin() { return; }
+    if skip_if_no_bin() {
+        return;
+    }
     let mut recs: Vec<IndexRecord> = Vec::new();
     let t0 = 1_700_000_000_000;
     for i in 0..32 {
@@ -135,13 +137,19 @@ fn idx_good_file_clean() {
     let bytes: &[u8] = bytemuck::cast_slice(&recs);
     let path = write_file("good.idx", bytes);
     let (code, _stdout, stderr) = run(&["idx", path.to_str().unwrap()]);
-    assert_eq!(code, 0, "expected clean exit, got {}; stderr={}", code, stderr);
+    assert_eq!(
+        code, 0,
+        "expected clean exit, got {}; stderr={}",
+        code, stderr
+    );
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn idx_truncated_file_errors() {
-    if skip_if_no_bin() { return; }
+    if skip_if_no_bin() {
+        return;
+    }
     // 56 + 30 bytes → not a multiple of 56.
     let mut recs: Vec<IndexRecord> = Vec::new();
     recs.push(good_record(1_700_000_000_000, 100.0, 100.1));
@@ -150,7 +158,11 @@ fn idx_truncated_file_errors() {
     bytes.extend_from_slice(&[0u8; 30]);
     let path = write_file("truncated.idx", &bytes);
     let (code, _stdout, stderr) = run(&["idx", path.to_str().unwrap()]);
-    assert_eq!(code, 2, "expected error exit, got {}; stderr={}", code, stderr);
+    assert_eq!(
+        code, 2,
+        "expected error exit, got {}; stderr={}",
+        code, stderr
+    );
     assert!(
         stderr.contains("truncated"),
         "expected 'truncated' in stderr, got: {}",
@@ -161,7 +173,9 @@ fn idx_truncated_file_errors() {
 
 #[test]
 fn idx_non_monotone_ts_errors() {
-    if skip_if_no_bin() { return; }
+    if skip_if_no_bin() {
+        return;
+    }
     let mut recs: Vec<IndexRecord> = Vec::new();
     recs.push(good_record(1_700_000_000_000, 100.0, 100.1));
     recs.push(good_record(1_700_000_000_100, 100.0, 100.1));
@@ -184,7 +198,9 @@ fn idx_non_monotone_ts_errors() {
 
 #[test]
 fn idx_crossed_quote_errors() {
-    if skip_if_no_bin() { return; }
+    if skip_if_no_bin() {
+        return;
+    }
     // ask < bid is rejected by Index::validate inside check_idx.
     let mut recs: Vec<IndexRecord> = Vec::new();
     recs.push(good_record(1_700_000_000_000, 100.5, 100.0));
@@ -193,8 +209,7 @@ fn idx_crossed_quote_errors() {
     let (code, _stdout, stderr) = run(&["idx", path.to_str().unwrap()]);
     assert_eq!(code, 2);
     assert!(
-        stderr.to_lowercase().contains("ask")
-            || stderr.contains("Index::validate"),
+        stderr.to_lowercase().contains("ask") || stderr.contains("Index::validate"),
         "expected crossed-quote error, got: {}",
         stderr
     );
@@ -203,7 +218,9 @@ fn idx_crossed_quote_errors() {
 
 #[test]
 fn vol_nan_sigma_errors() {
-    if skip_if_no_bin() { return; }
+    if skip_if_no_bin() {
+        return;
+    }
     let rows = [
         vol_row(1_700_000_000_000, 0.01),
         vol_row(1_700_000_000_100, f64::NAN),
@@ -224,7 +241,9 @@ fn vol_nan_sigma_errors() {
 
 #[test]
 fn bars_renko_discontinuity_errors() {
-    if skip_if_no_bin() { return; }
+    if skip_if_no_bin() {
+        return;
+    }
     // Two renko bars where bar2.open != bar1.close.
     let b1 = make_bar(
         1_700_000_000_000,

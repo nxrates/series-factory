@@ -1,4 +1,4 @@
-//! Renko continuity verifier — Sprint M1.
+//! Renko continuity verifier.
 //!
 //! Cross-shard validation NOT covered by `integrity-check bars`:
 //!   - B03 across day boundary: `close[shard_D.last] == open[shard_D+1.first]`
@@ -288,7 +288,12 @@ fn check_ticker_s10(ticker_dir: &Path, ticker_id: u64) -> Result<Option<S10Ticke
         .filter(|b| b.violated)
         .cloned()
         .collect::<Vec<_>>();
-    sorted.sort_by(|a, b| b.residual_ms.abs().partial_cmp(&a.residual_ms.abs()).unwrap());
+    sorted.sort_by(|a, b| {
+        b.residual_ms
+            .abs()
+            .partial_cmp(&a.residual_ms.abs())
+            .unwrap()
+    });
     let worst_grid = sorted.into_iter().take(5).collect();
 
     Ok(Some(S10TickerReport {
@@ -333,7 +338,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let bars_root = cli.common.data_root.join("bars");
     if !bars_root.exists() {
-        anyhow::bail!("data root has no bars/ subdirectory: {}", bars_root.display());
+        anyhow::bail!(
+            "data root has no bars/ subdirectory: {}",
+            bars_root.display()
+        );
     }
 
     let mut per_ticker: BTreeMap<String, TickerReport> = BTreeMap::new();
@@ -423,7 +431,16 @@ fn main() -> Result<()> {
         println!();
         println!(
             "{:<22} {:>6} {:>10} {:>9} {:>9} {:>9} {:>5} {:>5} {:>5} {:>5}",
-            "ticker_id", "shards", "bricks", "med_bpd", "mean_bpd", "mad_bpd", "min", "max", "b03", "gaps"
+            "ticker_id",
+            "shards",
+            "bricks",
+            "med_bpd",
+            "mean_bpd",
+            "mad_bpd",
+            "min",
+            "max",
+            "b03",
+            "gaps"
         );
         for (_, r) in &global.per_ticker {
             println!(
@@ -459,7 +476,11 @@ fn main() -> Result<()> {
                 for b in &r.worst_grid {
                     println!(
                         "  {} → {}: close_ts[D]={} close_ts[D+1]={} residual_ms={:.1}",
-                        b.day_from, b.day_to, b.last_close_ts_ms, b.first_close_ts_ms, b.residual_ms
+                        b.day_from,
+                        b.day_to,
+                        b.last_close_ts_ms,
+                        b.first_close_ts_ms,
+                        b.residual_ms
                     );
                 }
             }

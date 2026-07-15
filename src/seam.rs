@@ -122,7 +122,17 @@ mod tests {
     fn mk_s10_bar(bucket_open_ms: i64, open: f64, close: f64) -> Bar {
         let open_mts = timestamp::from_epoch_ms(bucket_open_ms);
         let close_mts = timestamp::from_epoch_ms(bucket_open_ms + BAR_MS_S10 - 1);
-        let mut b = Bar::new_ohlcv(open_mts, close_mts, open, open.max(close), open.min(close), close, 0, 0, 0);
+        let mut b = Bar::new_ohlcv(
+            open_mts,
+            close_mts,
+            open,
+            open.max(close),
+            open.min(close),
+            close,
+            0,
+            0,
+            0,
+        );
         b.open_ts = timestamp::encode_u48(open_mts);
         b.close_ts = timestamp::encode_u48(close_mts);
         b
@@ -157,8 +167,16 @@ mod tests {
         let last = mk_s10_bar(day_end - BAR_MS_S10, 100.0, 100.5);
         let first = mk_s10_bar(day_end, 100.5, 101.0);
         let r = check_s10_cross_shard_bars(&last, &first);
-        assert!(!r.violated, "contiguous s10 grid must not violate (delta={})", r.delta);
-        assert!(r.delta.abs() <= S10_SEAM_JITTER_MS as f64, "delta {} within jitter", r.delta);
+        assert!(
+            !r.violated,
+            "contiguous s10 grid must not violate (delta={})",
+            r.delta
+        );
+        assert!(
+            r.delta.abs() <= S10_SEAM_JITTER_MS as f64,
+            "delta {} within jitter",
+            r.delta
+        );
     }
 
     #[test]
@@ -169,7 +187,10 @@ mod tests {
         // close-to-close delta is 2×BAR_MS, residual ≈ +BAR_MS.
         let first = mk_s10_bar(day_end + BAR_MS_S10, 100.5, 101.0);
         let r = check_s10_cross_shard_bars(&last, &first);
-        assert!(r.violated, "a dropped bucket at the seam must violate s10 grid");
+        assert!(
+            r.violated,
+            "a dropped bucket at the seam must violate s10 grid"
+        );
         assert!(
             (r.delta - BAR_MS_S10 as f64).abs() <= S10_SEAM_JITTER_MS as f64,
             "dropped-bucket residual {} should be ≈ +BAR_MS",

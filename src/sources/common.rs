@@ -14,7 +14,6 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use rayon::prelude::*;
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
 
@@ -29,7 +28,7 @@ pub fn http_agent() -> Arc<ureq::Agent> {
     )
 }
 
-// ─── Archive URL resolver (phase 59.R3.C2.O4) ──────────────────────────────
+// ─── Archive URL resolver ───────────────────────────────────────────────────
 //
 // Per-exchange `archive_url_template.{monthly,daily,probe}` is YAML-driven
 // (see `nxr_sdk::pipeline_config::ExchangeYml::archive_url_template`).
@@ -44,13 +43,13 @@ pub struct ArchiveUrls {
 
 fn archive_urls_for(exch: &str) -> ArchiveUrls {
     use nxr_sdk::pipeline_config::{
-        ConfigHint, PipelineYml,
-        DEFAULT_ARCHIVE_URL_BINANCE_DAILY, DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY,
-        DEFAULT_ARCHIVE_URL_BINANCE_PROBE, DEFAULT_ARCHIVE_URL_BYBIT_DAILY,
-        DEFAULT_ARCHIVE_URL_BYBIT_MONTHLY, DEFAULT_ARCHIVE_URL_BYBIT_PROBE,
+        ConfigHint, PipelineYml, DEFAULT_ARCHIVE_URL_BINANCE_DAILY,
+        DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY, DEFAULT_ARCHIVE_URL_BINANCE_PROBE,
         DEFAULT_ARCHIVE_URL_BITGET_DAILY, DEFAULT_ARCHIVE_URL_BITGET_MONTHLY,
-        DEFAULT_ARCHIVE_URL_BITGET_PROBE, DEFAULT_ARCHIVE_URL_OKX_DAILY,
-        DEFAULT_ARCHIVE_URL_OKX_MONTHLY, DEFAULT_ARCHIVE_URL_OKX_PROBE,
+        DEFAULT_ARCHIVE_URL_BITGET_PROBE, DEFAULT_ARCHIVE_URL_BYBIT_DAILY,
+        DEFAULT_ARCHIVE_URL_BYBIT_MONTHLY, DEFAULT_ARCHIVE_URL_BYBIT_PROBE,
+        DEFAULT_ARCHIVE_URL_OKX_DAILY, DEFAULT_ARCHIVE_URL_OKX_MONTHLY,
+        DEFAULT_ARCHIVE_URL_OKX_PROBE,
     };
     let (def_m, def_d, def_p) = match exch {
         "binance" => (
@@ -91,7 +90,11 @@ fn archive_urls_for(exch: &str) -> ArchiveUrls {
         .as_ref()
         .and_then(|t| t.probe.clone())
         .unwrap_or_else(|| def_p.to_string());
-    ArchiveUrls { monthly, daily, probe }
+    ArchiveUrls {
+        monthly,
+        daily,
+        probe,
+    }
 }
 
 /// Resolve archive URLs for an exchange (cached per-exchange).
@@ -201,7 +204,11 @@ pub async fn download_to_file(
         writer.flush()?;
         drop(writer);
 
-        Ok(DownloadedArchive { path: tmp_path, bytes_got, content_length })
+        Ok(DownloadedArchive {
+            path: tmp_path,
+            bytes_got,
+            content_length,
+        })
     })
     .await?
 }
@@ -243,11 +250,18 @@ pub async fn download_to_file_retry(
                         );
                         last_err = Some(anyhow::anyhow!(
                             "truncated download {}: got {} of {} bytes",
-                            url, dl.bytes_got, expected
+                            url,
+                            dl.bytes_got,
+                            expected
                         ));
                         // `dl` drops here → temp file removed before retry.
                         if attempt + 1 < max_attempts {
-                            warn!("Attempt {}/{} truncated: {} - retrying", attempt + 1, max_attempts, url);
+                            warn!(
+                                "Attempt {}/{} truncated: {} - retrying",
+                                attempt + 1,
+                                max_attempts,
+                                url
+                            );
                         }
                         continue;
                     }
@@ -256,7 +270,12 @@ pub async fn download_to_file_retry(
             }
             Err(e) => {
                 if attempt + 1 < max_attempts {
-                    warn!("Attempt {}/{} failed: {} - retrying", attempt + 1, max_attempts, url);
+                    warn!(
+                        "Attempt {}/{} failed: {} - retrying",
+                        attempt + 1,
+                        max_attempts,
+                        url
+                    );
                 }
                 last_err = Some(e);
             }
@@ -364,7 +383,11 @@ pub fn month_ranges(from: NaiveDate, to: NaiveDate) -> Vec<(NaiveDate, NaiveDate
 /// Normalize a timestamp to milliseconds (handles microsecond timestamps).
 #[inline]
 pub fn normalize_timestamp_ms(ts: i64) -> i64 {
-    if ts > 10_000_000_000_000 { ts / 1000 } else { ts }
+    if ts > 10_000_000_000_000 {
+        ts / 1000
+    } else {
+        ts
+    }
 }
 
 // ─── Filesystem helpers ──────────���───────────────────��──────────────────────
@@ -449,7 +472,11 @@ async fn stream_as_tick_frames(
             break;
         }
         if filled % frame_size != 0 {
-            anyhow::bail!("short read {} bytes not aligned to TickFrame {}", filled, frame_size);
+            anyhow::bail!(
+                "short read {} bytes not aligned to TickFrame {}",
+                filled,
+                frame_size
+            );
         }
         let frames: &[TickFrame] = bytemuck::cast_slice(&buf[..filled]);
         let mut owned: Vec<TickFrame> = frames.to_vec();
@@ -464,11 +491,13 @@ async fn stream_as_tick_frames(
     Ok(())
 }
 
-
 // ─── Shared exchange download infrastructure ────────────────────────────────
 
 #[derive(Clone, Copy)]
-pub enum Compression { Zip, Gzip }
+pub enum Compression {
+    Zip,
+    Gzip,
+}
 
 /// Download archive (streamed to disk), stream-decompress from disk +
 /// stream-parse CSV, stream-write the `.ticks` cache file. Peak resident memory
@@ -503,8 +532,13 @@ pub enum Compression { Zip, Gzip }
 /// `.ticks` file is still written (possibly zero-length) so the caller can
 /// decide whether to keep it, delete it, or fall back to the daily archives.
 pub async fn download_and_convert<P>(
-    agent: &Arc<ureq::Agent>, url: &str, cache_path: &Path, ticker_id: u64,
-    compression: Compression, max_attempts: usize, parse_csv: &P,
+    agent: &Arc<ureq::Agent>,
+    url: &str,
+    cache_path: &Path,
+    ticker_id: u64,
+    compression: Compression,
+    max_attempts: usize,
+    parse_csv: &P,
 ) -> Result<u64>
 where
     P: Fn(&[u8], u64) -> Result<Vec<TickFrame>> + Sync,
@@ -567,13 +601,22 @@ where
                     if !file.name().ends_with(".csv") {
                         continue;
                     }
-                    stream_csv_in_chunks(BufReader::with_capacity(64 * 1024, file), CSV_CHUNK_BYTES, &mut feed)?;
+                    stream_csv_in_chunks(
+                        BufReader::with_capacity(64 * 1024, file),
+                        CSV_CHUNK_BYTES,
+                        &mut feed,
+                    )?;
                 }
             }
             Compression::Gzip => {
                 let gz_file = File::open(&archive_path)?;
-                let decoder = flate2::read::GzDecoder::new(BufReader::with_capacity(64 * 1024, gz_file));
-                stream_csv_in_chunks(BufReader::with_capacity(64 * 1024, decoder), CSV_CHUNK_BYTES, &mut feed)?;
+                let decoder =
+                    flate2::read::GzDecoder::new(BufReader::with_capacity(64 * 1024, gz_file));
+                stream_csv_in_chunks(
+                    BufReader::with_capacity(64 * 1024, decoder),
+                    CSV_CHUNK_BYTES,
+                    &mut feed,
+                )?;
             }
         }
 
@@ -690,7 +733,17 @@ where
                 used_cached_month = true;
             } else {
                 info!("Downloading monthly: {}", filename);
-                match download_and_convert(agent, &url, &cache_path, ticker_id, compression, 3, parse_csv).await {
+                match download_and_convert(
+                    agent,
+                    &url,
+                    &cache_path,
+                    ticker_id,
+                    compression,
+                    3,
+                    parse_csv,
+                )
+                .await
+                {
                     // Zero-tick monthly is NOT a success: drop the empty cache
                     // file and fall through to the daily archives, which may
                     // carry the data the monthly archive lacked (or confirm a
@@ -723,13 +776,26 @@ where
 
                 if !cache_path.exists() {
                     info!("Downloading daily: {}", filename);
-                    match download_and_convert(agent, &url, &cache_path, ticker_id, compression, 1, parse_csv).await {
+                    match download_and_convert(
+                        agent,
+                        &url,
+                        &cache_path,
+                        ticker_id,
+                        compression,
+                        1,
+                        parse_csv,
+                    )
+                    .await
+                    {
                         Ok(0) => {
                             // Empty daily archive — drop it, don't push.
                             let _ = std::fs::remove_file(&cache_path);
                             debug!("Empty {} daily archive for {}", exchange, day);
                         }
-                        Ok(n) => { month_ticks += n; files.push(cache_path); }
+                        Ok(n) => {
+                            month_ticks += n;
+                            files.push(cache_path);
+                        }
                         Err(_) => debug!("No {} data for {}", exchange, day),
                     }
                 } else {
@@ -811,9 +877,21 @@ mod tests {
 
             // ETH path is structurally identical to BNB/SOL once the symbol is
             // normalised out — proving no ETH-specific divergence by month.
-            let norm = |s: &str| s.replace("ETHUSDT", "§").replace("BNBUSDT", "§").replace("SOLUSDT", "§");
-            assert_eq!(norm(&eth_url), norm(&bnb_url), "ETH vs BNB url diverged @ {y}-{m:02}");
-            assert_eq!(norm(&eth_url), norm(&sol_url), "ETH vs SOL url diverged @ {y}-{m:02}");
+            let norm = |s: &str| {
+                s.replace("ETHUSDT", "§")
+                    .replace("BNBUSDT", "§")
+                    .replace("SOLUSDT", "§")
+            };
+            assert_eq!(
+                norm(&eth_url),
+                norm(&bnb_url),
+                "ETH vs BNB url diverged @ {y}-{m:02}"
+            );
+            assert_eq!(
+                norm(&eth_url),
+                norm(&sol_url),
+                "ETH vs SOL url diverged @ {y}-{m:02}"
+            );
 
             // Well-formed: exact expected ETH path for every month (no floor).
             assert_eq!(
@@ -834,7 +912,11 @@ mod tests {
             let (eth_url, _) = okx_monthly("ETH-USDT", y, m);
             let (bnb_url, _) = okx_monthly("BNB-USDT", y, m);
             let (sol_url, _) = okx_monthly("SOL-USDT", y, m);
-            let norm = |s: &str| s.replace("ETH-USDT", "§").replace("BNB-USDT", "§").replace("SOL-USDT", "§");
+            let norm = |s: &str| {
+                s.replace("ETH-USDT", "§")
+                    .replace("BNB-USDT", "§")
+                    .replace("SOL-USDT", "§")
+            };
             assert_eq!(norm(&eth_url), norm(&bnb_url));
             assert_eq!(norm(&eth_url), norm(&sol_url));
             assert_eq!(
@@ -854,8 +936,14 @@ mod tests {
     fn is_truncated_predicate() {
         assert!(is_truncated(100, Some(200)), "short body must be truncated");
         assert!(!is_truncated(200, Some(200)), "exact body is complete");
-        assert!(!is_truncated(201, Some(200)), "over-read (chunked) not truncated");
-        assert!(!is_truncated(0, None), "no Content-Length ⇒ cannot flag truncation");
+        assert!(
+            !is_truncated(201, Some(200)),
+            "over-read (chunked) not truncated"
+        );
+        assert!(
+            !is_truncated(0, None),
+            "no Content-Length ⇒ cannot flag truncation"
+        );
         assert!(!is_truncated(100, None), "no Content-Length ⇒ accept");
     }
 
@@ -895,7 +983,11 @@ mod tests {
         };
 
         // Complete archive → all 3 rows decode.
-        assert_eq!(decode_lines(&gz).unwrap(), 3, "complete gz must decode all rows");
+        assert_eq!(
+            decode_lines(&gz).unwrap(),
+            3,
+            "complete gz must decode all rows"
+        );
 
         // Truncated archive (drop trailing CRC/length + payload) → decode errors.
         let truncated = &gz[..gz.len() / 2];

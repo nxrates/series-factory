@@ -49,16 +49,16 @@ use clap::Parser;
 use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
 use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use nxr_sdk::resolve_ticker_id;
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, read_shard_aligned, shard_path, BarShardWriter, ShardStream,
     MS_PER_DAY,
 };
+use nxr_sdk::vol::{MtfVolCalculator, VolSource};
 use series_factory::bar_construction::{
     build_vol_from_s10, scale_to_target_k, CalibrationConfig, S10ShardIter,
 };
-use nxr_sdk::vol::{MtfVolCalculator, VolSource};
-use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
@@ -144,8 +144,8 @@ fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
 fn class_for_pair(pl: &PipelineYml, base: &str, quote: &str) -> &'static str {
     use mitch::common::InstrumentType;
     use nxr_sdk::asset_class::{
-        classify_ticker, effective_list,
-        DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
+        classify_ticker, effective_list, DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS,
+        DEFAULT_STABLECOINS,
     };
     let pair = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
     // resolve_ticker returns a TickerMatch with the wire-encoded TickerId.
@@ -161,7 +161,9 @@ fn class_for_pair(pl: &PipelineYml, base: &str, quote: &str) -> &'static str {
 
 // ── Date helpers ────────────────────────────────────────────────────────────
 
-use nxr_sdk::shard::{day_start_ms, day_range_inclusive as day_range, parse_utc_date as parse_date};
+use nxr_sdk::shard::{
+    day_range_inclusive as day_range, day_start_ms, parse_utc_date as parse_date,
+};
 
 // ── Future-dated junk wiper ─────────────────────────────────────────────────
 
@@ -261,7 +263,7 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     let ticker_id = resolve_ticker_id(&pair_str);
     let yml = &pl.series;
     let class_key = class_for_pair(pl, base, quote);
-    // Phase 60.π: per-class skip removed (operator policy "never skip a day").
+    // Per-class skip removed (operator policy "never skip a day").
     // target_for_pair → per-pair override or flat default, always returns a value.
     let target_bpd = yml.calibration.target_for_pair(&pair_str);
 
@@ -281,7 +283,11 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     let shards = list_shards(&idx_directory, "idx")?;
     if shards.is_empty() {
         warn!(pair = pair_str, "no idx shards found, skipping");
-        return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
+        return Ok(PairSummary {
+            pair: pair_str,
+            ticker_id,
+            ..Default::default()
+        });
     }
 
     let first_shard_date = shards.first().unwrap().0;
@@ -313,13 +319,21 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
 
     if from > to {
         warn!(pair = pair_str, %from, %to, "empty range, skipping");
-        return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
+        return Ok(PairSummary {
+            pair: pair_str,
+            ticker_id,
+            ..Default::default()
+        });
     }
 
     // ── Wipe future-dated junk before any write ──────────────────────────
     let removed = wipe_future_dated_junk(&bars_directory, today)?;
     if removed > 0 {
-        info!(pair = pair_str, n = removed, "removed future-dated renko shards");
+        info!(
+            pair = pair_str,
+            n = removed,
+            "removed future-dated renko shards"
+        );
     }
 
     // ── Pass 1: stream every idx shard once, building (a) the 30-min HLC
@@ -329,14 +343,12 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
     //    samples/day while the applier saw ~864k samples/day, so its `k`
     //    came out 3-5× too small and bricks fired 3-5× too often.
     //
-    //    Debate (Aoife HFT-quant ↔ Tomás storage):
-    //      - Aoife: "Cal granularity must match apply granularity, full
-    //        stop. Downsample = bias. Full ticks are non-negotiable."
-    //      - Tomás: "180d × 10 Hz × 16 B = 155 MB / ticker. RAM check?"
-    //      - Consensus: trim to longest calibration window only (i.e.
-    //        max(k_fit_windows_days) days back from `to`). 120-180d × 10 Hz ≈
-    //        130-200 MB, acceptable on 8 GiB pods. Symbols above 10 Hz are
-    //        ignored — aggregator caps records at delta-gate cadence.
+    //    Calibration granularity must match apply granularity; any downsample
+    //    biases `k`, so full ticks are non-negotiable. Memory stays bounded by
+    //    trimming to the longest calibration window only (i.e.
+    //    max(k_fit_windows_days) days back from `to`): 120-180d × 10 Hz ≈
+    //    130-200 MB, acceptable on 8 GiB pods. Symbols above 10 Hz are
+    //    ignored — the aggregator caps records at delta-gate cadence.
     // Full-tick stream feeds the per-day calibrator + brick replay. The vol
     // basis is built separately from the PERSISTED `.s10` shards (below), not
     // from idx mids, so no full-history mid buffer is collected here.
@@ -345,19 +357,16 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
 
     // Retention window for the tick stream that feeds the per-day calibrator.
     //
-    // 2-expert review (Aoife HFT-quant ↔ Tomás storage):
-    //   Aoife: "Day D's calibration needs trailing ticks back to D - max(k_fit_windows_days).
-    //    For a backfill spanning [from, to], that means we need ticks from
-    //    `from_d_start - max_window_days` onward — anchoring to `to` only keeps
-    //    the trailing window for the LAST emitted day; every earlier day gets
-    //    an empty slice → fallback to last_good_k → 22× bpd overshoot on 85%
-    //    of days. We just saw this fire in the 716462d sanity run."
-    //   Tomás: "RAM: 850 d × 10 Hz × 16 B = ~1.2 GB / pair. Pods are 8 Gi
-    //    requests / 32 Gi limits — fits with headroom. --all processes pairs
-    //    serially so peak RAM is single-pair."
-    // Consensus: anchor at `from_d_start`, not `to_d_end`. Same memory cost
-    // on a single-day backfill, much more memory on a 2-year backfill — but
-    // RAM budget allows it and correctness is non-negotiable.
+    // Day D's calibration needs trailing ticks back to
+    // D - max(k_fit_windows_days). For a backfill spanning [from, to] the
+    // stream must therefore start at `from_d_start - max_window_days`;
+    // anchoring to `to` only keeps the trailing window for the LAST emitted
+    // day — every earlier day gets an empty slice → fallback to last_good_k →
+    // 22× bpd overshoot on 85% of days (observed in a sanity run). RAM cost:
+    // 850 d × 10 Hz × 16 B ≈ 1.2 GB / pair; pods are 8 Gi requests / 32 Gi
+    // limits and `--all` processes pairs serially, so peak RAM is single-pair.
+    // Anchor at `from_d_start`, not `to_d_end`: same memory on a single-day
+    // backfill, more on a 2-year backfill, but correctness is non-negotiable.
     let max_window_days = yml.calibration.rolling_window_days;
     let from_d_start = day_start_ms(from);
     let tick_retain_from = from_d_start - (max_window_days as i64) * MS_PER_DAY;
@@ -393,7 +402,11 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
 
     if tick_stream.is_empty() {
         warn!(pair = pair_str, "no usable mid quotes after scan");
-        return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
+        return Ok(PairSummary {
+            pair: pair_str,
+            ticker_id,
+            ..Default::default()
+        });
     }
 
     // ── Build the .vol file (scratch, deleted at end). One vol file covers
@@ -420,7 +433,11 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
                 s10_dir = %bars_directory.display(),
                 "no .s10 shards — run s10-from-idx first (vol basis MUST match live/calibrator)"
             );
-            return Ok(PairSummary { pair: pair_str, ticker_id, ..Default::default() });
+            return Ok(PairSummary {
+                pair: pair_str,
+                ticker_id,
+                ..Default::default()
+            });
         }
         let mut writer = VolWriter::new(&vol_path)?;
         let mut s10_iter = S10ShardIter::new(s10_shards);
@@ -579,18 +596,11 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
             multiplier: prior_k as f32,
             min_pct: yml.renko.min_pct,
         };
-        // Hard rule (operator 2026-05-24): NO k fallback. If calibration
-        // fails (insufficient history OR all-windows-empty OR non-finite),
-        // skip the day entirely. Do NOT write a shard with a stub/last-good
-        // multiplier — that produces wrong-multiplier bricks that look like
-        // data but encode nothing meaningful.
+        // Policy history: the original rule (2026-05-24) was NO k fallback —
+        // if calibration failed, skip the day entirely rather than write a
+        // shard with a stub multiplier (wrong-multiplier bricks look like
+        // data but encode nothing meaningful).
         //
-        // 2-expert review (Aoife HFT-quant ↔ Tomás storage):
-        //   Aoife: "Stub k = garbage data downstream. Walk-forward integrity
-        //    requires every emitted day to have an actually-calibrated k.
-        //    Absence of bars in the first ~30 d of source is the correct
-        //    signal that the model is warming up."
-        //   Tomás: "Skipping is also storage-cheaper — no torn shards to heal."
         // Operator policy 2026-05-25 (revision 2): NEVER skip a day. Every day
         // must emit bricks. If the calibrator can't return a clean k for any
         // reason (insufficient history, all-windows-empty, NaN, validate
@@ -698,7 +708,12 @@ fn run_pair(args: &Args, pl: &PipelineYml, base: &str, quote: &str) -> Result<Pa
                         // prior close. The generator initialises last_close
                         // via snap_to_grid. No bar is emitted (one tick).
                         let sigma = sigma_at(d_start);
-                        let _ = gen_local.feed_tick_with_sigma(d_start, last.close, sigma, &mut |_: &Bar| Ok(()));
+                        let _ = gen_local.feed_tick_with_sigma(
+                            d_start,
+                            last.close,
+                            sigma,
+                            &mut |_: &Bar| Ok(()),
+                        );
                     }
                 }
             }
@@ -887,7 +902,10 @@ fn main() -> Result<()> {
         let median = grand_samples[grand_samples.len() / 2];
         let lo = (yml.calibration.target_bpd / 3.0).max(50.0);
         let hi = yml.calibration.target_bpd * 2.0;
-        let oob = grand_samples.iter().filter(|b| **b < lo || **b > hi).count();
+        let oob = grand_samples
+            .iter()
+            .filter(|b| **b < lo || **b > hi)
+            .count();
         eprintln!(
             "GRAND  pairs={} days={} bpd_mean={:.0} bpd_median={:.0} bpd_oob[{:.0}..{:.0}]={} target={:.0}",
             summaries.len(),
@@ -917,10 +935,10 @@ mod tests {
         let d_start = day_start_ms(NaiveDate::from_ymd_opt(2024, 5, 21).unwrap());
         let prices: Vec<(i64, f64)> = vec![
             (d_start - nxr_sdk::shard::MS_PER_DAY, 100.0), // D-1
-            (d_start - 60_000, 101.0),     // 1 min before D
-            (d_start - 1, 101.5),          // 1 ms before D
-            (d_start, 102.0),              // D start — MUST be excluded
-            (d_start + 60_000, 103.0),     // 1 min into D
+            (d_start - 60_000, 101.0),                     // 1 min before D
+            (d_start - 1, 101.5),                          // 1 ms before D
+            (d_start, 102.0),                              // D start — MUST be excluded
+            (d_start + 60_000, 103.0),                     // 1 min into D
         ];
         let cutoff = prices.partition_point(|(ts, _)| *ts < d_start);
         let trailing = &prices[..cutoff];

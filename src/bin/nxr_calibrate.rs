@@ -24,22 +24,22 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use mitch::timestamp;
 use mitch::common::InstrumentType;
+use mitch::timestamp;
 use nxr_sdk::asset_class::{
-    bucket_for_pair, effective_list, AssetClassBucket,
-    DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
+    bucket_for_pair, effective_list, AssetClassBucket, DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS,
+    DEFAULT_STABLECOINS,
 };
 use nxr_sdk::ipc::record::IndexRecord;
+use nxr_sdk::renko::{RenkoConfig, K_FLOOR, K_MAX_SAFETY};
 use nxr_sdk::shard::{list_shards, ShardStream};
+use nxr_sdk::vol::{MtfVolCalculator, VolConfig};
 use nxr_sdk::weights_schema::WeightsFile;
 use nxr_sdk::{resolve_ticker, resolve_ticker_id};
 use rayon::prelude::*;
 use series_factory::bar_construction::{
     build_vol_from_s10, scale_to_target_k, CalibrationConfig, S10ShardIter,
 };
-use nxr_sdk::vol::{MtfVolCalculator, VolConfig};
-use nxr_sdk::renko::{RenkoConfig, K_FLOOR, K_MAX_SAFETY};
 use series_factory::vol_bin::{VolMmap, VolWriter};
 use tracing::{info, warn};
 
@@ -133,12 +133,21 @@ fn drift_gate<S: nxr_sdk::vol::VolSource + ?Sized>(
     target_bpd: f64,
     fitted_k: f64,
 ) {
-    let first = match prices.first() { Some(p) => p.0, None => return };
-    let last = match prices.last() { Some(p) => p.0, None => return };
+    let first = match prices.first() {
+        Some(p) => p.0,
+        None => return,
+    };
+    let last = match prices.last() {
+        Some(p) => p.0,
+        None => return,
+    };
     const MS_PER_DAY: i64 = 86_400_000;
     let span_days = (last - first) / MS_PER_DAY;
     if span_days < 2 * DRIFT_SUBWINDOW_DAYS {
-        info!(label, ticker_id, span_days, "drift gate: window < 2× sub-window — skipped");
+        info!(
+            label,
+            ticker_id, span_days, "drift gate: window < 2× sub-window — skipped"
+        );
         return;
     }
     let start_lo = prices.partition_point(|p| p.0 < first);
@@ -149,17 +158,45 @@ fn drift_gate<S: nxr_sdk::vol::VolSource + ?Sized>(
     let end_slice = &prices[end_lo..end_hi];
     // Seed each sub-fit with the full-window fitted_k so the warm start is cheap.
     let k_start = scale_to_target_k(
-        start_slice, cal, base, vol_source, vol_cfg, sigma_cache, target_bpd, Some(fitted_k as f32)) as f64;
+        start_slice,
+        cal,
+        base,
+        vol_source,
+        vol_cfg,
+        sigma_cache,
+        target_bpd,
+        Some(fitted_k as f32),
+    ) as f64;
     let k_end = scale_to_target_k(
-        end_slice, cal, base, vol_source, vol_cfg, sigma_cache, target_bpd, Some(fitted_k as f32)) as f64;
+        end_slice,
+        cal,
+        base,
+        vol_source,
+        vol_cfg,
+        sigma_cache,
+        target_bpd,
+        Some(fitted_k as f32),
+    ) as f64;
     if !(k_start > 0.0 && k_end > 0.0) {
-        info!(label, ticker_id, k_start, k_end,
-            "drift gate: a sub-window failed to fit — k_drift unknown (not a block)");
+        info!(
+            label,
+            ticker_id,
+            k_start,
+            k_end,
+            "drift gate: a sub-window failed to fit — k_drift unknown (not a block)"
+        );
         return;
     }
     let k_drift = (k_end - k_start).abs() / k_start;
-    info!(label, ticker_id, k_start, k_end, k_drift, fitted_k,
-        "drift gate: first-{DRIFT_SUBWINDOW_DAYS}d vs last-{DRIFT_SUBWINDOW_DAYS}d k drift");
+    info!(
+        label,
+        ticker_id,
+        k_start,
+        k_end,
+        k_drift,
+        fitted_k,
+        "drift gate: first-{DRIFT_SUBWINDOW_DAYS}d vs last-{DRIFT_SUBWINDOW_DAYS}d k drift"
+    );
     if k_drift > DRIFT_GATE_MAX {
         warn!(label, ticker_id, k_start, k_end, k_drift, drift_max = DRIFT_GATE_MAX,
             "drift gate: k_drift > {:.0}% — ticker needs point-in-time rebuild (single-latest-k look-ahead exceeds bound; NOT blocking)",
@@ -167,7 +204,7 @@ fn drift_gate<S: nxr_sdk::vol::VolSource + ?Sized>(
     }
 }
 
-/// Resolve `target_bpd` for a given pair. Phase 60.π: per-pair overrides only,
+/// Resolve `target_bpd` for a given pair: per-pair overrides only,
 /// flat default for all unlisted pairs. Class arg retained for log context.
 fn target_for_pair(c: &CalibrationYml, pair: &str, class: AssetClassBucket) -> f64 {
     c.target_for_pair_classed(pair, class.as_key())
@@ -202,16 +239,18 @@ fn calibrate_one(
     renko_yml: &nxr_sdk::pipeline_config::RenkoYml,
     prior_k: Option<f32>,
 ) -> CalOutcome {
-    // Phase 55 sharded layout: shards live at `<idx_dir>/<ticker_id>/<YYYY-MM-DD>.idx`.
+    // Sharded layout: shards live at `<idx_dir>/<ticker_id>/<YYYY-MM-DD>.idx`.
     // Enumerate via `list_shards`, then stream each shard via `ShardStream` so
     // memory stays bounded (one shard's working buffer, not the full history).
     let ticker_dir = idx_dir.join(ticker_id.to_string());
     let shards = match list_shards(&ticker_dir, "idx") {
         Ok(v) => v,
-        Err(e) => return CalOutcome::Skipped {
-            ticker_id,
-            reason: format!("no shards under {}: {}", ticker_dir.display(), e),
-        },
+        Err(e) => {
+            return CalOutcome::Skipped {
+                ticker_id,
+                reason: format!("no shards under {}: {}", ticker_dir.display(), e),
+            }
+        }
     };
     if shards.is_empty() {
         return CalOutcome::Skipped {
@@ -257,19 +296,23 @@ fn calibrate_one(
     for (_date, shard_path) in &shards {
         let mut stream = match ShardStream::<IndexRecord>::open(shard_path) {
             Ok(s) => s,
-            Err(e) => return CalOutcome::Failed {
-                ticker_id,
-                reason: format!("open shard {}: {}", shard_path.display(), e),
-            },
+            Err(e) => {
+                return CalOutcome::Failed {
+                    ticker_id,
+                    reason: format!("open shard {}: {}", shard_path.display(), e),
+                }
+            }
         };
         loop {
             let rec = match stream.next() {
                 Ok(Some(r)) => r,
                 Ok(None) => break,
-                Err(e) => return CalOutcome::Failed {
-                    ticker_id,
-                    reason: format!("read shard {}: {}", shard_path.display(), e),
-                },
+                Err(e) => {
+                    return CalOutcome::Failed {
+                        ticker_id,
+                        reason: format!("read shard {}: {}", shard_path.display(), e),
+                    }
+                }
             };
             if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
                 continue;
@@ -278,22 +321,36 @@ fn calibrate_one(
             let bid = rec.index.bid;
             let ask = rec.index.ask;
             let mid = (bid + ask) * 0.5;
-            if !(mid.is_finite() && mid > 0.0) { continue; }
+            if !(mid.is_finite() && mid > 0.0) {
+                continue;
+            }
             tick_prices.push((ts, mid));
         }
     }
 
     if tick_prices.is_empty() {
-        return CalOutcome::Skipped { ticker_id, reason: "empty .idx".into() };
+        return CalOutcome::Skipped {
+            ticker_id,
+            reason: "empty .idx".into(),
+        };
     }
 
     // Build the .vol file (tmp, deleted at end of fn) from the gapless `.s10`
     // shards via the canonical RS-over-s10-OHLC builder. offline == live.
-    let vol_path = std::env::temp_dir().join(format!("nxr-calibrate-{}-{}.vol", ticker_id, std::process::id()));
+    let vol_path = std::env::temp_dir().join(format!(
+        "nxr-calibrate-{}-{}.vol",
+        ticker_id,
+        std::process::id()
+    ));
     {
         let mut writer = match VolWriter::new(&vol_path) {
             Ok(w) => w,
-            Err(e) => return CalOutcome::Failed { ticker_id, reason: format!("vol writer: {}", e) },
+            Err(e) => {
+                return CalOutcome::Failed {
+                    ticker_id,
+                    reason: format!("vol writer: {}", e),
+                }
+            }
         };
         let s10_dir = nxr_sdk::shard::bars_dir(bars_root, ticker_id);
         let s10_shards = list_shards(&s10_dir, "s10").unwrap_or_default();
@@ -306,10 +363,16 @@ fn calibrate_one(
         }
         let mut s10_iter = S10ShardIter::new(s10_shards);
         if let Err(e) = build_vol_from_s10(|| s10_iter.next_bar(), vol_cfg, &mut writer) {
-            return CalOutcome::Failed { ticker_id, reason: format!("vol build: {}", e) };
+            return CalOutcome::Failed {
+                ticker_id,
+                reason: format!("vol build: {}", e),
+            };
         }
         if let Err(e) = writer.finish() {
-            return CalOutcome::Failed { ticker_id, reason: format!("vol finish: {}", e) };
+            return CalOutcome::Failed {
+                ticker_id,
+                reason: format!("vol finish: {}", e),
+            };
         }
     }
 
@@ -317,7 +380,10 @@ fn calibrate_one(
         Ok(m) => m,
         Err(e) => {
             let _ = std::fs::remove_file(&vol_path);
-            return CalOutcome::Failed { ticker_id, reason: format!("vol mmap: {}", e) };
+            return CalOutcome::Failed {
+                ticker_id,
+                reason: format!("vol mmap: {}", e),
+            };
         }
     };
 
@@ -332,7 +398,10 @@ fn calibrate_one(
     };
     if let Err(e) = base.validate() {
         let _ = std::fs::remove_file(&vol_path);
-        return CalOutcome::Failed { ticker_id, reason: format!("base renko cfg: {}", e) };
+        return CalOutcome::Failed {
+            ticker_id,
+            reason: format!("base renko cfg: {}", e),
+        };
     }
 
     // Trim to the trailing rolling window (methodology §3): the .idx may hold
@@ -341,9 +410,15 @@ fn calibrate_one(
     let cal_inner = calibration_inner(cal_ext);
     let window = trailing_window(&tick_prices, cal_inner.rolling_window_days);
 
-    info!(ticker_id, pair, class = class.as_key(), target_bpd,
-        n_ticks = window.len(), window_days = cal_inner.rolling_window_days,
-        "calibrating (direct scale-to-target, full-tick)");
+    info!(
+        ticker_id,
+        pair,
+        class = class.as_key(),
+        target_bpd,
+        n_ticks = window.len(),
+        window_days = cal_inner.rolling_window_days,
+        "calibrating (direct scale-to-target, full-tick)"
+    );
     // Direct SCALE-TO-TARGET solver (methodology §4). prior_k (yesterday's k from
     // the weights file) is the warm-start seed.
     let mult = scale_to_target_k(
@@ -359,8 +434,18 @@ fn calibrate_one(
 
     if mult > 0.0 && (mult as f64).is_finite() {
         // Drift gate (§6): bound the single-latest-k look-ahead. Logging only.
-        drift_gate("base", ticker_id, window, &cal_inner, &base, &vol_mmap,
-            vol_cfg, &sigma_cache, target_bpd, mult as f64);
+        drift_gate(
+            "base",
+            ticker_id,
+            window,
+            &cal_inner,
+            &base,
+            &vol_mmap,
+            vol_cfg,
+            &sigma_cache,
+            target_bpd,
+            mult as f64,
+        );
     }
 
     let _ = std::fs::remove_file(&vol_path);
@@ -371,14 +456,19 @@ fn calibrate_one(
             reason: "calibration returned 0 (degenerate window / unreachable target)".into(),
         };
     }
-    CalOutcome::Ok { ticker_id, k: mult as f64 }
+    CalOutcome::Ok {
+        ticker_id,
+        k: mult as f64,
+    }
 }
 
 /// Trailing-window slice: the last `window_days` of the ts-ascending `prices`
 /// (by the LAST timestamp). The median objective is over this single window.
 fn trailing_window(prices: &[(i64, f64)], window_days: usize) -> &[(i64, f64)] {
     const MS_PER_DAY: i64 = 86_400_000;
-    let Some(&(last, _)) = prices.last() else { return prices };
+    let Some(&(last, _)) = prices.last() else {
+        return prices;
+    };
     let from = last - (window_days as i64) * MS_PER_DAY;
     let lo = prices.partition_point(|p| p.0 < from);
     &prices[lo..]
@@ -435,12 +525,15 @@ fn est_leg_ticks(idx_root: &Path, ticker_id: u64) -> usize {
 impl LegStream {
     fn open(idx_root: &Path, ticker_id: u64) -> Result<Self> {
         let dir = idx_root.join(ticker_id.to_string());
-        let shards = list_shards(&dir, "idx")
-            .with_context(|| format!("list shards {}", dir.display()))?;
+        let shards =
+            list_shards(&dir, "idx").with_context(|| format!("list shards {}", dir.display()))?;
         if shards.is_empty() {
             anyhow::bail!("no .idx shards under {}", dir.display());
         }
-        Ok(Self { shards: shards.into_iter(), cur: None })
+        Ok(Self {
+            shards: shards.into_iter(),
+            cur: None,
+        })
     }
 
     /// Next valid `(ts_ms, IndexRecord)` across all shards, or `Ok(None)` at end.
@@ -471,8 +564,12 @@ impl LegStream {
                     let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
                     let bid = rec.index.bid;
                     let ask = rec.index.ask;
-                    if !(bid.is_finite() && ask.is_finite()) { continue; }
-                    if bid <= 0.0 || ask <= 0.0 { continue; }
+                    if !(bid.is_finite() && ask.is_finite()) {
+                        continue;
+                    }
+                    if bid <= 0.0 || ask <= 0.0 {
+                        continue;
+                    }
                     return Ok(Some((ts, rec)));
                 }
                 None => {
@@ -503,24 +600,47 @@ fn calibrate_one_synth(
     // (was 16Gi pod OOM, 2026-05-30 incident).
     let mut leg_a_stream = match LegStream::open(idx_root, leg_a_id) {
         Ok(s) => s,
-        Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("leg_a={} {}", leg_a_id, e) },
+        Err(e) => {
+            return CalOutcome::Failed {
+                ticker_id: synth_id,
+                reason: format!("leg_a={} {}", leg_a_id, e),
+            }
+        }
     };
     let mut leg_b_stream = match LegStream::open(idx_root, leg_b_id) {
         Ok(s) => s,
-        Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("leg_b={} {}", leg_b_id, e) },
+        Err(e) => {
+            return CalOutcome::Failed {
+                ticker_id: synth_id,
+                reason: format!("leg_b={} {}", leg_b_id, e),
+            }
+        }
     };
 
     // Prime both legs' look-ahead slot. If either leg has zero valid ticks → skip.
     let mut a_next: Option<(i64, IndexRecord)> = match leg_a_stream.next_tick() {
         Ok(v) => v,
-        Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_a: {}", e) },
+        Err(e) => {
+            return CalOutcome::Failed {
+                ticker_id: synth_id,
+                reason: format!("read leg_a: {}", e),
+            }
+        }
     };
     let mut b_next: Option<(i64, IndexRecord)> = match leg_b_stream.next_tick() {
         Ok(v) => v,
-        Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_b: {}", e) },
+        Err(e) => {
+            return CalOutcome::Failed {
+                ticker_id: synth_id,
+                reason: format!("read leg_b: {}", e),
+            }
+        }
     };
     if a_next.is_none() || b_next.is_none() {
-        return CalOutcome::Skipped { ticker_id: synth_id, reason: "empty leg".into() };
+        return CalOutcome::Skipped {
+            ticker_id: synth_id,
+            reason: "empty leg".into(),
+        };
     }
 
     // ── 2. Event-driven 2-stream merge → synth (ts, bid, ask, mid) ───────────
@@ -559,8 +679,8 @@ fn calibrate_one_synth(
     // length is bounded by (leg_a_ticks + leg_b_ticks). Estimate each leg's tick
     // count from its on-disk shard bytes (56 B/IndexRecord). Upper bound — gated
     // drops + skip records trim it — so capacity is reserved once, no churn.
-    let est_synth_ticks: usize = est_leg_ticks(idx_root, leg_a_id)
-        .saturating_add(est_leg_ticks(idx_root, leg_b_id));
+    let est_synth_ticks: usize =
+        est_leg_ticks(idx_root, leg_a_id).saturating_add(est_leg_ticks(idx_root, leg_b_id));
     // Clamp the reservation (see `MAX_PRERESERVE_TICKS`): two sentinel-heavy legs
     // (e.g. BTC) summed can exceed the budget → a single multi-GB up-front alloc.
     let mut tick_prices: Vec<(i64, f64)> = Vec::with_capacity(clamp_prereserve(est_synth_ticks));
@@ -579,14 +699,24 @@ fn calibrate_one_synth(
             let cur = a_next.take().expect("a_next primed");
             a_next = match leg_a_stream.next_tick() {
                 Ok(v) => v,
-                Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_a: {}", e) },
+                Err(e) => {
+                    return CalOutcome::Failed {
+                        ticker_id: synth_id,
+                        reason: format!("read leg_a: {}", e),
+                    }
+                }
             };
             cur
         } else {
             let cur = b_next.take().expect("b_next primed");
             b_next = match leg_b_stream.next_tick() {
                 Ok(v) => v,
-                Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("read leg_b: {}", e) },
+                Err(e) => {
+                    return CalOutcome::Failed {
+                        ticker_id: synth_id,
+                        reason: format!("read leg_b: {}", e),
+                    }
+                }
             };
             cur
         };
@@ -610,17 +740,28 @@ fn calibrate_one_synth(
     drop(leg_b_stream);
 
     if tick_prices.is_empty() {
-        return CalOutcome::Skipped { ticker_id: synth_id, reason: "empty merged stream".into() };
+        return CalOutcome::Skipped {
+            ticker_id: synth_id,
+            reason: "empty merged stream".into(),
+        };
     }
 
     // ── 3. Build .vol from the persisted synth `.s10` shards (identical to the
     // native base path) → offline σ == live σ on the SAME real s10 artifact.
-    let vol_path = std::env::temp_dir()
-        .join(format!("nxr-calibrate-synth-{}-{}.vol", synth_id, std::process::id()));
+    let vol_path = std::env::temp_dir().join(format!(
+        "nxr-calibrate-synth-{}-{}.vol",
+        synth_id,
+        std::process::id()
+    ));
     {
         let mut writer = match VolWriter::new(&vol_path) {
             Ok(w) => w,
-            Err(e) => return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol writer: {}", e) },
+            Err(e) => {
+                return CalOutcome::Failed {
+                    ticker_id: synth_id,
+                    reason: format!("vol writer: {}", e),
+                }
+            }
         };
         let s10_dir = nxr_sdk::shard::bars_dir(bars_root, synth_id);
         let s10_shards = list_shards(&s10_dir, "s10").unwrap_or_default();
@@ -628,22 +769,34 @@ fn calibrate_one_synth(
             let _ = std::fs::remove_file(&vol_path);
             return CalOutcome::Skipped {
                 ticker_id: synth_id,
-                reason: format!("no synth .s10 shards under {} (run synth-backfill-from-idx first)", s10_dir.display()),
+                reason: format!(
+                    "no synth .s10 shards under {} (run synth-backfill-from-idx first)",
+                    s10_dir.display()
+                ),
             };
         }
         let mut s10_iter = S10ShardIter::new(s10_shards);
         if let Err(e) = build_vol_from_s10(|| s10_iter.next_bar(), vol_cfg, &mut writer) {
-            return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol build: {}", e) };
+            return CalOutcome::Failed {
+                ticker_id: synth_id,
+                reason: format!("vol build: {}", e),
+            };
         }
         if let Err(e) = writer.finish() {
-            return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol finish: {}", e) };
+            return CalOutcome::Failed {
+                ticker_id: synth_id,
+                reason: format!("vol finish: {}", e),
+            };
         }
     }
     let vol_mmap = match VolMmap::open(&vol_path) {
         Ok(m) => m,
         Err(e) => {
             let _ = std::fs::remove_file(&vol_path);
-            return CalOutcome::Failed { ticker_id: synth_id, reason: format!("vol mmap: {}", e) };
+            return CalOutcome::Failed {
+                ticker_id: synth_id,
+                reason: format!("vol mmap: {}", e),
+            };
         }
     };
     let sigma_cache = {
@@ -657,14 +810,24 @@ fn calibrate_one_synth(
     };
     if let Err(e) = base.validate() {
         let _ = std::fs::remove_file(&vol_path);
-        return CalOutcome::Failed { ticker_id: synth_id, reason: format!("base renko cfg: {}", e) };
+        return CalOutcome::Failed {
+            ticker_id: synth_id,
+            reason: format!("base renko cfg: {}", e),
+        };
     }
 
     let cal_inner = calibration_inner(cal_ext);
     let window = trailing_window(&tick_prices, cal_inner.rolling_window_days);
-    info!(synth_id, synth_sym, leg_a_id, leg_b_id, target_bpd,
-        n_ticks = window.len(), window_days = cal_inner.rolling_window_days,
-        "calibrating synth (direct scale-to-target, full-tick)");
+    info!(
+        synth_id,
+        synth_sym,
+        leg_a_id,
+        leg_b_id,
+        target_bpd,
+        n_ticks = window.len(),
+        window_days = cal_inner.rolling_window_days,
+        "calibrating synth (direct scale-to-target, full-tick)"
+    );
     // Same direct solver the base path uses (methodology §4). prior_k = yesterday's.
     let mult = scale_to_target_k(
         window,
@@ -678,8 +841,18 @@ fn calibrate_one_synth(
     );
 
     if mult > 0.0 && (mult as f64).is_finite() {
-        drift_gate("synth", synth_id, window, &cal_inner, &base, &vol_mmap,
-            vol_cfg, &sigma_cache, target_bpd, mult as f64);
+        drift_gate(
+            "synth",
+            synth_id,
+            window,
+            &cal_inner,
+            &base,
+            &vol_mmap,
+            vol_cfg,
+            &sigma_cache,
+            target_bpd,
+            mult as f64,
+        );
     }
 
     let _ = std::fs::remove_file(&vol_path);
@@ -690,7 +863,10 @@ fn calibrate_one_synth(
             reason: "synth calibration returned 0 (degenerate window / unreachable target)".into(),
         };
     }
-    CalOutcome::Ok { ticker_id: synth_id, k: mult as f64 }
+    CalOutcome::Ok {
+        ticker_id: synth_id,
+        k: mult as f64,
+    }
 }
 
 /// Resolve all synth-pair entries (from YAML or audit-frozen fallback) to
@@ -726,9 +902,18 @@ fn resolve_synth_work(yml_pairs: &[SynthPairYml]) -> Vec<(u64, &'static str, u64
                 }
             }
         };
-        let synth_id = match resolve(spec.synth_sym) { Some(v) => v, None => continue };
-        let leg_a_id = match resolve(spec.base_sym) { Some(v) => v, None => continue };
-        let leg_b_id = match resolve(spec.quote_sym) { Some(v) => v, None => continue };
+        let synth_id = match resolve(spec.synth_sym) {
+            Some(v) => v,
+            None => continue,
+        };
+        let leg_a_id = match resolve(spec.base_sym) {
+            Some(v) => v,
+            None => continue,
+        };
+        let leg_b_id = match resolve(spec.quote_sym) {
+            Some(v) => v,
+            None => continue,
+        };
         out.push((synth_id, spec.synth_sym, leg_a_id, leg_b_id));
     }
     out
@@ -737,9 +922,7 @@ fn resolve_synth_work(yml_pairs: &[SynthPairYml]) -> Vec<(u64, &'static str, u64
 // ── Main run ─────────────────────────────────────────────────────────────────
 
 fn run_once(args: &Args) -> Result<()> {
-    let root: PipelineYml = PipelineYml::load_default(
-        nxr_sdk::pipeline_config::ConfigHint::Bin,
-    )?;
+    let root: PipelineYml = PipelineYml::load_default(nxr_sdk::pipeline_config::ConfigHint::Bin)?;
     let series = &root.series;
     // Operator judgment lists (YAML override w/ audit-frozen sdk fallback).
     // Used for within-MITCH-class buckets that the wire bits don't encode
@@ -784,8 +967,7 @@ fn run_once(args: &Args) -> Result<()> {
     let mut weights_file: WeightsFile = if params_path.exists() {
         let raw = std::fs::read_to_string(&params_path)
             .with_context(|| format!("read {}", params_path.display()))?;
-        serde_json::from_str(&raw)
-            .with_context(|| format!("parse {}", params_path.display()))?
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", params_path.display()))?
     } else {
         warn!(path = %params_path.display(), "ticker-params.json missing — starting from scratch");
         WeightsFile::default()
@@ -798,13 +980,12 @@ fn run_once(args: &Args) -> Result<()> {
         for pair in pairs.keys() {
             let ticker_id = resolve_ticker_id(pair);
             let class = bucket_for_pair(pair, ticker_id, &crypto_majors, &stablecoins, &fx_majors);
-            seen.entry(ticker_id).or_insert_with(|| (pair.clone(), class));
+            seen.entry(ticker_id)
+                .or_insert_with(|| (pair.clone(), class));
         }
     }
-    let work: Vec<(u64, String, AssetClassBucket)> = seen
-        .into_iter()
-        .map(|(id, (p, c))| (id, p, c))
-        .collect();
+    let work: Vec<(u64, String, AssetClassBucket)> =
+        seen.into_iter().map(|(id, (p, c))| (id, p, c)).collect();
     info!(n_tickers = work.len(), "ticker universe assembled");
 
     // Configure rayon worker count.
@@ -823,9 +1004,8 @@ fn run_once(args: &Args) -> Result<()> {
     // SEARCH SEED only — never an emit fallback (renko_k starts empty;
     // feedback_no_k_fallback).
     let prior_k_map: BTreeMap<String, f64> = weights_file.renko_k_per_ticker.clone();
-    let prior_k_for = |id: u64| -> Option<f32> {
-        prior_k_map.get(&id.to_string()).map(|&k| k as f32)
-    };
+    let prior_k_for =
+        |id: u64| -> Option<f32> { prior_k_map.get(&id.to_string()).map(|&k| k as f32) };
 
     // Fail fast if config's mult_bounds disagree with the SDK's single-source
     // renko ceiling/floor (RCA ROOT2a). A mismatch makes the clamp-detector
@@ -849,12 +1029,24 @@ fn run_once(args: &Args) -> Result<()> {
             // the fit — provided it is within [K_FLOOR, MULT_UPPER_BOUND].
             if let Some(&forced_k) = cal_ext.renko_k_overrides.get(pair) {
                 if (K_FLOOR..=K_MAX_SAFETY).contains(&forced_k) {
-                    info!(ticker_id = *ticker_id, pair, forced_k, "renko_k override — skipping fit (operator-forced k)");
-                    results.lock().unwrap().push(CalOutcome::Ok { ticker_id: *ticker_id, k: forced_k });
+                    info!(
+                        ticker_id = *ticker_id,
+                        pair, forced_k, "renko_k override — skipping fit (operator-forced k)"
+                    );
+                    results.lock().unwrap().push(CalOutcome::Ok {
+                        ticker_id: *ticker_id,
+                        k: forced_k,
+                    });
                     return;
                 }
-                warn!(ticker_id = *ticker_id, pair, forced_k, k_floor = K_FLOOR, k_max_safety = K_MAX_SAFETY,
-                    "renko_k override out of [K_FLOOR, K_MAX_SAFETY] — ignoring, running fit");
+                warn!(
+                    ticker_id = *ticker_id,
+                    pair,
+                    forced_k,
+                    k_floor = K_FLOOR,
+                    k_max_safety = K_MAX_SAFETY,
+                    "renko_k override out of [K_FLOOR, K_MAX_SAFETY] — ignoring, running fit"
+                );
             }
 
             // Panic-safe: one bad ticker (malformed .idx, OOM in sigma cache,
@@ -885,7 +1077,10 @@ fn run_once(args: &Args) -> Result<()> {
                 } else {
                     "unknown panic".to_string()
                 };
-                CalOutcome::Failed { ticker_id: *ticker_id, reason: format!("panic: {}", msg) }
+                CalOutcome::Failed {
+                    ticker_id: *ticker_id,
+                    reason: format!("panic: {}", msg),
+                }
             });
 
             results.lock().unwrap().push(outcome);
@@ -979,43 +1174,76 @@ fn run_once(args: &Args) -> Result<()> {
     // the base pass uses (warm start + bounded bracket fallback + ±1-rung probe;
     // see `calibrate_one_synth`); the K_FLOOR / min_pct-clamp / unreachable-target
     // guards inside it drop degenerate windows. If the fit fails, k is NOT
-    // persisted (caller keeps prior). Phase 60.π: per-pair override or flat
-    // default per synth.
+    // persisted (caller keeps prior). Per-pair override or flat default per
+    // synth.
     let synth_work = {
         let pairs = nxr_sdk::synth::pipeline_pairs::synth_pipeline_pairs(&root);
         resolve_synth_work(&pairs)
     };
-    info!(n_synth = synth_work.len(), "synth calibration pass starting");
+    info!(
+        n_synth = synth_work.len(),
+        "synth calibration pass starting"
+    );
     let (mut s_passed, mut s_skipped, mut s_failed) = (0usize, 0usize, 0usize);
     for (synth_id, synth_sym, leg_a_id, leg_b_id) in synth_work {
         // Class-detect the synth pair too (stable/stable crosses like USD1/USDC
         // → crypto_stable → 50) instead of relying on a manual override entry.
-        let synth_class =
-            bucket_for_pair(synth_sym, synth_id, &crypto_majors, &stablecoins, &fx_majors);
+        let synth_class = bucket_for_pair(
+            synth_sym,
+            synth_id,
+            &crypto_majors,
+            &stablecoins,
+            &fx_majors,
+        );
         let synth_target = target_for_pair(cal_ext, synth_sym, synth_class);
         // PART B4: synth pairs honor the same per-pair forced-k escape hatch.
         if let Some(&forced_k) = cal_ext.renko_k_overrides.get(synth_sym) {
             if (K_FLOOR..=K_MAX_SAFETY).contains(&forced_k) {
-                info!(synth_id, synth_sym, forced_k, "synth renko_k override — skipping fit (operator-forced k)");
+                info!(
+                    synth_id,
+                    synth_sym,
+                    forced_k,
+                    "synth renko_k override — skipping fit (operator-forced k)"
+                );
                 s_passed += 1;
                 renko_k.insert(synth_id.to_string(), forced_k);
                 continue;
             }
-            warn!(synth_id, synth_sym, forced_k, "synth renko_k override out of [K_FLOOR, K_MAX_SAFETY] — ignoring, running fit");
+            warn!(
+                synth_id,
+                synth_sym,
+                forced_k,
+                "synth renko_k override out of [K_FLOOR, K_MAX_SAFETY] — ignoring, running fit"
+            );
         }
         let synth_prior_k = prior_k_for(synth_id);
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             calibrate_one_synth(
-                synth_id, synth_sym, leg_a_id, leg_b_id,
-                &idx_dir, &bars_root, cal_ext, synth_target, vol_cfg, renko_yml,
+                synth_id,
+                synth_sym,
+                leg_a_id,
+                leg_b_id,
+                &idx_dir,
+                &bars_root,
+                cal_ext,
+                synth_target,
+                vol_cfg,
+                renko_yml,
                 synth_prior_k,
             )
         }))
         .unwrap_or_else(|p| {
-            let msg = if let Some(s) = p.downcast_ref::<&str>() { s.to_string() }
-                      else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
-                      else { "unknown panic".to_string() };
-            CalOutcome::Failed { ticker_id: synth_id, reason: format!("panic: {}", msg) }
+            let msg = if let Some(s) = p.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = p.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            CalOutcome::Failed {
+                ticker_id: synth_id,
+                reason: format!("panic: {}", msg),
+            }
         });
         match outcome {
             CalOutcome::Ok { ticker_id, k } => {
@@ -1052,12 +1280,16 @@ fn run_once(args: &Args) -> Result<()> {
             if renko_k.contains_key(&ticker_id.to_string()) {
                 continue;
             }
-            let Some(base_sym) = pair.strip_suffix("/USDC") else { continue };
+            let Some(base_sym) = pair.strip_suffix("/USDC") else {
+                continue;
+            };
             if stablecoins.iter().any(|s| s.eq_ignore_ascii_case(base_sym)) {
                 continue;
             }
             let leg_pair = format!("{}/USDT", base_sym);
-            let Ok(leg) = resolve_ticker(&leg_pair, InstrumentType::SPOT) else { continue };
+            let Ok(leg) = resolve_ticker(&leg_pair, InstrumentType::SPOT) else {
+                continue;
+            };
             if !renko_k.contains_key(&leg.ticker.id.to_string()) {
                 continue; // unhealthy leg ⇒ no basis for a derived k
             }
@@ -1065,8 +1297,16 @@ fn run_once(args: &Args) -> Result<()> {
             let prior = prior_k_for(*ticker_id);
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 calibrate_one_synth(
-                    *ticker_id, pair, leg.ticker.id, quote_leg_id,
-                    &idx_dir, &bars_root, cal_ext, target, vol_cfg, renko_yml,
+                    *ticker_id,
+                    pair,
+                    leg.ticker.id,
+                    quote_leg_id,
+                    &idx_dir,
+                    &bars_root,
+                    cal_ext,
+                    target,
+                    vol_cfg,
+                    renko_yml,
                     prior,
                 )
             }))
@@ -1088,7 +1328,10 @@ fn run_once(args: &Args) -> Result<()> {
                 }
             }
         }
-        info!(inferred_fallbacks, "inferred xxx/USDC fallback pass complete");
+        info!(
+            inferred_fallbacks,
+            "inferred xxx/USDC fallback pass complete"
+        );
     }
 
     // k-STABILITY DIAGNOSTIC (2026-06-09): final distribution over ALL accepted
@@ -1135,8 +1378,7 @@ fn run_once(args: &Args) -> Result<()> {
 /// `nxr_sdk::ipc::write_atomic` but for non-Pod payloads.
 fn write_atomic_string(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create_dir_all {:?}", parent))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create_dir_all {:?}", parent))?;
     }
     let tmp = {
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
@@ -1147,8 +1389,7 @@ fn write_atomic_string(path: &Path, contents: &str) -> Result<()> {
         }
     };
     std::fs::write(&tmp, contents).with_context(|| format!("write {:?}", tmp))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {:?} -> {:?}", tmp, path))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {:?} -> {:?}", tmp, path))?;
     Ok(())
 }
 
@@ -1162,7 +1403,9 @@ fn main() -> Result<()> {
         if let Err(e) = run_once(&args) {
             warn!(err = %e, "calibration run failed");
         }
-        if args.once { break; }
+        if args.once {
+            break;
+        }
         info!("sleeping 24h until next calibration");
         std::thread::sleep(std::time::Duration::from_secs(nxr_sdk::shard::SECS_PER_DAY));
     }
@@ -1191,7 +1434,13 @@ mod tests {
         let actual_kept = (on_disk_records as f64 * 0.90) as usize; // 10% sentinels
         let estimate = on_disk_records; // bytes/56 == record count
         let ratio = estimate as f64 / actual_kept as f64;
-        assert!(ratio <= 1.2, "estimate {} / actual {} = {:.3} > 1.2", estimate, actual_kept, ratio);
+        assert!(
+            ratio <= 1.2,
+            "estimate {} / actual {} = {:.3} > 1.2",
+            estimate,
+            actual_kept,
+            ratio
+        );
         // And the clamp is a no-op here (well under the cap).
         assert_eq!(clamp_prereserve(estimate), estimate);
     }
@@ -1207,7 +1456,10 @@ mod tests {
 
         // Arbitrary huge / saturating estimates also clamp.
         assert_eq!(clamp_prereserve(usize::MAX), MAX_PRERESERVE_TICKS);
-        assert_eq!(clamp_prereserve(MAX_PRERESERVE_TICKS + 1), MAX_PRERESERVE_TICKS);
+        assert_eq!(
+            clamp_prereserve(MAX_PRERESERVE_TICKS + 1),
+            MAX_PRERESERVE_TICKS
+        );
 
         // At/below the cap the estimate passes through unchanged.
         assert_eq!(clamp_prereserve(MAX_PRERESERVE_TICKS), MAX_PRERESERVE_TICKS);
@@ -1221,7 +1473,11 @@ mod tests {
     fn capped_reservation_byte_ceiling_is_about_1gib() {
         let bytes = MAX_PRERESERVE_TICKS * core::mem::size_of::<(i64, f64)>();
         assert_eq!(core::mem::size_of::<(i64, f64)>(), 16);
-        assert!(bytes <= 1_100_000_000, "capped reservation {} B > ~1 GiB", bytes);
+        assert!(
+            bytes <= 1_100_000_000,
+            "capped reservation {} B > ~1 GiB",
+            bytes
+        );
     }
 
     // ── §5 PARITY GUARD (RCA #1763) ─────────────────────────────────────────
@@ -1265,7 +1521,8 @@ mod tests {
     /// collect `(ts, mid)` only on a gated `Some`). Mirrors the loop in
     /// `calibrate_one_synth` exactly — kept in lock-step with it.
     fn reconstruct_calibrate(base: &[IndexRecord], quote: &[IndexRecord]) -> Vec<(i64, f64)> {
-        let to_slot = |r: &IndexRecord| (timestamp::to_epoch_ms(r.header.get_timestamp()), r.clone());
+        let to_slot =
+            |r: &IndexRecord| (timestamp::to_epoch_ms(r.header.get_timestamp()), r.clone());
         let mut bi = base.iter();
         let mut qi = quote.iter();
         let mut a_next = bi.next().map(to_slot);
@@ -1310,7 +1567,11 @@ mod tests {
                 (Some(_), None) => bi.next().unwrap(),
                 (None, Some(_)) => qi.next().unwrap(),
                 (Some(b), Some(q)) => {
-                    if ts_of(b) <= ts_of(q) { bi.next().unwrap() } else { qi.next().unwrap() }
+                    if ts_of(b) <= ts_of(q) {
+                        bi.next().unwrap()
+                    } else {
+                        qi.next().unwrap()
+                    }
                 }
             };
             let ts = ts_of(rec);
@@ -1352,7 +1613,10 @@ mod tests {
 
         let cal = reconstruct_calibrate(&base, &quote);
         let bkf = reconstruct_backfill(&base, &quote);
-        assert_eq!(cal, bkf, "calibrate vs backfill gated reconstruction MUST be byte-identical");
+        assert_eq!(
+            cal, bkf,
+            "calibrate vs backfill gated reconstruction MUST be byte-identical"
+        );
 
         // Guard the gate actually fired: an UNGATED merge (old calibrate bug)
         // emits strictly MORE synth ticks than the gated path. If this ever
@@ -1368,18 +1632,34 @@ mod tests {
                     (None, None) => break,
                     (Some(_), None) => bi.next().unwrap(),
                     (None, Some(_)) => qi.next().unwrap(),
-                    (Some(b), Some(q)) => if ts_of(b) <= ts_of(q) { bi.next().unwrap() } else { qi.next().unwrap() },
+                    (Some(b), Some(q)) => {
+                        if ts_of(b) <= ts_of(q) {
+                            bi.next().unwrap()
+                        } else {
+                            qi.next().unwrap()
+                        }
+                    }
                 };
-                if rec.index.ticker == T_BASE_ID { lb = Some(rec.index); } else { lq = Some(rec.index); }
+                if rec.index.ticker == T_BASE_ID {
+                    lb = Some(rec.index);
+                } else {
+                    lq = Some(rec.index);
+                }
                 if let (Some(b), Some(q)) = (lb, lq) {
                     let bid = b.bid / q.ask;
                     let ask = b.ask / q.bid;
-                    if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 { n += 1; }
+                    if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 {
+                        n += 1;
+                    }
                 }
             }
             n
         };
-        assert!(ungated > cal.len(),
-            "gate must prune stale/low-conf ticks: ungated={} gated={}", ungated, cal.len());
+        assert!(
+            ungated > cal.len(),
+            "gate must prune stale/low-conf ticks: ungated={} gated={}",
+            ungated,
+            cal.len()
+        );
     }
 }

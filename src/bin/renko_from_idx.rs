@@ -17,19 +17,19 @@ use chrono::NaiveDate;
 use clap::Parser;
 use mitch::bar::{Bar, BarKind};
 use mitch::timestamp;
+use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use nxr_sdk::shard::{ShardStream, MS_PER_30MIN, MS_PER_DAY};
+use nxr_sdk::vol::{MtfVolCalculator, VolSource};
 use nxr_sdk::weights_schema::WeightsFile;
-use nxr_sdk::{BarAccumulator, resolve_ticker_id};
+use nxr_sdk::{resolve_ticker_id, BarAccumulator};
 use series_factory::sharding::{
-    bars_dir, idx_dir, list_shards, manifest_path, read_manifest, shard_path,
-    ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
+    bars_dir, idx_dir, list_shards, manifest_path, read_manifest, shard_path, ts_ms_to_utc_date,
+    write_manifest, write_shard_atomic, Manifest,
 };
 use series_factory::{
     bar_construction::{build_vol_from_s10, S10ShardIter},
     vol_bin::{VolMmap, VolWriter},
 };
-use nxr_sdk::vol::{MtfVolCalculator, VolSource};
-use nxr_sdk::renko::{RenkoConfig, RenkoGenerator, SIGMA_FALLBACK};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,23 +98,23 @@ fn main() -> Result<()> {
     'outer: for (_, path) in &shards {
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
         while let Some(chunk) = stream.next_chunk()? {
-          for rec in chunk {
-            // SEAM PARITY: skip heartbeat-sentinel records exactly like the live
-            // producers (core/src/bars_renko.rs:528, bars_s10.rs:198). Sentinels
-            // carry stale bid/ask liveness beacons; ingesting them offline (but
-            // not live) poisons the σ basis → hist↔live seam drift.
-            if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
-                continue;
+            for rec in chunk {
+                // SEAM PARITY: skip heartbeat-sentinel records exactly like the live
+                // producers (core/src/bars_renko.rs:528, bars_s10.rs:198). Sentinels
+                // carry stale bid/ask liveness beacons; ingesting them offline (but
+                // not live) poisons the σ basis → hist↔live seam drift.
+                if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                    continue;
+                }
+                let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+                let mid = (rec.index.bid + rec.index.ask) * 0.5;
+                if !(mid.is_finite() && mid > 0.0) {
+                    continue;
+                }
+                pass1_count += 1;
+                first_ts = (ts / MS_PER_30MIN) * MS_PER_30MIN;
+                break 'outer;
             }
-            let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
-            let mid = (rec.index.bid + rec.index.ask) * 0.5;
-            if !(mid.is_finite() && mid > 0.0) {
-                continue;
-            }
-            pass1_count += 1;
-            first_ts = (ts / MS_PER_30MIN) * MS_PER_30MIN;
-            break 'outer;
-          }
         }
     }
     info!(
@@ -146,7 +146,10 @@ fn main() -> Result<()> {
     let n_vol = build_vol_from_s10(|| s10_iter.next_bar(), &yml.vol, &mut vol_writer)?;
     vol_writer.finish()?;
     let vol_mmap = VolMmap::open(&vol_path)?;
-    info!(vol_records = n_vol, "vol file written (from persisted .s10)");
+    info!(
+        vol_records = n_vol,
+        "vol file written (from persisted .s10)"
+    );
 
     // ═══ PASS 2: feed composite mid → RenkoGenerator ═══
     let bootstrap_end = first_ts + yml.pipeline.bootstrap_days * MS_PER_DAY;
@@ -212,70 +215,74 @@ fn main() -> Result<()> {
     for (_, path) in &shards {
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
         while let Some(chunk) = stream.next_chunk()? {
-          for rec in chunk {
-            // SEAM PARITY: skip heartbeat sentinels (mirror live bars_renko.rs:528).
-            if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
-                continue;
-            }
-            let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
-            let idx = rec.index;
-            let mid = (idx.bid + idx.ask) * 0.5;
-            if !(mid.is_finite() && mid > 0.0) {
-                continue;
-            }
-            pass2_count += 1;
+            for rec in chunk {
+                // SEAM PARITY: skip heartbeat sentinels (mirror live bars_renko.rs:528).
+                if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
+                    continue;
+                }
+                let ts = timestamp::to_epoch_ms(rec.header.get_timestamp());
+                let idx = rec.index;
+                let mid = (idx.bid + idx.ask) * 0.5;
+                if !(mid.is_finite() && mid > 0.0) {
+                    continue;
+                }
+                pass2_count += 1;
 
-            if ts < bootstrap_end {
+                if ts < bootstrap_end {
+                    let sigma = sigma_at(ts);
+                    generator.feed_tick_with_sigma(ts, mid, sigma, &mut |_: &Bar| Ok(()))?;
+                    continue;
+                }
+                post_bootstrap += 1;
+
+                let ci_ubp = nxr_sdk::tdwap::decode_ci_ubp(idx.ci);
+                accum.ingest(
+                    idx.bid,
+                    idx.ask,
+                    idx.vbid,
+                    idx.vask,
+                    ts,
+                    ci_ubp,
+                    idx.accepted as u32,
+                    idx.rejected as u32,
+                );
                 let sigma = sigma_at(ts);
-                generator.feed_tick_with_sigma(ts, mid, sigma, &mut |_: &Bar| Ok(()))?;
-                continue;
-            }
-            post_bootstrap += 1;
+                generator.feed_tick_with_sigma(ts, mid, sigma, &mut |bar: &Bar| {
+                    pending.push(*bar);
+                    Ok(())
+                })?;
 
-            let ci_ubp = nxr_sdk::tdwap::decode_ci_ubp(idx.ci);
-            accum.ingest(
-                idx.bid,
-                idx.ask,
-                idx.vbid,
-                idx.vask,
-                ts,
-                ci_ubp,
-                idx.accepted as u32,
-                idx.rejected as u32,
-            );
-            let sigma = sigma_at(ts);
-            generator.feed_tick_with_sigma(ts, mid, sigma, &mut |bar: &Bar| {
-                pending.push(*bar);
-                Ok(())
-            })?;
-
-            if !pending.is_empty() {
-                let enrich = accum.flush();
-                let n_pending = pending.len() as u32;
-                for mut bar in pending.drain(..) {
-                    bar.kind = BarKind::Renko as u8;
-                    if let Some(ref e) = enrich {
-                        bar.vbid = e.vbid;
-                        bar.vask = e.vask;
-                        bar.tick_count = if n_pending > 0 { e.tick_count / n_pending } else { 0 };
-                        bar.realized_var = e.realized_var;
-                        bar.bipower_var = e.bipower_var;
-                        bar.drift = e.drift;
-                        bar.vol_imbalance = e.vol_imbalance;
-                        bar.avg_spread_bps = e.avg_spread_bps;
-                        bar.max_abs_return = e.max_abs_return;
-                        bar.avg_ci_ubp = e.avg_ci_ubp;
-                        bar.reject_rate = e.reject_rate;
+                if !pending.is_empty() {
+                    let enrich = accum.flush();
+                    let n_pending = pending.len() as u32;
+                    for mut bar in pending.drain(..) {
+                        bar.kind = BarKind::Renko as u8;
+                        if let Some(ref e) = enrich {
+                            bar.vbid = e.vbid;
+                            bar.vask = e.vask;
+                            bar.tick_count = if n_pending > 0 {
+                                e.tick_count / n_pending
+                            } else {
+                                0
+                            };
+                            bar.realized_var = e.realized_var;
+                            bar.bipower_var = e.bipower_var;
+                            bar.drift = e.drift;
+                            bar.vol_imbalance = e.vol_imbalance;
+                            bar.avg_spread_bps = e.avg_spread_bps;
+                            bar.max_abs_return = e.max_abs_return;
+                            bar.avg_ci_ubp = e.avg_ci_ubp;
+                            bar.reject_rate = e.reject_rate;
+                        }
+                        let date = ts_ms_to_utc_date(bar.open_time_ms());
+                        bars_by_date.entry(date).or_default().push(bar);
+                        total_bars += 1;
                     }
-                    let date = ts_ms_to_utc_date(bar.open_time_ms());
-                    bars_by_date.entry(date).or_default().push(bar);
-                    total_bars += 1;
-                }
-                if total_bars > yml.pipeline.max_bars {
-                    anyhow::bail!("bar count exceeds {} safety limit", yml.pipeline.max_bars);
+                    if total_bars > yml.pipeline.max_bars {
+                        anyhow::bail!("bar count exceeds {} safety limit", yml.pipeline.max_bars);
+                    }
                 }
             }
-          }
         }
     }
 

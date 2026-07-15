@@ -4,7 +4,7 @@
 //! (pair x exchange) pair in the series pipeline config, covering
 //! `[to - days, to)` where `to` is midnight UTC of the current day.
 //!
-//! Downstream (`generate-renko-from-ticks`) read from
+//! Downstream bins (`ticks-to-idx`, `backfill-all`) read from
 //! the same directory. Re-running is safe: the monthly/daily cache skips
 //! archives that already exist on disk.
 //!
@@ -102,8 +102,8 @@ async fn probe_one(
     );
 
     // Probe URL template sourced from YAML
-    // `cexs.exchanges.<exch>.archive_url_template.probe` (phase 59.R3.C2.O4,
-    // 2026-05-30). `{sym}` / `{y:04}` / `{m:02}` are filled at probe time.
+    // `cexs.exchanges.<exch>.archive_url_template.probe`.
+    // `{sym}` / `{y:04}` / `{m:02}` are filled at probe time.
     let probe_tpl: Option<String> = match exchange {
         "binance" | "bybit" => {
             let t = series_factory::sources::common::archive_urls(if exchange == "binance" {
@@ -113,7 +113,11 @@ async fn probe_one(
             })
             .probe
             .clone();
-            if t.is_empty() { None } else { Some(t) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
         }
         // bitget/okx have no easily-HEADable monthly archive convention
         // (per-day only) — return None to skip probing; fetcher itself
@@ -233,7 +237,11 @@ fn midnight_utc_today() -> DateTime<Utc> {
 
 fn parse_csv(arg: Option<&str>, fallback: &[String]) -> Vec<String> {
     match arg {
-        Some(s) => s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect(),
+        Some(s) => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
         None => fallback.to_vec(),
     }
 }
@@ -253,7 +261,9 @@ async fn main() -> Result<()> {
         anyhow::bail!("no pairs to fetch (empty config.series.pipeline.pairs and no --pairs)");
     }
     if exchanges.is_empty() {
-        anyhow::bail!("no exchanges to fetch (empty config.series.pipeline.exchanges and no --exchanges)");
+        anyhow::bail!(
+            "no exchanges to fetch (empty config.series.pipeline.exchanges and no --exchanges)"
+        );
     }
 
     let max_window: i64 = root.series.calibration.rolling_window_days as i64;
@@ -268,7 +278,8 @@ async fn main() -> Result<()> {
             let parse_day = |s: &str| -> Result<DateTime<Utc>> {
                 let d = NaiveDate::parse_from_str(s, "%Y-%m-%d")
                     .map_err(|e| anyhow::anyhow!("bad date {s:?}: {e}"))?;
-                Ok(d.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap()).and_utc())
+                Ok(d.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                    .and_utc())
             };
             let from = parse_day(f)?;
             // `--to-date` is inclusive; `fetch_monthly_daily`'s daily loop runs
@@ -376,9 +387,7 @@ async fn fetch_one(cfg: &Config, exchange: &str) -> Result<usize> {
     let (tx, mut rx) = mpsc::channel::<Vec<TickFrame>>(32);
 
     let cfg_cloned = cfg.clone();
-    let fetch = tokio::spawn(async move {
-        drive_source(source, &cfg_cloned, tx).await
-    });
+    let fetch = tokio::spawn(async move { drive_source(source, &cfg_cloned, tx).await });
 
     let mut batches = 0usize;
     while rx.recv().await.is_some() {

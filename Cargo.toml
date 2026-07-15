@@ -92,7 +92,7 @@ rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 # Date/time handling
 chrono = { version = "0.4", features = ["serde"] }
-# HTTP client - synchronous (TODO: replace with reqwest async)
+# HTTP client (synchronous)
 ureq = "2.10"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -119,14 +119,14 @@ anyhow = "1.0"
 memmap2 = "0.9"
 # POSIX resource limits (setrlimit for memory cap)
 libc = "0.2"
-# MITCH protocol types (shared with BTR/prime)
+# MITCH protocol types
 mitch = { path = "../mitch/impl/rust", features = ["bytemuck"] }
 bytemuck = "1.0"
 # Shared SDK (aggregation primitives, Parkinson sigma, etc.)
 nxr-sdk = { path = "../sdk/rust", default-features = false }
-# Δ1.C: coarsetime::Instant matches the SDK's `ProviderEntry::last_update`
-# clock so merge_idx can build a simulated anchor + offset and pass it
-# straight into `update_at` / `compute_vwap_at` without conversion.
+# coarsetime::Instant matches the SDK's `ProviderEntry::last_update` clock so
+# merge_idx can build a simulated anchor + offset and pass it straight into
+# `update_at` / `compute_vwap_at` without conversion.
 coarsetime = "0.1"
 
 [profile.dev]

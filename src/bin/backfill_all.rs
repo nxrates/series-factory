@@ -218,7 +218,10 @@ struct HeavySemaphore {
 
 impl HeavySemaphore {
     fn new(permits: usize) -> Self {
-        Self { permits: Mutex::new(permits.max(1)), cv: Condvar::new() }
+        Self {
+            permits: Mutex::new(permits.max(1)),
+            cv: Condvar::new(),
+        }
     }
     fn acquire(&self) -> HeavyPermit<'_> {
         let mut p = self.permits.lock().unwrap();
@@ -373,7 +376,9 @@ fn next_month_start(d: NaiveDate) -> NaiveDate {
 fn month_windows(from: NaiveDate, to: NaiveDate) -> Vec<(NaiveDate, NaiveDate)> {
     use chrono::Datelike;
     let mut out = Vec::new();
-    let mut cur = NaiveDate::from_ymd_opt(from.year(), from.month(), 1).unwrap().max(from);
+    let mut cur = NaiveDate::from_ymd_opt(from.year(), from.month(), 1)
+        .unwrap()
+        .max(from);
     while cur <= to {
         let month_end = next_month_start(cur) - chrono::Duration::days(1);
         out.push((cur, month_end.min(to)));
@@ -386,12 +391,7 @@ fn month_windows(from: NaiveDate, to: NaiveDate) -> Vec<(NaiveDate, NaiveDate)> 
 /// Called immediately after each month's t2i append succeeds so the raw never
 /// accumulates beyond the current month. Touches ONLY `ticks/<exch>/<BASE><QUOTE>`;
 /// never the per-provider/composite `.idx`, bars, or `.vol`.
-fn delete_month_raw_ticks(
-    out_dir: &Path,
-    exchanges: &[String],
-    base: &str,
-    quote: &str,
-) -> u64 {
+fn delete_month_raw_ticks(out_dir: &Path, exchanges: &[String], base: &str, quote: &str) -> u64 {
     let mut freed = 0u64;
     let sym_dir = format!("{}{}", base, quote);
     for ex in exchanges {
@@ -524,7 +524,8 @@ fn preflight_disk_guard(
     // before t2i folds+deletes it. A daily-fallback file is 1 day; a completed
     // month is up to 31. Size the in-flight peak at the worst single file.
     const PEAK_FILE_DAYS: u64 = 31;
-    let projected = cfg.bytes_per_exchange_day
+    let projected = cfg
+        .bytes_per_exchange_day
         .saturating_mul(n_exch as u64)
         .saturating_mul(parallel.max(1) as u64)
         .saturating_mul(PEAK_FILE_DAYS);
@@ -551,7 +552,10 @@ fn preflight_disk_guard(
             "pre-flight disk guard: projected in-flight raw peak {:.1} GiB > {:.1} GiB \
              (free {:.1} GiB × safety {:.2}). Lower --parallel, free space, or tune \
              series.pipeline.backfill.{{bytes_per_exchange_day,headroom_safety_factor}}.",
-            gib(projected), gib(budget), gib(free), cfg.headroom_safety_factor
+            gib(projected),
+            gib(budget),
+            gib(free),
+            cfg.headroom_safety_factor
         ));
     }
     Ok(())
@@ -612,7 +616,11 @@ fn probe_availability(
         Ok(o) if o.status.success() => {
             let raw = String::from_utf8_lossy(&o.stdout);
             // probe emits exactly 1 JSON line at the end; pick last non-empty
-            let last = raw.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("");
+            let last = raw
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .last()
+                .unwrap_or("");
             #[derive(Deserialize)]
             struct ProbeOut {
                 exchange: String,
@@ -754,7 +762,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         .unwrap_or(200)
         .to_string();
     let out_dir = &ctx.args.out_dir;
-    // Sharded paths — MITCH-ID keyed (canonical, U3/U4). See `docs/sharding-spec.md`.
+    // Sharded paths — MITCH-ID keyed (canonical). See `docs/sharding-spec.md`.
     let ticker_id = nxr_sdk::resolve_ticker_id(&format!("{}/{}", base, quote));
     let composite_dir = nxr_sdk::shard::idx_dir(out_dir, ticker_id);
     let bars_dir = nxr_sdk::shard::bars_dir(out_dir, ticker_id);
@@ -938,7 +946,10 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     for (ex, rep) in reps {
                         *t2i_ms.entry(ex.clone()).or_insert(0) += rep.duration_ms;
                         if rep.exit_code != 0 {
-                            t2i_err.push(format!("{} [{}]: t2i exit {}", m_start_s, ex, rep.exit_code));
+                            t2i_err.push(format!(
+                                "{} [{}]: t2i exit {}",
+                                m_start_s, ex, rep.exit_code
+                            ));
                             t2i_err.extend(rep.errors.clone());
                             hard_fail = true;
                         }
@@ -963,7 +974,11 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 steps_out.push(StepReport {
                     name: "fetch-crypto-history[monthly]".to_string(),
                     duration_ms: fetch_ms,
-                    exit_code: if hard_fail && !fetch_err.is_empty() { -1 } else { 0 },
+                    exit_code: if hard_fail && !fetch_err.is_empty() {
+                        -1
+                    } else {
+                        0
+                    },
                     bytes: total_freed,
                     skipped: false,
                     errors: fetch_err,
@@ -995,7 +1010,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 // P1.4: clean raw staging even on the failure path so a killed
                 // ticker doesn't orphan its raw `.ticks` forever.
                 if !ctx.args.keep_staging {
-                    steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+                    steps_out.push(cleanup_ticker_staging(
+                        out_dir,
+                        &active_exchanges,
+                        &base,
+                        &quote,
+                    ));
                 }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
                 ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -1038,7 +1058,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 // composite/bars/.vol). Raw was already month-deleted; this
                 // mops up the per-provider .idx + any orphan.
                 if !ctx.args.keep_staging {
-                    steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+                    steps_out.push(cleanup_ticker_staging(
+                        out_dir,
+                        &active_exchanges,
+                        &base,
+                        &quote,
+                    ));
                 }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
                 ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -1057,7 +1082,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         steps_out.push(shard_check.clone());
         if shard_check.exit_code != 0 {
             if !ctx.args.keep_staging {
-                steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+                steps_out.push(cleanup_ticker_staging(
+                    out_dir,
+                    &active_exchanges,
+                    &base,
+                    &quote,
+                ));
             }
             ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
             ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -1077,7 +1107,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         // bounded instead of hoarding every ticker's raw ticks until the end.
         // Purge ON by default; the single `--keep-staging` flag opts out.
         if !ctx.args.keep_staging {
-            steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+            steps_out.push(cleanup_ticker_staging(
+                out_dir,
+                &active_exchanges,
+                &base,
+                &quote,
+            ));
         } else {
             info!(ticker, "staging cleanup skipped (--keep-staging)");
         }
@@ -1101,7 +1136,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             steps_out.push(rep);
             if failed {
                 if !ctx.args.keep_staging {
-                    steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+                    steps_out.push(cleanup_ticker_staging(
+                        out_dir,
+                        &active_exchanges,
+                        &base,
+                        &quote,
+                    ));
                 }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
                 ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -1143,7 +1183,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             steps_out.push(rep);
             if failed {
                 if !ctx.args.keep_staging {
-                    steps_out.push(cleanup_ticker_staging(out_dir, &active_exchanges, &base, &quote));
+                    steps_out.push(cleanup_ticker_staging(
+                        out_dir,
+                        &active_exchanges,
+                        &base,
+                        &quote,
+                    ));
                 }
                 ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
                 ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -1163,7 +1208,10 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     if want("validate") {
         // idx already validated post-merge; re-emit for symmetry only if we
         // didn't already run it (e.g. resume skipped merge step).
-        if !steps_out.iter().any(|s| s.name == "integrity-check-shards[idx]") {
+        if !steps_out
+            .iter()
+            .any(|s| s.name == "integrity-check-shards[idx]")
+        {
             steps_out.push(validate_shards(ticker, &composite_dir, "idx"));
         }
         steps_out.push(validate_shards(ticker, &bars_dir, "s10"));
@@ -1182,9 +1230,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         }
     }
 
-    let any_fail = steps_out
-        .iter()
-        .any(|s| s.exit_code != 0 && !s.skipped);
+    let any_fail = steps_out.iter().any(|s| s.exit_code != 0 && !s.skipped);
     let all_skipped = !steps_out.is_empty() && steps_out.iter().all(|s| s.skipped);
     let status = if any_fail {
         "failed"
