@@ -84,11 +84,11 @@ const S10_BUCKET_MS: i64 = 10_000;
 /// corruption (deviates by seconds). Never masks a genuine misalignment.
 const GRID_TOL_MS: i64 = 2;
 
-/// Confidence-freshness floor (Q0.8, ∈[0,1]) — MUST match `integrity_check`'s
+/// Confidence-freshness floor (percent 0-100, `f ∈[0,1]`): MUST match `integrity_check`'s
 /// G4 `CONF_FRESHNESS_FLOOR`. When a record carries [`FLAG_CONF_FRESHNESS`] its
-/// `confidence` byte is a Q0.8 freshness `f = byte/255`; below this floor the
+/// `confidence` byte is a freshness percent 0-100, `f = byte/100`; below this floor the
 /// composite is built from stale components. The legacy `confidence <= accepted`
-/// invariant is INAPPLICABLE to such records (the freshness byte 200/255 of a
+/// invariant is INAPPLICABLE to such records (the freshness byte 78/100 of a
 /// healthy fresh feed routinely exceeds the active-provider `accepted` count),
 /// so the cert applies this advisory staleness check instead, exactly as G4 does.
 const CONF_FRESHNESS_FLOOR: f64 = 0.05;
@@ -380,8 +380,8 @@ struct TickerReport {
     invariant_violations: u64,
     invariant_samples: Vec<ViolationSample>,
     // G4-parity advisory: post-rollout records carrying FLAG_CONF_FRESHNESS whose
-    // Q0.8 freshness `f = confidence/255` is below CONF_FRESHNESS_FLOOR. WARN, not
-    // a FAIL — markets do go briefly stale. NEVER a `confidence > accepted` FAIL.
+    // freshness percent `f = confidence/100` is below CONF_FRESHNESS_FLOOR. WARN, not
+    // a FAIL: markets do go briefly stale. NEVER a `confidence > accepted` FAIL.
     conf_stale_advisories: u64,
     // Quote DEPTH (FIX depth): vbid/vask backing-size validation.
     zero_depth_violations: u64, // HARD FAIL: vbid==0 && vask==0 (phantom liquidity)
@@ -664,8 +664,8 @@ fn check_rollup_parity(
 
 /// Outcome of the per-record microstructure invariant chain. `reason = Some` ⇒
 /// a hard invariant FAIL; `conf_stale = true` ⇒ a freshness-flagged record whose
-/// Q0.8 freshness is below [`CONF_FRESHNESS_FLOOR`] (advisory WARN only, NEVER a
-/// FAIL — and NEVER the legacy `confidence > accepted` FAIL, which is
+/// freshness percent is below [`CONF_FRESHNESS_FLOOR`] (advisory WARN only, NEVER a
+/// FAIL, and NEVER the legacy `confidence > accepted` FAIL, which is
 /// inapplicable to freshness-byte records). Pure so the FIX #1/#2 wire-semantics
 /// + price-floor decisions are testable without on-disk shards.
 struct InvariantOutcome {
@@ -793,7 +793,7 @@ fn eval_invariant(
         Some("crossed quote (ask < bid)")
     } else if !is_freshness && confidence > accepted {
         // FIX #1: legacy semantics only — `confidence` = active-provider count.
-        // Freshness-flagged records carry an independent Q0.8 byte that routinely
+        // Freshness-flagged records carry an independent percent byte that routinely
         // exceeds `accepted`, so the cross-constraint must NOT apply to them.
         Some("confidence > accepted")
     } else {
@@ -1028,7 +1028,7 @@ fn audit_ticker(
         let is_sentinel = (idx.flags & FLAG_HEARTBEAT_SENTINEL) != 0;
         // FIX #1/#2: structural invariants + wire-semantics-aware confidence
         // handling are evaluated by the pure `eval_invariant` (unit-tested). A
-        // fresh record (FLAG_CONF_FRESHNESS, confidence≈200/255 > accepted) is NOT
+        // fresh record (FLAG_CONF_FRESHNESS, confidence≈78/100 > accepted) is NOT
         // a `confidence > accepted` FAIL; instead its sub-floor freshness is an
         // advisory WARN (G4 parity). Sub-floor denormals FAIL the price floor.
         let sb_for_eval = if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 {
@@ -2452,15 +2452,15 @@ mod tests {
     // ── FIX #1: fresh-record confidence>accepted must NOT false-FAIL ─────────
 
     /// A healthy post-rollout record carries FLAG_CONF_FRESHNESS with a freshness
-    /// byte (e.g. 200/255 ≈ 0.78) that routinely EXCEEDS the active-provider
+    /// byte (e.g. 78/100 = 0.78) that routinely EXCEEDS the active-provider
     /// `accepted` count (e.g. 6). The OLD hard invariant `confidence > accepted`
     /// would FAIL it; FIX #1 gates that constraint on the flag being CLEAR, so a
     /// fresh record produces NO invariant FAIL and NO freshness advisory.
     #[test]
     fn fix1_fresh_record_no_false_fail() {
         const FRESH: u8 = FLAG_CONF_FRESHNESS;
-        // confidence=200 (>accepted=6) but freshness-flagged → must NOT FAIL.
-        let o = eval_inv(100.0, 100.1, FRESH, 200, 6, 0.999_0 /*~spread bps*/);
+        // confidence=78 (>accepted=6) but freshness-flagged → must NOT FAIL.
+        let o = eval_inv(100.0, 100.1, FRESH, 78, 6, 0.999_0 /*~spread bps*/);
         assert!(
             o.reason.is_none(),
             "fresh record must not FAIL invariant: {:?}",
@@ -2468,7 +2468,7 @@ mod tests {
         );
         assert!(
             !o.conf_stale,
-            "freshness 200/255 ≈ 0.78 is above floor → no advisory"
+            "freshness 78/100 = 0.78 is above floor → no advisory"
         );
 
         // Same numbers WITHOUT the flag = legacy semantics → confidence>accepted FAIL.
@@ -2479,9 +2479,9 @@ mod tests {
             "legacy (flag clear) confidence>accepted must still FAIL"
         );
 
-        // Freshness-flagged BUT stale (byte 5/255 ≈ 0.0196 < 0.05 floor) → advisory
+        // Freshness-flagged BUT stale (byte 4/100 = 0.04 < 0.05 floor) → advisory
         // WARN only, still NOT an invariant FAIL.
-        let stale = eval_inv(100.0, 100.1, FRESH, 5, 6, 0.999_0);
+        let stale = eval_inv(100.0, 100.1, FRESH, 4, 6, 0.999_0);
         assert!(
             stale.reason.is_none(),
             "stale-fresh record must not FAIL: {:?}",

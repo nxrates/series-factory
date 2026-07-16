@@ -444,8 +444,8 @@ const FUTURE_SLACK_MS: i64 = 300_000;
 /// G8 — sane upper bound on `Index::accepted` (distinct providers contributing
 /// to the composite). `accepted` is a `u8` so it is non-negative and ≤ 255 by
 /// type; a value this large is metadata corruption, not a real provider count.
-/// ERROR on overrun. (`confidence` is now an independent Q0.8 freshness byte —
-/// see `mitch::index` — so no `confidence <= accepted` cross-constraint here.)
+/// ERROR on overrun. (`confidence` is now an independent freshness percent byte,
+/// see `mitch::index`, so no `confidence <= accepted` cross-constraint here.)
 const MAX_ACCEPTED_PROVIDERS: u8 = 64;
 
 /// G5 — price-jump heuristic ceiling: `|mid - prev_mid| / prev_mid`. A move of
@@ -489,9 +489,9 @@ const STUCK_MIN_DISTINCT_FRAC: f64 = 0.002;
 /// of one constant quote is legitimate and must never FAIL). 2000 records.
 const STUCK_MIN_SAMPLE: usize = 2000;
 
-/// G4 — confidence-freshness floor (Q0.8, ∈[0,1]). When a record carries
-/// `FLAG_CONF_FRESHNESS` (bit 3) its `confidence` byte is a Q0.8 freshness
-/// `f = byte/255`; an `f` below this floor means the composite is built from
+/// G4 — confidence-freshness floor (percent 0-100, `f ∈[0,1]`). When a record carries
+/// `FLAG_CONF_FRESHNESS` (bit 3) its `confidence` byte is a freshness percent 0-100,
+/// `f = byte/100`; an `f` below this floor means the composite is built from
 /// stale components. Heuristic (real markets do go briefly stale) → WARN by
 /// default, ERROR under `--strict`. When the flag is *clear* the byte is the
 /// legacy active-provider count and this gate is skipped entirely. 0.05.
@@ -817,7 +817,7 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                 }
 
                 // G4 — confidence-freshness floor. Only meaningful when the
-                // record opts into the Q0.8 freshness wire semantics via
+                // record opts into the freshness-percent wire semantics via
                 // `FLAG_CONF_FRESHNESS`; otherwise the byte is the legacy
                 // active-provider count and carries no staleness meaning.
                 if (idx_body.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0 {
@@ -1886,8 +1886,8 @@ mod tests {
         b
     }
 
-    /// Build an `IndexRecord` carrying `FLAG_CONF_FRESHNESS` with a given Q0.8
-    /// freshness byte (so `check_idx` reads `confidence` as freshness, not a
+    /// Build an `IndexRecord` carrying `FLAG_CONF_FRESHNESS` with a given
+    /// freshness-percent byte (so `check_idx` reads `confidence` as freshness, not a
     /// provider count).
     fn fresh_record(epoch_ms: i64, bid: f64, ask: f64, conf_byte: u8) -> IndexRecord {
         let mts = timestamp::from_epoch_ms(epoch_ms);
@@ -2539,8 +2539,8 @@ mod tests {
 
     #[test]
     fn g4_fresh_or_legacy_no_false_fail() {
-        // (a) flag set + full freshness (byte 255 → f=1.0) → no flag.
-        let fresh = fresh_record(T0, 100.0, 100.1, 255);
+        // (a) flag set + full freshness (byte 100 → f=1.0) → no flag.
+        let fresh = fresh_record(T0, 100.0, 100.1, 100);
         let p = write_idx("g4-fresh.idx", &[fresh]);
         let r = check_idx(&p, true).unwrap();
         assert!(

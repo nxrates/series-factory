@@ -23,7 +23,7 @@
 //!   10Hz sub-cycles. Last-in-bucket reproduces that emission exactly.
 //! - It is the only choice that is **confidence-safe**. The `confidence` byte
 //!   is flag-gated (`FLAG_CONF_FRESHNESS`): clear = legacy active-provider
-//!   COUNT, set = Q0.8 freshness (`byte/255`). A VWAP-style `max`/pool of two
+//!   COUNT, set = freshness percent 0-100 (`byte/100`). A VWAP-style `max`/pool of two
 //!   confidence bytes is meaningless across that flag boundary and could
 //!   silently produce a value whose flag no longer matches. Copying one whole
 //!   record keeps `confidence` and its `FLAG_CONF_FRESHNESS` bit traveling
@@ -36,7 +36,7 @@
 //!
 //! Historical `.idx` records carry the OLD confidence semantics: an integer
 //! active-provider COUNT (0..~22), with `FLAG_CONF_FRESHNESS` **clear**. The
-//! new wire semantics is Q0.8 freshness (`byte/255`) gated by that flag, and
+//! new wire semantics is freshness percent 0-100 (`byte/100`) gated by that flag, and
 //! it is computed from per-provider decay state that is **not** persisted in
 //! `.idx`. The raw decay inputs are gone ⇒ historical freshness is **not
 //! recomputable**. The honest, correct handling is therefore to **preserve the
@@ -44,7 +44,7 @@
 //! interpret historical rows as legacy counts. The flag-gated reader design
 //! (`mitch::index` doc, `nxr_sdk::shard::FLAG_CONF_FRESHNESS`) is *built* to
 //! span mixed old/new records exactly this way: only new realtime data carries
-//! Q0.8. This tool does NOT touch `confidence` or that flag — no fabricated
+//! freshness percent. This tool does NOT touch `confidence` or that flag: no fabricated
 //! freshness. Last-in-bucket copy guarantees this automatically.
 //!
 //! # Layout (sharded, per-MITCH-ticker)
@@ -824,16 +824,16 @@ mod tests {
         let recs = vec![
             rec(ticker, t0, 1.0, 12, 0),
             rec(ticker, t0 + 100, 1.0, 15, 0),
-            rec(ticker, t0 + 200, 1.0, 200, fresh),
-            rec(ticker, t0 + 300, 1.0, 210, fresh),
+            rec(ticker, t0 + 200, 1.0, 80, fresh),
+            rec(ticker, t0 + 300, 1.0, 84, fresh),
         ];
         let out = resample_last_in_bucket(&recs, 200);
         assert_eq!(out.len(), 2);
         // bin1 → later legacy row: conf 15, freshness flag clear.
         assert_eq!(out[0].index.confidence, 15);
         assert_eq!(out[0].index.flags & fresh, 0, "legacy flag stays clear");
-        // bin2 → later freshness row: conf 210, freshness flag still set.
-        assert_eq!(out[1].index.confidence, 210);
+        // bin2 → later freshness row: conf 84, freshness flag still set.
+        assert_eq!(out[1].index.confidence, 84);
         assert_ne!(out[1].index.flags & fresh, 0, "freshness flag preserved");
     }
 }
