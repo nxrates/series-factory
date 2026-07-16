@@ -23,7 +23,7 @@
 //!   10Hz sub-cycles. Last-in-bucket reproduces that emission exactly.
 //! - It is the only choice that is **confidence-safe**. The `confidence` byte
 //!   is flag-gated (`FLAG_CONF_FRESHNESS`): clear = legacy active-provider
-//!   COUNT, set = freshness percent 0-100 (`byte/100`). A VWAP-style `max`/pool of two
+//!   COUNT, set = freshness u8 0-255 0-100 (`byte/255`). A VWAP-style `max`/pool of two
 //!   confidence bytes is meaningless across that flag boundary and could
 //!   silently produce a value whose flag no longer matches. Copying one whole
 //!   record keeps `confidence` and its `FLAG_CONF_FRESHNESS` bit traveling
@@ -36,7 +36,7 @@
 //!
 //! Historical `.idx` records carry the OLD confidence semantics: an integer
 //! active-provider COUNT (0..~22), with `FLAG_CONF_FRESHNESS` **clear**. The
-//! new wire semantics is freshness percent 0-100 (`byte/100`) gated by that flag, and
+//! new wire semantics is freshness u8 0-255 0-100 (`byte/255`) gated by that flag, and
 //! it is computed from per-provider decay state that is **not** persisted in
 //! `.idx`. The raw decay inputs are gone ⇒ historical freshness is **not
 //! recomputable**. The honest, correct handling is therefore to **preserve the
@@ -44,7 +44,7 @@
 //! interpret historical rows as legacy counts. The flag-gated reader design
 //! (`mitch::index` doc, `nxr_sdk::shard::FLAG_CONF_FRESHNESS`) is *built* to
 //! span mixed old/new records exactly this way: only new realtime data carries
-//! freshness percent. This tool does NOT touch `confidence` or that flag: no fabricated
+//! freshness u8 0-255. This tool does NOT touch `confidence` or that flag: no fabricated
 //! freshness. Last-in-bucket copy guarantees this automatically.
 //!
 //! # Layout (sharded, per-MITCH-ticker)

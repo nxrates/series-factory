@@ -444,7 +444,7 @@ const FUTURE_SLACK_MS: i64 = 300_000;
 /// G8 — sane upper bound on `Index::accepted` (distinct providers contributing
 /// to the composite). `accepted` is a `u8` so it is non-negative and ≤ 255 by
 /// type; a value this large is metadata corruption, not a real provider count.
-/// ERROR on overrun. (`confidence` is now an independent freshness percent byte,
+/// ERROR on overrun. (`confidence` is now an independent freshness u8 0-255 byte,
 /// see `mitch::index`, so no `confidence <= accepted` cross-constraint here.)
 const MAX_ACCEPTED_PROVIDERS: u8 = 64;
 
@@ -489,9 +489,9 @@ const STUCK_MIN_DISTINCT_FRAC: f64 = 0.002;
 /// of one constant quote is legitimate and must never FAIL). 2000 records.
 const STUCK_MIN_SAMPLE: usize = 2000;
 
-/// G4 — confidence-freshness floor (percent 0-100, `f ∈[0,1]`). When a record carries
-/// `FLAG_CONF_FRESHNESS` (bit 3) its `confidence` byte is a freshness percent 0-100,
-/// `f = byte/100`; an `f` below this floor means the composite is built from
+/// G4 — confidence-freshness floor (fraction `f ∈[0,1]`, f = byte/255). When a record carries
+/// `FLAG_CONF_FRESHNESS` (bit 3) its `confidence` byte is a freshness u8 0-255 0-100,
+/// `f = byte/255`; an `f` below this floor means the composite is built from
 /// stale components. Heuristic (real markets do go briefly stale) → WARN by
 /// default, ERROR under `--strict`. When the flag is *clear* the byte is the
 /// legacy active-provider count and this gate is skipped entirely. 0.05.
