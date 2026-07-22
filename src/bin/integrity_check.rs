@@ -141,6 +141,9 @@ enum Cmd {
         /// flag the condition is only DETECTED and reported (ERROR).
         #[arg(long)]
         heal_orphaned_bak: bool,
+        /// Only shards dated within last N days (filename stem); unset = full history.
+        #[arg(long)]
+        since_days: Option<i64>,
     },
 }
 
@@ -1423,9 +1426,9 @@ fn exit_code(reports: &[FileReport], strict: bool) -> i32 {
 
 // ── Directory walk ──────────────────────────────────────────────────────────
 
-fn collect_files(root: &Path) -> Vec<PathBuf> {
+fn collect_files(root: &Path, since: Option<chrono::NaiveDate>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>, since: Option<chrono::NaiveDate>) {
         let read = match std::fs::read_dir(dir) {
             Ok(r) => r,
             Err(e) => {
@@ -1436,15 +1439,26 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
         for entry in read.flatten() {
             let p = entry.path();
             if p.is_dir() {
-                walk(&p, out);
+                walk(&p, out, since);
             } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
                 if matches!(ext, "idx" | "bars" | "s10" | "vol" | "renko") {
+                    // Non-date-stemmed files (manifest.json etc, excluded by
+                    // extension already) always pass; date-stemmed shards are
+                    // filtered by cutoff when --since-days is set.
+                    if let Some(cutoff) = since {
+                        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        if let Ok(d) = nxr_sdk::shard::parse_utc_date(stem) {
+                            if d < cutoff {
+                                continue;
+                            }
+                        }
+                    }
                     out.push(p);
                 }
             }
         }
     }
-    walk(root, &mut out);
+    walk(root, &mut out, since);
     out.sort();
     out
 }
@@ -1584,8 +1598,10 @@ fn check_dir(
     parallel: usize,
     strict: bool,
     heal_orphaned_bak: bool,
+    since_days: Option<i64>,
 ) -> Result<AggregateReport> {
-    let files = collect_files(root);
+    let since = since_days.map(|n| nxr_sdk::shard::today_utc() - chrono::Duration::days(n));
+    let files = collect_files(root, since);
     info!(root = %root.display(), n = files.len(), "integrity-check dir");
 
     // Orphaned live-writer detection / auto-heal (prod incident 2026-06-10).
@@ -1700,8 +1716,9 @@ fn main() -> Result<()> {
             report,
             strict,
             heal_orphaned_bak,
+            since_days,
         } => {
-            let agg = check_dir(&path, parallel, strict, heal_orphaned_bak)?;
+            let agg = check_dir(&path, parallel, strict, heal_orphaned_bak, since_days)?;
             for r in &agg.files {
                 print_summary(r);
             }
