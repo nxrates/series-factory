@@ -54,9 +54,10 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Duration, NaiveDate, Utc};
 use clap::Parser;
+use rayon::prelude::*;
 use serde::Serialize;
 
 use nxr_sdk::ipc::record::IndexRecord;
@@ -343,6 +344,15 @@ struct Cli {
     /// Emit a machine-readable JSON report instead of the human table.
     #[arg(long)]
     json: bool,
+
+    /// Ticker-level concurrency. Was hardcoded sequential (1 ticker at a
+    /// time, zero use of the 3-core CronJob limit) — a 45d/all-tickers run
+    /// blew the 50min `activeDeadlineSeconds` with zero output. Default 3
+    /// matches `dq-cert.yaml`'s `resources.limits.cpu`; override only if the
+    /// manifest's cpu limit changes too (over-subscribing rayon threads vs a
+    /// cgroup cpu quota buys nothing but context-switch overhead).
+    #[arg(long, default_value_t = 3)]
+    parallel: usize,
 }
 
 // ── Report types ──────────────────────────────────────────────────────────────
@@ -849,6 +859,79 @@ fn discover_tickers(data_root: &Path) -> Vec<u64> {
     ids
 }
 
+/// Placeholder report for a ticker `audit_ticker` returned `Err` for (unreadable
+/// shard tree, corrupt manifest, etc). A hard FAIL, never a silently dropped
+/// ticker — every discovered id must appear in the final report exactly once.
+fn failed_ticker_report(id: u64, e: &anyhow::Error) -> TickerReport {
+    TickerReport {
+        ticker_id: id,
+        has_data: false,
+        n_records: 0,
+        suspect_gaps: 0,
+        quiet_gaps: 0,
+        outage_gaps: 0,
+        missing_days: 0,
+        missing_day_list: Vec::new(),
+        worst_gaps: Vec::new(),
+        invariant_violations: 0,
+        invariant_samples: Vec::new(),
+        conf_stale_advisories: 0,
+        zero_depth_violations: 0,
+        one_sided_depth_warns: 0,
+        reject_dominant_records: 0,
+        reject_rate: f64::NAN,
+        reject_rate_warn: false,
+        mad_outliers: 0,
+        worst_mad_z: 0.0,
+        cusum_alarms: 0,
+        sigma_park_ann: f64::NAN,
+        crypto_stable: false,
+        zero_return_frac: f64::NAN,
+        longest_flat_run: 0,
+        stuck_feed: false,
+        vol_present: false,
+        vol_sigma_stored: f64::NAN,
+        vol_sigma_divergence: false,
+        rollup_violations: 0,
+        rollup_samples: Vec::new(),
+        renko_bpd: f64::NAN,
+        renko_days: 0,
+        renko_ratio: f64::NAN,
+        renko_target_bpd: f64::NAN,
+        renko_target_unresolved: false,
+        renko_skipped_stable: false,
+        renko_b03_violations: 0,
+        renko_brick_floor_violations: 0,
+        renko_k_present: false,
+        renko_uncalibrated: false,
+        renko_inferred_bpd: f64::NAN,
+        renko_bpd_off_band: false,
+        renko_bpd_median: f64::NAN,
+        renko_bpd_mad: f64::NAN,
+        renko_bpd_min_day: 0,
+        renko_dist_drift: false,
+        renko_dist_fail: false,
+        renko_k_used: None,
+        renko_k_stale: false,
+        renko_k_implausible: false,
+        renko_k_clamped_warn: false,
+        renko_shards_behind_calibration: false,
+        renko_provenance_missing: false,
+        renko_samples: Vec::new(),
+        s10_bars: 0,
+        s10_violations: 0,
+        s10_samples: Vec::new(),
+        s10_b03_violations: 0,
+        s10_b03_gaps: 0,
+        s10_misaligned: 0,
+        s10_coverage_pct: f64::NAN,
+        s10_coverage_fail: false,
+        s10_coverage_warn: false,
+        verdict: "FAIL".to_string(),
+        fail_reasons: vec![format!("audit error: {e}")],
+    }
+}
+
 // ── Per-ticker audit ─────────────────────────────────────────────────────────
 
 fn audit_ticker(
@@ -1148,17 +1231,25 @@ fn audit_ticker(
     let mut daily_hl_logsq: Vec<f64> = Vec::new(); // (ln(H/L))^2 per day
     let mut zero_return_frac = 0.0;
 
+    // Read every s10 shard in the window EXACTLY ONCE (was: read separately
+    // in the Parkinson-vol block below, again in Check 5 kline sanity, and a
+    // third time for Check 6 rollup-parity — 3x redundant IO/CPU per ticker
+    // across a run of ALL tickers x 45d is what turned dq-cert into a
+    // `activeDeadlineSeconds` timeout with zero JSON output). Unreadable
+    // shards degrade to an empty Vec (matches the old per-block `Err(_) =>
+    // continue` skip behavior) rather than failing the whole ticker.
+    let s10_bars_by_shard: Vec<(NaiveDate, Vec<Bar>)> = s10_shards
+        .iter()
+        .map(|(date, path)| (*date, read_shard_aligned::<Bar>(path).unwrap_or_default()))
+        .collect();
+
     // From s10 bars: aggregate daily high/low.
     if !s10_shards.is_empty() {
-        for (date, path) in &s10_shards {
-            let bars = match read_shard_aligned::<Bar>(path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+        for (date, bars) in &s10_bars_by_shard {
             let mut hi = f64::MIN;
             let mut lo = f64::MAX;
             let _ = date;
-            for bar in &bars {
+            for bar in bars {
                 let h = bar.high;
                 let l = bar.low;
                 if h.is_finite() && l.is_finite() && l > 0.0 && h > 0.0 {
@@ -1511,11 +1602,7 @@ fn audit_ticker(
         let mut prev_open_ms: Option<i64> = None; // K1 grid is computed OPEN→OPEN
         let mut prev_close_bar: Option<Bar> = None; // last bar of prev shard (seam x-check)
         let mut buckets_per_day: BTreeMap<NaiveDate, u64> = BTreeMap::new();
-        for (date, path) in &s10_shards {
-            let bars = match read_shard_aligned::<Bar>(path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+        for (date, bars) in &s10_bars_by_shard {
             // Cross-shard seam x-check via the SHARED production primitive
             // (`seam::check_s10_cross_shard`, close→close residual, ±1ms jitter
             // band). The per-bar K1 below tracks the OPEN grid for the precise
@@ -1536,7 +1623,7 @@ fn audit_ticker(
                     }
                 }
             }
-            for bar in &bars {
+            for bar in bars {
                 r.s10_bars += 1;
                 let o = bar.open;
                 let h = bar.high;
@@ -1650,26 +1737,20 @@ fn audit_ticker(
         // single most-recent shard when <2 shards exist. Picking the two most
         // recent shards that differ by ≥1 day guarantees a real UTC-day seam.
         let mut src: Vec<Ohlc> = Vec::new();
-        let n = s10_shards.len();
+        let n = s10_bars_by_shard.len();
         if n >= 2 {
-            let (last_date, last_path) = &s10_shards[n - 1];
+            let (last_date, last_bars) = &s10_bars_by_shard[n - 1];
             // Walk back to the newest earlier shard at least 1 day before `last`.
-            let prev = s10_shards[..n - 1]
+            let prev = s10_bars_by_shard[..n - 1]
                 .iter()
                 .rev()
                 .find(|(d, _)| (*last_date - *d).num_days() >= 1);
-            if let Some((_, prev_path)) = prev {
-                if let Ok(pbars) = read_shard_aligned::<Bar>(prev_path) {
-                    src.extend(pbars.iter().map(bar_to_ohlc));
-                }
+            if let Some((_, prev_bars)) = prev {
+                src.extend(prev_bars.iter().map(bar_to_ohlc));
             }
-            if let Ok(lbars) = read_shard_aligned::<Bar>(last_path) {
-                src.extend(lbars.iter().map(bar_to_ohlc));
-            }
-        } else if let Some((_, path)) = s10_shards.last() {
-            if let Ok(bars) = read_shard_aligned::<Bar>(path) {
-                src.extend(bars.iter().map(bar_to_ohlc));
-            }
+            src.extend(last_bars.iter().map(bar_to_ohlc));
+        } else if let Some((_, bars)) = s10_bars_by_shard.last() {
+            src.extend(bars.iter().map(bar_to_ohlc));
         }
         // `rollup` requires a ts-sorted src; the seam concatenation is already
         // date-ordered (prev shard before last) and each shard is ts-sorted, so
@@ -2133,103 +2214,49 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|c| (c.mult_bounds[0], c.mult_bounds[1]));
 
-    let mut reports: Vec<TickerReport> = Vec::with_capacity(tickers.len());
-    for id in tickers {
-        // FIX #5: distinguish a genuinely RESOLVED per-ticker target from the flat
-        // fallback. When unresolved, audit_ticker SKIPs the bpd-band gate.
-        let resolved = target_resolver.target_for_resolved(id);
-        let per_ticker_target = resolved.unwrap_or(cli.target_bpd);
-        let target_resolved = resolved.is_some();
-        let is_known_stable = target_resolver.is_known_stable(id);
-        let band = class_band(target_resolver.class_for(id));
-        match audit_ticker(
-            &cli.common.data_root,
-            id,
-            win_start,
-            win_end,
-            cli.max_gap_ms,
-            cli.quiet_tolerance_ms,
-            per_ticker_target,
-            target_resolved,
-            is_known_stable,
-            k_bounds,
-            band,
-        ) {
-            Ok(r) => reports.push(r),
-            Err(e) => {
-                // A per-ticker IO failure is a FAIL for that ticker, not a panic.
-                let mut r = TickerReport {
-                    ticker_id: id,
-                    has_data: false,
-                    n_records: 0,
-                    suspect_gaps: 0,
-                    quiet_gaps: 0,
-                    outage_gaps: 0,
-                    missing_days: 0,
-                    missing_day_list: Vec::new(),
-                    worst_gaps: Vec::new(),
-                    invariant_violations: 0,
-                    invariant_samples: Vec::new(),
-                    conf_stale_advisories: 0,
-                    zero_depth_violations: 0,
-                    one_sided_depth_warns: 0,
-                    reject_dominant_records: 0,
-                    reject_rate: f64::NAN,
-                    reject_rate_warn: false,
-                    mad_outliers: 0,
-                    worst_mad_z: 0.0,
-                    cusum_alarms: 0,
-                    sigma_park_ann: f64::NAN,
-                    crypto_stable: false,
-                    zero_return_frac: f64::NAN,
-                    longest_flat_run: 0,
-                    stuck_feed: false,
-                    vol_present: false,
-                    vol_sigma_stored: f64::NAN,
-                    vol_sigma_divergence: false,
-                    rollup_violations: 0,
-                    rollup_samples: Vec::new(),
-                    renko_bpd: f64::NAN,
-                    renko_days: 0,
-                    renko_ratio: f64::NAN,
-                    renko_target_bpd: f64::NAN,
-                    renko_target_unresolved: false,
-                    renko_skipped_stable: false,
-                    renko_b03_violations: 0,
-                    renko_brick_floor_violations: 0,
-                    renko_k_present: false,
-                    renko_uncalibrated: false,
-                    renko_inferred_bpd: f64::NAN,
-                    renko_bpd_off_band: false,
-                    renko_bpd_median: f64::NAN,
-                    renko_bpd_mad: f64::NAN,
-                    renko_bpd_min_day: 0,
-                    renko_dist_drift: false,
-                    renko_dist_fail: false,
-                    renko_k_used: None,
-                    renko_k_stale: false,
-                    renko_k_implausible: false,
-                    renko_k_clamped_warn: false,
-                    renko_shards_behind_calibration: false,
-                    renko_provenance_missing: false,
-                    renko_samples: Vec::new(),
-                    s10_bars: 0,
-                    s10_violations: 0,
-                    s10_samples: Vec::new(),
-                    s10_b03_violations: 0,
-                    s10_b03_gaps: 0,
-                    s10_misaligned: 0,
-                    s10_coverage_pct: f64::NAN,
-                    s10_coverage_fail: false,
-                    s10_coverage_warn: false,
-                    verdict: "FAIL".to_string(),
-                    fail_reasons: vec![format!("audit error: {e}")],
-                };
-                r.has_data = false;
-                reports.push(r);
-            }
-        }
-    }
+    // Ticker-level concurrency: was a fully sequential `for` loop with zero
+    // use of the CronJob's 3-core limit. Combined with the 3x redundant s10
+    // reads (fixed above in `audit_ticker`), a 45d/all-tickers run blew the
+    // 50min `activeDeadlineSeconds` and produced ZERO json output (verified
+    // 2026-07-24: dq-cert.json was 0 bytes after the deadline kill). A
+    // bounded pool (`--parallel`, default 3 = the manifest's cpu limit) turns
+    // this into wall-clock ≈ (work / min(parallel, tickers)) instead of a
+    // straight sum over every ticker.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cli.parallel.max(1))
+        .build()
+        .context("build rayon pool")?;
+    let reports: Vec<TickerReport> = pool.install(|| {
+        tickers
+            .par_iter()
+            .map(|&id| {
+                // FIX #5: distinguish a genuinely RESOLVED per-ticker target from the
+                // flat fallback. When unresolved, audit_ticker SKIPs the bpd-band gate.
+                let resolved = target_resolver.target_for_resolved(id);
+                let per_ticker_target = resolved.unwrap_or(cli.target_bpd);
+                let target_resolved = resolved.is_some();
+                let is_known_stable = target_resolver.is_known_stable(id);
+                let band = class_band(target_resolver.class_for(id));
+                audit_ticker(
+                    &cli.common.data_root,
+                    id,
+                    win_start,
+                    win_end,
+                    cli.max_gap_ms,
+                    cli.quiet_tolerance_ms,
+                    per_ticker_target,
+                    target_resolved,
+                    is_known_stable,
+                    k_bounds,
+                    band,
+                )
+                // A per-ticker IO failure is a FAIL for that ticker, not a panic
+                // and not a dropped ticker (silent omission would be indistinguishable
+                // from "no problems found" — every discovered ticker gets a report).
+                .unwrap_or_else(|e| failed_ticker_report(id, &e))
+            })
+            .collect()
+    });
 
     let n_pass = reports.iter().filter(|r| r.verdict == "PASS").count() as u64;
     let n_fail = reports.iter().filter(|r| r.verdict == "FAIL").count() as u64;
