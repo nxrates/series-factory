@@ -93,9 +93,68 @@ struct Args {
     #[arg(long)]
     once: bool,
     /// Rayon worker count for the per-ticker loop. Keep low to bound RAM
-    /// (each ticker mmaps a .idx and builds a sigma cache).
-    #[arg(long, default_value_t = 4)]
+    /// (each ticker mmaps a .idx and builds a sigma cache). Default 2, NOT 4:
+    /// `--parallel 4` drove node load to 322 and took the public feed down
+    /// (2026-06 outage). The k8s CronJob passes 2 explicitly; this default now
+    /// matches it so an ad-hoc manual run cannot reintroduce the outage.
+    #[arg(long, default_value_t = 2)]
     parallel: usize,
+    /// Override the trailing fit window (`calibration.rolling_window_days`, YAML
+    /// default 730). Exists to answer "is 730 d actually needed?" — the fit is a
+    /// volatility-scale estimate, so a shorter window may land the same k for a
+    /// fraction of the RAM/IO/time. k is only comparable across runs at EQUAL
+    /// window, so the value used is recorded in `last_run.window_days`.
+    #[arg(long)]
+    window_days: Option<u32>,
+}
+
+// ── ticker-params.json store ─────────────────────────────────────────────────
+
+/// Serialized read-modify-atomic-rename access to `ticker-params.json`.
+///
+/// The file is SHARED with `nxr-weights` (hourly): it owns `generated_at` /
+/// `pair_volumes` / `exchanges`, we own the `renko_k*` / `calibration_status` /
+/// `last_run` fields. The old code loaded the file once at startup and
+/// serialized the whole struct up to 90 minutes later, silently reverting every
+/// weights run in between — a lost update. Every write now re-reads immediately
+/// before mutating, under TWO locks: an in-process mutex so the `--parallel`
+/// workers cannot lose each other's updates (same bug class, one level down),
+/// and a `ParamsLock` flock so the SEPARATE `nxr-weights` process cannot either
+/// (the mutex is invisible to it — it is the original lost-update racer).
+/// Mutex first, flock second: that ordering means only one thread of this
+/// process ever holds the flock, so the per-open-fd flock cannot self-deadlock.
+struct ParamsStore {
+    path: PathBuf,
+    lock: std::sync::Mutex<()>,
+}
+
+impl ParamsStore {
+    fn new(path: PathBuf) -> Self {
+        Self { path, lock: std::sync::Mutex::new(()) }
+    }
+
+    fn read(&self) -> Result<WeightsFile> {
+        if !self.path.exists() {
+            warn!(path = %self.path.display(), "ticker-params.json missing — starting from scratch");
+            return Ok(WeightsFile::default());
+        }
+        let raw = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("read {}", self.path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", self.path.display()))
+    }
+
+    /// Re-read, mutate ONLY our own fields inside `f`, atomic-rename. The whole
+    /// read-modify-rename runs under the cross-process `ParamsLock`; a lock we
+    /// cannot take is an error (the caller logs it and the ticker is retried next
+    /// cycle) — never a silently dropped write.
+    fn update<F: FnOnce(&mut WeightsFile)>(&self, f: F) -> Result<()> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _flock = nxr_sdk::weights_schema::ParamsLock::acquire(&self.path)
+            .with_context(|| format!("lock {}", self.path.display()))?;
+        let mut w = self.read()?;
+        f(&mut w);
+        write_atomic_string(&self.path, &serde_json::to_string_pretty(&w)?)
+    }
 }
 
 // ── Config (subset of config.yml) ────────────────────────────────────────────
@@ -451,9 +510,16 @@ fn calibrate_one(
     let _ = std::fs::remove_file(&vol_path);
 
     if !(mult > 0.0 && (mult as f64).is_finite()) {
-        return CalOutcome::Failed {
+        // SKIPPED, not Failed: semantically identical to the K_FLOOR bracket skip
+        // — the asset has no brick structure to fit (pegged stable, thin
+        // FX-quoted book). Which code path noticed is an implementation detail, so
+        // it must not reach `consecutive_failures`: all 19 "failures" of the
+        // 2026-07-25 run were this, and alerting on them would have started the
+        // >=3 alert with 19 permanent false positives. The message keeps the
+        // diagnostic granularity.
+        return CalOutcome::Skipped {
             ticker_id,
-            reason: "calibration returned 0 (degenerate window / unreachable target)".into(),
+            reason: "unreachable target (solver returned 0 / degenerate window)".into(),
         };
     }
     CalOutcome::Ok {
@@ -858,9 +924,10 @@ fn calibrate_one_synth(
     let _ = std::fs::remove_file(&vol_path);
 
     if !(mult > 0.0 && (mult as f64).is_finite()) {
-        return CalOutcome::Failed {
+        // Skipped, not Failed — same reasoning as the base pass above.
+        return CalOutcome::Skipped {
             ticker_id: synth_id,
-            reason: "synth calibration returned 0 (degenerate window / unreachable target)".into(),
+            reason: "synth unreachable target (solver returned 0 / degenerate window)".into(),
         };
     }
     CalOutcome::Ok {
@@ -921,6 +988,65 @@ fn resolve_synth_work(yml_pairs: &[SynthPairYml]) -> Vec<(u64, &'static str, u64
 
 // ── Main run ─────────────────────────────────────────────────────────────────
 
+/// Persist ONE outcome before moving on: staged k (never the live map) +
+/// per-ticker diagnostics, so a kill after this point keeps the work. Serialized
+/// by `ParamsStore` (in-process mutex + flock) so `--parallel` workers and the
+/// `nxr-weights` process cannot lose each other's entries. 35 KB file, so the
+/// per-ticker cost is noise next to a fit.
+///
+/// Shared by all three passes (base loop, synth, inferred-USDC fallback) — the
+/// synth and fallback work used to be unstaged, so a kill in either phase threw
+/// it away every cycle. `count_in_run` is true for the BASE loop only, because
+/// `tickers_total` is the base roster: the fallback re-fits ids the base loop
+/// already counted (ratio > 1), and the synth universe is the full cross catalog,
+/// most of which is structurally skipped for want of `.s10` (ratio → 0). Either
+/// would make `nxr_calibrate_coverage_ratio` (= succeeded/total) lie.
+///
+/// `Skipped` is STRUCTURAL (no shards / window too short / target unreachable at
+/// K_FLOOR — a pegged stable may be flat forever), so it must not feed
+/// `consecutive_failures` or the >=3 alert would sit permanently red on assets
+/// renko is simply not offered for.
+fn stage_outcome(store: &ParamsStore, outcome: &CalOutcome, count_in_run: bool) {
+    let now = nxr_sdk::now_sec();
+    let (id_key, k_ok, err, skip) = match outcome {
+        CalOutcome::Ok { ticker_id, k } => (ticker_id.to_string(), Some(*k), None, None),
+        CalOutcome::Skipped { ticker_id, reason } => {
+            (ticker_id.to_string(), None, None, Some(reason.clone()))
+        }
+        CalOutcome::Failed { ticker_id, reason } => {
+            (ticker_id.to_string(), None, Some(reason.clone()), None)
+        }
+    };
+    if let Err(e) = store.update(|w| {
+        if let Some(k) = k_ok {
+            w.renko_k_staged.insert(id_key.clone(), k);
+        }
+        let st = w.calibration_status.entry(id_key.clone()).or_default();
+        st.last_attempt = Some(now);
+        if k_ok.is_some() {
+            st.last_success = Some(now);
+            st.consecutive_failures = 0;
+            st.last_error = None;
+            st.last_skip_reason = None;
+        } else if let Some(reason) = skip {
+            st.last_skip_reason = Some(reason);
+        } else {
+            st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+            st.last_error = err;
+        }
+        if count_in_run {
+            if let Some(r) = w.last_run.as_mut() {
+                r.tickers_attempted += 1;
+                if k_ok.is_some() {
+                    r.tickers_succeeded += 1;
+                }
+            }
+        }
+    }) {
+        warn!(ticker_id = %id_key, err = %e, "staged-result write failed (fit result lost for this ticker)");
+    }
+}
+
 fn run_once(args: &Args) -> Result<()> {
     let root: PipelineYml = PipelineYml::load_default(nxr_sdk::pipeline_config::ConfigHint::Bin)?;
     let series = &root.series;
@@ -963,30 +1089,143 @@ fn run_once(args: &Args) -> Result<()> {
         "nxr-calibrate starting"
     );
 
-    // Load the existing weights file so we can preserve volumes/exchanges/etc.
-    let mut weights_file: WeightsFile = if params_path.exists() {
-        let raw = std::fs::read_to_string(&params_path)
-            .with_context(|| format!("read {}", params_path.display()))?;
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", params_path.display()))?
-    } else {
-        warn!(path = %params_path.display(), "ticker-params.json missing — starting from scratch");
-        WeightsFile::default()
+    // Snapshot the file for the ROSTER + prior-k reads only. Every WRITE goes
+    // through `store`, which re-reads first (see ParamsStore).
+    let store = ParamsStore::new(params_path.clone());
+    let weights_file: WeightsFile = store.read()?;
+
+    // Run identity = UTC date + window. The 4 daily cycles therefore SHARE an id,
+    // so a cycle killed by activeDeadlineSeconds is resumed by the next one
+    // instead of restarting from zero; a window change starts a fresh staging set
+    // because k is not comparable across windows.
+    let window_days = args
+        .window_days
+        .map(|d| d as usize)
+        .unwrap_or(series.calibration.rolling_window_days);
+    let run_id = format!(
+        "{}-w{}",
+        chrono::Utc::now().format("%Y-%m-%d"),
+        window_days
+    );
+    let started_at = nxr_sdk::now_sec();
+
+    // Build the work list: (pair, ticker_id, class). De-dupe by ticker_id since
+    // the same pair appears under multiple exchanges in pair_volumes.
+    //
+    // Roster = CEX-volume pairs UNION the config's declared symbols
+    // (`PipelineYml::configured_symbols`, shared with core's
+    // `register_config_symbols`), filtered to ids that actually have `.idx` on
+    // disk. `pair_volumes` alone was the wrong key: the fit reads ONLY `.idx`
+    // ticks (`calibrate_one`) and never volume, so Pyth-only stables/metals/FX
+    // were excluded forever despite having full tick history — 17 of the 23 DEX
+    // pool assets, silently uncalibrated (2026-07-25). Union rather than replace,
+    // so nothing currently calibrated is dropped.
+    //
+    // MINUS the synth/cross universe, which the synth pass below owns: resolve it
+    // FIRST so the base roster can exclude it. `configured_symbols()` includes
+    // `cexs.cross_pairs`, and a cross's only correct basis is the event-merged pair
+    // of USDT leg `.idx` streams (a cross `.idx`, where one exists at all, is a
+    // stale live-inference artifact — crosses are RAM-only on the wire). Without
+    // this exclusion any cross with an on-disk `.idx` was fitted TWICE per run on
+    // two different bases: once in the base loop, then overwritten by the synth
+    // pass. Each id is now fitted exactly once, on its own basis.
+    let synth_work = {
+        let pairs = nxr_sdk::synth::pipeline_pairs::synth_pipeline_pairs(&root);
+        resolve_synth_work(&pairs)
+    };
+    let synth_ids: std::collections::HashSet<u64> =
+        synth_work.iter().map(|(id, ..)| *id).collect();
+    let synth_count = synth_work.len();
+    let mut seen: HashMap<u64, (String, AssetClassBucket)> = HashMap::new();
+    let volume_pairs: Vec<String> = weights_file
+        .pair_volumes
+        .values()
+        .flat_map(|pairs| pairs.keys().cloned())
+        .collect();
+    let mut no_shards = 0usize;
+    let mut deferred_to_synth = 0usize;
+    for pair in volume_pairs.iter().cloned().chain(root.configured_symbols()) {
+        let ticker_id = resolve_ticker_id(&pair);
+        if seen.contains_key(&ticker_id) {
+            continue;
+        }
+        // Owned by the synth pass (correct basis = the two USDT leg streams).
+        if synth_ids.contains(&ticker_id) {
+            deferred_to_synth += 1;
+            continue;
+        }
+        // A declared symbol with no `.idx` yet (gated Lazer feed, brand-new
+        // listing) is not an error — it simply has nothing to fit. Skip it here
+        // instead of spending a worker to reach the same conclusion.
+        if !idx_dir.join(ticker_id.to_string()).is_dir() {
+            no_shards += 1;
+            continue;
+        }
+        let class = bucket_for_pair(&pair, ticker_id, &crypto_majors, &stablecoins, &fx_majors);
+        seen.insert(ticker_id, (pair.clone(), class));
+    }
+    info!(
+        from_volumes = volume_pairs.len(),
+        declared = root.configured_symbols().len(),
+        skipped_no_idx = no_shards,
+        deferred_to_synth,
+        n_synth = synth_work.len(),
+        "roster sources merged (volume pairs ∪ config-declared, minus synth crosses, filtered to on-disk .idx)"
+    );
+    let roster: Vec<(u64, String, AssetClassBucket)> =
+        seen.into_iter().map(|(id, (p, c))| (id, p, c)).collect();
+    let roster_ids: std::collections::HashSet<String> =
+        roster.iter().map(|(id, ..)| id.to_string()).collect();
+
+    // Arm the run stamp + staging set BEFORE any work, and drop a stale staging
+    // set (different run_id ⇒ different day or window). `finished_at: None` here
+    // is what makes a killed run detectable: a stamp older than one cycle with no
+    // finish time is a run that died, which used to be invisible because
+    // ttlSecondsAfterFinished reaps the Job object.
+    let resume: BTreeMap<String, f64> = {
+        let mut resumed = BTreeMap::new();
+        store.update(|w| {
+            if w.staged_run_id.as_deref() == Some(run_id.as_str()) {
+                resumed = w.renko_k_staged.clone();
+            } else {
+                w.renko_k_staged.clear();
+                w.staged_run_id = Some(run_id.clone());
+            }
+            let resumed_roster = resumed.keys().filter(|k| roster_ids.contains(*k)).count();
+            // Counters START at what earlier cycles of this run_id already staged
+            // for ROSTER ids — otherwise `coverage_ratio` (= succeeded/total)
+            // reads near-zero on a resumed cycle that in fact finished the roster.
+            // Roster-only, matching `tickers_total`: staged synth ids are not in it.
+            w.last_run = Some(nxr_sdk::weights_schema::CalibrateRun {
+                run_id: run_id.clone(),
+                started_at,
+                finished_at: None,
+                tickers_total: roster.len(),
+                tickers_attempted: resumed_roster,
+                tickers_succeeded: resumed_roster,
+                exit_reason: "partial".to_string(),
+                window_days: Some(window_days as u32),
+            });
+        })?;
+        resumed
     };
 
-    // Build the work list: (pair, ticker_id, class). De-dupe across providers
-    // since the same ticker_id appears under multiple exchanges in pair_volumes.
-    let mut seen: HashMap<u64, (String, AssetClassBucket)> = HashMap::new();
-    for pairs in weights_file.pair_volumes.values() {
-        for pair in pairs.keys() {
-            let ticker_id = resolve_ticker_id(pair);
-            let class = bucket_for_pair(pair, ticker_id, &crypto_majors, &stablecoins, &fx_majors);
-            seen.entry(ticker_id)
-                .or_insert_with(|| (pair.clone(), class));
-        }
-    }
-    let work: Vec<(u64, String, AssetClassBucket)> =
-        seen.into_iter().map(|(id, (p, c))| (id, p, c)).collect();
-    info!(n_tickers = work.len(), "ticker universe assembled");
+    // Resume: skip tickers this run_id already staged. Partial work from a killed
+    // cycle is therefore never repeated, which is what lets 184 tickers finish
+    // across cycles instead of restarting into the same deadline every time.
+    let work: Vec<(u64, String, AssetClassBucket)> = roster
+        .iter()
+        .filter(|(id, _, _)| !resume.contains_key(&id.to_string()))
+        .cloned()
+        .collect();
+    info!(
+        n_tickers = work.len(),
+        roster = roster.len(),
+        resumed = resume.len(),
+        run_id = %run_id,
+        window_days,
+        "ticker universe assembled"
+    );
 
     // Configure rayon worker count.
     let pool = rayon::ThreadPoolBuilder::new()
@@ -994,7 +1233,14 @@ fn run_once(args: &Args) -> Result<()> {
         .build()
         .with_context(|| "build rayon pool")?;
 
-    let cal_ext = &series.calibration;
+    // `--window-days` applies here, so BOTH passes (base + synth) and every
+    // solver call see the same window the run records in `last_run.window_days`.
+    let cal_owned = {
+        let mut c = series.calibration.clone();
+        c.rolling_window_days = window_days;
+        c
+    };
+    let cal_ext = &cal_owned;
     let vol_cfg = &series.vol;
     let renko_yml = &series.renko;
 
@@ -1018,8 +1264,7 @@ fn run_once(args: &Args) -> Result<()> {
     pool.install(|| {
         work.par_iter().for_each(|(ticker_id, pair, class)| {
             // Per-pair override → per-class default (e.g. crypto_stable → 50,
-            // detected from the already-computed bucket) → flat default. No skip
-            // path — operator policy: never skip a day, always return a target.
+            // detected from the already-computed bucket) → flat default.
             let target_bpd = target_for_pair(cal_ext, pair, *class);
 
             // PART B4 (2026-06-09): per-pair FORCED renko-k escape hatch. If the
@@ -1032,10 +1277,12 @@ fn run_once(args: &Args) -> Result<()> {
                         ticker_id = *ticker_id,
                         pair, forced_k, "renko_k override — skipping fit (operator-forced k)"
                     );
-                    results.lock().unwrap().push(CalOutcome::Ok {
+                    let forced = CalOutcome::Ok {
                         ticker_id: *ticker_id,
                         k: forced_k,
-                    });
+                    };
+                    stage_outcome(&store, &forced, true);
+                    results.lock().unwrap().push(forced);
                     return;
                 }
                 warn!(
@@ -1082,6 +1329,8 @@ fn run_once(args: &Args) -> Result<()> {
                 }
             });
 
+            stage_outcome(&store, &outcome, true);
+
             results.lock().unwrap().push(outcome);
         });
     });
@@ -1089,14 +1338,25 @@ fn run_once(args: &Args) -> Result<()> {
     // Tally.
     let outcomes = results.into_inner().unwrap();
     let (mut passed, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-    // Start renko_k EMPTY. Only Ok outcomes populate.
-    // Failed/Skipped tickers are NOT carried over from the prior weights file.
-    // Policy: skip the day when calibration fails; never bootstrap a k. Carrying
-    // forward stale k corrupts the live renko engine for tickers whose σ regime
-    // has shifted since last successful calibration (renko_k cohort 2026-06-01
-    // found 91 % of base tickers using prior-run k due to today's pass=17/188).
+    // Seed renko_k from `resume` — THIS run_id's staged Ok outcomes from an earlier
+    // cycle that `activeDeadlineSeconds` killed — and nothing else. Never from the
+    // prior weights file: Failed/Skipped tickers are NOT carried over. Policy:
+    // skip the day when calibration fails; never bootstrap a k. Carrying forward
+    // stale k corrupts the live renko engine for tickers whose σ regime has shifted
+    // since last successful calibration (renko_k cohort 2026-06-01 found 91 % of
+    // base tickers using prior-run k due to today's pass=17/188).
+    //
+    // Seeding is what makes the staged/promote feature work at all: `work` excludes
+    // resumed tickers, so without it every id an earlier cycle staged is absent
+    // from `renko_k` and the final base+synth write drops it — the promoted set
+    // silently shrinks back to one cycle's worth. It also makes the two downstream
+    // readers of `renko_k` correct for resumed ids: the inferred-USDC fallback no
+    // longer re-fits an id that already has a k, and a resumed USDT leg no longer
+    // reads as an "unhealthy leg". Same-run outcomes only ⇒ the no-k-fallback
+    // policy is intact: a killed run still promotes nothing new and no default k
+    // (0.075 or otherwise) can enter here.
     let prior_count = weights_file.renko_k_per_ticker.len();
-    let mut renko_k: BTreeMap<String, f64> = BTreeMap::new();
+    let mut renko_k: BTreeMap<String, f64> = resume.clone();
 
     for o in &outcomes {
         match o {
@@ -1156,34 +1416,55 @@ fn run_once(args: &Args) -> Result<()> {
         }
     }
 
-    // SLA-CRITICAL: write ticker-params.json AFTER base pass so
-    // renko emission unblocks for base tickers even if synth pass hangs/fails.
-    // Synth pass below re-writes with synth k's added.
-    weights_file.renko_k_per_ticker = renko_k.clone();
-    weights_file.calibrated_at = Some(nxr_sdk::now_sec());
-    let json_base = serde_json::to_string_pretty(&weights_file)?;
-    write_atomic_string(&params_path, &json_base)?;
-    info!(path = %params_path.display(), bytes = json_base.len(), base_k_count = renko_k.len(), "ticker-params.json updated (base pass)");
-
-    // ── Synth-pair pass (5 crosses) ──────────────────────────────────────────
-    // Runs unconditionally after the base pass. Cheap (~10 pairs, mostly
-    // bound by leg .idx I/O which the base pass already warmed in page
-    // cache). Synths route through the SAME `scale_to_target_k` direct solver
-    // the base pass uses (warm start + bounded bracket fallback + ±1-rung probe;
-    // see `calibrate_one_synth`); the K_FLOOR / min_pct-clamp / unreachable-target
-    // guards inside it drop degenerate windows. If the fit fails, k is NOT
-    // persisted (caller keeps prior). Per-pair override or flat default per
-    // synth.
-    let synth_work = {
-        let pairs = nxr_sdk::synth::pipeline_pairs::synth_pipeline_pairs(&root);
-        resolve_synth_work(&pairs)
-    };
+    // PROMOTE: the base pass covered every roster ticker (this run's outcomes +
+    // whatever an earlier killed cycle staged under the same run_id), so the
+    // staged set is now a COMPLETE pass and may replace the live map wholesale.
+    //
+    // Whole-set replace, never per-ticker merge: the live map's contract is "only
+    // this pass's Ok outcomes". Merging incrementally would leave unreached or
+    // failed tickers on prior-run k — the stale-k corruption the `no k fallback`
+    // policy forbids (renko_k cohort 2026-06-01: 91% of base tickers were running
+    // on prior-run k). A killed run therefore promotes NOTHING and the live map
+    // keeps the last complete pass, which is the safe direction.
+    // `renko_k` is already `resume ∪ this run's Ok` (see the seed above), so it IS
+    // the promotable set.
+    let base_at = nxr_sdk::now_sec();
+    let promoted = renko_k.clone();
+    let promoted_count = promoted.len();
+    store.update(|w| {
+        w.renko_k_per_ticker = promoted;
+        w.calibrated_at = Some(base_at);
+        // Staging set is NOT cleared here: the synth + inferred-fallback phases
+        // still stage into it, so a kill after this point resumes those instead of
+        // redoing them. Cleared only by the final write (whole run complete) —
+        // which is also the only place `exit_reason`/`finished_at` are stamped, so
+        // `nxr_calibrate_run_completed` cannot read 1 while the synth phase is
+        // still outstanding.
+    })?;
     info!(
-        n_synth = synth_work.len(),
-        "synth calibration pass starting"
+        path = %params_path.display(),
+        promoted = promoted_count,
+        resumed = resume.len(),
+        "ticker-params.json updated (base pass promoted; weights fields preserved)"
     );
+
+    // ── Synth-pair pass (crosses; roster excludes these ids) ─────────────────
+    // Runs unconditionally after the base pass, over the `synth_work` resolved
+    // before the roster. Synths route through the SAME `scale_to_target_k` direct
+    // solver the base pass uses (warm start + bounded bracket fallback + ±1-rung
+    // probe; see `calibrate_one_synth`); the K_FLOOR / min_pct-clamp /
+    // unreachable-target guards inside it drop degenerate windows. If the fit
+    // fails, k is NOT persisted (caller keeps prior). Per-pair override or flat
+    // default per synth.
+    info!(n_synth = synth_count, "synth calibration pass starting");
     let (mut s_passed, mut s_skipped, mut s_failed) = (0usize, 0usize, 0usize);
     for (synth_id, synth_sym, leg_a_id, leg_b_id) in synth_work {
+        // Already staged by an earlier cycle of this run_id (seeded into renko_k);
+        // synth ids are disjoint from the base roster, so a hit here can only be a
+        // resume. Never re-fit it.
+        if renko_k.contains_key(&synth_id.to_string()) {
+            continue;
+        }
         // Class-detect the synth pair too (stable/stable crosses like USD1/USDC
         // → crypto_stable → 50) instead of relying on a manual override entry.
         let synth_class = bucket_for_pair(
@@ -1205,6 +1486,14 @@ fn run_once(args: &Args) -> Result<()> {
                 );
                 s_passed += 1;
                 renko_k.insert(synth_id.to_string(), forced_k);
+                stage_outcome(
+                    &store,
+                    &CalOutcome::Ok {
+                        ticker_id: synth_id,
+                        k: forced_k,
+                    },
+                    false,
+                );
                 continue;
             }
             warn!(
@@ -1243,6 +1532,8 @@ fn run_once(args: &Args) -> Result<()> {
                 reason: format!("panic: {}", msg),
             }
         });
+        // count_in_run = false: `tickers_total` is the base roster (see stage_outcome).
+        stage_outcome(&store, &outcome, false);
         match outcome {
             CalOutcome::Ok { ticker_id, k } => {
                 s_passed += 1;
@@ -1312,6 +1603,8 @@ fn run_once(args: &Args) -> Result<()> {
                 ticker_id: *ticker_id,
                 reason: "panic in inferred-USDC fallback".into(),
             });
+            // count_in_run = false: already counted by the base loop.
+            stage_outcome(&store, &outcome, false);
             match outcome {
                 CalOutcome::Ok { ticker_id, k } => {
                     inferred_fallbacks += 1;
@@ -1360,14 +1653,23 @@ fn run_once(args: &Args) -> Result<()> {
         }
     }
 
-    weights_file.renko_k_per_ticker = renko_k;
-    weights_file.calibrated_at = Some(nxr_sdk::now_sec());
-
-    let json = serde_json::to_string_pretty(&weights_file)?;
-    // write_atomic requires Pod; we have a String → emit via a tiny helper
-    // that mirrors its tmp+rename semantics for the JSON case.
-    write_atomic_string(&params_path, &json)?;
-    info!(path = %params_path.display(), bytes = json.len(), "ticker-params.json updated");
+    // Final write (base + synth k). Through the store, so `nxr-weights` runs that
+    // landed while this pass was working are preserved instead of being reverted
+    // to the snapshot this process read at startup.
+    let final_at = nxr_sdk::now_sec();
+    let k_count = renko_k.len();
+    store.update(|w| {
+        w.renko_k_per_ticker = renko_k;
+        w.calibrated_at = Some(final_at);
+        // Whole run done ⇒ retire the staging set; the next run_id starts fresh.
+        w.renko_k_staged.clear();
+        w.staged_run_id = None;
+        if let Some(r) = w.last_run.as_mut() {
+            r.exit_reason = "completed".to_string();
+            r.finished_at = Some(final_at);
+        }
+    })?;
+    info!(path = %params_path.display(), k_count, "ticker-params.json updated (base+synth)");
 
     Ok(())
 }
