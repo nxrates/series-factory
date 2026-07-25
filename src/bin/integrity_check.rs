@@ -28,7 +28,9 @@
 //!   INDEX`; ts non-decreasing; large gaps → WARN; `Index::validate()` passes;
 //!   stuck/flatline (G9: bit-identical mid run ≥ STUCK_RUN, or distinct-mid
 //!   fraction below floor over a large sample) → WARN/strict-ERROR;
-//!   confidence-freshness floor (G4: only when `FLAG_CONF_FRESHNESS` set) →
+//!   composite-liveness floor (G4: ticking-leg count + fresh-weight bit when
+//!   `FLAG_CONF_ACTIVE` set, legacy freshness fraction when
+//!   `FLAG_CONF_FRESHNESS` set, skipped only when neither) →
 //!   WARN/strict-ERROR; strict → mean(ci_price/mid) < 100 bps, frac(spread >
 //!   500 bps) < 0.5 %.
 //! - `.bars` (`mitch::Bar`, 96 B): length % 96 == 0; `open_ts <= close_ts`;
@@ -492,13 +494,19 @@ const STUCK_MIN_DISTINCT_FRAC: f64 = 0.002;
 /// of one constant quote is legitimate and must never FAIL). 2000 records.
 const STUCK_MIN_SAMPLE: usize = 2000;
 
-/// G4 — confidence-freshness floor (fraction `f ∈[0,1]`, f = byte/255). When a record carries
-/// `FLAG_CONF_FRESHNESS` (bit 3) its `confidence` byte is a freshness u8 0-255 0-100,
-/// `f = byte/255`; an `f` below this floor means the composite is built from
-/// stale components. Heuristic (real markets do go briefly stale) → WARN by
-/// default, ERROR under `--strict`. When the flag is *clear* the byte is the
-/// legacy active-provider count and this gate is skipped entirely. 0.05.
+/// G4 — LEGACY confidence-freshness floor (fraction `f ∈[0,1]`, f = byte/255).
+/// Applies ONLY to records carrying `FLAG_CONF_FRESHNESS` (bit 3), i.e. rows
+/// written before the 2026-07-25 encoding cutover; an `f` below this floor means
+/// the composite was built from stale components. Heuristic (real markets do go
+/// briefly stale) → WARN by default, ERROR under `--strict`. 0.05.
 const CONF_FRESHNESS_FLOOR: f64 = 0.05;
+
+/// G4 — CURRENT liveness floor: minimum genuinely-TICKING legs
+/// (`confidence` bits 0..6 under `FLAG_CONF_ACTIVE`). Mirrors
+/// `core::server::signed::MIN_ACTIVE_PROVIDERS` (2-of-N cross-validation) and
+/// `data_quality_audit::CONF_ACTIVE_COUNT_FLOOR` — keep all three in lock-step.
+/// Same heuristic severity as the legacy floor: WARN, ERROR under `--strict`.
+const CONF_ACTIVE_COUNT_FLOOR: u32 = 2;
 
 /// Per-file accumulators threaded through the `.idx` validator.
 #[derive(Default)]
@@ -524,7 +532,10 @@ struct IdxState {
     /// excludes sentinels); using the all-records `n_finite` would depress the
     /// fraction on a sentinel-dense feed and falsely trip the stuck-feed gate.
     n_nonsentinel_finite: usize,
-    /// G4 — # records that carried `FLAG_CONF_FRESHNESS` with `f` below floor.
+    /// G4 — # records that failed the composite-liveness floor: `FLAG_CONF_ACTIVE`
+    /// rows below `CONF_ACTIVE_COUNT_FLOOR` or with the fresh-weight bit clear,
+    /// plus legacy `FLAG_CONF_FRESHNESS` rows with `f` below
+    /// `CONF_FRESHNESS_FLOOR`.
     n_stale_conf: usize,
 }
 
@@ -819,29 +830,51 @@ fn check_idx(path: &Path, strict: bool) -> Result<FileReport> {
                     s.prev_mid_bits = Some(bits);
                 }
 
-                // G4 — confidence-freshness floor. Only meaningful when the
-                // record opts into the freshness-percent wire semantics via
-                // `FLAG_CONF_FRESHNESS`; otherwise the byte is the legacy
-                // active-provider count and carries no staleness meaning.
-                if (idx_body.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0 {
+                // G4 — composite-liveness floor. The `confidence` byte is
+                // FLAG-SELECTED (three states), so this gate branches the same way
+                // the signed-quote gate does:
+                //  1. `FLAG_CONF_ACTIVE` → packed ticking-leg count + fresh-weight
+                //     bit: audit BOTH (this is the live encoding since 2026-07-25).
+                //  2. `FLAG_CONF_FRESHNESS` → legacy fraction floor.
+                //  3. neither → genuinely-legacy raw count (resample_idx / healed
+                //     rows): no liveness meaning on the wire, skipped as before.
+                //     NOT a silent skip of the live case — case 1 covers it.
+                let conf_msg = if (idx_body.flags & nxr_sdk::shard::FLAG_CONF_ACTIVE) != 0 {
+                    let active = mitch::index::conf_active_count(idx_body.confidence);
+                    let fresh_ok = mitch::index::conf_fresh_weight_ok(idx_body.confidence);
+                    if active < CONF_ACTIVE_COUNT_FLOOR {
+                        Some(format!(
+                            "active (ticking) providers {active} < floor \
+                             {CONF_ACTIVE_COUNT_FLOOR} (stale composite)"
+                        ))
+                    } else if !fresh_ok {
+                        Some("fresh-weight share below floor (stale composite)".to_string())
+                    } else {
+                        None
+                    }
+                } else if (idx_body.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0 {
                     let f = mitch::index::conf_from_u8(idx_body.confidence);
-                    if f < CONF_FRESHNESS_FLOOR {
-                        s.n_stale_conf += 1;
-                        let msg = format!(
+                    (f < CONF_FRESHNESS_FLOOR).then(|| {
+                        format!(
                             "confidence freshness {:.3} < floor {} (stale composite)",
                             f, CONF_FRESHNESS_FLOOR
-                        );
-                        if strict {
-                            errors.push(Finding {
-                                record_ix: Some(i),
-                                msg,
-                            });
-                        } else {
-                            warnings.push(Finding {
-                                record_ix: Some(i),
-                                msg,
-                            });
-                        }
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some(msg) = conf_msg {
+                    s.n_stale_conf += 1;
+                    if strict {
+                        errors.push(Finding {
+                            record_ix: Some(i),
+                            msg,
+                        });
+                    } else {
+                        warnings.push(Finding {
+                            record_ix: Some(i),
+                            msg,
+                        });
                     }
                 }
 

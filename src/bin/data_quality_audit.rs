@@ -64,8 +64,8 @@ use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::ohlc::{rollup, Ohlc};
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, manifest_path, read_manifest, read_shard_aligned,
-    ts_ms_to_utc_date, vol_path_for_id, ShardRecord, BAR_MS_S10, FLAG_CONF_FRESHNESS,
-    FLAG_HEARTBEAT_SENTINEL, MS_PER_DAY,
+    ts_ms_to_utc_date, vol_path_for_id, ShardRecord, BAR_MS_S10, FLAG_CONF_ACTIVE,
+    FLAG_CONF_FRESHNESS, FLAG_HEARTBEAT_SENTINEL, MS_PER_DAY,
 };
 use nxr_sdk::stats as sdk_stats;
 use nxr_sdk::weights_schema::WeightsFile;
@@ -85,14 +85,22 @@ const S10_BUCKET_MS: i64 = 10_000;
 /// corruption (deviates by seconds). Never masks a genuine misalignment.
 const GRID_TOL_MS: i64 = 2;
 
-/// Confidence-freshness floor (fraction `f ∈[0,1]`, f = byte/255): MUST match `integrity_check`'s
-/// G4 `CONF_FRESHNESS_FLOOR`. When a record carries [`FLAG_CONF_FRESHNESS`] its
-/// `confidence` byte is a freshness u8 0-255 0-100, `f = byte/255`; below this floor the
-/// composite is built from stale components. The legacy `confidence <= accepted`
-/// invariant is INAPPLICABLE to such records (the freshness byte 200/255 of a
-/// healthy fresh feed routinely exceeds the active-provider `accepted` count),
-/// so the cert applies this advisory staleness check instead, exactly as G4 does.
+/// LEGACY confidence-freshness floor (fraction `f ∈[0,1]`, f = byte/255): MUST
+/// match `integrity_check`'s G4 `CONF_FRESHNESS_FLOOR`. Applies only to records
+/// carrying [`FLAG_CONF_FRESHNESS`] (pre-2026-07-25 rows), whose `confidence` byte
+/// is the freshness fraction; below this floor the composite was built from stale
+/// components.
 const CONF_FRESHNESS_FLOOR: f64 = 0.05;
+
+/// CURRENT liveness floor: minimum genuinely-TICKING legs (`confidence` bits 0..6
+/// under [`FLAG_CONF_ACTIVE`]). MUST match `integrity_check`'s
+/// `CONF_ACTIVE_COUNT_FLOOR` and `core::server::signed::MIN_ACTIVE_PROVIDERS`.
+///
+/// Under EITHER flagged encoding the legacy `confidence <= accepted` invariant is
+/// INAPPLICABLE (a packed byte with bit 7 set exceeds any count; a healthy
+/// freshness byte 200/255 likewise), so the cert applies this advisory liveness
+/// check instead, exactly as G4 does.
+const CONF_ACTIVE_COUNT_FLOOR: u32 = 2;
 
 /// Renko brick floor (`series.renko.min_pct`) from `config.yml`, falling back to
 /// `0.0001`. Mirrors `integrity_check::load_renko_bounds` (single canonical
@@ -389,9 +397,11 @@ struct TickerReport {
     // Invariants
     invariant_violations: u64,
     invariant_samples: Vec<ViolationSample>,
-    // G4-parity advisory: post-rollout records carrying FLAG_CONF_FRESHNESS whose
-    // freshness u8 0-255 `f = confidence/100` is below CONF_FRESHNESS_FLOOR. WARN, not
-    // a FAIL: markets do go briefly stale. NEVER a `confidence > accepted` FAIL.
+    // G4-parity advisory: records that fail their encoding's liveness floor —
+    // FLAG_CONF_ACTIVE rows below CONF_ACTIVE_COUNT_FLOOR ticking legs or with the
+    // fresh-weight bit clear, or legacy FLAG_CONF_FRESHNESS rows with
+    // `f = confidence/255` below CONF_FRESHNESS_FLOOR. WARN, not a FAIL: markets do
+    // go briefly stale. NEVER a `confidence > accepted` FAIL.
     conf_stale_advisories: u64,
     // Quote DEPTH (FIX depth): vbid/vask backing-size validation.
     zero_depth_violations: u64, // HARD FAIL: vbid==0 && vask==0 (phantom liquidity)
@@ -782,7 +792,11 @@ fn eval_invariant(
     spread_bps: f64,
     band: ClassBand,
 ) -> InvariantOutcome {
-    let is_freshness = (flags & FLAG_CONF_FRESHNESS) != 0;
+    // `confidence` is FLAG-SELECTED: FLAG_CONF_ACTIVE → packed ticking-leg count
+    // + fresh-weight bit (live encoding since 2026-07-25); else
+    // FLAG_CONF_FRESHNESS → legacy freshness fraction; else raw legacy count.
+    let is_active = (flags & FLAG_CONF_ACTIVE) != 0;
+    let is_freshness = !is_active && (flags & FLAG_CONF_FRESHNESS) != 0;
     // DEPTH SIGNAL — count metric ONLY, NEVER a verdict input. NXR composites are
     // a price+confidence feed: inferred/triangulated pairs (triangulator.rs:143)
     // and volume-less FX providers carry vbid=vask=0 BY DESIGN. So zero/
@@ -801,10 +815,11 @@ fn eval_invariant(
         Some("bid/ask below price floor (denormal)")
     } else if ask < bid {
         Some("crossed quote (ask < bid)")
-    } else if !is_freshness && confidence > accepted {
-        // FIX #1: legacy semantics only — `confidence` = active-provider count.
-        // Freshness-flagged records carry an independent percent byte that routinely
-        // exceeds `accepted`, so the cross-constraint must NOT apply to them.
+    } else if !is_freshness && !is_active && confidence > accepted {
+        // FIX #1: RAW-LEGACY semantics only (neither flag) — `confidence` = the
+        // active-provider count. Both flagged encodings carry an independent byte
+        // that routinely exceeds `accepted` (freshness 200/255; a packed byte with
+        // bit 7 set is >= 128), so the cross-constraint must NOT apply to them.
         Some("confidence > accepted")
     } else {
         // SPREAD WIDTH IS NOT A HARD FAIL. A wide-but-positive spread (no crossed
@@ -820,11 +835,16 @@ fn eval_invariant(
     // the WARN still flags a dislocated major, but it never FAILs a ticker.
     let spread_out_of_band =
         spread_bps.is_finite() && spread_bps > band.spread_ceiling_bps && reason.is_none();
-    // FIX #1 (G4 parity, advisory): freshness-flagged + structurally-OK records
-    // whose decoded freshness is below the floor are a stale composite. WARN-only.
-    let conf_stale = is_freshness
-        && reason.is_none()
-        && mitch::index::conf_from_u8(confidence) < CONF_FRESHNESS_FLOOR;
+    // FIX #1 (G4 parity, advisory): structurally-OK records that fail their
+    // encoding's liveness floor are a stale composite. WARN-only. Records with
+    // NEITHER flag carry no liveness metadata and are skipped, as in G4.
+    let conf_stale = reason.is_none()
+        && if is_active {
+            mitch::index::conf_active_count(confidence) < CONF_ACTIVE_COUNT_FLOOR
+                || !mitch::index::conf_fresh_weight_ok(confidence)
+        } else {
+            is_freshness && mitch::index::conf_from_u8(confidence) < CONF_FRESHNESS_FLOOR
+        };
     InvariantOutcome {
         reason,
         conf_stale,

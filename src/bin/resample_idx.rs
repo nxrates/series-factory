@@ -21,13 +21,14 @@
 //! - A 5Hz aggregator's delta-gate would have emitted the *latest composite
 //!   state* at each 200ms boundary, not a volume-weighted blend of the two
 //!   10Hz sub-cycles. Last-in-bucket reproduces that emission exactly.
-//! - It is the only choice that is **confidence-safe**. The `confidence` byte
-//!   is flag-gated (`FLAG_CONF_FRESHNESS`): clear = legacy active-provider
-//!   COUNT, set = freshness u8 0-255 0-100 (`byte/255`). A VWAP-style `max`/pool of two
-//!   confidence bytes is meaningless across that flag boundary and could
-//!   silently produce a value whose flag no longer matches. Copying one whole
-//!   record keeps `confidence` and its `FLAG_CONF_FRESHNESS` bit traveling
-//!   together, untouched. See the confidence note below.
+//! - It is the only choice that is **confidence-safe**. The `confidence` byte is
+//!   flag-gated with THREE states: `FLAG_CONF_ACTIVE` set = packed ticking-leg
+//!   count + fresh-weight bit (live encoding since 2026-07-25);
+//!   `FLAG_CONF_FRESHNESS` set = legacy freshness fraction (`byte/255`); neither =
+//!   legacy active-provider COUNT. A VWAP-style `max`/pool of two confidence bytes
+//!   is meaningless across those boundaries and could silently produce a value
+//!   whose flag no longer matches. Copying one whole record keeps `confidence` and
+//!   its encoding bit traveling together, untouched. See the confidence note below.
 //! - Volumes/ticks are per-cycle counters on the wire, not flows to be summed:
 //!   the live 5Hz writer reports the counters of *its* cycle, so preserving the
 //!   representative record's counters is correct, not summing across sub-cycles.
@@ -35,17 +36,19 @@
 //! # Confidence handling (deliberately a NO-OP)
 //!
 //! Historical `.idx` records carry the OLD confidence semantics: an integer
-//! active-provider COUNT (0..~22), with `FLAG_CONF_FRESHNESS` **clear**. The
-//! new wire semantics is freshness u8 0-255 0-100 (`byte/255`) gated by that flag, and
-//! it is computed from per-provider decay state that is **not** persisted in
-//! `.idx`. The raw decay inputs are gone ⇒ historical freshness is **not
-//! recomputable**. The honest, correct handling is therefore to **preserve the
-//! existing confidence byte and leave `FLAG_CONF_FRESHNESS` clear**, so readers
-//! interpret historical rows as legacy counts. The flag-gated reader design
-//! (`mitch::index` doc, `nxr_sdk::shard::FLAG_CONF_FRESHNESS`) is *built* to
-//! span mixed old/new records exactly this way: only new realtime data carries
-//! freshness u8 0-255. This tool does NOT touch `confidence` or that flag: no fabricated
-//! freshness. Last-in-bucket copy guarantees this automatically.
+//! active-provider COUNT (0..~22), with **both** encoding flags clear. The live
+//! wire semantics (`FLAG_CONF_ACTIVE`: ticking-leg count + fresh-weight bit) and
+//! the intermediate one (`FLAG_CONF_FRESHNESS`: fraction `byte/255`) are computed
+//! from per-provider decay state that is **not** persisted in `.idx`. The raw
+//! decay inputs are gone ⇒ historical liveness is **not recomputable**. The
+//! honest, correct handling is therefore to **preserve the existing confidence
+//! byte and whatever encoding flags the source row carried — never to set one**,
+//! so readers interpret historical rows as legacy counts. The flag-gated reader
+//! design (`mitch::index` doc, `nxr_sdk::shard::FLAG_CONF_ACTIVE`) is *built* to
+//! span mixed old/new records exactly this way: only realtime data carries a
+//! marker. This tool does NOT touch `confidence` or either flag: no fabricated
+//! liveness. Last-in-bucket copy guarantees this automatically, and
+//! `verify_invariants` (6) FAILS the run if either marker appears from nowhere.
 //!
 //! # Layout (sharded, per-MITCH-ticker)
 //!
@@ -450,7 +453,8 @@ fn resample_last_in_bucket(records: &[IndexRecord], target_ms: i64) -> Vec<Index
 }
 
 /// Copy a record verbatim, re-stamp header ts to `bin_ms`, OR in FLAG_IDX_HEALED.
-/// Body (confidence, FLAG_CONF_FRESHNESS, ci, vols, counters) untouched.
+/// Body (confidence, FLAG_CONF_ACTIVE / FLAG_CONF_FRESHNESS, ci, vols, counters)
+/// untouched — the packed liveness byte and its marker travel together verbatim.
 #[inline]
 fn stamp(r: &IndexRecord, bin_ms: i64) -> IndexRecord {
     let mut out = *r;
@@ -540,22 +544,24 @@ fn verify_invariants(
         failures.push(format!("record missing FLAG_IDX_HEALED (flags={f:#x})"));
     }
 
-    // (6) Confidence is NOT fabricated: FLAG_CONF_FRESHNESS distribution is
-    //     preserved (we never set or clear it). Every new row's flag bit must
-    //     have come from some old row (last-in-bucket copies verbatim) — i.e.
-    //     if NO old row had it set, no new row may have it set.
-    let old_any_fresh = old
-        .iter()
-        .any(|r| (r.index.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0);
-    if !old_any_fresh {
-        if let Some(bad) = new
-            .iter()
-            .find(|r| (r.index.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) != 0)
-        {
+    // (6) Confidence is NOT fabricated: the distribution of BOTH encoding markers
+    //     is preserved (we never set or clear either). Every new row's marker bit
+    //     must have come from some old row (last-in-bucket copies verbatim) — i.e.
+    //     if NO old row had it set, no new row may have it set. Covers
+    //     FLAG_CONF_ACTIVE (live packed encoding) as well as the legacy
+    //     FLAG_CONF_FRESHNESS: fabricating the ACTIVE marker on a healed row would
+    //     make the signed-quote gate and the G4 audits read a raw legacy count as
+    //     a ticking-leg count.
+    for (name, bit) in [
+        ("FLAG_CONF_FRESHNESS", nxr_sdk::shard::FLAG_CONF_FRESHNESS),
+        ("FLAG_CONF_ACTIVE", nxr_sdk::shard::FLAG_CONF_ACTIVE),
+    ] {
+        if old.iter().any(|r| (r.index.flags & bit) != 0) {
+            continue;
+        }
+        if let Some(bad) = new.iter().find(|r| (r.index.flags & bit) != 0) {
             let f = bad.index.flags;
-            failures.push(format!(
-                "fabricated FLAG_CONF_FRESHNESS (flags={f:#x}) — none in source"
-            ));
+            failures.push(format!("fabricated {name} (flags={f:#x}) — none in source"));
         }
     }
 
@@ -707,8 +713,8 @@ mod tests {
 
     /// 100→200ms last-in-bucket: 10 records at 100ms → 5 records at 200ms,
     /// each carrying the LATER sub-cycle's body (bid/confidence) verbatim, ts
-    /// bin-aligned to the 200ms grid, FLAG_IDX_HEALED set, FLAG_CONF_FRESHNESS
-    /// untouched (clear → stays clear).
+    /// bin-aligned to the 200ms grid, FLAG_IDX_HEALED set, and NEITHER encoding
+    /// marker (FLAG_CONF_FRESHNESS, FLAG_CONF_ACTIVE) untouched — clear stays clear.
     #[test]
     fn downsample_100_to_200_last_in_bucket() {
         let t0 = 1_700_000_000_000_i64; // already 200ms-aligned
@@ -731,11 +737,16 @@ mod tests {
             assert_eq!(ts, t0 + i as i64 * 200, "200ms grid");
         }
         assert_eq!(median_spacing(&out), 200, "spacing ≈ 200ms");
-        // Marker set, freshness flag NOT fabricated.
+        // Marker set, NEITHER encoding flag fabricated.
         assert!(out.iter().all(|r| (r.index.flags & FLAG_IDX_HEALED) != 0));
         assert!(out
             .iter()
             .all(|r| (r.index.flags & nxr_sdk::shard::FLAG_CONF_FRESHNESS) == 0));
+        assert!(
+            out.iter()
+                .all(|r| (r.index.flags & nxr_sdk::shard::FLAG_CONF_ACTIVE) == 0),
+            "healed rows must never claim the packed ACTIVE encoding"
+        );
 
         let mut failures = Vec::new();
         verify_invariants(&recs, &out, 200, &mut failures);
@@ -812,28 +823,65 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Confidence is NEVER converted: a legacy-count record (flag clear) stays a
-    /// legacy count with the flag clear; a freshness record (flag set) keeps its
-    /// flag — neither is fabricated nor stripped.
+    /// Confidence is NEVER converted, across all THREE encodings: a legacy-count
+    /// record (both flags clear) stays a legacy count with both clear; a legacy
+    /// freshness record keeps FLAG_CONF_FRESHNESS; a packed record keeps
+    /// FLAG_CONF_ACTIVE **and its exact byte** (count bits + fresh-weight bit) —
+    /// none is fabricated, converted, or stripped.
     #[test]
     fn confidence_flag_preserved_verbatim() {
         let t0 = 1_700_000_000_000_i64;
         let ticker = 9;
         let fresh = nxr_sdk::shard::FLAG_CONF_FRESHNESS;
-        // bin 1: two legacy-count rows (flag clear); bin 2: two freshness rows.
+        let active = nxr_sdk::shard::FLAG_CONF_ACTIVE;
+        // packed: 3 ticking legs + fresh-weight OK → 0x83.
+        let packed = mitch::index::conf_pack_active(3, true);
+        // bin 1: legacy-count rows (both clear); bin 2: freshness rows; bin 3: packed.
         let recs = vec![
             rec(ticker, t0, 1.0, 12, 0),
             rec(ticker, t0 + 100, 1.0, 15, 0),
             rec(ticker, t0 + 200, 1.0, 80, fresh),
             rec(ticker, t0 + 300, 1.0, 84, fresh),
+            rec(ticker, t0 + 400, 1.0, packed, active),
+            rec(ticker, t0 + 500, 1.0, packed, active),
         ];
         let out = resample_last_in_bucket(&recs, 200);
-        assert_eq!(out.len(), 2);
-        // bin1 → later legacy row: conf 15, freshness flag clear.
+        assert_eq!(out.len(), 3);
+        // bin1 → later legacy row: conf 15, both markers clear.
         assert_eq!(out[0].index.confidence, 15);
-        assert_eq!(out[0].index.flags & fresh, 0, "legacy flag stays clear");
-        // bin2 → later freshness row: conf 84, freshness flag still set.
+        assert_eq!(out[0].index.flags & (fresh | active), 0, "legacy stays unmarked");
+        // bin2 → later freshness row: conf 84, freshness flag still set, ACTIVE not
+        // fabricated (a legacy fraction must never be read as a ticking count).
         assert_eq!(out[1].index.confidence, 84);
         assert_ne!(out[1].index.flags & fresh, 0, "freshness flag preserved");
+        assert_eq!(out[1].index.flags & active, 0, "ACTIVE never fabricated");
+        // bin3 → packed row: byte AND flag verbatim, so the count still decodes.
+        assert_eq!(out[2].index.confidence, packed);
+        assert_ne!(out[2].index.flags & active, 0, "ACTIVE flag preserved");
+        assert_eq!(out[2].index.flags & fresh, 0, "fraction flag never fabricated");
+        assert_eq!(mitch::index::conf_active_count(out[2].index.confidence), 3);
+        assert!(mitch::index::conf_fresh_weight_ok(out[2].index.confidence));
+
+        let mut failures = Vec::new();
+        verify_invariants(&recs, &out, 200, &mut failures);
+        assert!(failures.is_empty(), "invariants: {failures:?}");
+    }
+
+    /// The no-fabrication guard must FIRE on FLAG_CONF_ACTIVE, not just on the
+    /// legacy fraction flag: a healed row that claims the packed encoding would
+    /// make the signed-quote gate read a raw legacy count as a ticking-leg count.
+    #[test]
+    fn fabricated_active_flag_fails_invariants() {
+        let t0 = 1_700_000_000_000_i64;
+        let ticker = 11;
+        let old = vec![rec(ticker, t0, 1.0, 12, 0), rec(ticker, t0 + 100, 1.0, 15, 0)];
+        let mut new = resample_last_in_bucket(&old, 200);
+        new[0].index.flags |= nxr_sdk::shard::FLAG_CONF_ACTIVE;
+        let mut failures = Vec::new();
+        verify_invariants(&old, &new, 200, &mut failures);
+        assert!(
+            failures.iter().any(|f| f.contains("fabricated FLAG_CONF_ACTIVE")),
+            "guard must catch a fabricated ACTIVE marker: {failures:?}"
+        );
     }
 }
