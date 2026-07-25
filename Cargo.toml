@@ -56,6 +56,10 @@ name = "migrate-to-sharded"
 path = "src/bin/migrate_to_sharded.rs"
 
 [[bin]]
+name = "migrate-phantom-ids"
+path = "src/bin/migrate_phantom_ids.rs"
+
+[[bin]]
 name = "data-quality-audit"
 path = "src/bin/data_quality_audit.rs"
 
