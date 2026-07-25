@@ -76,6 +76,16 @@ pub struct ShardedWriter {
     current: Option<(NaiveDate, AppendLog<IndexRecord>)>,
     /// Dates already opened (and truncated) by THIS run.
     touched: std::collections::HashSet<NaiveDate>,
+    /// Exclusive `.writer.lock` on `out_dir`, held for this writer's whole life.
+    ///
+    /// The idempotent-truncate below `fs::remove_file`s the target shard. Without
+    /// this lock that unlink raced the LIVE aggregator's `IdxShardWriter` for the
+    /// same ticker: the offline run deletes today's shard, the live writer keeps
+    /// appending to its now-unlinked fd, and every record the live process wrote
+    /// today is gone at the next `list_shards`. `acquire_idx_writer_lock` is the
+    /// same flock `IdxShardWriter::open` takes, so whichever side is already
+    /// writing wins and the other fails loudly instead of destroying data.
+    _writer_lock: std::fs::File,
     /// Cached `[start, end)` epoch-ms window of `current`'s UTC day. An in-window
     /// ts is provably same-day, so we skip the per-record `ts_ms_to_utc_date`
     /// chrono call and decide "no rotate" with two int compares. UTC days are
@@ -86,14 +96,23 @@ pub struct ShardedWriter {
 }
 
 impl ShardedWriter {
-    pub fn new(out_dir: PathBuf) -> Self {
-        Self {
+    /// Fails when the live aggregator (or another offline job) already holds the
+    /// ticker's writer lock — see [`Self::_writer_lock`]. Callers that iterate a
+    /// roster should log and SKIP that ticker, never fall back to an unlocked
+    /// write.
+    pub fn new(out_dir: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&out_dir)
+            .with_context(|| format!("create shard dir {}", out_dir.display()))?;
+        let lock = nxr_sdk::shard::acquire_idx_writer_lock(&out_dir)
+            .with_context(|| format!("writer-lock {}", out_dir.display()))?;
+        Ok(Self {
             out_dir,
             current: None,
             touched: std::collections::HashSet::new(),
             cur_day_start_ms: i64::MAX,
             cur_day_end_ms: i64::MIN,
-        }
+            _writer_lock: lock,
+        })
     }
 
     pub fn append(&mut self, ts_ms: i64, rec: &IndexRecord) -> Result<()> {
@@ -116,7 +135,21 @@ impl ShardedWriter {
             let path = shard_path(&self.out_dir, date, "idx");
             // Idempotency: first touch of this date in THIS run replaces any
             // pre-existing shard (re-runs must converge, never append-double).
-            if self.touched.insert(date) {
+            //
+            // ⚠ NEVER unlink TODAY's shard. The writer lock above keeps the live
+            // aggregator out of this ticker, but a shard for the current UTC day
+            // is the one the live process appends to, and "replace" is not a
+            // meaningful operation on a series that is still being written —
+            // whatever this run rebuilds is immediately incomplete. Offline
+            // rebuilds cover CLOSED days; the live tail is the aggregator's.
+            let today = ts_ms_to_utc_date(nxr_sdk::now_ms() as i64);
+            if date >= today {
+                tracing::warn!(
+                    shard = %path.display(), %date, %today,
+                    "refusing to replace a current-day shard (live aggregator owns the tail); appending instead"
+                );
+                self.touched.insert(date);
+            } else if self.touched.insert(date) {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
                         tracing::info!(shard = %path.display(), "replacing existing shard (idempotent re-run)")

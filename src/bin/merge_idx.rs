@@ -191,8 +191,10 @@ fn main() -> Result<()> {
         anchor_instant + Duration::from_millis((ms - anchor_ms).max(0) as u64)
     };
 
-    // sharded writer: rotates AppendLog on UTC date boundary
-    let mut writer = ShardedWriter::new(out_dir.clone());
+    // sharded writer: rotates AppendLog on UTC date boundary. Takes the ticker's
+    // exclusive writer lock — a live aggregator holding it aborts this run rather
+    // than letting the idempotent-truncate unlink a shard being appended to.
+    let mut writer = ShardedWriter::new(out_dir.clone())?;
 
     let cycle_ms = args.cycle_ms as i64;
     let mut next_cycle_ms: Option<i64> = None;
