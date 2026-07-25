@@ -83,6 +83,10 @@ path = "src/bin/live_latency_audit.rs"
 name = "renko-continuity-check"
 path = "src/bin/renko_continuity_check.rs"
 
+[[bin]]
+name = "fetch-pyth-history"
+path = "src/bin/fetch_pyth_history.rs"
+
 [dependencies]
 # Core async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util"] }
