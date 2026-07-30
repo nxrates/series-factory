@@ -1,6 +1,20 @@
-//! Backfill orchestrator — drives `fetch-crypto-history` → `ticks-to-idx` →
-//! `merge-idx` → `s10-from-idx` → `renko-from-idx` → `integrity-check` for
-//! many tickers in parallel and emits a single JSON report.
+//! Backfill orchestrator — the SINGLE entry point for populating, verifying,
+//! gap-checking and repairing every series. Drives `fetch-crypto-history` /
+//! `fetch-pyth-history` → `ticks-to-idx` → `merge-idx` → `s10-from-idx` →
+//! `renko-from-idx` → `integrity-check` → `data-quality-audit` for many tickers
+//! in parallel and emits a single JSON report.
+//!
+//! Canonical invocation (nothing per-asset, nothing ad hoc):
+//!
+//! ```text
+//! backfill-all /etc/nxr/config.yml --tickers native --from "365 days ago" \
+//!   --to today --resume --parallel 2 --min-free-gib 120 --out-dir /data
+//! ```
+//!
+//! `--tickers native` is the CEX subscription manifest ∪ the oracle symbol
+//! keys — the same set `core` materializes. Crosses are composed on read and
+//! are never backfilled. Default `--steps` already covers populate → verify →
+//! detect → repair, so gap repair is part of the pipeline, not a runbook.
 //!
 //! Observability + shard emission:
 //! - tracing-subscriber init at startup (defaults to INFO; honours RUST_LOG)
@@ -50,7 +64,10 @@ struct Args {
     /// End date (YYYY-MM-DD) or `today`. Default: today.
     #[arg(long, default_value = "today")]
     to: String,
-    /// Comma-separated tickers `BASE-QUOTE`. Default: from --quote expansion (must set --tickers).
+    /// Comma-separated tickers `BASE-QUOTE`, or the sentinel `native` for
+    /// every natively aggregated ticker (CEX subscription manifest ∪
+    /// `oracles.providers.*.symbols`) — the same set `core` treats as native,
+    /// so no derived/cross series is ever backfilled to disk.
     #[arg(long)]
     tickers: Option<String>,
     /// Comma-separated exchanges. Default: binance,bybit,bitget,okx.
@@ -59,8 +76,14 @@ struct Args {
     /// Quote currency (used to expand BASE-only tickers if needed).
     #[arg(long, default_value = "USDT")]
     quote: String,
-    /// Comma-separated steps to run. Default: all.
-    #[arg(long, default_value = "fetch,t2i,merge,s10,renko,validate")]
+    /// Comma-separated steps to run. Default: the whole pipeline — populate
+    /// (`fetch`/`pyth` → `t2i` → `merge` → `s10` → `renko`), verify
+    /// (`validate`), detect (`gaps`) and repair (`repair`). One invocation is
+    /// the contract: gap repair is NOT a separate manual runbook.
+    #[arg(
+        long,
+        default_value = "fetch,pyth,t2i,merge,s10,renko,validate,gaps,repair"
+    )]
     steps: String,
     /// Parallel ticker workers. Default 2: each
     /// in-flight ticker holds up to 1 month × n_exch of raw `.ticks` during its
@@ -100,6 +123,19 @@ struct Args {
     /// or offline environments.
     #[arg(long)]
     skip_probe: bool,
+    /// Trailing window (days) the `gaps` step audits. Kept separate from
+    /// `--from`: a 365 d populate is normal, a 365 d re-audit of every ticker
+    /// every run is not (the `nxr-dq-cert` CronJob already blew a 50 min
+    /// deadline doing exactly that).
+    #[arg(long, default_value_t = 45)]
+    gap_window_days: i64,
+    /// Hard floor on free space (GiB) for the filesystem backing `--out-dir`.
+    /// Checked before every ticker and by the heartbeat: the run ABORTS rather
+    /// than writing the node into disk pressure. A cascade on 2026-07-30
+    /// evicted 61 pods and took price serving down; a backfill must never be
+    /// able to cause that.
+    #[arg(long, default_value_t = 120)]
+    min_free_gib: u64,
 }
 
 // ── Report types ─────────────────────────────────────────────────────────────
@@ -570,6 +606,135 @@ struct PlanCtx {
     exchanges: Vec<String>,
     steps: Vec<String>,
     counters: Arc<Counters>,
+    /// 0 = normal pass, 1 = the narrowed re-run a `repair` spawned. Bounds the
+    /// recursion at one level: a day that is still missing after one repair is
+    /// unrecoverable from the sources we have, and retrying cannot change that.
+    repair_pass: u8,
+}
+
+/// Missing UTC days + outage windows for one ticker, as reported by
+/// `data-quality-audit`.
+///
+/// Detection is NOT reimplemented here: `data-quality-audit` already does
+/// sentinel-aware gap classification (`suspect`/`quiet`/`OUTAGE`) plus
+/// missing-day enumeration over the canonical sharded layout. This just runs it
+/// per ticker and turns its verdict into repair work.
+#[derive(Default)]
+struct GapVerdict {
+    missing_days: Vec<NaiveDate>,
+    outage_gaps: u64,
+    worst: Vec<String>,
+}
+
+/// Severity of a gap, by duration. Drives whether the run FAILS.
+fn gap_severity(dt_ms: i64) -> &'static str {
+    match dt_ms {
+        d if d >= 3_600_000 => "CRITICAL", // ≥1h: a shard-scale hole
+        d if d >= 300_000 => "MAJOR",      // ≥5m: the 2026-07-30 sink outage class
+        d if d >= 60_000 => "MINOR",
+        _ => "INFO",
+    }
+}
+
+/// Run `data-quality-audit` for one ticker id and parse its gap verdict.
+fn detect_gaps(
+    ticker: &str,
+    ticker_id: u64,
+    out_dir: &Path,
+    window_days: i64,
+) -> (StepReport, GapVerdict) {
+    let start = Instant::now();
+    let mut errors = Vec::new();
+    let mut verdict = GapVerdict::default();
+    let out = Command::new("data-quality-audit")
+        .arg("--tickers")
+        .arg(ticker_id.to_string())
+        .arg("--window-days")
+        .arg(window_days.to_string())
+        .arg("--data-root")
+        .arg(out_dir)
+        .arg("--json")
+        .output();
+    let exit_code = match out {
+        Err(e) => {
+            errors.push(format!("spawn data-quality-audit: {e}"));
+            -1
+        }
+        Ok(o) => {
+            // A FAIL verdict is a non-zero exit; that is the SIGNAL, not an
+            // error, so the JSON is parsed either way.
+            match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                Ok(v) => {
+                    for t in v["tickers"].as_array().into_iter().flatten() {
+                        verdict.outage_gaps += t["outage_gaps"].as_u64().unwrap_or(0);
+                        // Flat-filled outage: the s10 producer emits a bar per
+                        // bucket regardless of ticks, so downtime shows up as a
+                        // run of identical mids, NOT as missing rows. Prod
+                        // 2026-07-30: an 8.5 min sink outage on BTC/USDT left 0
+                        // missing rows and 52 zero-tick bars.
+                        let flat = t["longest_flat_run"].as_u64().unwrap_or(0);
+                        if flat > 30 {
+                            verdict
+                                .worst
+                                .push(format!("FLATLINE run of {flat} identical mids"));
+                        }
+                        for d in t["missing_day_list"].as_array().into_iter().flatten() {
+                            if let Some(d) = d.as_str().and_then(|d| d.parse::<NaiveDate>().ok()) {
+                                verdict.missing_days.push(d);
+                            }
+                        }
+                        for g in t["worst_gaps"].as_array().into_iter().flatten() {
+                            let dt = g["dt_ms"].as_i64().unwrap_or(0);
+                            verdict.worst.push(format!(
+                                "{} gap {}ms [{}..{}] ({})",
+                                gap_severity(dt),
+                                dt,
+                                g["start_ts"].as_i64().unwrap_or(0),
+                                g["end_ts"].as_i64().unwrap_or(0),
+                                g["classification"].as_str().unwrap_or("?"),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => errors.push(format!("parse dq json: {e}")),
+            }
+            0
+        }
+    };
+    verdict.missing_days.sort_unstable();
+    verdict.missing_days.dedup();
+    if !verdict.missing_days.is_empty() || verdict.outage_gaps > 0 {
+        // Loud by construction: this lands in the JSON report AND the log.
+        warn!(
+            ticker,
+            missing_days = verdict.missing_days.len(),
+            outage_gaps = verdict.outage_gaps,
+            "GAPS DETECTED"
+        );
+        errors.extend(verdict.worst.iter().take(8).cloned());
+        if !verdict.missing_days.is_empty() {
+            errors.push(format!(
+                "missing days: {}",
+                verdict
+                    .missing_days
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+    }
+    (
+        StepReport {
+            name: "gaps".to_string(),
+            duration_ms: start.elapsed().as_millis(),
+            exit_code,
+            bytes: 0,
+            skipped: false,
+            errors,
+        },
+        verdict,
+    )
 }
 
 struct Counters {
@@ -770,13 +935,54 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
 
     let want = |s: &str| ctx.steps.iter().any(|x| x == s);
 
+    // Disk floor — checked per ticker, not just pre-flight. A long run must
+    // notice the node filling under it and stop, never push it into pressure.
+    if free_bytes(out_dir).is_some_and(|f| f < ctx.args.min_free_gib * 1024 * 1024 * 1024) {
+        let free = free_bytes(out_dir).unwrap_or(0);
+        error!(
+            ticker,
+            free_gib = free / (1024 * 1024 * 1024),
+            floor_gib = ctx.args.min_free_gib,
+            "DISK FLOOR breached; aborting ticker"
+        );
+        ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+        ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+        write_marker(&ctx.args.out_dir, ticker, "failed");
+        return TickerReport {
+            ticker: ticker.to_string(),
+            status: "failed".to_string(),
+            steps: vec![StepReport {
+                name: "disk-floor".to_string(),
+                duration_ms: 0,
+                exit_code: -1,
+                bytes: 0,
+                skipped: false,
+                errors: vec![format!(
+                    "free {} GiB < floor {} GiB",
+                    free / (1024 * 1024 * 1024),
+                    ctx.args.min_free_gib
+                )],
+            }],
+            ticker_availability: Vec::new(),
+            skip_reason: None,
+        };
+    }
+
     // 0) availability probe — drops dead exchanges before fetch
     let mut availability = Vec::new();
     let mut active_exchanges = ctx.exchanges.clone();
+    // An oracle-relayed symbol (FX, metals, equities, stablecoin pegs) has no
+    // CEX book at all. Before the `pyth` step existed this was a hard skip, so
+    // the "backfill everything" entry point silently covered crypto only.
+    let mut pyth_only = false;
     if !ctx.args.skip_probe && want("fetch") {
         let (av, active) = probe_availability(ctx, &base, &quote);
         availability = av;
-        if active.is_empty() {
+        if active.is_empty() && want("pyth") {
+            info!(ticker, "no CEX coverage; routing to pyth history");
+            pyth_only = true;
+            active_exchanges = vec!["pyth".to_string()];
+        } else if active.is_empty() {
             warn!(ticker, "all exchanges report no coverage; skipping ticker");
             ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
             ctx.counters.skipped.fetch_add(1, Ordering::Relaxed);
@@ -788,8 +994,9 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 ticker_availability: availability,
                 skip_reason: Some("no archive coverage in any exchange".into()),
             };
+        } else {
+            active_exchanges = active;
         }
-        active_exchanges = active;
         info!(ticker, active_exchanges = ?active_exchanges, "availability check ok");
     }
 
@@ -881,8 +1088,39 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 let m_start_s = m_start.format("%Y-%m-%d").to_string();
                 let m_end_s = m_end.format("%Y-%m-%d").to_string();
 
+                // Oracle-sourced ticker: Pyth Lazer history is the only source
+                // (no CEX book exists), and it emits `.ticks` in the SAME shape
+                // fetch-crypto-history does, so everything downstream is
+                // unchanged. 1-minute resolution is the floor Pyth serves.
+                if pyth_only && want("pyth") {
+                    let args = vec![
+                        base.clone(),
+                        "--quote".to_string(),
+                        quote.clone(),
+                        "--from-unix".to_string(),
+                        m_start
+                            .and_hms_opt(0, 0, 0)
+                            .map(|d| d.and_utc().timestamp())
+                            .unwrap_or(0)
+                            .to_string(),
+                        "--to-unix".to_string(),
+                        m_end
+                            .and_hms_opt(23, 59, 59)
+                            .map(|d| d.and_utc().timestamp())
+                            .unwrap_or(0)
+                            .to_string(),
+                    ];
+                    let rep = run_step(ticker, "fetch-pyth-history", &args, None);
+                    fetch_ms += rep.duration_ms;
+                    if rep.exit_code == -1 {
+                        fetch_err.extend(rep.errors.clone());
+                        hard_fail = true;
+                        break 'months;
+                    }
+                }
+
                 // fetch this month (all active exchanges)
-                if want("fetch") {
+                if want("fetch") && !pyth_only {
                     let args = vec![
                         cfg.clone(),
                         "--pairs".to_string(),
@@ -1230,6 +1468,46 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         }
     }
 
+    // 7) gaps → repair. Detection runs on the persisted series (so it sees the
+    // holes a live sink outage left, not just fetch failures); repair re-drives
+    // the SAME producer chain over the missing days only.
+    if want("gaps") {
+        let window_days = (ctx.to - ctx.from)
+            .num_days()
+            .clamp(1, ctx.args.gap_window_days);
+        let (rep, verdict) = detect_gaps(ticker, ticker_id, out_dir, window_days);
+        let has_gaps = !verdict.missing_days.is_empty() || verdict.outage_gaps > 0;
+        steps_out.push(rep);
+        if has_gaps && want("repair") && ctx.repair_pass == 0 && !verdict.missing_days.is_empty() {
+            let (lo, hi) = (
+                *verdict.missing_days.first().unwrap(),
+                *verdict.missing_days.last().unwrap(),
+            );
+            info!(ticker, %lo, %hi, n_days = verdict.missing_days.len(), "repairing gaps");
+            let sub = PlanCtx {
+                args: ctx.args.clone(),
+                from: lo,
+                to: hi + chrono::Duration::days(1),
+                exchanges: ctx.exchanges.clone(),
+                steps: ["fetch", "pyth", "t2i", "merge", "s10", "renko", "gaps"]
+                    .iter()
+                    .filter(|s| want(s) || **s == "gaps")
+                    .map(|s| s.to_string())
+                    .collect(),
+                counters: Arc::clone(&ctx.counters),
+                repair_pass: 1,
+            };
+            let sub_rep = run_ticker(&sub, ticker);
+            // The post-repair `gaps` step is the proof: anything it still
+            // reports is PERMANENTLY LOST (no source retains it) and must stay
+            // visible rather than being quietly marked repaired.
+            for mut s in sub_rep.steps {
+                s.name = format!("repair:{}", s.name);
+                steps_out.push(s);
+            }
+        }
+    }
+
     let any_fail = steps_out.iter().any(|s| s.exit_code != 0 && !s.skipped);
     let all_skipped = !steps_out.is_empty() && steps_out.iter().all(|s| s.skipped);
     let status = if any_fail {
@@ -1381,6 +1659,30 @@ fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
     }
 }
 
+/// Every natively aggregated ticker: the CEX subscription manifest
+/// (`NxrConfig::symbol_list`, i.e. `NXR_SYMBOLS` or its compiled default) ∪
+/// every `oracles.providers.*.symbols` key.
+///
+/// This is the SAME union `core` calls `native_ids` (`core/src/main.rs`), and
+/// deliberately excludes `cexs.cross_pairs`: crosses are a pure function of
+/// their legs, are composed on read, and are never materialized. Backfilling
+/// one would recreate exactly the 2 657 derived trees that filled the node.
+fn native_tickers(config: &Path) -> Result<Vec<String>> {
+    let mut out: Vec<String> = nxr_sdk::NxrConfig::from_env().symbol_list();
+    if let Ok(y) = nxr_sdk::pipeline_config::PipelineYml::load(config) {
+        for prov in y.oracles.providers.values() {
+            out.extend(prov.symbols.keys().cloned());
+        }
+    }
+    out.iter_mut().for_each(|s| *s = s.replace('/', "-"));
+    out.sort();
+    out.dedup();
+    if out.is_empty() {
+        return Err(anyhow!("--tickers native resolved to an empty set"));
+    }
+    Ok(out)
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -1396,11 +1698,16 @@ fn main() -> Result<()> {
     };
     let exchanges = split_csv(&args.exchanges);
     let steps = split_csv(&args.steps);
-    let tickers: Vec<String> = match &args.tickers {
+    let tickers: Vec<String> = match args.tickers.as_deref() {
+        // `all` is what the deployed `nxr-backfill` CronJob already passes; it
+        // was never a sentinel, so it parsed as a literal ticker named "all"
+        // and the job could only ever fail. Same set as `native` — a cross is
+        // never backfilled.
+        Some("native") | Some("all") => native_tickers(&args.config)?,
         Some(s) => split_csv(s),
         None => {
             return Err(anyhow!(
-                "--tickers required (comma-separated BASE-QUOTE list)"
+                "--tickers required (comma-separated BASE-QUOTE list, or `native`)"
             ));
         }
     };
@@ -1450,6 +1757,7 @@ fn main() -> Result<()> {
         exchanges,
         steps,
         counters: counters.clone(),
+        repair_pass: 0,
     };
 
     // ensure progress dir exists
