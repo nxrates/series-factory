@@ -67,6 +67,15 @@ struct Args {
     /// stablecoin feeds are `fixed_rate@200ms`).
     #[arg(long, default_value = "fixed_rate@200ms")]
     channel: String,
+    /// Pyth feed family prefix, i.e. the part of the upstream symbol before the
+    /// dot (`Crypto.XAUT/USD`, `FX.USD/BRL`, `Metal.XAU/USD`,
+    /// `Commodities.Index.NATGAS/USD`). Was hardcoded to `Crypto`, which made
+    /// every FX, metal and commodity feed in `oracles.providers.pyth.symbols`
+    /// unreachable by this tool: the request 404'd and no history was ever
+    /// backfilled for them. Verify against
+    /// https://history.pyth-lazer.dourolabs.app/history/v1/symbols.
+    #[arg(long, default_value = "Crypto")]
+    family: String,
     /// Override output path (default: `$NXR_DATA_TICKS/pyth/<BASE><QUOTE>/history.ticks`).
     #[arg(long)]
     out: Option<PathBuf>,
@@ -108,7 +117,7 @@ fn main() -> Result<()> {
 
     let base_uc = args.base.to_uppercase();
     let quote_uc = args.quote.to_uppercase();
-    let symbol = format!("Crypto.{base_uc}/{quote_uc}");
+    let symbol = format!("{}.{base_uc}/{quote_uc}", args.family);
     let ticker_id = nxr_sdk::resolve_ticker_id(&format!("{base_uc}/{quote_uc}"));
     let provider_id = provider_id_for("pyth");
     anyhow::ensure!(
