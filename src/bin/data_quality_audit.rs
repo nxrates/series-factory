@@ -79,6 +79,12 @@ use series_factory::vol_bin::VolMmap;
 /// s10 bucket width: UTC-grid alignment + per-day coverage are computed against
 /// this. Matches `integrity-check s10 --bucket-ms` default and the live producer.
 const S10_BUCKET_MS: i64 = 10_000;
+/// K4: consecutive zero-tick s10 bars before a flat-fill run is reported.
+/// 30 bars = 5 minutes of frozen price. Below that a thin pair can legitimately
+/// see no trade in a bucket; above it the series is asserting a price nothing
+/// observed. The 2026-07-30 BTC/USDT outage ran 52.
+const K4_ZERO_RUN_WARN: u64 = 30;
+
 /// Grid-alignment tolerance (ms) for s10 K1/K2. `open_ts` persists as u48 mts
 /// (16µs units); the ms round-trip can jitter a grid-aligned value by ~1 ms, so
 /// a ±2 ms window distinguishes mts quantization (benign) from real off-grid
@@ -461,6 +467,16 @@ struct TickerReport {
     s10_b03_violations: u64, // K1 cross-shard off-grid boundary
     s10_b03_gaps: u64,       // K1 multi-bucket gap at boundary (WARN)
     s10_misaligned: u64,     // K2 open_time_ms % 10_000 != 0
+    // K4 flat-fill: the s10 producer writes a bar for EVERY bucket whether or
+    // not a tick arrived, carrying the last close forward. A sink outage
+    // therefore leaves no hole — it leaves real-looking bars at a frozen price.
+    // Prod 2026-07-30: an 8.5 min outage on BTC/USDT produced ZERO missing rows,
+    // 52 zero-tick bars, and a chart flat-line a human caught by eye while every
+    // automated check passed. `longest_flat_run` does NOT cover this: it runs on
+    // `.idx` mids, and the `.idx` writer simply stops during an outage.
+    s10_zero_tick_bars: u64,      // bars with tick_count == 0
+    s10_longest_zero_run: u64,    // longest consecutive run of them
+    s10_zero_run_samples: Vec<String>,
     s10_coverage_pct: f64,   // K3 bars/day vs 8640
     s10_coverage_fail: bool, // K3 < 0.5
     s10_coverage_warn: bool, // K3 0.5..0.8
@@ -944,6 +960,9 @@ fn failed_ticker_report(id: u64, e: &anyhow::Error) -> TickerReport {
         s10_b03_violations: 0,
         s10_b03_gaps: 0,
         s10_misaligned: 0,
+        s10_zero_tick_bars: 0,
+        s10_longest_zero_run: 0,
+        s10_zero_run_samples: Vec::new(),
         s10_coverage_pct: f64::NAN,
         s10_coverage_fail: false,
         s10_coverage_warn: false,
@@ -1028,6 +1047,9 @@ fn audit_ticker(
         s10_b03_violations: 0,
         s10_b03_gaps: 0,
         s10_misaligned: 0,
+        s10_zero_tick_bars: 0,
+        s10_longest_zero_run: 0,
+        s10_zero_run_samples: Vec::new(),
         s10_coverage_pct: f64::NAN,
         s10_coverage_fail: false,
         s10_coverage_warn: false,
@@ -1622,6 +1644,8 @@ fn audit_ticker(
         let mut prev_open_ms: Option<i64> = None; // K1 grid is computed OPEN→OPEN
         let mut prev_close_bar: Option<Bar> = None; // last bar of prev shard (seam x-check)
         let mut buckets_per_day: BTreeMap<NaiveDate, u64> = BTreeMap::new();
+        let mut zero_run: u64 = 0;
+        let mut zero_run_end_ms: i64 = 0;
         for (date, bars) in &s10_bars_by_shard {
             // Cross-shard seam x-check via the SHARED production primitive
             // (`seam::check_s10_cross_shard`, close→close residual, ±1ms jitter
@@ -1645,6 +1669,28 @@ fn audit_ticker(
             }
             for bar in bars {
                 r.s10_bars += 1;
+                // K4 flat-fill run (see `s10_zero_tick_bars`). Counted per
+                // ticker across shards: an outage that straddles UTC midnight is
+                // one event, not two.
+                if bar.tick_count == 0 {
+                    r.s10_zero_tick_bars += 1;
+                    zero_run += 1;
+                    if zero_run > r.s10_longest_zero_run {
+                        r.s10_longest_zero_run = zero_run;
+                        zero_run_end_ms = bar.open_time_ms();
+                    }
+                } else {
+                    if zero_run >= K4_ZERO_RUN_WARN && r.s10_zero_run_samples.len() < 10 {
+                        r.s10_zero_run_samples.push(format!(
+                            "[{}] K4 {} consecutive zero-tick bars ({} s frozen price) ending ts={}",
+                            date,
+                            zero_run,
+                            zero_run * (S10_BUCKET_MS as u64) / 1000,
+                            zero_run_end_ms
+                        ));
+                    }
+                    zero_run = 0;
+                }
                 let o = bar.open;
                 let h = bar.high;
                 let l = bar.low;
@@ -1728,6 +1774,17 @@ fn audit_ticker(
             if let Some(last) = bars.last() {
                 prev_close_bar = Some(*last);
             }
+        }
+
+        // A run still open at the end of the window is the WORST case — it means
+        // the price is frozen right now — so flush it rather than dropping it.
+        if zero_run >= K4_ZERO_RUN_WARN && r.s10_zero_run_samples.len() < 10 {
+            r.s10_zero_run_samples.push(format!(
+                "K4 {} consecutive zero-tick bars ({} s frozen price) ending ts={} (RUN OPEN AT WINDOW END)",
+                zero_run,
+                zero_run * (S10_BUCKET_MS as u64) / 1000,
+                zero_run_end_ms
+            ));
         }
 
         // K3 coverage: mean bars/day vs expected (MS_PER_DAY / bucket = 8640).
@@ -1885,6 +1942,16 @@ fn audit_ticker(
         reasons.push(format!(
             "s10 coverage {:.1}% < 50% of expected (K3)",
             r.s10_coverage_pct * 100.0
+        ));
+    }
+    // K4 (HIGH): a run of flat-filled s10 bars. The series asserted a price no
+    // tick ever backed. This is the check that was missing on 2026-07-30 — the
+    // outage left the grid dense and every other s10 gate green.
+    if r.s10_longest_zero_run >= K4_ZERO_RUN_WARN {
+        reasons.push(format!(
+            "{} consecutive zero-tick s10 bars = {} s of flat-filled price (K4)",
+            r.s10_longest_zero_run,
+            r.s10_longest_zero_run * (S10_BUCKET_MS as u64) / 1000
         ));
     }
     // R2 (MED→HARD): per-day brick distribution shows a transiently-wrong-k
