@@ -20,7 +20,15 @@
 //!   glue-check --ticker-id 12345 --data-root /data
 //!   glue-check --all --data-root /data --report /data/glue/last.json
 //!
-//! Exit code: 0 if 0 errors; 1 if any errors.
+//! ## Severity
+//!
+//! Verdicts are not equally actionable, and lumping them made this check
+//! permanently red and therefore useless as an alert (186/186 non-pass:
+//! 123 `gap`, 55 `missing_shards`, 8 `monotone_violation`). See [`Severity`]
+//! for which verdict means corruption and which means expected absence.
+//!
+//! Exit code, matching `integrity-check`: 0 = clean, 1 = warnings only,
+//! 2 = at least one error (or any warning under `--strict`).
 
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
@@ -28,6 +36,7 @@ use clap::Parser;
 use nxr_sdk::ipc::record::IndexRecord;
 use nxr_sdk::shard::{idx_dir, list_shards, read_shard_aligned, ShardRecord, SENTINEL_INTERVAL_MS};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -57,6 +66,61 @@ struct Args {
     /// In `--all` mode, write aggregate JSON report to this path.
     #[arg(long)]
     report: Option<PathBuf>,
+
+    /// Treat warnings as errors (exit 2 on any non-pass verdict).
+    #[arg(long)]
+    strict: bool,
+}
+
+/// How actionable a verdict is. SINGLE source for the status -> exit-code
+/// mapping, shared by the single-ticker and `--all` paths so the taxonomy
+/// cannot drift between them (it had: two separate string lists disagreed).
+///
+/// Rule, same as `integrity_check`: hard structural corruption is an ERROR
+/// always; absence that has a benign explanation is a WARN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Severity {
+    Pass,
+    Warn,
+    Error,
+}
+
+fn severity(status: &str) -> Severity {
+    match status {
+        "ok" => Severity::Pass,
+        // Expected absence, NOT evidence of corruption:
+        // - `gap`: the 90 s budget assumes a sentinel every 60 s, but the
+        //   sentinel is emitted from `append()` (sdk shard.rs), i.e. it is
+        //   tick-driven, not timer-driven. No inbound tick means no sentinel,
+        //   so a quiet ticker, a closed session and an overnight roll all
+        //   register as `gap` and are indistinguishable from a real outage.
+        // - `missing_shards`: a shard file is created lazily on first append,
+        //   so any UTC day with zero traffic for that ticker legitimately has
+        //   no file (weekends, holidays, dark venues, delistings).
+        // - `empty` / `missing_live` / `insufficient_samples`: coverage
+        //   questions, nothing read back wrong.
+        "empty" | "missing_live" | "gap" | "missing_shards" | "insufficient_samples" => {
+            Severity::Warn
+        }
+        // `monotone_violation` (record ts went backwards: interleaved writer,
+        // bad merge, clock rewind), `error` (the checker could not read the
+        // store), and any status not yet classified. Unknown verdicts fail
+        // loud rather than silently joining the warn pile.
+        _ => Severity::Error,
+    }
+}
+
+/// 0 clean, 1 warnings only, 2 any error. Under `--strict` a warning is an
+/// error, so the cron can be tightened without changing the taxonomy.
+fn exit_code(errored: usize, warned: usize, strict: bool) -> i32 {
+    if errored > 0 || (strict && warned > 0) {
+        2
+    } else if warned > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +177,9 @@ struct AggregateReport {
     passed: usize,
     warned: usize,
     errored: usize,
+    /// Verdict histogram, so "55 missing_shards" is readable without walking
+    /// `tickers`. The counts are what make a warn pile triageable.
+    by_status: BTreeMap<String, usize>,
     tickers: Vec<TickerReport>,
 }
 
@@ -128,8 +195,17 @@ fn run_sharded(args: &Args) -> Result<()> {
     if args.all {
         let agg = run_sharded_all(args)?;
         emit_aggregate(&agg, args)?;
-        if agg.errored > 0 {
-            std::process::exit(1);
+        let code = exit_code(agg.errored, agg.warned, args.strict);
+        info!(
+            passed = agg.passed,
+            warned = agg.warned,
+            errored = agg.errored,
+            by_status = ?agg.by_status,
+            exit = code,
+            "glue-check verdict"
+        );
+        if code != 0 {
+            std::process::exit(code);
         }
         return Ok(());
     }
@@ -144,11 +220,13 @@ fn run_sharded(args: &Args) -> Result<()> {
     } else {
         print_human(&report);
     }
-    if matches!(
-        report.status.as_str(),
-        "monotone_violation" | "missing_shards" | "gap" | "error"
-    ) {
-        std::process::exit(1);
+    let code = match severity(&report.status) {
+        Severity::Pass => 0,
+        Severity::Warn => exit_code(0, 1, args.strict),
+        Severity::Error => 2,
+    };
+    if code != 0 {
+        std::process::exit(code);
     }
     Ok(())
 }
@@ -183,22 +261,17 @@ fn run_sharded_all(args: &Args) -> Result<AggregateReport> {
     let mut warned = 0usize;
     let mut errored = 0usize;
 
+    let mut by_status: BTreeMap<String, usize> = BTreeMap::new();
+
     for id in ids {
         let r = check_sharded_safe(id, &args.common.data_root);
-        match r.status.as_str() {
-            "ok" => {
-                checked += 1;
-                passed += 1;
-            }
-            "empty" | "missing_live" => {
-                checked += 1;
-                warned += 1;
-            }
-            _ => {
-                checked += 1;
-                errored += 1;
-            }
+        checked += 1;
+        match severity(&r.status) {
+            Severity::Pass => passed += 1,
+            Severity::Warn => warned += 1,
+            Severity::Error => errored += 1,
         }
+        *by_status.entry(r.status.clone()).or_default() += 1;
         tickers.push(r);
     }
 
@@ -208,6 +281,7 @@ fn run_sharded_all(args: &Args) -> Result<AggregateReport> {
         passed,
         warned,
         errored,
+        by_status,
         tickers,
     })
 }
