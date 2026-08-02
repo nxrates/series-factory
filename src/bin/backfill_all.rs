@@ -1368,7 +1368,16 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 errors: Vec::new(),
             });
         } else {
-            let args = vec![cfg.clone(), format!("{}-{}", base, quote)];
+            // Today's `.s10` belongs to the live `bars_s10` producer. Without
+            // `--to-date` the regen rewrites it atomically and leaves that
+            // writer appending to an unlinked inode, so the day's live bars
+            // vanish until the pod restarts. Stop at yesterday, always.
+            let args = vec![
+                cfg.clone(),
+                format!("{}-{}", base, quote),
+                "--to-date".to_string(),
+                (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).to_string(),
+            ];
             let rep = run_step(ticker, "s10-from-idx", &args, Some(&bars_dir));
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
