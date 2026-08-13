@@ -2270,6 +2270,9 @@ fn fmt_bpd(b: f64, skipped: bool) -> String {
 // ── Entrypoint ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    // Hard RSS ceiling + watchdog: this audit holds one ticker's whole window
+    // resident and was OOM-killed at its 4Gi cgroup limit on every 45d run.
+    nxr_sdk::memory::apply_safe_cap();
     let cli = Cli::parse();
 
     let today = Utc::now().date_naive();

@@ -1710,6 +1710,7 @@ fn check_dir(
 
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
+    nxr_sdk::memory::apply_safe_cap();
     let cli = Cli::parse();
 
     match cli.cmd {

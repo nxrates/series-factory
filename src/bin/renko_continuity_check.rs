@@ -335,6 +335,7 @@ impl Clone for BoundaryReport {
 
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
+    nxr_sdk::memory::apply_safe_cap();
     let cli = Cli::parse();
     let bars_root = cli.common.data_root.join("bars");
     if !bars_root.exists() {
