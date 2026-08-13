@@ -35,6 +35,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// SEAM PARITY with the live pre-feed jump guard (`core::bars_renko`, EMERGENCY
+/// 2026-06-01 T0.5): a mid that jumps more than this vs `last_close` in one tick
+/// is a feed spike, not a move, and must never reach the engine. Offline never
+/// applied it, so a rebuild turned spikes into MAX_BRICKS_PER_TICK runs: one
+/// ticker's 2026-07-08..11 rebuild wrote 8.2 GB of `.renko` against a 4-8 MB/day
+/// norm (69% of all renko bytes on the box, found 2026-08-03).
+// ponytail: third copy of this constant (live is a bare 0.05 literal at
+// core/src/bars_renko.rs:512); canonical home is `nxr_sdk::renko` alongside
+// MAX_BRICKS_PER_TICK, and all three should collapse into it.
+const MAX_JUMP_PCT: f64 = 0.05;
+
+/// Consecutive jump-guard trips after which the divergence is treated as a real
+/// regime change (or a stale anchor after a gap) rather than a spike, and
+/// `last_close` is reseeded so the walk resumes. Mirrors the live constant.
+const RESEED_AFTER_TRIPS: u32 = 30;
+
 #[derive(Parser, Debug)]
 #[command(about = "Build renko shards from a sharded composite idx dir.")]
 struct Args {
@@ -211,6 +227,8 @@ fn main() -> Result<()> {
     let mut pass2_count: u64 = 0;
     let mut post_bootstrap: u64 = 0;
     let mut total_bars: usize = 0;
+    let mut guard_trips: u32 = 0;
+    let mut guard_skipped: u64 = 0;
 
     for (_, path) in &shards {
         let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
@@ -227,6 +245,23 @@ fn main() -> Result<()> {
                     continue;
                 }
                 pass2_count += 1;
+
+                // PRE-FEED jump guard: a spiked mid must never reach the engine.
+                // A genuine spike reverts within a tick or two (counter resets);
+                // only a sustained divergence reaches RESEED_AFTER_TRIPS, where
+                // the anchor is stale rather than the tick wrong, so we snap
+                // `last_close` to the mid and resume instead of dropping forever.
+                let last_close = generator.last_close();
+                if last_close > 0.0 && (mid - last_close).abs() / last_close > MAX_JUMP_PCT {
+                    guard_trips += 1;
+                    guard_skipped += 1;
+                    if guard_trips >= RESEED_AFTER_TRIPS {
+                        generator.seed_last_close(mid);
+                        guard_trips = 0;
+                    }
+                    continue;
+                }
+                guard_trips = 0;
 
                 if ts < bootstrap_end {
                     let sigma = sigma_at(ts);
@@ -290,6 +325,7 @@ fn main() -> Result<()> {
         bars = total_bars,
         pass2_records = pass2_count,
         post_bootstrap,
+        jump_guard_skipped = guard_skipped,
         out_shards = bars_by_date.len(),
         "pass 2 done in {}ms",
         t1.elapsed().as_millis()
