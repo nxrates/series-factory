@@ -1670,18 +1670,22 @@ fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
 
 /// Every natively aggregated ticker: the CEX subscription manifest
 /// (`NxrConfig::symbol_list`, i.e. `NXR_SYMBOLS` or its compiled default) ∪
-/// every `oracles.providers.*.symbols` key.
+/// `PipelineYml::relay_symbols()` (`oracles.providers.*` ∪
+/// `ctrader.providers.*`).
 ///
 /// This is the SAME union `core` calls `native_ids` (`core/src/main.rs`), and
 /// deliberately excludes `cexs.cross_pairs`: crosses are a pure function of
 /// their legs, are composed on read, and are never materialized. Backfilling
 /// one would recreate exactly the 2 657 derived trees that filled the node.
+///
+/// The oracle-only walk here skipped every `ctrader` broker symbol, so
+/// `--tickers native` covered crypto + Pyth and silently omitted the FX /
+/// metals / energy / softs / index primaries the moment that section landed:
+/// the same section-blind union bug already fixed in `configured_symbols`.
 fn native_tickers(config: &Path) -> Result<Vec<String>> {
     let mut out: Vec<String> = nxr_sdk::NxrConfig::from_env().symbol_list();
     if let Ok(y) = nxr_sdk::pipeline_config::PipelineYml::load(config) {
-        for prov in y.oracles.providers.values() {
-            out.extend(prov.symbols.keys().cloned());
-        }
+        out.extend(y.relay_symbols());
     }
     out.iter_mut().for_each(|s| *s = s.replace('/', "-"));
     out.sort();

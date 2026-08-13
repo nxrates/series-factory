@@ -96,10 +96,23 @@ fn main() -> Result<()> {
     // resolve providers + weights (YAML-driven, NO hardcoded list)
     let weight_map = resolve_weights(&args)?;
     let exchanges: Vec<String> = if args.exchanges.is_empty() {
-        // Default exchange set = whichever providers appear in the YAML
-        // `cexs.exchanges` map (loaded via resolve_weights above).
+        // Default provider set = the YAML `cexs.exchanges` map (loaded via
+        // resolve_weights above) ∪ the relay sections (`oracles.providers`,
+        // `ctrader.providers`). Keying only off `cexs.exchanges` made every
+        // non-CEX ticker unmergeable: its staging tree is `indexes/pyth/…` or
+        // `indexes/<broker>/…`, which was never scanned, so the run reached
+        // "no per-provider .idx files loaded" for FX, metals, energy and index
+        // primaries no matter how complete their staging was.
         // Falls through to empty if neither CLI flag nor YAML supplied.
-        weight_map.keys().cloned().collect()
+        let mut v: Vec<String> = weight_map.keys().cloned().collect();
+        if let Ok(y) = nxr_sdk::pipeline_config::PipelineYml::load_default(
+            nxr_sdk::pipeline_config::ConfigHint::Bin,
+        ) {
+            v.extend(y.relay_providers());
+        }
+        v.sort();
+        v.dedup();
+        v
     } else {
         args.exchanges.clone()
     };
@@ -150,9 +163,14 @@ fn main() -> Result<()> {
             .join(format!("{}-{}.idx", base_uc, quote_uc));
         let provider_id = nxr_sdk::providers::get_market_provider_id_by_name(exch)
             .with_context(|| format!("unknown exchange {}", exch))?;
-        let base_weight = *weight_map
+        // A relay provider (oracle, broker) has no `cexs.exchanges.<name>.weight`
+        // and never will: it is the sole source for its tickers, so its weight is
+        // only ever compared against itself. Bailing here meant a single missing
+        // CEX weight entry also killed every oracle/broker merge.
+        let base_weight = weight_map
             .get(exch.as_str())
-            .with_context(|| format!("no weight configured for {} in YAML cexs.exchanges", exch))?;
+            .copied()
+            .unwrap_or(FALLBACK_EQUAL_WEIGHT);
         match SourceStream::load(&path, provider_id, base_weight) {
             Ok(s) => {
                 info!(
