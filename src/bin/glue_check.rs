@@ -70,6 +70,13 @@ struct Args {
     /// Treat warnings as errors (exit 2 on any non-pass verdict).
     #[arg(long)]
     strict: bool,
+
+    /// Only inspect records written in the last N minutes (shards outside the
+    /// window are never opened). This is what makes the check cheap enough to
+    /// run hourly over EVERY ticker: full-history mode re-reads years of sealed
+    /// shards each run, which is the I/O shape that pinned the node.
+    #[arg(long)]
+    since_minutes: Option<i64>,
 }
 
 /// How actionable a verdict is. SINGLE source for the status -> exit-code
@@ -100,6 +107,12 @@ fn severity(status: &str) -> Severity {
         //   no file (weekends, holidays, dark venues, delistings).
         // - `empty` / `missing_live` / `insufficient_samples`: coverage
         //   questions, nothing read back wrong.
+        // A ticker the config does not declare as a forwarder-observed primary
+        // has no `.idx` BY DESIGN: crosses compose on read and the sink gates
+        // them out (`core::aggregator::append_idx_unless_composed`), so their
+        // absent or frozen shard tree is the intended state, not a finding.
+        // Pass, so `--strict` cannot turn ~2.6 k derived ids into failures.
+        "composed" => Severity::Pass,
         "empty" | "missing_live" | "gap" | "missing_shards" | "insufficient_samples" => {
             Severity::Warn
         }
@@ -185,6 +198,10 @@ struct AggregateReport {
 
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
+    // Hard RSS ceiling + watchdog. This scan walks every ticker's shard tree,
+    // so an unbounded run is exactly the shape that OOM-killed the cert job
+    // and, before that, the operator's machine.
+    nxr_sdk::memory::apply_safe_cap();
     let args = Args::parse();
     run_sharded(&args)
 }
@@ -214,7 +231,7 @@ fn run_sharded(args: &Args) -> Result<()> {
             "missing --ticker-id (or pass --all); use --legacy-flat for the old flat-file layout"
         )
     })?;
-    let report = check_sharded_safe(id, &args.common.data_root);
+    let report = check_sharded_safe(id, &args.common.data_root, &Scope::build(args));
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -262,9 +279,10 @@ fn run_sharded_all(args: &Args) -> Result<AggregateReport> {
     let mut errored = 0usize;
 
     let mut by_status: BTreeMap<String, usize> = BTreeMap::new();
+    let scope = Scope::build(args);
 
     for id in ids {
-        let r = check_sharded_safe(id, &args.common.data_root);
+        let r = check_sharded_safe(id, &args.common.data_root, &scope);
         checked += 1;
         match severity(&r.status) {
             Severity::Pass => passed += 1,
@@ -286,9 +304,60 @@ fn run_sharded_all(args: &Args) -> Result<AggregateReport> {
     })
 }
 
-fn check_sharded_safe(ticker_id: u64, data_root: &std::path::Path) -> TickerReport {
+/// What a run is allowed to look at, and which ids it may hold to account.
+/// Both halves are derived, never hardcoded: the window from `--since-minutes`,
+/// the primary roster from `config.yml` (`NXR_SYMBOLS` ∪
+/// `PipelineYml::relay_symbols()`), so a new forwarder section is covered by
+/// the next run with no code change.
+struct Scope {
+    cutoff_ms: Option<i64>,
+    primaries: std::collections::HashSet<u64>,
+}
+
+impl Scope {
+    fn build(args: &Args) -> Self {
+        let cutoff_ms = args
+            .since_minutes
+            .map(|m| chrono::Utc::now().timestamp_millis() - m.max(0) * 60_000);
+        let mut primaries: std::collections::HashSet<u64> = nxr_sdk::NxrConfig::from_env()
+            .symbol_list()
+            .iter()
+            .map(|s| nxr_sdk::resolve_ticker_id(s))
+            .collect();
+        match nxr_sdk::pipeline_config::PipelineYml::load_default(
+            nxr_sdk::pipeline_config::ConfigHint::Bin,
+        ) {
+            Ok(y) => primaries.extend(
+                y.relay_symbols()
+                    .iter()
+                    .map(|s| nxr_sdk::resolve_ticker_id(s)),
+            ),
+            // No config = no roster: every id is treated as a primary rather
+            // than silently excusing a real outage.
+            Err(e) => warn!(err = %e, "no config.yml: cannot separate primaries from composed ids"),
+        }
+        Scope {
+            cutoff_ms,
+            primaries,
+        }
+    }
+
+    fn is_primary(&self, ticker_id: u64) -> bool {
+        self.primaries.is_empty() || self.primaries.contains(&ticker_id)
+    }
+
+    fn cutoff_date(&self) -> Option<NaiveDate> {
+        self.cutoff_ms.map(|ms| {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .unwrap_or_default()
+                .date_naive()
+        })
+    }
+}
+
+fn check_sharded_safe(ticker_id: u64, data_root: &std::path::Path, scope: &Scope) -> TickerReport {
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        check_sharded(ticker_id, data_root)
+        check_sharded(ticker_id, data_root, scope)
     }));
     match res {
         Ok(Ok(r)) => r,
@@ -309,15 +378,34 @@ fn check_sharded_safe(ticker_id: u64, data_root: &std::path::Path) -> TickerRepo
     }
 }
 
-fn check_sharded(ticker_id: u64, data_root: &std::path::Path) -> Result<TickerReport> {
+fn check_sharded(
+    ticker_id: u64,
+    data_root: &std::path::Path,
+    scope: &Scope,
+) -> Result<TickerReport> {
     let dir = idx_dir(data_root, ticker_id);
-    let shards = list_shards(&dir, "idx")?;
+    let all_shards = list_shards(&dir, "idx")?;
+    // Window filter BEFORE any file is opened: a sealed shard outside the
+    // window is never read, so cost scales with the window, not with history.
+    let shards: Vec<(NaiveDate, PathBuf)> = match scope.cutoff_date() {
+        Some(from) => all_shards.into_iter().filter(|(d, _)| *d >= from).collect(),
+        None => all_shards,
+    };
     if shards.is_empty() {
+        let composed = !scope.is_primary(ticker_id);
         return Ok(TickerReport {
             ticker: ticker_id.to_string(),
             ticker_id: Some(ticker_id),
-            status: "missing_live".to_string(),
-            note: Some(format!("no shards under {}", dir.display())),
+            status: if composed { "composed" } else { "missing_live" }.to_string(),
+            note: Some(format!(
+                "no shards {}under {}",
+                if scope.cutoff_ms.is_some() {
+                    "in window "
+                } else {
+                    ""
+                },
+                dir.display()
+            )),
             ..base_report(ticker_id)
         });
     }
@@ -355,6 +443,9 @@ fn check_sharded(ticker_id: u64, data_root: &std::path::Path) -> Result<TickerRe
             read_shard_aligned(path).with_context(|| format!("read shard {}", path.display()))?;
         for r in &recs {
             let t = r.shard_ts_ms();
+            if scope.cutoff_ms.is_some_and(|c| t < c) {
+                continue; // pre-window record inside an in-window shard
+            }
             if let Some(p) = prev_ts {
                 let dt = t - p;
                 if dt < 0 {
@@ -380,8 +471,19 @@ fn check_sharded(ticker_id: u64, data_root: &std::path::Path) -> Result<TickerRe
     let mut status = "ok".to_string();
     let mut note: Option<String> = None;
     if total_records == 0 {
-        status = "empty".to_string();
-        note = Some("0 records across all shards".to_string());
+        // Frozen tree: expected for a composed cross (its shards stopped growing
+        // when the sink gate shipped), a real outage for a declared primary.
+        let composed = !scope.is_primary(ticker_id);
+        status = if composed { "composed" } else { "empty" }.to_string();
+        note = Some(format!(
+            "0 records across {} shard(s){}",
+            shards_present,
+            if scope.cutoff_ms.is_some() {
+                " in window"
+            } else {
+                ""
+            }
+        ));
     } else if monotone_violation_ix.is_some() {
         status = "monotone_violation".to_string();
         note = Some(format!(
@@ -498,5 +600,40 @@ fn print_human(r: &TickerReport) {
     println!("status:                {}", r.status);
     if let Some(n) = r.note.as_ref() {
         println!("note:                  {}", n);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gate constraint, pinned: an id the config does not declare as a
+    /// forwarder-observed primary has no `.idx` by design, so its absence is a
+    /// PASS and cannot be escalated by `--strict`. A declared primary with the
+    /// same emptiness stays a warning (an outage, or a not-yet-deployed
+    /// forwarder), which is what an operator must see.
+    #[test]
+    fn composed_absence_passes_primary_absence_warns() {
+        assert_eq!(severity("composed"), Severity::Pass);
+        assert_eq!(exit_code(0, 1, true), 2, "strict escalates a real warning");
+        assert_eq!(severity("missing_live"), Severity::Warn);
+        assert_eq!(severity("empty"), Severity::Warn);
+        assert_eq!(severity("monotone_violation"), Severity::Error);
+    }
+
+    /// An empty roster (no config.yml) must NOT silently excuse everything:
+    /// every id is then treated as a primary.
+    #[test]
+    fn empty_roster_treats_every_id_as_primary() {
+        let s = Scope {
+            cutoff_ms: None,
+            primaries: std::collections::HashSet::new(),
+        };
+        assert!(s.is_primary(42));
+        let s = Scope {
+            cutoff_ms: None,
+            primaries: std::collections::HashSet::from([7u64]),
+        };
+        assert!(s.is_primary(7) && !s.is_primary(42));
     }
 }
