@@ -38,7 +38,7 @@ fn sigma_for_ts<S: VolSource + ?Sized>(ts_ms: i64, vol_source: &S, sigma_cache: 
 ///
 /// One trailing window (`rolling_window_days`), one median objective, one
 /// direct solver. The σ-blend MTF (the entire regime-adaptive layer) lives on
-/// `VolConfig.sigma_blend_windows_days` and is unrelated to this.
+/// `VolConfig.sigma_blend_windows_min` and is unrelated to this.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CalibrationConfig {
     /// Target bars-per-day to converge to (default 300 for crypto majors).
@@ -782,7 +782,7 @@ mod tests {
     fn vol_cfg() -> VolConfig {
         VolConfig {
             ema_period: 1,
-            sigma_blend_windows_days: vec![1],
+            sigma_blend_windows_min: nxr_sdk::mtf::MtfWindows::equal([1_440u32]),
             winsorize_pct: [0.05, 0.95],
             winsorize_min_samples: 1,
             recompute_cooldown_ms: 0,

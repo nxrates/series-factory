@@ -107,7 +107,9 @@ series:
     # (offline == live). The estimator kernel is fixed in code; only the
     # smoothing/blend knobs are configurable.
     ema_period: 28                       # EMA smoothing (28 x 30 min = 14 h)
-    sigma_blend_windows_days: [14, 60, 180]  # inverse-variance weighted blend
+    # Lookbacks in MINUTES: 20160/86400/259200 = 14d / 60d / 180d.
+    sigma_blend_windows_min:
+      windows_min: [20160, 86400, 259200]
     winsorize_pct: [0.05, 0.95]          # clip percentiles for outlier robustness
     winsorize_min_samples: 5             # skip winsorization below this
     recompute_cooldown_ms: 43200000      # 12 h recalibration cooldown (.vol -> .k)
