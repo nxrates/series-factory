@@ -396,6 +396,8 @@ struct TickerReport {
     // Gap detection
     suspect_gaps: u64,
     quiet_gaps: u64,
+    /// Gaps covering no session time (overnight, weekend, holiday).
+    closed_gaps: u64,
     outage_gaps: u64,
     missing_days: u64,
     missing_day_list: Vec<String>,
@@ -906,6 +908,7 @@ fn failed_ticker_report(id: u64, e: &anyhow::Error) -> TickerReport {
         n_records: 0,
         suspect_gaps: 0,
         quiet_gaps: 0,
+        closed_gaps: 0,
         outage_gaps: 0,
         missing_days: 0,
         missing_day_list: Vec::new(),
@@ -994,6 +997,7 @@ fn audit_ticker(
         n_records: 0,
         suspect_gaps: 0,
         quiet_gaps: 0,
+        closed_gaps: 0,
         outage_gaps: 0,
         missing_days: 0,
         missing_day_list: Vec::new(),
@@ -1091,6 +1095,34 @@ fn audit_ticker(
         .iter()
         .any(|rec| (rec.index.flags & FLAG_HEARTBEAT_SENTINEL) != 0);
 
+    // Observed session envelope per UTC day: first and last record that day.
+    // A market that is closed prints nothing, so the envelope IS the session,
+    // derived per ticker with no calendar and no per-class table. A 24/7 tape
+    // yields a full-day envelope and so excuses nothing; an equity yields its
+    // real session and its overnight gap stops reading as an outage. 439 of
+    // 439 cert failures on 2026-08-14 were this: a 3.6 h overnight close
+    // scored identically to a dead feed.
+    let sessions: std::collections::BTreeMap<NaiveDate, (i64, i64)> = {
+        let mut m: std::collections::BTreeMap<NaiveDate, (i64, i64)> =
+            std::collections::BTreeMap::new();
+        for rec in records.iter() {
+            let ts = rec.shard_ts_ms();
+            let e = m.entry(ts_ms_to_utc_date(ts)).or_insert((ts, ts));
+            e.0 = e.0.min(ts);
+            e.1 = e.1.max(ts);
+        }
+        m
+    };
+    // Active milliseconds a span covers: overlap with the days that traded.
+    // A day with no records contributes nothing, so weekends and holidays fall
+    // out for free rather than needing to be enumerated.
+    let active_ms = |from: i64, to: i64| -> i64 {
+        sessions
+            .values()
+            .map(|(o, c)| (to.min(*c) - from.max(*o)).max(0))
+            .sum()
+    };
+
     for pair in records.windows(2) {
         let a = &pair[0];
         let b = &pair[1];
@@ -1108,7 +1140,14 @@ fn audit_ticker(
         // "quiet" if a sentinel covers an endpoint, OR the whole stream predates
         // sentinel rollout (no sentinels anywhere) — but only within tolerance.
         let excused = endpoint_sentinel || !any_sentinel;
-        let classification = if excused && dt <= quiet_tol_ms {
+        // Judge the gap on the time the market was OPEN inside it, not on wall
+        // clock. An overnight or weekend span covers no active time; a genuine
+        // stall inside a session covers all of it, so a 24/7 tape is unchanged.
+        let dt_active = active_ms(ts1, ts2);
+        let classification = if dt_active <= max_gap_ms {
+            r.closed_gaps += 1;
+            "closed"
+        } else if excused && dt <= quiet_tol_ms {
             r.quiet_gaps += 1;
             "quiet"
         } else {
