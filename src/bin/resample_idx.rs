@@ -484,7 +484,7 @@ fn median_spacing(records: &[IndexRecord]) -> i64 {
     if records.len() < 2 {
         return 0;
     }
-    let mut deltas: Vec<i64> = records
+    let deltas: Vec<i64> = records
         .windows(2)
         .map(|w| {
             to_epoch_ms(w[1].header.get_timestamp()) - to_epoch_ms(w[0].header.get_timestamp())
@@ -494,8 +494,8 @@ fn median_spacing(records: &[IndexRecord]) -> i64 {
     if deltas.is_empty() {
         return 0;
     }
-    deltas.sort_unstable();
-    deltas[deltas.len() / 2]
+    // Spacing is whole ms, so the averaged middle of an even sample rounds.
+    nxr_sdk::stats::median_by(&deltas, |&v| v as f64).round() as i64
 }
 
 fn verify_invariants(
