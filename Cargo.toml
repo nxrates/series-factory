@@ -60,6 +60,10 @@ name = "migrate-phantom-ids"
 path = "src/bin/migrate_phantom_ids.rs"
 
 [[bin]]
+name = "migrate-quote-basis"
+path = "src/bin/migrate_quote_basis.rs"
+
+[[bin]]
 name = "data-quality-audit"
 path = "src/bin/data_quality_audit.rs"
 
