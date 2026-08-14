@@ -286,7 +286,7 @@ fn detect_source_ms(shards: &[(NaiveDate, PathBuf)]) -> Option<i64> {
         return None;
     }
     let idxs = [0, shards.len() / 2, shards.len() - 1];
-    let mut samples: Vec<i64> = idxs
+    let samples: Vec<i64> = idxs
         .iter()
         .copied()
         .collect::<std::collections::BTreeSet<_>>()
@@ -300,15 +300,15 @@ fn detect_source_ms(shards: &[(NaiveDate, PathBuf)]) -> Option<i64> {
     if samples.is_empty() {
         return None;
     }
-    samples.sort_unstable();
-    Some(samples[samples.len() / 2])
+    // Cadence is whole ms, so the averaged middle of an even sample rounds.
+    Some(nxr_sdk::stats::median_by(&samples, |&v| v as f64).round() as i64)
 }
 
 fn detect_median_delta_ms(recs: &[IndexRecord]) -> Option<i64> {
     if recs.len() < 2 {
         return None;
     }
-    let mut deltas: Vec<i64> = recs
+    let deltas: Vec<i64> = recs
         .windows(2)
         .map(|w| w[1].shard_ts_ms() - w[0].shard_ts_ms())
         .filter(|d| *d > 0 && *d < 5000)
@@ -316,8 +316,7 @@ fn detect_median_delta_ms(recs: &[IndexRecord]) -> Option<i64> {
     if deltas.is_empty() {
         return None;
     }
-    deltas.sort_unstable();
-    Some(deltas[deltas.len() / 2])
+    Some(nxr_sdk::stats::median_by(&deltas, |&v| v as f64).round() as i64)
 }
 
 fn bin_start(ts_ms: i64, target_ms: i64) -> i64 {
