@@ -437,6 +437,9 @@ fn merge_chunk(chunk: &[IndexRecord], target_ms: i64) -> Result<IndexRecord> {
     } else {
         chunk.iter().map(|r| r.index.ask).sum::<f64>() / chunk.len() as f64
     };
+    // NOT quadrature (`stats::ci::rss`): these are repeated observations of ONE
+    // quantity inside a bin, so they pool as a volume-weighted RMS and SHRINK
+    // with sample count. Quadrature is for independent legs, and grows.
     let ci_out = if ci_den > 0.0 {
         encode_ci_ubp((ci_num / ci_den).sqrt())
     } else {
