@@ -217,22 +217,16 @@ struct PairSummary {
 
 impl PairSummary {
     fn finalize(&self, target_bpd: f64) -> String {
-        let mut sorted = self.bpd_samples.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = if sorted.is_empty() {
-            0.0
-        } else {
-            sorted[sorted.len() / 2]
-        };
-        let mean = if sorted.is_empty() {
-            0.0
-        } else {
-            sorted.iter().sum::<f64>() / sorted.len() as f64
-        };
+        let median = nxr_sdk::stats::median(&self.bpd_samples);
+        let mean = nxr_sdk::stats::mean(&self.bpd_samples);
         // Error window: |bpd - target| ≤ target/3 (so 200..400 around 300).
         let lo = (target_bpd / 3.0).max(50.0);
         let hi = target_bpd * 2.0;
-        let out_of_band = sorted.iter().filter(|b| **b < lo || **b > hi).count();
+        let out_of_band = self
+            .bpd_samples
+            .iter()
+            .filter(|b| **b < lo || **b > hi)
+            .count();
         format!(
             "pair={} id={} days={} written={} failed={} skipped={} bpd_mean={:.0} bpd_median={:.0} bpd_oob[{:.0}..{:.0}]={} k_n={}",
             self.pair,
