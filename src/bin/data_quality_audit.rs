@@ -65,7 +65,7 @@ use nxr_sdk::ohlc::{rollup, Ohlc};
 use nxr_sdk::shard::{
     bars_dir, idx_dir, list_shards, manifest_path, read_manifest, read_shard_aligned,
     ts_ms_to_utc_date, vol_path_for_id, ShardRecord, BAR_MS_S10, FLAG_CONF_ACTIVE,
-    FLAG_CONF_FRESHNESS, FLAG_HEARTBEAT_SENTINEL, MS_PER_DAY,
+    FLAG_CONF_FRESHNESS, FLAG_HEARTBEAT_SENTINEL,
 };
 use nxr_sdk::stats as sdk_stats;
 use nxr_sdk::weights_schema::WeightsFile;
@@ -474,10 +474,11 @@ struct TickerReport {
     // 52 zero-tick bars, and a chart flat-line a human caught by eye while every
     // automated check passed. `longest_flat_run` does NOT cover this: it runs on
     // `.idx` mids, and the `.idx` writer simply stops during an outage.
-    s10_zero_tick_bars: u64,      // bars with tick_count == 0
-    s10_longest_zero_run: u64,    // longest consecutive run of them
+    s10_zero_tick_bars: u64,   // bars with tick_count == 0
+    s10_longest_zero_run: u64, // longest consecutive run of them
     s10_zero_run_samples: Vec<String>,
-    s10_coverage_pct: f64,   // K3 bars/day vs 8640
+    s10_coverage_pct: f64, // K3 mean per-day fill vs this ticker's own session norm
+    s10_expected_per_day: f64, // that norm: median bars on days it actually traded
     s10_coverage_fail: bool, // K3 < 0.5
     s10_coverage_warn: bool, // K3 0.5..0.8
     // Verdict
@@ -964,6 +965,7 @@ fn failed_ticker_report(id: u64, e: &anyhow::Error) -> TickerReport {
         s10_longest_zero_run: 0,
         s10_zero_run_samples: Vec::new(),
         s10_coverage_pct: f64::NAN,
+        s10_expected_per_day: f64::NAN,
         s10_coverage_fail: false,
         s10_coverage_warn: false,
         verdict: "FAIL".to_string(),
@@ -1051,6 +1053,7 @@ fn audit_ticker(
         s10_longest_zero_run: 0,
         s10_zero_run_samples: Vec::new(),
         s10_coverage_pct: f64::NAN,
+        s10_expected_per_day: f64::NAN,
         s10_coverage_fail: false,
         s10_coverage_warn: false,
         verdict: "NO_DATA".to_string(),
@@ -1500,12 +1503,26 @@ fn audit_ticker(
             if target_bpd > 0.0 {
                 r.renko_ratio = r.renko_bpd / target_bpd;
             }
-            // R2 per-day distribution: median + MAD of bricks/day.
-            let counts: Vec<f64> = per_day.values().map(|&c| c as f64).collect();
+            // R2 per-day distribution: median + MAD of bricks/day, over
+            // COMPLETE days only. `win_end` is the CURRENT UTC day, still in
+            // progress, so it contributes a fraction of a day's bricks: at the
+            // 06:15 cron that is ~26 %, which trips `min_day < 0.33·median` on
+            // essentially every live ticker and hard-FAILed 62 of them on the
+            // 2026-08-14 cert. A partial day is not a starved day.
+            let counts: Vec<f64> = per_day
+                .iter()
+                .filter(|(d, _)| **d < win_end)
+                .map(|(_, &c)| c as f64)
+                .collect();
             let (med, mad) = sdk_stats::median_and_mad(&counts);
             r.renko_bpd_median = med;
             r.renko_bpd_mad = mad;
-            r.renko_bpd_min_day = per_day.values().copied().min().unwrap_or(0);
+            r.renko_bpd_min_day = per_day
+                .iter()
+                .filter(|(d, _)| **d < win_end)
+                .map(|(_, &c)| c)
+                .min()
+                .unwrap_or(0);
             if med > 0.0 && (mad > 0.5 * med || (r.renko_bpd_min_day as f64) < 0.33 * med) {
                 r.renko_dist_drift = true;
             }
@@ -1641,7 +1658,9 @@ fn audit_ticker(
         let mut prev_close_ms: Option<i64> = None; // across shards (date-sorted)
         let mut prev_open_ms: Option<i64> = None; // K1 grid is computed OPEN→OPEN
         let mut prev_close_bar: Option<Bar> = None; // last bar of prev shard (seam x-check)
-        let mut buckets_per_day: BTreeMap<NaiveDate, u64> = BTreeMap::new();
+                                                    // Per day: bar count, plus the first and last bucket seen that day.
+                                                    // The span between them IS the session, so coverage needs no calendar.
+        let mut buckets_per_day: BTreeMap<NaiveDate, (u64, i64, i64)> = BTreeMap::new();
         let mut zero_run: u64 = 0;
         let mut zero_run_end_ms: i64 = 0;
         for (date, bars) in &s10_bars_by_shard {
@@ -1695,9 +1714,12 @@ fn audit_ticker(
                 let c = bar.close;
                 let open_ms = bar.open_time_ms();
                 let close_ms = bar.close_time_ms();
-                *buckets_per_day
+                let e = buckets_per_day
                     .entry(ts_ms_to_utc_date(open_ms))
-                    .or_insert(0) += 1;
+                    .or_insert((0, open_ms as i64, open_ms as i64));
+                e.0 += 1;
+                e.1 = e.1.min(open_ms as i64);
+                e.2 = e.2.max(open_ms as i64);
 
                 let mut why: Option<String> = None;
                 if !(o.is_finite() && h.is_finite() && l.is_finite() && c.is_finite()) {
@@ -1785,12 +1807,37 @@ fn audit_ticker(
             ));
         }
 
-        // K3 coverage: mean bars/day vs expected (MS_PER_DAY / bucket = 8640).
-        if !buckets_per_day.is_empty() {
-            let expected = MS_PER_DAY as f64 / S10_BUCKET_MS as f64;
-            let total: u64 = buckets_per_day.values().sum();
-            let mean_per_day = total as f64 / buckets_per_day.len() as f64;
-            r.s10_coverage_pct = mean_per_day / expected;
+        // K3 coverage, measured against the ticker's OWN session norm rather
+        // than a 24/7 day. A fixed `MS_PER_DAY / bucket` denominator asserts
+        // every instrument trades continuously, so an equity (~6.5 h/day) or a
+        // 5-day FX week scores ~0.27 and fails on a normal session calendar:
+        // 214 of 221 EQ tickers failed that way on the 2026-08-14 cert while
+        // the real defects sat underneath. Baseline = MEDIAN bars on the days
+        // this ticker actually traded, which lands on 8640 for a 24/7 crypto
+        // tape and on the true session length for everything else, with no
+        // per-class session table to hand-maintain.
+        // Score each day against ITS OWN first-to-last span, never against the
+        // other days: a denominator taken from the same vector being scored
+        // normalises uniform degradation to 1.0, so a feed that halves on every
+        // day would read perfect. The span is absolute, so an intra-session
+        // hole still shows no matter how many days share it, while a short
+        // session simply yields a short span. Drop the window's first and last
+        // day, which are clipped by the window edge rather than by a session.
+        let days: Vec<(u64, i64, i64)> = buckets_per_day.values().copied().collect();
+        if days.len() >= 3 {
+            let inner = &days[1..days.len() - 1];
+            let mut sum = 0.0;
+            let mut spans = 0.0;
+            for &(count, first_ms, last_ms) in inner {
+                let span = (last_ms - first_ms) / S10_BUCKET_MS + 1;
+                if span <= 0 {
+                    continue;
+                }
+                sum += count as f64 / span as f64;
+                spans += span as f64;
+            }
+            r.s10_expected_per_day = spans / inner.len() as f64;
+            r.s10_coverage_pct = sum / inner.len() as f64;
             if r.s10_coverage_pct < 0.5 {
                 r.s10_coverage_fail = true;
             } else if r.s10_coverage_pct < 0.8 {
