@@ -35,21 +35,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// SEAM PARITY with the live pre-feed jump guard (`core::bars_renko`, EMERGENCY
-/// 2026-06-01 T0.5): a mid that jumps more than this vs `last_close` in one tick
-/// is a feed spike, not a move, and must never reach the engine. Offline never
-/// applied it, so a rebuild turned spikes into MAX_BRICKS_PER_TICK runs: one
-/// ticker's 2026-07-08..11 rebuild wrote 8.2 GB of `.renko` against a 4-8 MB/day
-/// norm (69% of all renko bytes on the box, found 2026-08-03).
-// ponytail: third copy of this constant (live is a bare 0.05 literal at
-// core/src/bars_renko.rs:512); canonical home is `nxr_sdk::renko` alongside
-// MAX_BRICKS_PER_TICK, and all three should collapse into it.
-const MAX_JUMP_PCT: f64 = 0.05;
-
-/// Consecutive jump-guard trips after which the divergence is treated as a real
-/// regime change (or a stale anchor after a gap) rather than a spike, and
-/// `last_close` is reseeded so the walk resumes. Mirrors the live constant.
-const RESEED_AFTER_TRIPS: u32 = 30;
+// SEAM PARITY with the live pre-feed jump guard: offline and live now read the
+// SAME constants, which is the whole point of the sdk home.
+use nxr_sdk::renko::{MAX_JUMP_PCT, RESEED_AFTER_TRIPS};
 
 #[derive(Parser, Debug)]
 #[command(about = "Build renko shards from a sharded composite idx dir.")]
