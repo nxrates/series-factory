@@ -1270,7 +1270,8 @@ fn audit_ticker(
         .filter(|(d, _)| *d >= win_start && *d <= win_end)
         .collect();
 
-    let mut daily_hl_logsq: Vec<f64> = Vec::new(); // (ln(H/L))^2 per day
+    let mut daily_hi: Vec<f64> = Vec::new(); // daily high, aligned with daily_lo
+    let mut daily_lo: Vec<f64> = Vec::new();
     let mut zero_return_frac = 0.0;
 
     // Read every s10 shard in the window EXACTLY ONCE (was: read separately
@@ -1303,9 +1304,9 @@ fn audit_ticker(
                     }
                 }
             }
-            if hi > 0.0 && lo > 0.0 && hi >= lo && lo != f64::MAX {
-                let lr = (hi / lo).ln();
-                daily_hl_logsq.push(lr * lr);
+            if lo != f64::MAX {
+                daily_hi.push(hi);
+                daily_lo.push(lo);
             }
         }
     } else if !mids.is_empty() {
@@ -1323,17 +1324,14 @@ fn audit_ticker(
             }
         }
         for (_, (hi, lo)) in by_day {
-            if hi > 0.0 && lo > 0.0 && hi >= lo {
-                let lr = (hi / lo).ln();
-                daily_hl_logsq.push(lr * lr);
-            }
+            daily_hi.push(hi);
+            daily_lo.push(lo);
         }
     }
 
-    if !daily_hl_logsq.is_empty() {
-        // sigma_daily = sqrt( (1/(4 ln2)) * mean( (ln(H/L))^2 ) )
-        let factor = 1.0 / (4.0 * std::f64::consts::LN_2);
-        let sigma_daily = (factor * sdk_stats::mean(&daily_hl_logsq)).sqrt();
+    // `parkinson_sigma` drops the `lo <= 0` / `hi < lo` bars itself.
+    let sigma_daily = nxr_sdk::vol_estimator::parkinson_sigma(&daily_hi, &daily_lo);
+    if sigma_daily > 0.0 {
         // Annualize: crypto trades ~365 days; FX ~252. Use 365 as conservative
         // upper bound for the 24/7 crypto-dominated store.
         r.sigma_park_ann = sigma_daily * (365.0_f64).sqrt();
