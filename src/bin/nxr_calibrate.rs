@@ -1400,11 +1400,7 @@ fn run_once(args: &Args) -> Result<()> {
             let n = ks.len();
             let k_min = ks[0];
             let k_max = ks[n - 1];
-            let k_median = if n % 2 == 1 {
-                ks[n / 2]
-            } else {
-                0.5 * (ks[n / 2 - 1] + ks[n / 2])
-            };
+            let k_median = nxr_sdk::stats::median(&ks);
             info!(
                 k_count = n,
                 k_min,
@@ -1637,11 +1633,7 @@ fn run_once(args: &Args) -> Result<()> {
             let n = ks.len();
             let k_min = ks[0];
             let k_max = ks[n - 1];
-            let k_median = if n % 2 == 1 {
-                ks[n / 2]
-            } else {
-                0.5 * (ks[n / 2 - 1] + ks[n / 2])
-            };
+            let k_median = nxr_sdk::stats::median(&ks);
             info!(
                 k_count = n,
                 k_min,

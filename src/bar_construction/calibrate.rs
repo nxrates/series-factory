@@ -189,18 +189,6 @@ pub struct DailyBpdStats {
     pub days: usize,
 }
 
-fn median_sorted(sorted: &[u64]) -> f64 {
-    let n = sorted.len();
-    if n == 0 {
-        return 0.0;
-    }
-    if n % 2 == 1 {
-        sorted[n / 2] as f64
-    } else {
-        0.5 * (sorted[n / 2 - 1] as f64 + sorted[n / 2] as f64)
-    }
-}
-
 /// Replay `prices` through a fresh `RenkoGenerator(config)`, bucket emitted
 /// bricks into per-UTC-day counts, and return the storms-included MEDIAN.
 ///
@@ -277,9 +265,8 @@ pub fn count_bars_per_day_from_prices<S: VolSource + ?Sized>(
         };
     };
 
-    let mut sorted = clean.clone();
-    sorted.sort_unstable();
-    let median = median_sorted(&sorted);
+    // `median_by` sorts its own projected copy, so no pre-sort here.
+    let median = nxr_sdk::stats::median_by(&clean, |&v| v as f64);
 
     // `days` reflects the count of CLEAN days actually scored, so a degenerate
     // (gappy) window surfaces as days==0.
@@ -631,9 +618,11 @@ mod tests {
             quarantine_clean_days(&per_day, per_day.len()).expect("9 non-gap days >= min_clean(5)");
         assert_eq!(clean.len(), 9, "only gap(0) excluded; storm(1000) KEPT");
         assert!(clean.contains(&1000), "storm day retained in objective");
-        let mut s = clean.clone();
-        s.sort_unstable();
-        assert_eq!(median_sorted(&s), 100.0, "median absorbs the storm day");
+        assert_eq!(
+            nxr_sdk::stats::median_by(&clean, |&v| v as f64),
+            100.0,
+            "median absorbs the storm day"
+        );
     }
 
     #[test]
@@ -660,14 +649,10 @@ mod tests {
         let n = per_day.len();
         let clean = quarantine_clean_days(&per_day, n).expect("non-empty");
         assert_eq!(clean.len(), 12, "no gap days ⇒ all kept, storms included");
-        let mut cs = clean.clone();
-        cs.sort_unstable();
-        let kept_median = median_sorted(&cs);
-        let mut all = per_day.clone();
-        all.sort_unstable();
+        let kept_median = nxr_sdk::stats::median_by(&clean, |&v| v as f64);
         assert_eq!(
             kept_median,
-            median_sorted(&all),
+            nxr_sdk::stats::median_by(&per_day, |&v| v as f64),
             "kept median == full-set median"
         );
         // A legacy [median/3, median*3] clip would have dropped the 4 storm days
@@ -918,11 +903,9 @@ mod tests {
             .copied()
             .filter(|&b| b > 0)
             .collect();
-        let mut nz = nonzero.clone();
-        nz.sort_unstable();
         assert_eq!(
             full.median,
-            median_sorted(&nz),
+            nxr_sdk::stats::median_by(&nonzero, |&v| v as f64),
             "reported median is storms-included"
         );
     }
