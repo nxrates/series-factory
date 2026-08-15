@@ -76,9 +76,10 @@ use nxr_sdk::{phantom_ticker_id, try_resolve_ticker_id, IndexRecord};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-/// The three shard trees, as (subdir, extension). `indexes` holds 56 B
-/// `IndexRecord`; `bars` holds 96 B `Bar` under two extensions in ONE directory.
-const TREES: &[(&str, &str)] = &[("indexes", "idx"), ("bars", "s10"), ("bars", "renko")];
+/// Every artefact this migration must carry, from the one enumerator that knows
+/// them all (`nxr_sdk::shard`). Hand-written tree tables are what left `.vol`
+/// behind here for a whole release.
+use nxr_sdk::shard::{rename_vol, vol_path_for_id, DAILY_TREES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TreeState {
@@ -304,13 +305,13 @@ fn main() -> Result<()> {
     let mut journal = load_journal(&data_root)?;
     let mut failures = 0usize;
     for c in &cands {
-        for (subdir, ext) in TREES {
+        for (subdir, ext) in DAILY_TREES {
             let key = format!("{}|{subdir}.{ext}", c.symbol);
             if journal.done.get(&key) == Some(&TreeState::Done) {
                 continue; // already finished by an earlier run
             }
             // `.idx` is IndexRecord (56 B); `.s10`/`.renko` are Bar (96 B).
-            let res = if *ext == "idx" {
+            let res = if ext == "idx" {
                 migrate_tree::<IndexRecord>(&data_root, c, subdir, ext, apply)
             } else {
                 migrate_tree::<nxr_sdk::mitch::bar::Bar>(&data_root, c, subdir, ext, apply)
@@ -330,6 +331,32 @@ fn main() -> Result<()> {
                     warn!(symbol = %c.symbol, tree = %format!("{subdir}.{ext}"), err = %e,
                           "tree migration FAILED — not journaled, re-run to retry");
                 }
+            }
+        }
+        // The rolling `.vol` is dateless, so it is not in `DAILY_TREES`. Omitting
+        // it here left every migrated ticker's sigma prime reading the dead id.
+        let vkey = format!("{}|vol", c.symbol);
+        if journal.done.get(&vkey) == Some(&TreeState::Done)
+            || !vol_path_for_id(&data_root, c.old_id).is_file()
+        {
+            continue;
+        }
+        if !apply {
+            info!(symbol = %c.symbol, old_id = c.old_id, new_id = c.new_id,
+                  "PLAN vol (dry run): re-key <data>/vol/<id>.vol");
+            continue;
+        }
+        match rename_vol(&data_root, c.old_id, c.new_id) {
+            Ok(true) => {
+                journal.done.insert(vkey, TreeState::Done);
+                save_journal(&data_root, &journal)?;
+                info!(symbol = %c.symbol, old_id = c.old_id, new_id = c.new_id, "vol migrated");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                failures += 1;
+                warn!(symbol = %c.symbol, err = %e,
+                      "vol migration FAILED — not journaled, re-run to retry");
             }
         }
     }

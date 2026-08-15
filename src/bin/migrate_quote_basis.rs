@@ -70,7 +70,7 @@
 //! for the new USD ids and renko falls back to the default multiplier. Run
 //! `nxr-calibrate` against the new id set before trusting renko output.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -78,21 +78,12 @@ use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 use clap::{Parser, ValueEnum};
 use nxr_sdk::shard::{
-    date_stem, list_shards, manifest_path, read_manifest, write_manifest, Manifest, ShardEntry,
+    date_stem, list_shards, manifest_path, read_manifest, rename_vol, stored_ticker_ids,
+    vol_path_for_id, write_manifest, Manifest, ShardEntry, DAILY_TREES,
 };
 use nxr_sdk::IndexRecord;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-
-/// The three shard trees, as (subdir, extension). `indexes` holds 56 B
-/// `IndexRecord`; `bars` holds 96 B `Bar` under two extensions in ONE directory
-/// (verified against `nxr_sdk::shard::bars_dir` / `shard_path`: `.s10` and
-/// `.renko` are siblings inside `<data>/bars/<id>/`, so they move with that
-/// tree). `vol` is NOT a shard tree: it is a single `<data>/vol/<id>.vol` file
-/// (`nxr_sdk::shard::vol_path_for_id`) and is handled separately — the
-/// phantom-id migration omitted it, which leaves the sigma prime reading the
-/// old id.
-const TREES: &[(&str, &str)] = &[("indexes", "idx"), ("bars", "s10"), ("bars", "renko")];
 
 /// Storage quote (`cexs.pivot.storage_quote`): USD, asset class 3, id 5001.
 const USD_QUOTE_CLASS: u64 = 3;
@@ -234,51 +225,6 @@ fn tree_dir(data_root: &Path, subdir: &str, id: u64) -> PathBuf {
     data_root.join(subdir).join(id.to_string())
 }
 
-fn vol_file(data_root: &Path, id: u64) -> PathBuf {
-    data_root.join("vol").join(format!("{id}.vol"))
-}
-
-/// Every ticker id with bytes on disk, from all three trees.
-fn stored_ids(data_root: &Path) -> Result<BTreeSet<u64>> {
-    let mut ids = BTreeSet::new();
-    for subdir in ["indexes", "bars"] {
-        let dir = data_root.join(subdir);
-        if !dir.is_dir() {
-            continue;
-        }
-        for e in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
-            let p = e?.path();
-            if !p.is_dir() {
-                continue;
-            }
-            if let Some(id) = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.parse().ok())
-            {
-                ids.insert(id);
-            }
-        }
-    }
-    let vdir = data_root.join("vol");
-    if vdir.is_dir() {
-        for e in std::fs::read_dir(&vdir).with_context(|| format!("read_dir {}", vdir.display()))? {
-            let p = e?.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("vol") {
-                continue;
-            }
-            if let Some(id) = p
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.parse().ok())
-            {
-                ids.insert(id);
-            }
-        }
-    }
-    Ok(ids)
-}
-
 /// (file count, total bytes) directly inside `dir` (shard dirs are flat).
 fn dir_files(dir: &Path) -> (u64, u64) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -297,7 +243,7 @@ fn source_paths(data_root: &Path, id: u64) -> Vec<PathBuf> {
         .map(|s| tree_dir(data_root, s, id))
         .filter(|p| p.is_dir())
         .collect();
-    let vf = vol_file(data_root, id);
+    let vf = vol_path_for_id(data_root, id);
     if vf.is_file() {
         v.push(vf);
     }
@@ -342,7 +288,7 @@ fn written_within(paths: &[PathBuf], window: Duration) -> bool {
 /// its quote leg rebased to USD. Falls back to the bare id when no manifest
 /// exists (a bars-only tree written before manifests, for instance).
 fn symbol_for(data_root: &Path, old_id: u64, new_id: u64) -> String {
-    for (subdir, _) in TREES {
+    for (subdir, _) in DAILY_TREES {
         let mp = manifest_path(&tree_dir(data_root, subdir, old_id));
         if let Ok(Some(m)) = read_manifest(&mp) {
             if let Some((base, _)) = m.ticker.split_once('/') {
@@ -355,7 +301,7 @@ fn symbol_for(data_root: &Path, old_id: u64, new_id: u64) -> String {
 
 fn candidates(data_root: &Path, filter: QuoteFilter) -> Result<Vec<Candidate>> {
     let mut out = Vec::new();
-    for old_id in stored_ids(data_root)? {
+    for old_id in stored_ticker_ids(data_root)? {
         let q = quote_of(old_id);
         let quote = if q == USDC_QUOTE {
             QuoteFilter::Usdc
@@ -538,27 +484,18 @@ fn migrate_tree<T: nxr_sdk::shard::ShardRecord>(
 /// phantom-id migration: without this the sigma prime keeps reading the old id
 /// and the live renko producer starts from a cold Parkinson ring.
 fn migrate_vol(data_root: &Path, c: &Candidate, apply: bool) -> Result<Option<UnitState>> {
-    let src = vol_file(data_root, c.old_id);
+    let src = vol_path_for_id(data_root, c.old_id);
     if !src.is_file() {
         return Ok(None);
     }
-    let dst = vol_file(data_root, c.new_id);
     let bytes = src.metadata().map(|m| m.len()).unwrap_or(0);
-    info!(symbol = %c.symbol, src = %src.display(), dst = %dst.display(), bytes,
+    info!(symbol = %c.symbol, src = %src.display(),
+          dst = %vol_path_for_id(data_root, c.new_id).display(), bytes,
           "{}", if apply { "migrating vol" } else { "PLAN vol (dry run)" });
     if !apply {
         return Ok(None);
     }
-    if dst.exists() {
-        bail!(
-            "{}: {} already exists — refusing to overwrite the sigma prime",
-            c.symbol,
-            dst.display()
-        );
-    }
-    std::fs::create_dir_all(dst.parent().unwrap())?;
-    std::fs::rename(&src, &dst)
-        .with_context(|| format!("rename {} -> {}", src.display(), dst.display()))?;
+    rename_vol(data_root, c.old_id, c.new_id).with_context(|| c.symbol.clone())?;
     Ok(Some(UnitState::Done))
 }
 
@@ -689,13 +626,13 @@ fn main() -> Result<()> {
         }
 
         let mut ok = false;
-        for (subdir, ext) in TREES {
+        for (subdir, ext) in DAILY_TREES {
             let key = format!("{}|{subdir}.{ext}", c.old_id);
             if journal.done.get(&key) == Some(&UnitState::Done) {
                 continue; // already finished by an earlier run
             }
             // `.idx` is IndexRecord (56 B); `.s10`/`.renko` are Bar (96 B).
-            let res = if *ext == "idx" {
+            let res = if ext == "idx" {
                 migrate_tree::<IndexRecord>(&data_root, c, subdir, ext, args.apply)
             } else {
                 migrate_tree::<nxr_sdk::mitch::bar::Bar>(&data_root, c, subdir, ext, args.apply)
