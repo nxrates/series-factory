@@ -1062,14 +1062,14 @@ fn run_once(args: &Args) -> Result<()> {
     if root.cexs.crypto_majors.is_empty() {
         warn!("cexs.crypto_majors empty in YAML — falling back to DEFAULT_CRYPTO_MAJORS");
     }
-    if root.cexs.stablecoins.is_empty() {
-        warn!("cexs.stablecoins empty in YAML — falling back to DEFAULT_STABLECOINS");
+    if root.cexs.pegged.is_empty() {
+        warn!("cexs.pegged empty in YAML — falling back to DEFAULT_STABLECOINS");
     }
     if root.cexs.fx_majors.is_empty() {
         warn!("cexs.fx_majors empty in YAML — falling back to DEFAULT_FX_MAJORS");
     }
     let crypto_majors = effective_list(&root.cexs.crypto_majors, DEFAULT_CRYPTO_MAJORS);
-    let stablecoins = effective_list(&root.cexs.stablecoins, DEFAULT_STABLECOINS);
+    let stablecoins = effective_list(&root.cexs.pegged, DEFAULT_STABLECOINS);
     let fx_majors = effective_list(&root.cexs.fx_majors, DEFAULT_FX_MAJORS);
 
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();

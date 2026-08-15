@@ -229,7 +229,7 @@ impl TargetResolver {
                         DEFAULT_CRYPTO_MAJORS,
                     )),
                     stablecoins: to_owned(effective_list(
-                        &yml.cexs.stablecoins,
+                        &yml.cexs.pegged,
                         DEFAULT_STABLECOINS,
                     )),
                     fx_majors: to_owned(effective_list(&yml.cexs.fx_majors, DEFAULT_FX_MAJORS)),

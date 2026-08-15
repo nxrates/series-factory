@@ -94,7 +94,7 @@ fn main() -> Result<()> {
     let renko_min_pct = series.renko.min_pct;
 
     let crypto_majors = effective_list(&root.cexs.crypto_majors, DEFAULT_CRYPTO_MAJORS);
-    let stablecoins = effective_list(&root.cexs.stablecoins, DEFAULT_STABLECOINS);
+    let stablecoins = effective_list(&root.cexs.pegged, DEFAULT_STABLECOINS);
     let fx_majors = effective_list(&root.cexs.fx_majors, DEFAULT_FX_MAJORS);
 
     // Data roots: same env-driven resolution as nxr_calibrate (NXR_DATA_*).

@@ -138,7 +138,7 @@ fn calibration_inner(c: &CalibrationYml) -> CalibrationConfig {
 // Pair → asset-class bucket: derived from MITCH wire bits via
 // nxr_sdk::asset_class::classify_ticker. NO hardcoded stablecoin / FX /
 // majors lists — MITCH wire encodes the COARSE class (CR/SD/FX/PM/CM/…)
-// and YAML `cexs.{crypto_majors,stablecoins,fx_majors}` carries the
+// and YAML `cexs.{crypto_majors,pegged,fx_majors}` carries the
 // within-class judgments (the wire deliberately does not — stablecoins
 // ARE crypto-assets on-chain). Empty YAML → audit-frozen sdk fallback.
 fn class_for_pair(pl: &PipelineYml, base: &str, quote: &str) -> &'static str {
@@ -154,7 +154,7 @@ fn class_for_pair(pl: &PipelineYml, base: &str, quote: &str) -> &'static str {
         Err(_) => return "default",
     };
     let majors = effective_list(&pl.cexs.crypto_majors, DEFAULT_CRYPTO_MAJORS);
-    let stables = effective_list(&pl.cexs.stablecoins, DEFAULT_STABLECOINS);
+    let stables = effective_list(&pl.cexs.pegged, DEFAULT_STABLECOINS);
     let fx_m = effective_list(&pl.cexs.fx_majors, DEFAULT_FX_MAJORS);
     classify_ticker(&ticker_id, base, quote, &majors, &stables, &fx_m).as_key()
 }

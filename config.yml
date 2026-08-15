@@ -8,9 +8,9 @@
 
 # ── Exchange metadata ────────────────────────────────────────────────────────
 cexs:
-  # Stablecoins recognized by asset-class detection: a pair with both legs in
+  # USD-pegged assets: a pair with both legs in
   # this list classifies as crypto_stable and inherits the low bpd target.
-  stablecoins:
+  pegged:
     - USDT
     - USDC
     - FDUSD
@@ -145,7 +145,7 @@ series:
     # reflects their regime. Resolution: per-pair override -> per-class
     # default -> flat target_bpd.
     target_bpd_by_class:
-      crypto_stable: 50    # both legs in cexs.stablecoins
+      crypto_stable: 50    # both legs in cexs.pegged
     target_bpd_overrides:
       # Stable/stable pairs (peg +/- 50 bps)
       "USDC/USDT": 50
