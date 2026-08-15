@@ -849,7 +849,11 @@ mod tests {
         assert_eq!(out.len(), 3);
         // bin1 → later legacy row: conf 15, both markers clear.
         assert_eq!(out[0].index.confidence, 15);
-        assert_eq!(out[0].index.flags & (fresh | active), 0, "legacy stays unmarked");
+        assert_eq!(
+            out[0].index.flags & (fresh | active),
+            0,
+            "legacy stays unmarked"
+        );
         // bin2 → later freshness row: conf 84, freshness flag still set, ACTIVE not
         // fabricated (a legacy fraction must never be read as a ticking count).
         assert_eq!(out[1].index.confidence, 84);
@@ -858,7 +862,11 @@ mod tests {
         // bin3 → packed row: byte AND flag verbatim, so the count still decodes.
         assert_eq!(out[2].index.confidence, packed);
         assert_ne!(out[2].index.flags & active, 0, "ACTIVE flag preserved");
-        assert_eq!(out[2].index.flags & fresh, 0, "fraction flag never fabricated");
+        assert_eq!(
+            out[2].index.flags & fresh,
+            0,
+            "fraction flag never fabricated"
+        );
         assert_eq!(mitch::index::conf_active_count(out[2].index.confidence), 3);
         assert!(mitch::index::conf_fresh_weight_ok(out[2].index.confidence));
 
@@ -874,13 +882,18 @@ mod tests {
     fn fabricated_active_flag_fails_invariants() {
         let t0 = 1_700_000_000_000_i64;
         let ticker = 11;
-        let old = vec![rec(ticker, t0, 1.0, 12, 0), rec(ticker, t0 + 100, 1.0, 15, 0)];
+        let old = vec![
+            rec(ticker, t0, 1.0, 12, 0),
+            rec(ticker, t0 + 100, 1.0, 15, 0),
+        ];
         let mut new = resample_last_in_bucket(&old, 200);
         new[0].index.flags |= nxr_sdk::shard::FLAG_CONF_ACTIVE;
         let mut failures = Vec::new();
         verify_invariants(&old, &new, 200, &mut failures);
         assert!(
-            failures.iter().any(|f| f.contains("fabricated FLAG_CONF_ACTIVE")),
+            failures
+                .iter()
+                .any(|f| f.contains("fabricated FLAG_CONF_ACTIVE")),
             "guard must catch a fabricated ACTIVE marker: {failures:?}"
         );
     }

@@ -1126,7 +1126,10 @@ fn main() -> Result<()> {
             nxr_sdk::pipeline_config::ConfigHint::Bin,
         )
         .map(|root| nxr_sdk::synth::pipeline_pairs::synth_pipeline_pairs(&root))
-        .unwrap_or_else(|_| nxr_sdk::synth::pipeline_pairs::default_synth_pipeline_pairs());
+        // No literal fallback: the pairs are derived from the config universe,
+        // and an unreadable config must surface rather than silently backfill a
+        // hardcoded five.
+        .context("synth pipeline pairs: config unreadable")?;
         yml_pairs
             .into_iter()
             .map(|p| {

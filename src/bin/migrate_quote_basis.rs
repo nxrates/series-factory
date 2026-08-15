@@ -251,7 +251,11 @@ fn stored_ids(data_root: &Path) -> Result<BTreeSet<u64>> {
             if !p.is_dir() {
                 continue;
             }
-            if let Some(id) = p.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()) {
+            if let Some(id) = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.parse().ok())
+            {
                 ids.insert(id);
             }
         }
@@ -263,7 +267,11 @@ fn stored_ids(data_root: &Path) -> Result<BTreeSet<u64>> {
             if p.extension().and_then(|x| x.to_str()) != Some("vol") {
                 continue;
             }
-            if let Some(id) = p.file_stem().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()) {
+            if let Some(id) = p
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.parse().ok())
+            {
                 ids.insert(id);
             }
         }
@@ -363,14 +371,16 @@ fn candidates(data_root: &Path, filter: QuoteFilter) -> Result<Vec<Candidate>> {
         if new_id == old_id {
             continue;
         }
-        let (files, bytes) = source_paths(data_root, old_id).iter().fold((0, 0), |(n, b), p| {
-            let (dn, db) = if p.is_dir() {
-                dir_files(p)
-            } else {
-                (1, p.metadata().map(|m| m.len()).unwrap_or(0))
-            };
-            (n + dn, b + db)
-        });
+        let (files, bytes) = source_paths(data_root, old_id)
+            .iter()
+            .fold((0, 0), |(n, b), p| {
+                let (dn, db) = if p.is_dir() {
+                    dir_files(p)
+                } else {
+                    (1, p.metadata().map(|m| m.len()).unwrap_or(0))
+                };
+                (n + dn, b + db)
+            });
         // An emptied leftover directory is not a candidate: it has nothing to
         // move, and a finished run must not re-trip the hot-tree refusal on the
         // dirs it just drained.
@@ -601,10 +611,10 @@ fn main() -> Result<()> {
 
     let data_root = match &args.data_root {
         Some(p) => p.clone(),
-        None => {
-            nxr_sdk::config::NxrConfig::from_env_with_hint(nxr_sdk::pipeline_config::ConfigHint::Bin)
-                .data_root()
-        }
+        None => nxr_sdk::config::NxrConfig::from_env_with_hint(
+            nxr_sdk::pipeline_config::ConfigHint::Bin,
+        )
+        .data_root(),
     };
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
 
@@ -887,9 +897,11 @@ mod tests {
             collides: false,
             bytes: 0,
         };
-        assert!(migrate_tree::<IndexRecord>(&root, &c, "indexes", "idx", false)
-            .unwrap()
-            .is_none());
+        assert!(
+            migrate_tree::<IndexRecord>(&root, &c, "indexes", "idx", false)
+                .unwrap()
+                .is_none()
+        );
         assert!(migrate_vol(&root, &c, false).unwrap().is_none());
         assert!(park_tree(&root, &c, "TS", false).unwrap().is_none());
 
@@ -936,11 +948,26 @@ mod tests {
             park_tree(&root, &c, "TS", true).unwrap(),
             Some(UnitState::Parked)
         );
-        let park = root.join("migrations").join("superseded").join("TS").join(old.to_string());
-        assert!(park.join("indexes").join(old.to_string()).join("2020-01-02.idx").is_file());
-        assert!(park.join("bars").join(old.to_string()).join("2020-01-02.s10").is_file());
+        let park = root
+            .join("migrations")
+            .join("superseded")
+            .join("TS")
+            .join(old.to_string());
+        assert!(park
+            .join("indexes")
+            .join(old.to_string())
+            .join("2020-01-02.idx")
+            .is_file());
+        assert!(park
+            .join("bars")
+            .join(old.to_string())
+            .join("2020-01-02.s10")
+            .is_file());
         assert!(park.join("vol").join(format!("{old}.vol")).is_file());
-        assert!(!root.join("bars").join(old.to_string()).exists(), "source gone, not merged");
+        assert!(
+            !root.join("bars").join(old.to_string()).exists(),
+            "source gone, not merged"
+        );
         let dst_files: Vec<_> = std::fs::read_dir(&twin)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())

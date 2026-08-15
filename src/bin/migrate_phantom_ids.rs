@@ -66,13 +66,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 use nxr_sdk::pipeline_config::{ConfigHint, PipelineYml};
 use nxr_sdk::shard::{
-    Manifest, ShardEntry, date_stem, list_shards, manifest_path, read_manifest, write_manifest,
+    date_stem, list_shards, manifest_path, read_manifest, write_manifest, Manifest, ShardEntry,
 };
-use nxr_sdk::{IndexRecord, phantom_ticker_id, try_resolve_ticker_id};
+use nxr_sdk::{phantom_ticker_id, try_resolve_ticker_id, IndexRecord};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -249,8 +249,8 @@ fn migrate_tree<T: nxr_sdk::shard::ShardRecord>(
     // whatever now sits in the directory (which may include shards the
     // destination already had).
     let mpath = manifest_path(&dst);
-    let mut m = read_manifest(&mpath)?
-        .unwrap_or_else(|| Manifest::new(c.symbol.clone(), c.new_id, ext));
+    let mut m =
+        read_manifest(&mpath)?.unwrap_or_else(|| Manifest::new(c.symbol.clone(), c.new_id, ext));
     m.ticker = c.symbol.clone();
     m.ticker_id = c.new_id;
     m.refresh_kind::<T>(&dst, ext)?;

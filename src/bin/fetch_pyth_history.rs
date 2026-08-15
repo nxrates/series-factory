@@ -183,7 +183,10 @@ fn main() -> Result<()> {
             tick,
         ));
     }
-    anyhow::ensure!(!frames.is_empty(), "every row for {symbol} was corrupt/non-finite");
+    anyhow::ensure!(
+        !frames.is_empty(),
+        "every row for {symbol} was corrupt/non-finite"
+    );
 
     let cfg = nxr_sdk::NxrConfig::from_env();
     let sym_dir = format!("{base_uc}{quote_uc}");
@@ -195,8 +198,7 @@ fn main() -> Result<()> {
     });
     ensure_parent_dir(&out_path)?;
     let bytes: &[u8] = bytemuck::cast_slice(&frames);
-    std::fs::write(&out_path, bytes)
-        .with_context(|| format!("write {}", out_path.display()))?;
+    std::fs::write(&out_path, bytes).with_context(|| format!("write {}", out_path.display()))?;
 
     let first_ms = frames.first().map(|f| f.timestamp_ms()).unwrap_or(0);
     let last_ms = frames.last().map(|f| f.timestamp_ms()).unwrap_or(0);

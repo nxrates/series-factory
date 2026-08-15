@@ -82,7 +82,7 @@ fn clamp_prereserve(estimate: usize) -> usize {
 
 // Synth pair registry — canonical source @ nxr_sdk::synth::pairs.
 use nxr_sdk::pipeline_config::SynthPairYml;
-use nxr_sdk::synth::pairs::{SynthPairSpec, DEFAULT_INITIAL_SYNTH_PAIRS};
+use nxr_sdk::synth::pairs::SynthPairSpec;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -130,7 +130,10 @@ struct ParamsStore {
 
 impl ParamsStore {
     fn new(path: PathBuf) -> Self {
-        Self { path, lock: std::sync::Mutex::new(()) }
+        Self {
+            path,
+            lock: std::sync::Mutex::new(()),
+        }
     }
 
     fn read(&self) -> Result<WeightsFile> {
@@ -944,8 +947,10 @@ fn resolve_synth_work(yml_pairs: &[SynthPairYml]) -> Vec<(u64, &'static str, u64
     // or direct reference to the sdk default array.
     let owned: Vec<SynthPairSpec>;
     let specs: &[SynthPairSpec] = if yml_pairs.is_empty() {
-        warn!("synths.initial_pairs empty in YAML — falling back to DEFAULT_INITIAL_SYNTH_PAIRS");
-        DEFAULT_INITIAL_SYNTH_PAIRS
+        // No fallback list: the hardcoded five were a second, divergent source
+        // next to the derived set. An empty YAML means nothing to calibrate.
+        warn!("synths.initial_pairs empty in YAML: nothing to calibrate");
+        &[]
     } else {
         owned = yml_pairs
             .iter()
@@ -1102,11 +1107,7 @@ fn run_once(args: &Args) -> Result<()> {
         .window_days
         .map(|d| d as usize)
         .unwrap_or(series.calibration.rolling_window_days);
-    let run_id = format!(
-        "{}-w{}",
-        chrono::Utc::now().format("%Y-%m-%d"),
-        window_days
-    );
+    let run_id = format!("{}-w{}", chrono::Utc::now().format("%Y-%m-%d"), window_days);
     let started_at = nxr_sdk::now_sec();
 
     // Build the work list: (pair, ticker_id, class). De-dupe by ticker_id since
@@ -1133,8 +1134,7 @@ fn run_once(args: &Args) -> Result<()> {
         let pairs = nxr_sdk::synth::pipeline_pairs::synth_pipeline_pairs(&root);
         resolve_synth_work(&pairs)
     };
-    let synth_ids: std::collections::HashSet<u64> =
-        synth_work.iter().map(|(id, ..)| *id).collect();
+    let synth_ids: std::collections::HashSet<u64> = synth_work.iter().map(|(id, ..)| *id).collect();
     let synth_count = synth_work.len();
     let mut seen: HashMap<u64, (String, AssetClassBucket)> = HashMap::new();
     let volume_pairs: Vec<String> = weights_file
@@ -1144,7 +1144,11 @@ fn run_once(args: &Args) -> Result<()> {
         .collect();
     let mut no_shards = 0usize;
     let mut deferred_to_synth = 0usize;
-    for pair in volume_pairs.iter().cloned().chain(root.configured_symbols()) {
+    for pair in volume_pairs
+        .iter()
+        .cloned()
+        .chain(root.configured_symbols())
+    {
         let ticker_id = resolve_ticker_id(&pair);
         if seen.contains_key(&ticker_id) {
             continue;
