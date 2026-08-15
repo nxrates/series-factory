@@ -4,11 +4,11 @@
 //!
 //! ## Why this exists
 //!
-//! The published denomination is `cexs.pivot.storage_quote` (USD). The pivot an
-//! asset aggregates in is inferred per weights run and may move hourly, but the
-//! ticker_id that names the directory must not: a dynamic denomination renames
-//! an asset's folder whenever its pivot moves. Trees written before that rule
-//! landed are filed under the pivot's quote (USDC / USDT) instead of USD, so the
+//! The published denomination is `cexs.storage.storage_quote` (USD), and the
+//! ticker_id that names the directory follows it. Historically an asset
+//! aggregated in a per-asset basis re-inferred every weights run, which renamed
+//! its folder whenever that basis moved. That basis was deleted 2026-08-15, but
+//! trees written before are still filed under its quote (USDC / USDT), so the
 //! serving path addresses `<data>/{indexes,bars}/<usd_id>/` and finds nothing,
 //! while the history sits under `<data>/{indexes,bars}/<usdc_or_usdt_id>/`.
 //!
@@ -85,7 +85,7 @@ use nxr_sdk::IndexRecord;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-/// Storage quote (`cexs.pivot.storage_quote`): USD, asset class 3, id 5001.
+/// Storage quote (`cexs.storage.storage_quote`): USD, asset class 3, id 5001.
 const USD_QUOTE_CLASS: u64 = 3;
 const USD_QUOTE_ID: u64 = 5001;
 /// Stablecoin quotes eligible for rebasing, as (class, id).
