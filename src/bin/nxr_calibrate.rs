@@ -266,6 +266,19 @@ fn drift_gate<S: nxr_sdk::vol::VolSource + ?Sized>(
     }
 }
 
+/// Base leg of a USDC-quoted, non-stable pair; `None` otherwise. Both legs
+/// compare case-insensitively: roster pairs carry CMC venue spellings
+/// (`XAUt` on one venue, `XAUT` on another) and mixed-case configured symbols.
+fn inferred_usdc_base<'a>(pair: &'a str, stablecoins: &[&str]) -> Option<&'a str> {
+    let (base, quote) = nxr_sdk::split_pair_multi(pair, &['/', '-', '_'])?;
+    if !quote.eq_ignore_ascii_case("USDC")
+        || stablecoins.iter().any(|s| s.eq_ignore_ascii_case(base))
+    {
+        return None;
+    }
+    Some(base)
+}
+
 /// Resolve `target_bpd` for a given pair: per-pair overrides only,
 /// flat default for all unlisted pairs. Class arg retained for log context.
 fn target_for_pair(c: &CalibrationYml, pair: &str, class: AssetClassBucket) -> f64 {
@@ -1569,12 +1582,9 @@ fn run_once(args: &Args) -> Result<()> {
             if renko_k.contains_key(&ticker_id.to_string()) {
                 continue;
             }
-            let Some(base_sym) = pair.strip_suffix("/USDC") else {
+            let Some(base_sym) = inferred_usdc_base(pair, &stablecoins) else {
                 continue;
             };
-            if stablecoins.iter().any(|s| s.eq_ignore_ascii_case(base_sym)) {
-                continue;
-            }
             let leg_pair = format!("{}/USDT", base_sym);
             let Ok(leg) = resolve_ticker(&leg_pair, InstrumentType::SPOT) else {
                 continue;
@@ -1711,6 +1721,23 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Roster pairs carry CMC venue spellings, so the USDC-fallback gate must
+    /// case-fold BOTH legs. A case-sensitive `strip_suffix("/USDC")` next to a
+    /// case-insensitive stablecoin compare is the XAUt/XAUT shape that hid
+    /// $3.3M of depth.
+    #[test]
+    fn inferred_usdc_base_folds_case_on_both_legs() {
+        let stables = ["USDT", "USDC", "DAI"];
+        assert_eq!(inferred_usdc_base("XAUt/USDC", &stables), Some("XAUt"));
+        assert_eq!(inferred_usdc_base("XAUT/usdc", &stables), Some("XAUT"));
+        assert_eq!(inferred_usdc_base("ETH-USDC", &stables), Some("ETH"));
+        // Stables route to overrides, whatever the venue's spelling.
+        assert_eq!(inferred_usdc_base("dai/USDC", &stables), None);
+        // Non-USDC quotes and malformed pairs are skipped.
+        assert_eq!(inferred_usdc_base("ETH/USDT", &stables), None);
+        assert_eq!(inferred_usdc_base("USDC", &stables), None);
+    }
 
     /// Records-per-byte sizing must match the on-disk `IndexRecord` stride the
     /// loader reads (`ShardStream` reads `file_bytes / size_of::<IndexRecord>()`
