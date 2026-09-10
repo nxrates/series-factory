@@ -64,6 +64,10 @@ name = "migrate-quote-basis"
 path = "src/bin/migrate_quote_basis.rs"
 
 [[bin]]
+name = "backfill-native-s10"
+path = "src/bin/backfill_native_s10.rs"
+
+[[bin]]
 name = "data-quality-audit"
 path = "src/bin/data_quality_audit.rs"
 
