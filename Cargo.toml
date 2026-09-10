@@ -131,6 +131,9 @@ rand_distr = "0.4"
 async-trait = "0.1"
 # Error handling
 anyhow = "1.0"
+# Content hashes for the backfill journal (sha_planned / sha_after)
+sha2 = "0.10"
+hex = "0.4"
 # Memory-mapped files
 memmap2 = "0.9"
 # POSIX resource limits (setrlimit for memory cap)
