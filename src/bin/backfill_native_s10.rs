@@ -74,11 +74,18 @@
 //! * **Never a second rebase.** A source bar that already carries bit 1 (a
 //!   re-run sourced from a tree this tool wrote) refuses the run. A re-run on
 //!   the pristine inputs re-derives the same bytes and reports `unchanged`.
-//! * **Apply writes what the dry run reviewed.** `--apply` needs `--expect
-//!   <dry-run journal>`: same target, range, plan and band hashes, and every
-//!   day's `sha_before`/`sha_planned` equal, checked in pass 1.
-//! * **Manifest.** `--apply` byte-copies `manifest.json` to the quarantine dir
-//!   before its first change; `--rollback` restores it byte-exact.
+//! * **Apply writes what the dry run reviewed.** Every `--apply`, `--resume`
+//!   included, needs `--expect <dry-run journal>`: same target, range, plan,
+//!   band and multiplier hashes, and every day's `sha_before`/`sha_planned`
+//!   equal, checked in pass 1. A resume must name the same dry run.
+//! * **Applied days stay applied.** A plan that changes a day holding bars a
+//!   prior apply wrote (bit 1) refuses stage and apply: roll that run back, or
+//!   plan from its originals so the day re-derives `unchanged`.
+//! * **Manifest.** Live s10/renko writers upsert `manifest.json` at every
+//!   rotation and shutdown. `--apply` byte-copies it to the quarantine dir, then
+//!   points only the entries of its journal days at the files (compare before
+//!   write). `--rollback` restores the copy only if no other writer touched the
+//!   manifest since; otherwise it rebuilds the journal days' entries from disk.
 //! * **Torn journal tail.** A kill or ENOSPC mid-append leaves an unterminated
 //!   last line that was never durable; `--resume` and `--rollback` drop it.
 //! * **Dry run by default.** `--stage <dir>` writes a complete served tree off
@@ -101,8 +108,8 @@ use clap::Parser;
 use mitch::bar::Bar;
 use nxr_sdk::shard::{
     bars_dir, date_stem, day_start_ms, manifest_path, parse_utc_date, read_manifest,
-    read_shard_aligned, sha256_file, shard_path, today_utc, ts_ms_to_utc_date, write_manifest,
-    write_shard_atomic, Manifest, BAR_MS_S10, FLAG_HISTORICAL_BACKFILL, MS_PER_DAY,
+    read_shard_aligned, sha256_file, shard_entry, shard_path, today_utc, ts_ms_to_utc_date, write_manifest,
+    write_shard_atomic, Manifest, ShardEntry, BAR_MS_S10, FLAG_HISTORICAL_BACKFILL, MS_PER_DAY,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -168,8 +175,8 @@ struct Args {
     /// --resume or --rollback.
     #[arg(long)]
     report: PathBuf,
-    /// Dry-run journal (same target, range, plan, band) this run must reproduce
-    /// day by day. Required for --apply unless --resume.
+    /// Dry-run journal (same target, range, plan, band, multipliers) this run
+    /// must reproduce day by day. Required for every --apply, --resume included.
     #[arg(long, conflicts_with = "rollback")]
     expect: Option<PathBuf>,
 }
@@ -293,6 +300,8 @@ struct DayReport {
     dedup_identical: usize,
     /// Bars the previous day file also holds with different bytes (refuses writes).
     dup_conflict: usize,
+    /// Bars a prior apply wrote (bit 1) in a file this plan changes (refuses writes).
+    backfill_rewritten: usize,
     src_missing: usize,
     src_rejected: usize,
     mult_missing: usize,
@@ -324,6 +333,7 @@ struct Summary {
     holes: usize,
     dedup_identical: usize,
     dup_conflict: usize,
+    backfill_rewritten: usize,
 }
 
 impl Summary {
@@ -346,6 +356,7 @@ impl Summary {
         self.holes += r.holes;
         self.dedup_identical += r.dedup_identical;
         self.dup_conflict += r.dup_conflict;
+        self.backfill_rewritten += r.backfill_rewritten;
     }
 }
 
@@ -485,10 +496,13 @@ fn load_band(path: &Path, close_bp: f64, wick_bp: f64) -> Result<Band> {
     })
 }
 
-fn load_plan(path: &Path, target_dir: &Path, target_id: u64) -> Result<Vec<Window>> {
+/// Windows, plus one hash over every multiplier file's bytes and basename in
+/// first-use order: equal on any host the same inputs were uploaded to.
+fn load_plan(path: &Path, target_dir: &Path, target_id: u64) -> Result<(Vec<Window>, String)> {
     let raw = fs::read_to_string(path).with_context(|| format!("read plan {}", path.display()))?;
     let target = fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
     let mut cache = HashMap::new();
+    let mut mult_ids = String::new();
     let mut out: Vec<Window> = Vec::new();
     for (n, line) in raw.lines().enumerate().skip(1) {
         if line.trim().is_empty() {
@@ -562,6 +576,11 @@ fn load_plan(path: &Path, target_dir: &Path, target_id: u64) -> Result<Vec<Windo
                 n + 1
             );
             let age: i64 = f[5].parse().context("mult_max_age_s")?;
+            let mp = Path::new(f[4]);
+            if !cache.contains_key(mp) {
+                let name = mp.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                mult_ids.push_str(&format!("{}  {name}\n", sha256_file(mp)?));
+            }
             (
                 Some(src),
                 Some(load_mult(Path::new(f[4]), age, &mut cache)?),
@@ -586,7 +605,7 @@ fn load_plan(path: &Path, target_dir: &Path, target_id: u64) -> Result<Vec<Windo
             tag: f[6].to_string(),
         });
     }
-    Ok(out)
+    Ok((out, sha_hex(mult_ids.as_bytes())))
 }
 
 /// Target day file: exact bytes, refusing torn or hot files.
@@ -735,6 +754,10 @@ impl Ctx {
         };
         let existing = before.map(bars_of).unwrap_or_default();
         r.existing_bars = existing.len();
+        let prior_backfill = existing
+            .iter()
+            .filter(|b| b.flags & FLAG_HISTORICAL_BACKFILL != 0)
+            .count();
 
         let (held, prev) = self.neighbour_held(d)?;
         let mut out: BTreeMap<i64, (Bar, bool)> = BTreeMap::new();
@@ -860,6 +883,11 @@ impl Ctx {
             (true, false) => DayAction::Merge,
         };
         r.action = Some(action);
+        // A re-plan over an applied day must come from its originals: from the
+        // applied bytes a changed plan silently loses what that apply dropped.
+        if matches!(action, DayAction::Merge | DayAction::Emptied) {
+            r.backfill_rewritten = prior_backfill;
+        }
         r.sha_planned = match action {
             DayAction::Absent | DayAction::Emptied => None,
             DayAction::Unchanged => r.sha_before.clone(),
@@ -1017,8 +1045,18 @@ struct Start {
     to: String,
     plan_sha256: String,
     band_sha256: String,
+    mult_sha256: String,
     band_close_bp: f64,
     band_wick_bp: f64,
+    /// The dry-run journal an apply is bound to; a resume must name the same one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expect_sha256: Option<String>,
+}
+
+fn phase_lines<'a>(lines: &'a [Value], phase: &'a str) -> impl Iterator<Item = &'a Value> {
+    lines
+        .iter()
+        .filter(move |l| l.get("phase").and_then(Value::as_str) == Some(phase))
 }
 
 /// `sha_before` of the manifest if the journal copied it (`manifest_intent`).
@@ -1049,6 +1087,7 @@ fn load_expect(path: &Path, start: &Start) -> Result<Expect> {
         "to",
         "plan_sha256",
         "band_sha256",
+        "mult_sha256",
         "band_close_bp",
         "band_wick_bp",
     ] {
@@ -1125,8 +1164,9 @@ fn open_journal(path: &Path, start: &Start, resume: bool) -> Result<(Journal, Ve
     Ok((j, prior))
 }
 
-/// Refresh the manifest from the files on disk, dropping entries for days
-/// that no longer have a file (`refresh_kind` alone keeps them).
+/// `--stage` only: a complete manifest for the staged tree, which holds run
+/// days only (all before today). Never used on a live dir: it rehashes every
+/// file and drops entries of other kinds.
 fn refresh_manifest(out_dir: &Path, target_dir: &Path, symbol: &str, id: u64) -> Result<()> {
     let mut m = read_manifest(&manifest_path(target_dir))?
         .unwrap_or_else(|| Manifest::new(symbol.to_string(), id, "s10"));
@@ -1143,6 +1183,92 @@ fn refresh_manifest(out_dir: &Path, target_dir: &Path, symbol: &str, id: u64) ->
         .collect();
     m.set_shards_batch(kept);
     write_manifest(&manifest_path(out_dir), &m)
+}
+
+/// Per journal day, the s10 shas this run knows for it (`sha_before`,
+/// `sha_planned`).
+type DayShas = BTreeMap<NaiveDate, Vec<String>>;
+
+fn journal_days(prior: &BTreeMap<String, Prior>) -> Result<DayShas> {
+    prior
+        .iter()
+        .map(|(d, p)| {
+            let known = [&p.sha_before, &p.sha_planned].into_iter().flatten().cloned();
+            Ok((parse_utc_date(d)?, known.collect()))
+        })
+        .collect()
+}
+
+/// Point the manifest entries of `days` at the s10 files on disk. Entries are
+/// keyed by date only and the live renko writer rotates 2 s after the s10 one
+/// in the same dir, so a closed day's entry often describes its `.renko`: an
+/// entry is this run's only if it is absent or names a sha the run knows.
+/// Such an entry is set to the file (or dropped when the file is gone); any
+/// other entry (renko, later live rotations, today) is kept and no other file
+/// is read. The bytes are re-read before the write: a writer that replaced the
+/// manifest meanwhile refuses the update. Returns (sha read, sha after); no
+/// write when nothing changes.
+fn update_manifest_days(
+    dir: &Path,
+    symbol: &str,
+    id: u64,
+    days: &DayShas,
+) -> Result<(Option<String>, Option<String>)> {
+    let mpath = manifest_path(dir);
+    let load = || mpath.exists().then(|| fs::read(&mpath)).transpose();
+    let raw = load()?;
+    let read = raw.as_deref().map(sha_hex);
+    let m = match &raw {
+        Some(b) => serde_json::from_slice::<Manifest>(b)
+            .with_context(|| format!("parse {}", mpath.display()))?,
+        None => Manifest::new(symbol.to_string(), id, "s10"),
+    };
+    let mut entries = m.shards.clone();
+    let ours = |e: Option<&ShardEntry>, known: &[String]| e.is_none_or(|e| known.contains(&e.sha256));
+    for (d, known) in days {
+        let date = date_stem(*d);
+        if !ours(entries.iter().find(|s| s.date == date), known) {
+            continue;
+        }
+        entries.retain(|s| s.date != date);
+        let p = shard_path(dir, *d, "s10");
+        if p.exists() {
+            entries.push(shard_entry::<Bar>(*d, &p)?);
+        }
+    }
+    let mut next = m.clone();
+    next.set_shards_batch(entries);
+    if !next.kind.split(',').any(|k| k == "s10") {
+        next.kind = [next.kind.as_str(), "s10"]
+            .iter()
+            .filter(|k| !k.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    if raw.is_some()
+        && serde_json::to_value(&next.shards)? == serde_json::to_value(&m.shards)?
+        && next.kind == m.kind
+    {
+        return Ok((read.clone(), read));
+    }
+    ensure!(
+        load()? == raw,
+        "{} changed while this run updated it (live rotation or restart): run again outside 23:55-00:05Z and core rolls",
+        mpath.display()
+    );
+    write_manifest(&mpath, &next)?;
+    let got = read_manifest(&mpath)?.context("manifest vanished after write")?;
+    for (d, known) in days {
+        let date = date_stem(*d);
+        let e = got.shards.iter().find(|s| s.date == date);
+        let f = sha_opt(&shard_path(dir, *d, "s10"))?;
+        ensure!(
+            e.map(|e| &e.sha256) == f.as_ref() || !ours(e, known),
+            "{date}: manifest entry does not describe the file after update"
+        );
+    }
+    Ok((read, sha_opt(&mpath)?))
 }
 
 fn days(from: NaiveDate, to: NaiveDate) -> impl Iterator<Item = NaiveDate> {
@@ -1179,7 +1305,7 @@ fn run(args: &Args) -> Result<Summary> {
     );
 
     let target_dir = bars_dir(&args.data_root, args.target_id);
-    let windows = load_plan(&plan_p, &target_dir, args.target_id)?;
+    let (windows, mult_sha256) = load_plan(&plan_p, &target_dir, args.target_id)?;
     let band = load_band(&band_p, args.band_close_bp, args.band_wick_bp)?;
     let mode = match (&args.stage, args.apply) {
         (Some(_), _) => "stage",
@@ -1216,14 +1342,18 @@ fn run(args: &Args) -> Result<Summary> {
         to: date_stem(to),
         plan_sha256: sha256_file(&plan_p)?,
         band_sha256: sha256_file(&band_p)?,
+        mult_sha256,
         band_close_bp: args.band_close_bp,
         band_wick_bp: args.band_wick_bp,
+        expect_sha256: args.expect.as_deref().map(sha256_file).transpose()?,
     };
     let expect = match (&args.expect, mode) {
         (Some(p), "stage" | "apply") => Some(load_expect(p, &start)?),
         (Some(_), _) => bail!("--expect binds --stage or --apply to a dry run"),
-        (None, "apply") if !args.resume => bail!(
-            "--apply needs --expect <dry-run journal>: write only the bytes a dry run on this root reviewed"
+        // A resume re-plans every day the crash never reached: those bytes need
+        // the same review as the first attempt's.
+        (None, "apply") => bail!(
+            "--apply (--resume included) needs --expect <dry-run journal>: write only the bytes a dry run on this root reviewed"
         ),
         (None, _) => None,
     };
@@ -1265,13 +1395,21 @@ fn run(args: &Args) -> Result<Summary> {
     for d in days(from, to) {
         let p = prior.get(&date_stem(d));
         if let Some(Prior {
-            done: Some(after), ..
+            done: Some(after),
+            sha_before,
+            sha_planned,
         }) = p
         {
             ensure!(
                 sha_opt(&shard_path(&out_dir, d, "s10"))? == *after,
                 "{d}: journal says done but the file changed since"
             );
+            if let Some(exp) = &expect {
+                ensure!(
+                    exp.get(&date_stem(d)) == Some(&(sha_before.clone(), sha_planned.clone())),
+                    "{d}: journal intent differs from the dry run"
+                );
+            }
             planned.push((d, None));
             continue;
         }
@@ -1294,6 +1432,11 @@ fn run(args: &Args) -> Result<Summary> {
             "{d}: {} bucket(s) held by the previous file with different bytes: resolve before writing",
             r.dup_conflict
         );
+        ensure!(
+            mode == "dry-run" || r.backfill_rewritten == 0,
+            "{d}: changes a file holding {} bar(s) a prior apply wrote: roll that run back, or plan from its originals so the day stays unchanged",
+            r.backfill_rewritten
+        );
         if mode == "dry-run" {
             s.add(&r, bytes.len() / STRIDE);
             journal.append("plan", &r)?;
@@ -1312,28 +1455,22 @@ fn run(args: &Args) -> Result<Summary> {
         r.as_ref()
             .is_some_and(|r| !matches!(r.action, Some(DayAction::Absent | DayAction::Unchanged)))
     });
-    if mode == "apply" && mutating {
+    if mode == "apply" && mutating && manifest_prior.is_none() {
+        // Copy, then intent, then the first day intent: a journaled sha always
+        // has its copy. Live writers may change the manifest later; rollback
+        // checks for that instead of trusting this copy.
         let m = manifest_path(&target_dir);
         let cur = m.exists().then(|| fs::read(&m)).transpose()?;
-        // No day intent yet: the manifest is still the pre-run one (refresh
-        // runs only after the last day). The copy precedes every day intent.
-        let untouched = prior.is_empty();
-        match &manifest_prior {
-            None => journal.append(
-                "manifest_intent",
-                &json!({ "sha_before": cur.as_deref().map(sha_hex) }),
-            )?,
-            Some(sha) if untouched => ensure!(
-                cur.as_deref().map(sha_hex) == *sha,
-                "manifest changed since its journal intent"
-            ),
-            Some(_) => {}
-        }
-        if let Some(b) = cur.as_ref().filter(|_| untouched && !manifest_q.exists()) {
+        if let Some(b) = &cur {
             write_shard_atomic(&manifest_q, b)?;
             ensure!(fs::read(&manifest_q)? == *b, "manifest quarantine copy differs");
         }
+        journal.append(
+            "manifest_intent",
+            &json!({ "sha_before": cur.as_deref().map(sha_hex) }),
+        )?;
     }
+    let mut touched = journal_days(&prior)?;
     let mut wrote = false;
     for (d, pr) in planned {
         let Some(pr) = pr else {
@@ -1360,6 +1497,10 @@ fn run(args: &Args) -> Result<Summary> {
         }
         if p.is_none() {
             journal.append("intent", &r)?;
+            touched.insert(
+                d,
+                [&r.sha_before, &r.sha_planned].into_iter().flatten().cloned().collect(),
+            );
         }
         if let Some(orig) = before.as_deref() {
             if action != DayAction::Unchanged {
@@ -1405,7 +1546,13 @@ fn run(args: &Args) -> Result<Summary> {
         s.add(&r, bytes.len() / STRIDE);
     }
 
-    if wrote || s.resumed_done > 0 {
+    if mode == "apply" && !touched.is_empty() {
+        let (read, after) = update_manifest_days(&out_dir, &symbol, args.target_id, &touched)?;
+        journal.append(
+            "manifest_done",
+            &json!({ "sha_read": read, "sha_after": after, "days": touched.len() }),
+        )?;
+    } else if mode == "stage" && wrote {
         refresh_manifest(&out_dir, &target_dir, &symbol, args.target_id)?;
         journal.append(
             "manifest_done",
@@ -1479,21 +1626,33 @@ fn rollback(args: &Args) -> Result<Summary> {
         };
         steps.push((d, path, step, p.sha_before.clone()));
     }
-    // Manifest: back to the journaled bytes (a refresh would restamp it).
+    // Manifest. The quarantined bytes are only right if nothing but this run
+    // wrote the manifest since: every `manifest_done` read what the previous
+    // step left, and the current bytes are the last step's. A live rotation or
+    // restart breaks that chain; then only the journal days' entries are
+    // rebuilt from the restored files, keeping what the live writer added.
     let mpath = manifest_path(&target_dir);
     let mq = qdir.join("manifest.json");
     let msha = manifest_intent(&lines);
+    let cur = sha_opt(&mpath)?;
+    let chain_end = msha.clone().and_then(|b| {
+        phase_lines(&lines, "manifest_done").try_fold(b, |exp, l| {
+            (opt_str(l, "sha_read") == exp).then(|| opt_str(l, "sha_after"))
+        })
+    });
+    let journal_days = journal_days(&prior)?;
     let mstep = match &msha {
-        None => "refresh",
-        Some(b) if sha_opt(&mpath)? == *b => "untouched",
-        Some(Some(b)) => {
-            ensure!(
-                mq.exists() && sha256_file(&mq)? == *b,
-                "manifest quarantine copy missing or differs from the journal"
-            );
+        Some(b) if cur == *b => "untouched",
+        Some(Some(b))
+            if chain_end.as_ref() == Some(&cur)
+                && mq.exists()
+                && sha256_file(&mq)? == *b =>
+        {
             "restore"
         }
-        Some(None) => "remove",
+        Some(None) if chain_end.as_ref() == Some(&cur) => "remove",
+        _ if journal_days.is_empty() => "untouched",
+        _ => "rebuild",
     };
     if torn > 0 {
         journal.append("torn_tail_dropped", &json!({ "bytes": torn }))?;
@@ -1525,16 +1684,21 @@ fn rollback(args: &Args) -> Result<Summary> {
             );
         }
         "remove" => fs::remove_file(&mpath)?,
-        "refresh" if target_dir.exists() => {
-            let sym = read_manifest(&mpath)?
-                .map(|m| m.ticker)
-                .or_else(|| args.symbol.clone())
-                .unwrap_or_default();
-            refresh_manifest(&target_dir, &target_dir, &sym, args.target_id)?;
-        }
         _ => {}
     }
-    journal.append("rolled_back", &json!({ "manifest": mstep }))?;
+    // Every step ends with the journal days' own entries describing the files:
+    // a no-op after a clean restore, the whole repair after a live rotation,
+    // and a fix of a pre-run manifest that already listed this run's output.
+    let mut fixed = false;
+    if mstep != "remove" && !journal_days.is_empty() {
+        let sym = read_manifest(&mpath)?
+            .map(|m| m.ticker)
+            .or_else(|| args.symbol.clone())
+            .unwrap_or_else(|| args.target_id.to_string());
+        let (read, after) = update_manifest_days(&target_dir, &sym, args.target_id, &journal_days)?;
+        fixed = read != after;
+    }
+    journal.append("rolled_back", &json!({ "manifest": mstep, "entries_fixed": fixed }))?;
     journal.append("summary", &s)?;
     Ok(s)
 }
@@ -2284,9 +2448,46 @@ mod tests {
                 fs::remove_file(qpath(&root, d3)).unwrap();
             }
             let shas_partial = tree_shas(&root.join("data"));
+            let dry = a.report.with_extension("dry.jsonl");
 
+            // A resume re-plans days the crash never reached: it needs the dry
+            // run too, and refuses inputs changed since that review.
             let mut re = a.clone();
             re.resume = true;
+            let err = run(&re).unwrap_err().to_string();
+            assert!(err.contains("--expect"), "{err}");
+            re.expect = Some(dry.clone());
+            let mfile = root.join("mult.csv");
+            let reviewed = fs::read(&mfile).unwrap();
+            mult_csv(&root, &minute_mult(day0("2026-01-02"), 3 * 1440, 1.002));
+            let err = run(&re).unwrap_err().to_string();
+            assert!(err.contains("mult_sha256"), "{err}");
+            fs::write(&mfile, &reviewed).unwrap();
+            let src3 = shard_path(
+                &root.join("src").join(USDT_ID.to_string()),
+                parse_utc_date(d3).unwrap(),
+                "s10",
+            );
+            let src_reviewed = fs::read(&src3).unwrap();
+            put(&root.join("src").join(USDT_ID.to_string()), d3, &series(day0(d3), 8640, 698.0));
+            let err = run(&re).unwrap_err().to_string();
+            // A: day 3 never intended (dry-run binding); B: intended (journal binding).
+            let want = if scenario == "A" { "differs from the dry run" } else { "differs from the journal intent" };
+            assert!(err.contains(want), "{err}");
+            fs::write(&src3, &src_reviewed).unwrap();
+            let mut other = re.clone();
+            other.expect = Some(root.join("other-dry.jsonl"));
+            fs::copy(&dry, other.expect.as_ref().unwrap()).unwrap();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(other.expect.as_ref().unwrap())
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+            let err = run(&other).unwrap_err().to_string();
+            assert!(err.contains("start line differs"), "{err}");
+            assert_eq!(tree_shas(&root.join("data")), shas_partial, "refused resume wrote");
+
             let s = run(&re).unwrap();
             assert_eq!(s.resumed_done, if scenario == "A" { 1 } else { 2 });
             assert_eq!(tree_shas(&root.join("data")), full, "resume {scenario}");
@@ -2304,9 +2505,8 @@ mod tests {
                 let p = shard_path(&tgt, parse_utc_date(d).unwrap(), "s10");
                 assert_eq!(p.exists().then(|| fs::read(&p).unwrap()), *o, "rollback {d}");
             }
-            let mut again = a.clone();
-            again.resume = true;
-            assert!(run(&again).unwrap_err().to_string().contains("rolled back"));
+            let err = run(&re).unwrap_err().to_string();
+            assert!(err.contains("rolled back"), "{err}");
 
             // Rollback straight from the partial state (no resume first).
             let (root2, pl2, origs2) = three_days(&format!("crashrb{scenario}"));
@@ -2373,6 +2573,23 @@ mod tests {
         let err = go(&third).unwrap_err().to_string();
         assert!(err.contains("already carries bit 1"), "{err}");
         assert_eq!(fs::read(&p).unwrap(), applied);
+
+        // §5.3 class: a new hole over applied bit-1 bars, planned from the
+        // applied bytes. Dry run reports it; stage and apply refuse.
+        let mut rows4 = rows(&src);
+        rows4[1] = fill(d0 + h, d0 + 2 * h, &src, &m, 60);
+        rows4.push(format!("{},{},hole,-,-,-,p2b", d0 + 2 * h, d0 + 3 * h));
+        rows4.push(fill(d0 + 3 * h, d0 + MS_PER_DAY, &src, &m, 60));
+        let pl4 = plan(&root, &rows4);
+        let mut dry = args(&root, pl4.clone(), D, D);
+        dry.apply = false;
+        dry.run_id = "t4".into();
+        assert!(run(&dry).unwrap().backfill_rewritten > 0);
+        let mut fourth = args(&root, pl4, D, D);
+        fourth.run_id = "t5".into();
+        let err = go(&fourth).unwrap_err().to_string();
+        assert!(err.contains("a prior apply wrote"), "{err}");
+        assert_eq!(fs::read(&p).unwrap(), applied);
     }
 
     /// --apply writes only what a finished dry run of the same inputs planned:
@@ -2398,9 +2615,21 @@ mod tests {
         let mut changed = args(&root, pl.clone(), "2026-01-02", "2026-01-04");
         changed.expect = Some(dry.report.clone());
         let err = run(&changed).unwrap_err().to_string();
-        assert!(err.contains("differs from the dry run"), "{err}");
+        assert!(err.contains("mult_sha256"), "{err}");
         assert_originals(&tgt, &origs);
         fs::write(&mfile, &reviewed).unwrap();
+
+        // Source bytes are not hashed up front: the per-day shas catch them.
+        let src = root.join("src").join(USDT_ID.to_string());
+        let s3 = shard_path(&src, parse_utc_date("2026-01-03").unwrap(), "s10");
+        let src_reviewed = fs::read(&s3).unwrap();
+        put(&src, "2026-01-03", &series(day0("2026-01-03"), 8640, 698.0));
+        let mut changed = args(&root, pl.clone(), "2026-01-02", "2026-01-04");
+        changed.expect = Some(dry.report.clone());
+        let err = run(&changed).unwrap_err().to_string();
+        assert!(err.contains("differs from the dry run"), "{err}");
+        assert_originals(&tgt, &origs);
+        fs::write(&s3, &src_reviewed).unwrap();
 
         let pl2 = root.join("plan2.csv");
         fs::write(&pl2, format!("{}\n", fs::read_to_string(&pl).unwrap())).unwrap();
@@ -2432,6 +2661,7 @@ mod tests {
         assert!(read_journal(&a.report).is_err());
         let mut re = a.clone();
         re.resume = true;
+        re.expect = Some(a.report.with_extension("dry.jsonl"));
         run(&re).unwrap();
         assert_eq!(tree_shas(&root.join("data")), full);
         assert!(day_lines(&a.report, "resume")
@@ -2465,5 +2695,67 @@ mod tests {
         run(&rb).unwrap();
         assert_eq!(fs::read(manifest_path(&tgt)).unwrap(), m0);
         assert_originals(&tgt, &origs);
+        assert!(day_lines(&a.report, "rolled_back")
+            .iter()
+            .any(|l| l["manifest"] == "restore"));
+    }
+
+    /// Live s10/renko writers upsert the manifest at every rotation and
+    /// shutdown. Apply touches only its journal days' entries; after a rotation
+    /// since the apply, rollback rebuilds those entries and keeps the live one.
+    #[test]
+    fn rollback_keeps_manifest_entries_a_live_writer_added() {
+        let (root, pl, origs) = three_days("livemanifest");
+        let tgt = bars_dir(&root.join("data"), USD_ID);
+        refresh_manifest(&tgt, &tgt, "BNB/USD", USD_ID).unwrap();
+        let entry = |date: &str, sha: &str| ShardEntry {
+            date: date.into(),
+            first_ts: 1,
+            last_ts: 2,
+            n_records: 3,
+            size_bytes: 4,
+            sha256: sha.into(),
+        };
+        let upsert = |e: ShardEntry| {
+            let mut m = read_manifest(&manifest_path(&tgt)).unwrap().unwrap();
+            m.upsert(e);
+            write_manifest(&manifest_path(&tgt), &m).unwrap();
+        };
+        // A renko-only date (the stage refresh would drop it) and a journal day
+        // whose entry the renko rotation overwrote: apply leaves both alone.
+        upsert(entry("2026-01-06", "renko"));
+        upsert(entry("2026-01-04", "renko-0104"));
+        let a = args(&root, pl, "2026-01-02", "2026-01-04");
+        go(&a).unwrap();
+        let listed = |m: &Manifest, d: &str| m.shards.iter().find(|s| s.date == d).cloned();
+        let m1 = read_manifest(&manifest_path(&tgt)).unwrap().unwrap();
+        assert!(listed(&m1, "2026-01-06").is_some(), "apply dropped a foreign entry");
+        assert_eq!(listed(&m1, "2026-01-04").map(|e| e.sha256), Some("renko-0104".into()));
+        for d in ["2026-01-02", "2026-01-03"] {
+            let f = sha_opt(&shard_path(&tgt, parse_utc_date(d).unwrap(), "s10")).unwrap();
+            assert_eq!(listed(&m1, d).map(|e| e.sha256), f, "{d}");
+        }
+
+        upsert(entry("2026-01-07", "live-rotation"));
+        let mut rb = a.clone();
+        rb.rollback = true;
+        rb.apply = false;
+        run(&rb).unwrap();
+        assert_originals(&tgt, &origs);
+        assert!(day_lines(&a.report, "rolled_back")
+            .iter()
+            .any(|l| l["manifest"] == "rebuild"));
+        let m2 = read_manifest(&manifest_path(&tgt)).unwrap().unwrap();
+        assert_eq!(listed(&m2, "2026-01-07").map(|e| e.sha256), Some("live-rotation".into()));
+        assert_eq!(listed(&m2, "2026-01-06").map(|e| e.sha256), Some("renko".into()));
+        assert!(listed(&m2, "2026-01-03").is_none(), "removed day still listed");
+        assert_eq!(listed(&m2, "2026-01-04").map(|e| e.sha256), Some("renko-0104".into()));
+        for (d, o) in origs.iter().filter(|(d, _)| d != "2026-01-04") {
+            assert_eq!(
+                listed(&m2, d).map(|e| e.sha256),
+                o.as_deref().map(sha_hex),
+                "{d}"
+            );
+        }
     }
 }
