@@ -676,6 +676,21 @@ fn calibrate_one_synth(
     renko_yml: &nxr_sdk::pipeline_config::RenkoYml,
     prior_k: Option<f32>,
 ) -> CalOutcome {
+    // ── 0. Synth `.s10` first. The `.vol` in step 3 needs it; checked after the
+    // legs, every cross without it paid a full two-leg `.idx` read to be skipped
+    // (~85% of ~9k crosses), so the synth phase never fit the deadline (09-11).
+    let s10_dir = nxr_sdk::shard::bars_dir(bars_root, synth_id);
+    let s10_shards = list_shards(&s10_dir, "s10").unwrap_or_default();
+    if s10_shards.is_empty() {
+        return CalOutcome::Skipped {
+            ticker_id: synth_id,
+            reason: format!(
+                "no synth .s10 shards under {} (run synth-backfill-from-idx first)",
+                s10_dir.display()
+            ),
+        };
+    }
+
     // ── 1. Open both leg streams (no materialization) ───────────────────────
     // Streams pull one tick at a time from on-disk shards. Memory bounded
     // to two ShardStream buffers (~300 KB total) instead of full history
@@ -845,18 +860,6 @@ fn calibrate_one_synth(
                 }
             }
         };
-        let s10_dir = nxr_sdk::shard::bars_dir(bars_root, synth_id);
-        let s10_shards = list_shards(&s10_dir, "s10").unwrap_or_default();
-        if s10_shards.is_empty() {
-            let _ = std::fs::remove_file(&vol_path);
-            return CalOutcome::Skipped {
-                ticker_id: synth_id,
-                reason: format!(
-                    "no synth .s10 shards under {} (run synth-backfill-from-idx first)",
-                    s10_dir.display()
-                ),
-            };
-        }
         let mut s10_iter = S10ShardIter::new(s10_shards);
         if let Err(e) = build_vol_from_s10(|| s10_iter.next_bar(), vol_cfg, &mut writer) {
             return CalOutcome::Failed {
@@ -1984,5 +1987,39 @@ mod tests {
             ungated,
             cal.len()
         );
+    }
+
+    /// A synth cross with no `.s10` is skipped BEFORE either leg is opened, so
+    /// legs that do not even exist still yield the s10 skip, not a leg failure.
+    #[test]
+    fn synth_without_s10_skips_before_reading_legs() {
+        let root = std::env::temp_dir().join(format!("nxr-cal-s10-first-{}", std::process::id()));
+        let (idx, bars) = (root.join("indexes"), root.join("bars"));
+        std::fs::create_dir_all(&idx).unwrap();
+        std::fs::create_dir_all(&bars).unwrap();
+        let cal: CalibrationYml =
+            serde_yml::from_str("target_bpd: 300\nmin_window_days: 1\nmult_bounds: [0.1, 10.0]\n")
+                .unwrap();
+        let renko = nxr_sdk::pipeline_config::RenkoYml { min_pct: 0.0001 };
+        let out = calibrate_one_synth(
+            T_SYNTH_ID,
+            "BASE/QUOTE",
+            T_BASE_ID,
+            T_QUOTE_ID,
+            &idx,
+            &bars,
+            &cal,
+            300.0,
+            &VolConfig::default(),
+            &renko,
+            None,
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        match out {
+            CalOutcome::Skipped { reason, .. } => {
+                assert!(reason.starts_with("no synth .s10"), "{reason}")
+            }
+            other => panic!("expected the s10 skip, got {other:?}"),
+        }
     }
 }
