@@ -32,7 +32,7 @@ use nxr_sdk::{
     ipc::record::IndexRecord,
     resolve_ticker_id,
     shard::{FLAG_HISTORICAL_BACKFILL, FLAG_NO_BOOK},
-    tdwap::ProviderEntry,
+    tdwap::{Kernel, ProviderEntry},
 };
 use series_factory::sharding::{
     list_shards, manifest_path, shard_entry_for_idx, write_manifest, Manifest, ShardedWriter,
@@ -240,6 +240,7 @@ fn main() -> Result<()> {
                     ticker_id,
                     slots.iter().filter_map(|s| s.as_ref()),
                     args.stale_secs,
+                    Kernel::for_wire(ticker_id),
                     boundary_now,
                 ) {
                     let mts = mitch::timestamp::from_epoch_ms(boundary);
@@ -285,6 +286,7 @@ fn main() -> Result<()> {
             ticker_id,
             slots.iter().filter_map(|s| s.as_ref()),
             args.stale_secs,
+            Kernel::for_wire(ticker_id),
             boundary_now,
         ) {
             let mts = mitch::timestamp::from_epoch_ms(boundary);
