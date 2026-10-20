@@ -247,6 +247,7 @@ fn audit_pair(data_root: &Path, base: &str, quote: &str, now_ms: i64) -> Result<
 }
 
 fn main() -> Result<()> {
+    nxr_sdk::pipeline_config::PipelineYml::check_config_and_exit_if_requested(nxr_sdk::pipeline_config::ConfigHint::Bin);
     nxr_sdk::logging::init("info");
     let args = Args::parse();
     let yml = PipelineYml::load(&args.config)?;

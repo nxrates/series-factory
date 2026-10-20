@@ -1699,6 +1699,7 @@ fn native_tickers(config: &Path) -> Result<Vec<String>> {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    nxr_sdk::pipeline_config::PipelineYml::check_config_and_exit_if_requested(nxr_sdk::pipeline_config::ConfigHint::Bin);
     // tracing init — default INFO, RUST_LOG override honoured via sdk's init.
     nxr_sdk::logging::init("info");
 

@@ -1703,6 +1703,7 @@ fn write_atomic_string(path: &Path, contents: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    nxr_sdk::pipeline_config::PipelineYml::check_config_and_exit_if_requested(nxr_sdk::pipeline_config::ConfigHint::Bin);
     nxr_sdk::logging::init("info");
     nxr_sdk::memory::apply_safe_cap();
 
