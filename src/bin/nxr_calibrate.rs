@@ -1027,6 +1027,23 @@ fn resolve_synth_work(yml_pairs: &[SynthPairYml]) -> Vec<(u64, &'static str, u64
 /// K_FLOOR — a pegged stable may be flat forever), so it must not feed
 /// `consecutive_failures` or the >=3 alert would sit permanently red on assets
 /// renko is simply not offered for.
+/// Ok and expected structural Skips both resolve a roster ticker; only Failed
+/// leaves it unresolved. Keeps `coverage_ratio` at 1 / `exit_reason` meaningful
+/// when the only misses are deliberate skips (e.g. unreachable target).
+fn outcome_resolved(o: &CalOutcome) -> bool {
+    !matches!(o, CalOutcome::Failed { .. })
+}
+
+/// Drop `calibration_status` rows for ids no longer in the roster or synth set
+/// (dead crosses / delisted tickers) so the map cannot grow without bound.
+fn prune_status<V>(
+    m: &mut BTreeMap<String, V>,
+    roster: &std::collections::HashSet<String>,
+    synth: &std::collections::HashSet<u64>,
+) {
+    m.retain(|k, _| roster.contains(k) || k.parse::<u64>().is_ok_and(|id| synth.contains(&id)));
+}
+
 fn stage_outcome(store: &ParamsStore, outcome: &CalOutcome, count_in_run: bool) {
     let now = nxr_sdk::now_sec();
     let (id_key, k_ok, err, skip) = match outcome {
@@ -1058,7 +1075,7 @@ fn stage_outcome(store: &ParamsStore, outcome: &CalOutcome, count_in_run: bool) 
         if count_in_run {
             if let Some(r) = w.last_run.as_mut() {
                 r.tickers_attempted += 1;
-                if k_ok.is_some() {
+                if outcome_resolved(outcome) {
                     r.tickers_succeeded += 1;
                 }
             }
@@ -1673,6 +1690,7 @@ fn run_once(args: &Args) -> Result<()> {
         // Whole run done ⇒ retire the staging set; the next run_id starts fresh.
         w.renko_k_staged.clear();
         w.staged_run_id = None;
+        prune_status(&mut w.calibration_status, &roster_ids, &synth_ids);
         if let Some(r) = w.last_run.as_mut() {
             r.exit_reason = "completed".to_string();
             r.finished_at = Some(final_at);
@@ -1746,6 +1764,25 @@ mod tests {
     /// Records-per-byte sizing must match the on-disk `IndexRecord` stride the
     /// loader reads (`ShardStream` reads `file_bytes / size_of::<IndexRecord>()`
     /// with no file header), so `bytes / 56` is the exact pre-filter count.
+    #[test]
+    fn skip_counts_resolved_failed_does_not() {
+        let skip = CalOutcome::Skipped { ticker_id: 1, reason: "x".into() };
+        let fail = CalOutcome::Failed { ticker_id: 1, reason: "x".into() };
+        assert!(outcome_resolved(&CalOutcome::Ok { ticker_id: 1, k: 0.1 }));
+        assert!(outcome_resolved(&skip));
+        assert!(!outcome_resolved(&fail));
+    }
+
+    #[test]
+    fn prune_status_keeps_only_roster_and_synth() {
+        let roster: std::collections::HashSet<String> = ["1".to_string()].into();
+        let synth: std::collections::HashSet<u64> = [2].into();
+        let mut m: BTreeMap<String, u8> =
+            [("1", 0), ("2", 0), ("3", 0), ("x", 0)].map(|(k, v)| (k.to_string(), v)).into();
+        prune_status(&mut m, &roster, &synth);
+        assert_eq!(m.keys().cloned().collect::<Vec<_>>(), ["1", "2"]);
+    }
+
     #[test]
     fn index_record_is_56_bytes() {
         assert_eq!(core::mem::size_of::<IndexRecord>(), 56);
