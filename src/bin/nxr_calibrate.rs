@@ -1165,8 +1165,11 @@ fn run_once(args: &Args) -> Result<()> {
         "EFFECTIVE calibration window"
     );
     if params_path != prod_params_path && !params_path.exists() {
-        std::fs::copy(&prod_params_path, &params_path)
-            .with_context(|| format!("seed isolated params {:?}", params_path))?;
+        let tmp = params_path.with_extension("seed.tmp");
+        std::fs::copy(&prod_params_path, &tmp)
+            .with_context(|| format!("seed isolated params {:?}", tmp))?;
+        std::fs::rename(&tmp, &params_path)
+            .with_context(|| format!("rename {:?} -> {:?}", tmp, params_path))?;
     }
 
     info!(
