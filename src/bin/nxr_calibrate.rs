@@ -106,6 +106,11 @@ struct Args {
     /// window, so the value used is recorded in `last_run.window_days`.
     #[arg(long)]
     window_days: Option<u32>,
+    /// Non-production run: always works on an isolated params file
+    /// (`<ticker-params>.canary.w<window>`), never the production one.
+    /// `--window-days` different from the config requires this flag.
+    #[arg(long)]
+    canary: bool,
 }
 
 // ── ticker-params.json store ─────────────────────────────────────────────────
@@ -1125,19 +1130,7 @@ fn run_once(args: &Args) -> Result<()> {
     let fx_majors = effective_list(&root.cexs.fx_majors, DEFAULT_FX_MAJORS);
 
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();
-    let window_days = args
-        .window_days
-        .map(|d| d as usize)
-        .unwrap_or(series.calibration.rolling_window_days);
-    // A non-default window is a canary: it works on its own params file so it can
-    // never clear or overwrite the production staging set / live k map.
     let prod_params_path = PathBuf::from(&nxr_cfg.ticker_params_path);
-    let params_path =
-        params_path_for(&prod_params_path, window_days, series.calibration.rolling_window_days);
-    if params_path != prod_params_path && !params_path.exists() {
-        std::fs::copy(&prod_params_path, &params_path)
-            .with_context(|| format!("seed isolated params {:?}", params_path))?;
-    }
     let idx_dir = PathBuf::from(&nxr_cfg.indexes_dir);
     // Bars root holds the per-ticker `.s10` shards (the canonical vol basis).
     // `bars_dir` = `<root>/bars`; sharding helpers want the data root, so use
@@ -1149,6 +1142,24 @@ fn run_once(args: &Args) -> Result<()> {
     let cfg_path = nxr_sdk::pipeline_config::PipelineYml::resolve_path(
         nxr_sdk::pipeline_config::ConfigHint::Bin,
     );
+
+    let (window_days, params_path) = resolve_params(
+        &prod_params_path,
+        args.window_days.map(|d| d as usize),
+        args.canary,
+        series.calibration.rolling_window_days,
+    )?;
+    warn!(
+        window_days,
+        cfg_window_days = series.calibration.rolling_window_days,
+        canary = args.canary,
+        params = %params_path.display(),
+        "EFFECTIVE calibration window"
+    );
+    if params_path != prod_params_path && !params_path.exists() {
+        std::fs::copy(&prod_params_path, &params_path)
+            .with_context(|| format!("seed isolated params {:?}", params_path))?;
+    }
 
     info!(
         cfg = %cfg_path.display(),
@@ -1751,15 +1762,26 @@ fn run_once(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Params file for this run: production path when `window_days` is the
-/// configured one, else `<path>.w<window>` (isolated canary state).
-fn params_path_for(prod: &Path, window_days: usize, default_window: usize) -> PathBuf {
-    if window_days == default_window {
-        return prod.to_path_buf();
+/// Effective (window, params path). Production = no flags: config window, prod
+/// path. `--canary` always gets an isolated path. A `--window-days` that differs
+/// from the config without `--canary` is refused.
+fn resolve_params(
+    prod: &Path,
+    flag_window: Option<usize>,
+    canary: bool,
+    cfg_window: usize,
+) -> Result<(usize, PathBuf)> {
+    let window = flag_window.unwrap_or(cfg_window);
+    if canary {
+        let mut name = prod.as_os_str().to_owned();
+        name.push(format!(".canary.w{window}"));
+        return Ok((window, PathBuf::from(name)));
     }
-    let mut name = prod.as_os_str().to_owned();
-    name.push(format!(".w{window_days}"));
-    PathBuf::from(name)
+    anyhow::ensure!(
+        window == cfg_window,
+        "--window-days {window} != configured {cfg_window}: pass --canary for a non-production run"
+    );
+    Ok((window, prod.to_path_buf()))
 }
 
 /// Staged k restricted to ids still in the roster or synth universe, so ids
@@ -1844,13 +1866,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canary_window_uses_isolated_params_path() {
+    fn canary_flag_isolates_and_window_mismatch_is_refused() {
         let prod = Path::new("/data/ticker-params.json");
-        assert_eq!(params_path_for(prod, 730, 730), prod);
-        assert_eq!(
-            params_path_for(prod, 90, 730),
-            Path::new("/data/ticker-params.json.w90")
-        );
+        assert_eq!(resolve_params(prod, None, false, 730).unwrap(), (730, prod.to_path_buf()));
+        assert_eq!(resolve_params(prod, Some(730), false, 730).unwrap().1, prod);
+        assert!(resolve_params(prod, Some(90), false, 730).is_err());
+        let (w, p) = resolve_params(prod, Some(90), true, 730).unwrap();
+        assert_eq!((w, p), (90, PathBuf::from("/data/ticker-params.json.canary.w90")));
+        // canary at the configured window is still isolated
+        assert_ne!(resolve_params(prod, None, true, 730).unwrap().1, prod);
     }
 
     #[test]
