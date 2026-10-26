@@ -1125,7 +1125,19 @@ fn run_once(args: &Args) -> Result<()> {
     let fx_majors = effective_list(&root.cexs.fx_majors, DEFAULT_FX_MAJORS);
 
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();
-    let params_path = PathBuf::from(&nxr_cfg.ticker_params_path);
+    let window_days = args
+        .window_days
+        .map(|d| d as usize)
+        .unwrap_or(series.calibration.rolling_window_days);
+    // A non-default window is a canary: it works on its own params file so it can
+    // never clear or overwrite the production staging set / live k map.
+    let prod_params_path = PathBuf::from(&nxr_cfg.ticker_params_path);
+    let params_path =
+        params_path_for(&prod_params_path, window_days, series.calibration.rolling_window_days);
+    if params_path != prod_params_path && !params_path.exists() {
+        std::fs::copy(&prod_params_path, &params_path)
+            .with_context(|| format!("seed isolated params {:?}", params_path))?;
+    }
     let idx_dir = PathBuf::from(&nxr_cfg.indexes_dir);
     // Bars root holds the per-ticker `.s10` shards (the canonical vol basis).
     // `bars_dir` = `<root>/bars`; sharding helpers want the data root, so use
@@ -1157,10 +1169,6 @@ fn run_once(args: &Args) -> Result<()> {
     // restarted from zero every run and never finished. The set is promoted only
     // when complete, so resuming never publishes a partial set; it is dropped
     // after MAX_RESUME_DAYS so staged k never mixes data older than that.
-    let window_days = args
-        .window_days
-        .map(|d| d as usize)
-        .unwrap_or(series.calibration.rolling_window_days);
     let today = chrono::Utc::now().date_naive();
     let run_id = resolve_run_id(weights_file.staged_run_id.as_deref(), today, window_days);
     let started_at = nxr_sdk::now_sec();
@@ -1245,7 +1253,7 @@ fn run_once(args: &Args) -> Result<()> {
         let mut resumed = BTreeMap::new();
         store.update(|w| {
             if w.staged_run_id.as_deref() == Some(run_id.as_str()) {
-                resumed = w.renko_k_staged.clone();
+                resumed = filter_resume(&w.renko_k_staged, &roster_ids, &synth_ids);
             } else {
                 w.renko_k_staged.clear();
                 w.staged_run_id = Some(run_id.clone());
@@ -1743,6 +1751,33 @@ fn run_once(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Params file for this run: production path when `window_days` is the
+/// configured one, else `<path>.w<window>` (isolated canary state).
+fn params_path_for(prod: &Path, window_days: usize, default_window: usize) -> PathBuf {
+    if window_days == default_window {
+        return prod.to_path_buf();
+    }
+    let mut name = prod.as_os_str().to_owned();
+    name.push(format!(".w{window_days}"));
+    PathBuf::from(name)
+}
+
+/// Staged k restricted to ids still in the roster or synth universe, so ids
+/// delisted since the run started are not re-promoted.
+fn filter_resume(
+    staged: &BTreeMap<String, f64>,
+    roster_ids: &std::collections::HashSet<String>,
+    synth_ids: &std::collections::HashSet<u64>,
+) -> BTreeMap<String, f64> {
+    staged
+        .iter()
+        .filter(|(k, _)| {
+            roster_ids.contains(*k) || k.parse::<u64>().is_ok_and(|id| synth_ids.contains(&id))
+        })
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
 /// Max age (days) of an unfinished staging set that a new run may still resume.
 const MAX_RESUME_DAYS: i64 = 7;
 
@@ -1807,6 +1842,29 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canary_window_uses_isolated_params_path() {
+        let prod = Path::new("/data/ticker-params.json");
+        assert_eq!(params_path_for(prod, 730, 730), prod);
+        assert_eq!(
+            params_path_for(prod, 90, 730),
+            Path::new("/data/ticker-params.json.w90")
+        );
+    }
+
+    #[test]
+    fn resume_drops_delisted_ids() {
+        let staged: BTreeMap<String, f64> =
+            [("1", 0.1), ("2", 0.2), ("3", 0.3), ("4", 0.4)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+        let roster: std::collections::HashSet<String> = ["1".to_string()].into();
+        let synth: std::collections::HashSet<u64> = [3].into();
+        let out = filter_resume(&staged, &roster, &synth);
+        assert_eq!(out.keys().cloned().collect::<Vec<_>>(), vec!["1", "3"]);
+    }
 
     #[test]
     fn run_id_resumes_across_days_until_expiry() {
