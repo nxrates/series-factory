@@ -1151,15 +1151,18 @@ fn run_once(args: &Args) -> Result<()> {
     let store = ParamsStore::new(params_path.clone());
     let weights_file: WeightsFile = store.read()?;
 
-    // Run identity = UTC date + window. The 4 daily cycles therefore SHARE an id,
-    // so a cycle killed by activeDeadlineSeconds is resumed by the next one
-    // instead of restarting from zero; a window change starts a fresh staging set
-    // because k is not comparable across windows.
+    // Run identity = start date + window, but an unfinished staging set is
+    // RESUMED across days (see `resolve_run_id`): the synth pass needs ~150 min
+    // against a 5400 s deadline and the cron fires once a day, so a date-only id
+    // restarted from zero every run and never finished. The set is promoted only
+    // when complete, so resuming never publishes a partial set; it is dropped
+    // after MAX_RESUME_DAYS so staged k never mixes data older than that.
     let window_days = args
         .window_days
         .map(|d| d as usize)
         .unwrap_or(series.calibration.rolling_window_days);
-    let run_id = format!("{}-w{}", chrono::Utc::now().format("%Y-%m-%d"), window_days);
+    let today = chrono::Utc::now().date_naive();
+    let run_id = resolve_run_id(weights_file.staged_run_id.as_deref(), today, window_days);
     let started_at = nxr_sdk::now_sec();
 
     // Build the work list: (pair, ticker_id, class). De-dupe by ticker_id since
@@ -1234,7 +1237,7 @@ fn run_once(args: &Args) -> Result<()> {
         roster.iter().map(|(id, ..)| id.to_string()).collect();
 
     // Arm the run stamp + staging set BEFORE any work, and drop a stale staging
-    // set (different run_id ⇒ different day or window). `finished_at: None` here
+    // set (different run_id ⇒ expired or different window). `finished_at: None` here
     // is what makes a killed run detectable: a stamp older than one cycle with no
     // finish time is a run that died, which used to be invisible because
     // ttlSecondsAfterFinished reaps the Job object.
@@ -1740,6 +1743,28 @@ fn run_once(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Max age (days) of an unfinished staging set that a new run may still resume.
+const MAX_RESUME_DAYS: i64 = 7;
+
+/// Run id = `<start date>-w<window>`. Keeps the persisted `staged` id while it
+/// has the same window and started <= MAX_RESUME_DAYS ago (a run killed by the
+/// deadline continues next day); otherwise starts fresh as `<today>-w<window>`.
+/// A completed run clears `staged_run_id`, so the next run always starts fresh.
+fn resolve_run_id(staged: Option<&str>, today: chrono::NaiveDate, window_days: usize) -> String {
+    let suffix = format!("-w{window_days}");
+    if let Some(prev) = staged {
+        if let Some(date) = prev.strip_suffix(suffix.as_str()) {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+                let age = (today - d).num_days();
+                if (0..=MAX_RESUME_DAYS).contains(&age) {
+                    return prev.to_string();
+                }
+            }
+        }
+    }
+    format!("{}{suffix}", today.format("%Y-%m-%d"))
+}
+
 /// Atomic JSON-string write: `<path>.tmp` + rename. Mirrors
 /// `nxr_sdk::ipc::write_atomic` but for non-Pod payloads.
 fn write_atomic_string(path: &Path, contents: &str) -> Result<()> {
@@ -1782,6 +1807,33 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_id_resumes_across_days_until_expiry() {
+        let d = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        // fresh / completed run: today's id
+        assert_eq!(resolve_run_id(None, d("2026-10-27"), 730), "2026-10-27-w730");
+        // killed yesterday, same window: resume
+        assert_eq!(
+            resolve_run_id(Some("2026-10-26-w730"), d("2026-10-27"), 730),
+            "2026-10-26-w730"
+        );
+        // exactly at the limit still resumes, one day past starts fresh
+        assert_eq!(
+            resolve_run_id(Some("2026-10-20-w730"), d("2026-10-27"), 730),
+            "2026-10-20-w730"
+        );
+        assert_eq!(
+            resolve_run_id(Some("2026-10-19-w730"), d("2026-10-27"), 730),
+            "2026-10-27-w730"
+        );
+        // window change or garbage id: fresh
+        assert_eq!(
+            resolve_run_id(Some("2026-10-26-w90"), d("2026-10-27"), 730),
+            "2026-10-27-w730"
+        );
+        assert_eq!(resolve_run_id(Some("junk"), d("2026-10-27"), 730), "2026-10-27-w730");
+    }
 
     /// Roster pairs carry CMC venue spellings, so the USDC-fallback gate must
     /// case-fold BOTH legs. A case-sensitive `strip_suffix("/USDC")` next to a
