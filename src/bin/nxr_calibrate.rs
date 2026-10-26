@@ -1165,11 +1165,7 @@ fn run_once(args: &Args) -> Result<()> {
         "EFFECTIVE calibration window"
     );
     if params_path != prod_params_path && !params_path.exists() {
-        let tmp = params_path.with_extension("seed.tmp");
-        std::fs::copy(&prod_params_path, &tmp)
-            .with_context(|| format!("seed isolated params {:?}", tmp))?;
-        std::fs::rename(&tmp, &params_path)
-            .with_context(|| format!("rename {:?} -> {:?}", tmp, params_path))?;
+        seed_isolated(&prod_params_path, &params_path)?;
     }
 
     info!(
@@ -1795,6 +1791,17 @@ fn resolve_params(
     Ok((window, prod.to_path_buf()))
 }
 
+/// Copy `src` to `dst` via `<dst>.tmp` (full name + ".tmp", so canary windows
+/// never share a tmp file) then rename.
+fn seed_isolated(src: &Path, dst: &Path) -> Result<()> {
+    let mut name = dst.as_os_str().to_owned();
+    name.push(".tmp");
+    let tmp = PathBuf::from(name);
+    std::fs::copy(src, &tmp).with_context(|| format!("seed isolated params {:?}", tmp))?;
+    std::fs::rename(&tmp, dst).with_context(|| format!("rename {:?} -> {:?}", tmp, dst))?;
+    Ok(())
+}
+
 /// True when the YAML explicitly sets `series.calibration.rolling_window_days`.
 fn cfg_declares_window(yaml: &str) -> bool {
     serde_yml::from_str::<serde_yml::Value>(yaml)
@@ -1883,6 +1890,21 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_isolated_renames_and_keeps_windows_apart() {
+        let d = std::env::temp_dir().join(format!("nxr-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let src = d.join("p.json");
+        std::fs::write(&src, b"{}").unwrap();
+        let (a, b) = (d.join("p.json.canary.w90"), d.join("p.json.canary.w180"));
+        seed_isolated(&src, &a).unwrap();
+        seed_isolated(&src, &b).unwrap();
+        assert!(a.exists() && b.exists());
+        assert_eq!(std::fs::read(&a).unwrap(), b"{}");
+        assert!(!d.join("p.json.canary.w90.tmp").exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     #[test]
     fn canary_flag_isolates_and_window_mismatch_is_refused() {
