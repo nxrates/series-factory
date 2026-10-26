@@ -1143,6 +1143,14 @@ fn run_once(args: &Args) -> Result<()> {
         nxr_sdk::pipeline_config::ConfigHint::Bin,
     );
 
+    // The serde default (365) is a drift hazard: refuse unless the YAML states it.
+    let cfg_text = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("read {}", cfg_path.display()))?;
+    anyhow::ensure!(
+        cfg_declares_window(&cfg_text),
+        "series.calibration.rolling_window_days missing from {}; refusing to run on the serde default",
+        cfg_path.display()
+    );
     let (window_days, params_path) = resolve_params(
         &prod_params_path,
         args.window_days.map(|d| d as usize),
@@ -1784,6 +1792,14 @@ fn resolve_params(
     Ok((window, prod.to_path_buf()))
 }
 
+/// True when the YAML explicitly sets `series.calibration.rolling_window_days`.
+fn cfg_declares_window(yaml: &str) -> bool {
+    serde_yml::from_str::<serde_yml::Value>(yaml)
+        .ok()
+        .and_then(|v| v.get("series")?.get("calibration")?.get("rolling_window_days").cloned())
+        .is_some()
+}
+
 /// Staged k restricted to ids still in the roster or synth universe, so ids
 /// delisted since the run started are not re-promoted.
 fn filter_resume(
@@ -1875,6 +1891,13 @@ mod tests {
         assert_eq!((w, p), (90, PathBuf::from("/data/ticker-params.json.canary.w90")));
         // canary at the configured window is still isolated
         assert_ne!(resolve_params(prod, None, true, 730).unwrap().1, prod);
+    }
+
+    #[test]
+    fn missing_rolling_window_days_is_detected() {
+        assert!(cfg_declares_window("series:\n  calibration:\n    rolling_window_days: 730\n"));
+        assert!(!cfg_declares_window("series:\n  calibration:\n    target_bpd: 300\n"));
+        assert!(!cfg_declares_window("series: {}\n"));
     }
 
     #[test]
