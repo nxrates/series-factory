@@ -663,6 +663,32 @@ impl LegStream {
     }
 }
 
+/// Structural pre-filter for the synth pass: a cross with no `.s10` shard can only
+/// yield the "no synth .s10" skip inside `calibrate_one_synth`, but each such skip
+/// went through `stage_outcome`, which rewrites the whole ticker-params.json
+/// (~0.73 s measured with 7.3k status entries). 6k of them ate the 5400 s deadline
+/// every night. One readdir per id here, no per-id write. Returns (runnable, dropped).
+type SynthWork = Vec<(u64, &'static str, u64, u64)>;
+
+fn split_unreachable_synths(work: SynthWork, bars_root: &Path) -> (SynthWork, Vec<(u64, String)>) {
+    let (mut keep, mut dropped) = (Vec::with_capacity(work.len()), Vec::new());
+    for w in work {
+        let dir = nxr_sdk::shard::bars_dir(bars_root, w.0);
+        if list_shards(&dir, "s10").map(|v| v.is_empty()).unwrap_or(true) {
+            dropped.push((
+                w.0,
+                format!(
+                    "no synth .s10 shards under {} (run synth-backfill-from-idx first)",
+                    dir.display()
+                ),
+            ));
+        } else {
+            keep.push(w);
+        }
+    }
+    (keep, dropped)
+}
+
 fn calibrate_one_synth(
     synth_id: u64,
     synth_sym: &str,
@@ -1225,6 +1251,7 @@ fn run_once(args: &Args) -> Result<()> {
                 tickers_succeeded: resumed_roster,
                 exit_reason: "partial".to_string(),
                 window_days: Some(window_days as u32),
+                synth_prefiltered: 0,
             });
         })?;
         resumed
@@ -1472,7 +1499,27 @@ fn run_once(args: &Args) -> Result<()> {
     // unreachable-target guards inside it drop degenerate windows. If the fit
     // fails, k is NOT persisted (caller keeps prior). Per-pair override or flat
     // default per synth.
-    info!(n_synth = synth_count, "synth calibration pass starting");
+    let (synth_work, prefiltered) = split_unreachable_synths(synth_work, &bars_root);
+    let n_prefiltered = prefiltered.len();
+    if let Err(e) = store.update(|w| {
+        // One write for all structural skips (was one full-file rewrite per id).
+        for (id, reason) in &prefiltered {
+            let st = w.calibration_status.entry(id.to_string()).or_default();
+            st.last_attempt = Some(base_at);
+            st.last_skip_reason = Some(reason.clone());
+        }
+        if let Some(r) = w.last_run.as_mut() {
+            r.synth_prefiltered = n_prefiltered;
+        }
+    }) {
+        warn!(err = %e, "synth prefilter status write failed");
+    }
+    info!(
+        n_synth = synth_count,
+        n_prefiltered,
+        n_runnable = synth_work.len(),
+        "synth calibration pass starting (structurally unreachable ids dropped pre-pass)"
+    );
     let (mut s_passed, mut s_skipped, mut s_failed) = (0usize, 0usize, 0usize);
     for (synth_id, synth_sym, leg_a_id, leg_b_id) in synth_work {
         // Already staged by an earlier cycle of this run_id (seeded into renko_k);
@@ -2022,5 +2069,22 @@ mod tests {
             }
             other => panic!("expected the s10 skip, got {other:?}"),
         }
+    }
+
+    /// Ids without `.s10` are dropped before the pass; ids with one are kept.
+    #[test]
+    fn prefilter_drops_ids_without_s10() {
+        let root = std::env::temp_dir().join(format!("nxr-cal-prefilter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = nxr_sdk::shard::bars_dir(&root, 7);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2026-10-01.s10"), b"").unwrap();
+        std::fs::create_dir_all(nxr_sdk::shard::bars_dir(&root, 8)).unwrap(); // empty dir
+        let work = vec![(7, "A/B", 1, 2), (8, "C/D", 1, 2), (9, "E/F", 1, 2)];
+        let (keep, dropped) = split_unreachable_synths(work, &root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(keep.iter().map(|w| w.0).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(dropped.iter().map(|d| d.0).collect::<Vec<_>>(), vec![8, 9]);
+        assert!(dropped[0].1.starts_with("no synth .s10"));
     }
 }
