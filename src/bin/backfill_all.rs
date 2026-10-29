@@ -136,6 +136,35 @@ struct Args {
     /// able to cause that.
     #[arg(long, default_value_t = 120)]
     min_free_gib: u64,
+    /// PEER FILL MODE (replaces the CEX pipeline): peer base URL, repeatable,
+    /// tried in the order given. Holes in local `.idx`/`.s10` closed-day shards
+    /// are refilled from the first peer whose whole-hole rows validate. Dry-run
+    /// unless `--peer-apply`. Window = `--from`..`--to`, default last
+    /// `--peer-days` days.
+    #[arg(long = "peer-url")]
+    peer_url: Vec<String>,
+    /// NAME of the env var holding the peer API key (octet reads need a plan key).
+    #[arg(long, default_value = "NXR_PEER_API_KEY")]
+    peer_key_env: String,
+    /// Write the fills (default: report only).
+    #[arg(long)]
+    peer_apply: bool,
+    /// Series to fill: `idx`, `s10` or both.
+    #[arg(long, default_value = "idx,s10")]
+    peer_kinds: String,
+    #[arg(long, default_value_t = 2)]
+    peer_days: i64,
+    /// Smallest ts step (s) counted as a hole.
+    #[arg(long, default_value_t = 300)]
+    peer_min_gap_secs: i64,
+    /// Seam price tolerance: base bps + per-sqrt(hour) bps of distance.
+    #[arg(long, default_value_t = 100.0)]
+    peer_seam_tol_bps: f64,
+    #[arg(long, default_value_t = 300.0)]
+    peer_seam_tol_bps_per_sqrt_h: f64,
+    /// Pause between pages, ms.
+    #[arg(long, default_value_t = 100)]
+    peer_pause_ms: u64,
 }
 
 // ── Report types ─────────────────────────────────────────────────────────────
@@ -1696,6 +1725,88 @@ fn native_tickers(config: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+// ── Peer fill mode ───────────────────────────────────────────────────────────
+
+fn peer_mode(args: &Args, to: NaiveDate, from: Option<NaiveDate>, tickers: &[String]) -> Result<()> {
+    use nxr_sdk::shard::{bars_dir, idx_dir, today_utc};
+    use series_factory::peer_fill::{run_series, HttpPeer, KindReport, Run, Tol};
+    let client = HttpPeer::new(&args.peer_key_env);
+    if !client.has_key() {
+        warn!(env = %args.peer_key_env, "peer key env var unset: octet reads will 406 unless the peer allows anon MITCH");
+    }
+    let tol = Tol {
+        min_gap_ms: args.peer_min_gap_secs * 1000,
+        seam_base_bps: args.peer_seam_tol_bps,
+        seam_per_sqrt_h_bps: args.peer_seam_tol_bps_per_sqrt_h,
+    };
+    let kinds = split_csv(&args.peer_kinds);
+    let run = Run {
+        client: &client,
+        peers: &args.peer_url,
+        tol: &tol,
+        pause: Duration::from_millis(args.peer_pause_ms),
+        apply: args.peer_apply,
+        from: from.unwrap_or(to - chrono::Duration::days(args.peer_days)),
+        to,
+        today: today_utc(),
+    };
+    #[derive(Serialize)]
+    struct T { ticker: String, kinds: Vec<KindReport>, error: Option<String> }
+    let mut out = Vec::new();
+    let (mut filled, mut uncovered, mut errs) = (0usize, 0usize, 0usize);
+    for t in tickers {
+        let sym = t.replace('/', "-");
+        let id = nxr_sdk::resolve_ticker_id(&sym.replace('-', "/"));
+        let mut rep = T { ticker: sym.clone(), kinds: vec![], error: None };
+        for k in &kinds {
+            let r = match k.as_str() {
+                "idx" => run_series::<nxr_sdk::ipc::record::IndexRecord>(&run, &idx_dir(&args.out_dir, id), &sym, &sym, id),
+                "s10" => run_series::<mitch::bar::Bar>(&run, &bars_dir(&args.out_dir, id), &sym, &sym, id),
+                other => Err(anyhow!("unknown --peer-kinds entry {other}")),
+            };
+            match r {
+                Ok(kr) => {
+                    filled += kr.filled.len();
+                    uncovered += kr.uncovered.len();
+                    if kr.applied {
+                        let dir = if k == "idx" { idx_dir(&args.out_dir, id) } else { bars_dir(&args.out_dir, id) };
+                        for f in &kr.filled {
+                            let d = NaiveDate::parse_from_str(&f.date, "%Y-%m-%d")?;
+                            if !integrity_clean(&nxr_sdk::shard::shard_path(&dir, d, k), k) {
+                                errs += 1;
+                                rep.error = Some(format!("integrity-check failed {k} {}", f.date));
+                            }
+                        }
+                    }
+                    rep.kinds.push(kr);
+                }
+                Err(e) => {
+                    errs += 1;
+                    rep.error = Some(format!("{e:#}"));
+                }
+            }
+        }
+        out.push(rep);
+    }
+    fs::write(&args.log_file, serde_json::to_string_pretty(&out)?)?;
+    println!(
+        "peer-fill {}: filled {filled} range(s), UNCOVERED {uncovered} range(s), errors {errs}; report {}",
+        if args.peer_apply { "APPLIED" } else { "DRY-RUN" },
+        args.log_file.display()
+    );
+    for t in &out {
+        for k in &t.kinds {
+            for u in &k.uncovered {
+                println!("UNCOVERED {} {} {} [{}..{}) {}", t.ticker, k.kind, u.date, u.start_ms, u.end_ms, u.reasons.join(" | "));
+            }
+        }
+    }
+    if uncovered > 0 || errs > 0 {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -1725,6 +1836,10 @@ fn main() -> Result<()> {
             ));
         }
     };
+
+    if !args.peer_url.is_empty() {
+        return peer_mode(&args, parse_date(&args.to)?, args.from.as_deref().map(parse_date).transpose()?, &tickers);
+    }
 
     let started_at = Utc::now().to_rfc3339();
     let cfg_echo = ConfigEcho {

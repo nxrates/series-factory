@@ -1,6 +1,7 @@
 pub mod bar_construction;
 pub mod cli;
 pub mod idx_heal;
+pub mod peer_fill;
 pub mod seam;
 pub mod sharding;
 pub mod sources;
