@@ -129,6 +129,8 @@ async-trait = "0.1"
 anyhow = "1.0"
 # Memory-mapped files
 memmap2 = "0.9"
+# Advisory file locks (peer-fill)
+fs2 = "0.4"
 # POSIX resource limits (setrlimit for memory cap)
 libc = "0.2"
 # MITCH protocol types

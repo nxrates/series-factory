@@ -1270,6 +1270,7 @@ dependencies = [
  "coarsetime",
  "csv",
  "flate2",
+ "fs2",
  "libc",
  "memmap2",
  "mitch",

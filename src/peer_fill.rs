@@ -12,13 +12,21 @@
 //!   whole records, in window, monotone, stride, ticker, sane prices, both
 //!   hole edges covered, price at each seam within tolerance of the local
 //!   neighbour.
-//! - The per-ticker `.writer.lock` is honoured; a held lock skips the ticker.
+//! - Closed days only: a hole is applied only once its day ended
+//!   `CLOSE_GRACE_MS` ago, so the live writer (which owns today's shard and,
+//!   across a rollover, the tail of yesterday's) can never touch the same
+//!   bytes. The directory-wide `.writer.lock` is NOT taken: the live
+//!   aggregator holds it for its whole life, so honouring it made apply
+//!   impossible on a running node. Concurrent peer-fill runs serialise on a
+//!   private `.peerfill.lock`; a held lock skips the ticker.
 //! - Every filled range lands in the `backfill.json` sidecar next to the shards.
 //!
-//! Light (`sign_only`) peers hold no `.idx` (`/v1/idx` answers `200 []`) and
-//! serve `/v1/bars` composed from their ~14 d window, so for idx a light peer
-//! is reported as `empty` and never fills. `/v1/ohlc` is derived from idx/bars
-//! and has no shard on disk, so it is not a fill source.
+//! Light (`sign_only`) peers persist `.idx` only for the retention window
+//! (`signed_quotes.retention_days`, 1 on today's signer configs) and only for
+//! tickers that are not composed. Outside that window or set `/v1/idx`
+//! answers `200 []`, which a light peer is reported as `empty` for and never
+//! fills. `/v1/ohlc` is derived from idx/bars and has no shard on disk, so it
+//! is not a fill source.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -40,6 +48,22 @@ use serde::{Deserialize, Serialize};
 const PAGE: usize = 10_000;
 const MAX_PAGES: usize = 500;
 const MAX_BODY: u64 = 64 << 20;
+/// A day is closed for peer-fill this long after midnight UTC: covers the live
+/// writer's rollover flush and `finalize_manifest` of the finished day.
+pub const CLOSE_GRACE_MS: i64 = 600_000;
+const PEERFILL_LOCK: &str = ".peerfill.lock";
+
+/// Exclusive non-blocking lock serialising peer-fill runs on one ticker dir.
+/// Deliberately not `.writer.lock` (see module docs).
+fn acquire_peerfill_lock(dir: &Path) -> Result<fs::File> {
+    use fs2::FileExt;
+    fs::create_dir_all(dir).with_context(|| format!("create_dir_all {}", dir.display()))?;
+    let p = dir.join(PEERFILL_LOCK);
+    let f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&p)
+        .with_context(|| format!("open {}", p.display()))?;
+    f.try_lock_exclusive().map_err(|e| anyhow!("{} held by another peer-fill run: {e}", p.display()))?;
+    Ok(f)
+}
 
 // -- row abstraction ----------------------------------------------------------
 
@@ -612,6 +636,8 @@ pub struct Run<'a> {
     pub from: NaiveDate,
     pub to: NaiveDate,
     pub today: NaiveDate,
+    /// Wall clock (ms) the closed-day rule is judged against.
+    pub now_ms: i64,
 }
 
 /// Detect, fetch, validate and (with `run.apply`) write the holes of one
@@ -647,7 +673,23 @@ pub fn run_series<T: PeerRow>(run: &Run, dir: &Path, name: &str, sym: &str, tick
         rep.filled = fills.iter().map(&mut note).collect();
         return Ok(rep);
     }
-    let _lock = match nxr_sdk::shard::acquire_idx_writer_lock(dir) {
+    // Closed days only. Anything fetched for a day still inside the grace is
+    // left a hole for the next run.
+    let (fills, open): (Vec<Fill<T>>, Vec<Fill<T>>) = fills
+        .into_iter()
+        .partition(|f| day_start_ms(f.gap.date) + MS_PER_DAY + CLOSE_GRACE_MS <= run.now_ms);
+    for f in &open {
+        rep.uncovered.push(UncoveredRange {
+            date: date_stem(f.gap.date),
+            start_ms: f.gap.start,
+            end_ms: f.gap.end,
+            reasons: vec!["day not closed yet".into()],
+        });
+    }
+    if fills.is_empty() {
+        return Ok(rep);
+    }
+    let _lock = match acquire_peerfill_lock(dir) {
         Ok(l) => l,
         Err(e) => {
             rep.skipped = Some(format!("{e}"));
@@ -657,7 +699,7 @@ pub fn run_series<T: PeerRow>(run: &Run, dir: &Path, name: &str, sym: &str, tick
                     date: date_stem(f.gap.date),
                     start_ms: f.gap.start,
                     end_ms: f.gap.end,
-                    reasons: vec!["writer lock held".into()],
+                    reasons: vec!["peer-fill lock held".into()],
                 });
             }
             return Ok(rep);
@@ -801,7 +843,7 @@ mod tests {
         (dir, series(day_ms(21), day_ms(22)))
     }
     fn run<'a>(c: &'a dyn PeerClient, peers: &'a [String], t: &'a Tol, apply: bool) -> Run<'a> {
-        Run { client: c, peers, tol: t, pause: Duration::ZERO, apply, from: d(18), to: d(22), today: d(26) }
+        Run { client: c, peers, tol: t, pause: Duration::ZERO, apply, from: d(18), to: d(22), today: d(26), now_ms: day_ms(26) + 3600 * SEC }
     }
     fn peers(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -966,9 +1008,9 @@ mod tests {
     }
 
     #[test]
-    fn writer_lock_held_skips_ticker() {
+    fn peerfill_lock_held_skips_ticker() {
         let (dir, truth) = setup("lock");
-        let _held = nxr_sdk::shard::acquire_idx_writer_lock(&dir).unwrap();
+        let _held = acquire_peerfill_lock(&dir).unwrap();
         let mut m = Mock::new();
         m.rows.insert("V".into(), truth);
         let ps = peers(&["V"]);
@@ -976,6 +1018,44 @@ mod tests {
         let rep = run_series::<IndexRecord>(&run(&m, &ps, &t, true), &dir, "BTC-USDT", "BTC-USDT", tid()).unwrap();
         assert!(rep.skipped.is_some() && !rep.applied && rep.uncovered.len() == 1);
         assert!(!shard_path(&dir, d(21), "idx").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The live aggregator holds `.writer.lock` for its whole life; apply on a
+    /// closed day must still go through (it never touches today's shard).
+    #[test]
+    fn live_writer_lock_does_not_block_closed_day() {
+        use fs2::FileExt;
+        let (dir, truth) = setup("livelock");
+        let live = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(".writer.lock")).unwrap();
+        live.try_lock_exclusive().unwrap();
+        let mut m = Mock::new();
+        m.rows.insert("V".into(), truth);
+        let ps = peers(&["V"]);
+        let t = tol();
+        let rep = run_series::<IndexRecord>(&run(&m, &ps, &t, true), &dir, "BTC-USDT", "BTC-USDT", tid()).unwrap();
+        assert!(rep.applied && rep.skipped.is_none(), "{rep:?}");
+        assert!(shard_path(&dir, d(21), "idx").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn day_inside_close_grace_is_left_a_hole() {
+        let (dir, truth) = setup("grace");
+        let mut m = Mock::new();
+        m.rows.insert("V".into(), truth);
+        let ps = peers(&["V"]);
+        let t = tol();
+        // day 21 ended 1 s ago: live writer may still be flushing its tail.
+        let mut r = run(&m, &ps, &t, true);
+        r.now_ms = day_ms(22) + SEC;
+        let rep = run_series::<IndexRecord>(&r, &dir, "BTC-USDT", "BTC-USDT", tid()).unwrap();
+        assert!(!rep.applied && rep.uncovered.iter().any(|u| u.reasons[0] == "day not closed yet"), "{rep:?}");
+        assert!(!shard_path(&dir, d(21), "idx").exists());
+        // past the grace it applies
+        r.now_ms = day_ms(22) + CLOSE_GRACE_MS;
+        let rep = run_series::<IndexRecord>(&r, &dir, "BTC-USDT", "BTC-USDT", tid()).unwrap();
+        assert!(rep.applied, "{rep:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

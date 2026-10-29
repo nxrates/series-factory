@@ -1749,6 +1749,7 @@ fn peer_mode(args: &Args, to: NaiveDate, from: Option<NaiveDate>, tickers: &[Str
         from: from.unwrap_or(to - chrono::Duration::days(args.peer_days)),
         to,
         today: today_utc(),
+        now_ms: nxr_sdk::now_ms() as i64,
     };
     #[derive(Serialize)]
     struct T { ticker: String, kinds: Vec<KindReport>, error: Option<String> }
