@@ -76,6 +76,9 @@ struct Args {
     /// https://history.pyth-lazer.dourolabs.app/history/v1/symbols.
     #[arg(long, default_value = "Crypto")]
     family: String,
+    /// Config file carrying the `egress:` block (default: `$NXR_CONFIG`).
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// Override output path (default: `$NXR_DATA_TICKS/pyth/<BASE><QUOTE>/history.ticks`).
     #[arg(long)]
     out: Option<PathBuf>,
@@ -99,6 +102,16 @@ struct HistoryResponse {
     c: Vec<f64>,
     #[serde(default)]
     v: Vec<f64>,
+}
+
+/// Query-value percent-encoding (`Crypto.BTC/USD` -> `Crypto.BTC%2FUSD`).
+fn urlenc(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 fn now_unix() -> i64 {
@@ -128,25 +141,38 @@ fn main() -> Result<()> {
     let url = format!("https://pyth.dourolabs.app/v1/{}/history", args.channel);
     info!(symbol, url, from, to, resolution = %args.resolution, "fetching Pyth history");
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
-    let mut req = agent
-        .get(&url)
-        .query("symbol", &symbol)
-        .query("resolution", &args.resolution)
-        .query("from", &from.to_string())
-        .query("to", &to.to_string());
+    // Consumer `pyth_hist` of the `egress:` block (config `NXR_CONFIG` / `--config`): rotating
+    // proxy tiers with a browser identity, `require_proxy` so a missing proxy list is an error,
+    // never a call from this machine's own address.
+    let cfg_path = args
+        .config
+        .clone()
+        .or_else(|| std::env::var_os("NXR_CONFIG").map(PathBuf::from))
+        .context("no egress config: pass --config or set NXR_CONFIG")?;
+    let egress = btr_rpc::EgressCfg::from_yaml(
+        &std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("read {}", cfg_path.display()))?,
+        "egress",
+    )?;
+    let http = egress.http_for("pyth_hist", std::time::Duration::from_secs(30))?;
+    let query = format!(
+        "{url}?symbol={}&resolution={}&from={from}&to={to}",
+        urlenc(&symbol),
+        urlenc(&args.resolution)
+    );
     // Auth becomes mandatory 2026-07-24 (config.yml oracle-relay note) - wire
     // it in now so this tool keeps working past the cutover with no edit.
-    if let Ok(token) = std::env::var("NXR_ORACLE_TOKEN_PYTH") {
-        req = req.set("Authorization", &format!("Bearer {token}"));
-    }
-    let resp = req
-        .call()
+    let token = std::env::var("NXR_ORACLE_TOKEN_PYTH").ok().map(|t| format!("Bearer {t}"));
+    let headers: Vec<(&str, &str)> = token.iter().map(|t| ("authorization", t.as_str())).collect();
+    let resp = tokio::runtime::Runtime::new()?
+        .block_on(http.get(&query, &headers))
         .with_context(|| format!("GET {url} (symbol={symbol})"))?;
-    let raw = resp
-        .into_string()
+    anyhow::ensure!(
+        resp.status == 200,
+        "GET {url} (symbol={symbol}): HTTP {}",
+        resp.status
+    );
+    let raw = String::from_utf8(resp.body)
         .with_context(|| format!("read history response body for {symbol}"))?;
     let body: HistoryResponse = serde_json::from_str(&raw)
         .with_context(|| format!("parse history JSON for {symbol}: {raw}"))?;

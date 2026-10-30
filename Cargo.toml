@@ -134,6 +134,8 @@ libc = "0.2"
 # MITCH protocol types
 mitch = { path = "../mitch/impl/rust", features = ["bytemuck"] }
 bytemuck = "1.0"
+# Rotating egress client (consumer `pyth_hist`); `yaml` reads the `egress:` block
+btr-rpc = { path = "../btr-core/rpc", features = ["yaml"] }
 # Shared SDK (aggregation primitives, Parkinson sigma, etc.)
 nxr-sdk = { path = "../sdk/rust", default-features = false }
 # coarsetime::Instant matches the SDK's `ProviderEntry::last_update` clock so
