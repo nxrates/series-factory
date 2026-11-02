@@ -112,7 +112,8 @@ chrono = { version = "0.4", features = ["serde"] }
 ureq = "2.10"
 # The one egress client for third-party reads (process-wide rotating set)
 btr-rpc = { path = "../btr-core/rpc" }
-reqwest = { version = "0.13", default-features = false }
+reqwest = { version = "0.13", default-features = false }  # Method::HEAD only (btr-rpc does not re-export)
+percent-encoding = "2.3"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

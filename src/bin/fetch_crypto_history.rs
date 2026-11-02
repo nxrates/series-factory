@@ -95,16 +95,10 @@ async fn probe_one(
     const MAX_PROBE_MONTHS: i32 = 72; // 6y cap
 
     let sym = format!("{}{}", pair.to_uppercase(), quote.to_uppercase());
-    let Ok(agent) = btr_rpc::env_http(std::time::Duration::from_secs(15)) else {
-        tracing::warn!("egress config unusable: probe refused");
-        return ProbeResult {
-            ticker: pair.to_uppercase(),
-            exchange: exchange.to_string(),
-            has_data: false,
-            first_date: None,
-            last_date: None,
-        };
-    };
+    // A broken egress config is not "no data": fail loudly.
+    let agent = btr_rpc::env_http(std::time::Duration::from_secs(15))
+        .expect("egress config unusable")
+        .missing_403();
 
     // Probe URL template sourced from YAML
     // `cexs.exchanges.<exch>.archive_url_template.probe`.

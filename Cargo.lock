@@ -2049,6 +2049,7 @@ dependencies = [
  "mitch",
  "nxr-onchain",
  "nxr-sdk",
+ "percent-encoding",
  "rand 0.8.5",
  "rand_chacha",
  "rand_distr",

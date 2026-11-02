@@ -22,8 +22,13 @@ use zip::ZipArchive;
 /// Shared egress client with 10-min timeout (large monthly archives can be 300MB+): the process-wide
 /// btr-rpc set, direct when no egress is configured.
 pub fn http_agent() -> Arc<btr_rpc::Http> {
+    // Archive CDNs answer a missing object 403 (bitget) or 404: a normal reply, never an IP park.
+    // Patience: a parked IP after a 5xx is waited out instead of failing "every IP backing off".
     Arc::new(
-        btr_rpc::env_http(std::time::Duration::from_secs(600)).expect("egress config unusable"),
+        btr_rpc::env_http(std::time::Duration::from_secs(600))
+            .expect("egress config unusable")
+            .missing_403()
+            .patience(std::time::Duration::from_secs(90)),
     )
 }
 
@@ -161,7 +166,7 @@ pub async fn download_to_file(
         .get_stream(url, &[])
         .await
         .map_err(|e| anyhow::anyhow!("Download failed {}: {}", url, e))?;
-    if status >= 400 {
+    if !(200..300).contains(&status) {
         return Err(anyhow::anyhow!("Download failed {}: HTTP {}", url, status));
     }
 
@@ -235,6 +240,9 @@ pub async fn download_to_file_retry(
 ) -> Result<DownloadedArchive> {
     let mut last_err = None;
     for attempt in 0..max_attempts {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+        }
         match download_to_file(agent, url, dst_dir).await {
             Ok(dl) => {
                 if is_truncated(dl.bytes_got, dl.content_length) {
@@ -268,6 +276,11 @@ pub async fn download_to_file_retry(
                 return Ok(dl);
             }
             Err(e) => {
+                // 403/404 = missing object: final, not a transfer fault.
+                let msg = e.to_string();
+                if msg.ends_with("HTTP 404") || msg.ends_with("HTTP 403") {
+                    return Err(e);
+                }
                 if attempt + 1 < max_attempts {
                     warn!(
                         "Attempt {}/{} failed: {} - retrying",

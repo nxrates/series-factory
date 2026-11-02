@@ -108,16 +108,15 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Percent-encode a query value (RFC 3986 unreserved passes through).
+/// RFC 3986 unreserved passes through.
+const QUERY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
 fn urlenc(v: &str) -> String {
-    v.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
+    percent_encoding::utf8_percent_encode(v, QUERY).to_string()
 }
 
 fn main() -> Result<()> {
@@ -151,7 +150,10 @@ fn main() -> Result<()> {
     let bearer = std::env::var("NXR_ORACLE_TOKEN_PYTH")
         .ok()
         .map(|t| format!("Bearer {t}"));
-    let hdrs: Vec<(&str, &str)> = bearer.iter().map(|b| ("authorization", b.as_str())).collect();
+    let hdrs: Vec<(&str, &str)> = bearer
+        .iter()
+        .map(|b| ("authorization", b.as_str()))
+        .collect();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
