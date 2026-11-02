@@ -51,6 +51,21 @@ PASS/FAIL certification
 
 `backfill-all` orchestrates the full chain for many tickers in parallel, with resume logic, availability probing, and a JSON report.
 
+## On-chain backfill
+
+`onchain-backfill` rebuilds `.idx` for on-chain-only assets (MUSD, SYRUPUSDC, USDAT) from HyperSync pool logs with the live `nxr-onchain` pool/TWAP/composite math and gates, at <= 5 HyperSync req/s, default weights, records flagged `BACKFILL`.
+
+```text
+HYPERSYNC_API_KEY=... onchain-backfill --config config.yml --asset MUSD \
+  --from 2026-10-17 --to 2026-11-01 --out-root <staging>      # --to strictly before today (UTC)
+s10-from-idx config.yml MUSD-USD --in-dir <staging>/indexes/<id> --out-dir <staging>/bars/<id> --to-date 2026-11-01
+```
+Writes a per-asset sidecar `onchain-backfill.<ASSET>.json` (legs, held-price %, shard sha256, `weights: default`). Staging only: never a live data dir. Install by copying the new closed-day files (`*.idx`, `*.s10`) onto the PVC with tmp + rename; never overwrite a live shard.
+
+Gap in a day the live writer already started: wait until the day is closed, then `scripts/merge_backfill_day.py <backfill.idx> <live.idx> <out.idx>` (live records kept, backfill records before the first live record prepended), rebuild that day's `.s10` with `s10-from-idx`, refresh both manifests (sha256, n_records, first/last ts), swap in with tmp + rename.
+
+Every new symbol, leg or source needs >= 7 d of history in the rollout (`docs/internal/nxr-feeds-rollout.md`, Backfill step).
+
 ## Binaries
 
 ### Ingestion and merge
