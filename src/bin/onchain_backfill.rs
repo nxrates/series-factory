@@ -7,8 +7,10 @@
 //!     --from 2026-10-01 --to 2026-10-31 --out-root /staging/root [--force]
 //! ```
 //! Writes `<out-root>/indexes/<id of ASSET/USD>/<YYYY-MM-DD>.idx` + `manifest.json` and a sidecar
-//! `<out-root>/onchain-backfill.json`. `--to` must be before today (UTC). `--out-root` has no
-//! default and existing shards are refused without `--force`. Never point it at a live data dir.
+//! `<out-root>/onchain-backfill.<ASSET>.json`. `--to` must be before today (UTC). `--out-root` has no
+//! default and existing shards/sidecar are refused without `--force`. The target dir is symlink-checked,
+//! flock'd (`.writer.lock`) and refused if it holds a shard dated today or later. Never point it at a
+//! live data dir; to promote, copy the `*.idx` files only (the manifest here is a staging manifest).
 //!
 //! Bars from the staged idx (do not reimplement; `s10-from-idx` is the producer):
 //! ```text
@@ -25,6 +27,8 @@
 //! * Curve: price from each `TokenExchange` (out/in, un-biased by the configured `fee_bps`; swaps
 //!   under 1 unit ignored); live uses get_dy at 1 unit both ways. Depth = 4 x depth floor (live:
 //!   0 / 1x / 4x by a probe swap); AddLiquidity/RemoveLiquidity ignored. Token decimals are 6.
+//! * A leg whose last swap is older than `--hold-cap-hours` (default 6) is dropped from the composite.
+//! * Curve fills used for price are capped at 1% of 4 x the depth floor (larger swaps carry impact).
 //! * Venue trust, chain-dark state and block-age gates are not modeled (always trusted/fresh).
 //! * SYRUPUSDC: no vault-rate leg and no rate anchor (no free archive RPC): pool composite only,
 //!   peg-band gate skipped.
@@ -61,10 +65,14 @@ const LOOKBACK_MS: u64 = 7 * 86_400_000;
 const HS_RPS: u32 = 5;
 const HEARTBEAT_MS: u64 = 5_000;
 const MIN_CURVE_RAW: u128 = 1_000_000;
+const MAX_QUOTE_GAP_MS: u64 = 300_000;
+/// Static sanity band for rate-anchored assets without a peg (SYRUPUSDC, USDC per token).
+const RATE_SANITY: (f64, f64) = (1.0, 1.3);
 const ASSETS: [&str; 3] = ["MUSD", "SYRUPUSDC", "USDAT"];
 const V4_SWAP: &str = "Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)";
 const CURVE_XCH: &str = "TokenExchange(address,int128,uint256,int128,uint256)";
 const CURVE_COINS: &str = "0xc6610657";
+const DECIMALS_CALL: &str = "0x313ce567";
 
 #[derive(Parser, Debug)]
 #[command(about = "Backfill .idx for on-chain-only assets from HyperSync pool logs.")]
@@ -90,6 +98,9 @@ struct Args {
     /// Curve base coin index; default read from the pool (`coins(k)`) over the config RPCs.
     #[arg(long)]
     curve_base_idx: Option<u8>,
+    /// Drop a leg from the composite once its last swap is older than this.
+    #[arg(long, default_value_t = 6)]
+    hold_cap_hours: u64,
 }
 
 // ---------- pure helpers ----------
@@ -157,6 +168,8 @@ struct PoolCfg {
     floor: f64,
     fee: f64,
     base_idx: i128,
+    /// Curve: largest input (raw) whose fill price is used.
+    max_sold_raw: u128,
 }
 
 /// (price, depth) of base in quote after a v4 swap: the live `sample` math, constant-L depth.
@@ -171,7 +184,7 @@ fn curve_state(
     p: &PoolCfg,
     (sid, sold, bid, bought): (i128, u128, i128, u128),
 ) -> Option<(f64, f64)> {
-    if sold.min(bought) < MIN_CURVE_RAW {
+    if sold.min(bought) < MIN_CURVE_RAW || sold > p.max_sold_raw {
         return None;
     }
     let px = if sid == p.base_idx {
@@ -263,6 +276,9 @@ struct Params {
     min_legs: usize,
     /// (peg, band_bps); None = no anchor available.
     peg: Option<(f64, u32)>,
+    /// Static USDC-per-token band when there is no peg.
+    sanity: Option<(f64, f64)>,
+    hold_cap_ms: u64,
 }
 
 struct Leg {
@@ -277,6 +293,24 @@ struct Leg {
 struct Quote(Vec<(u64, f64)>);
 
 impl Quote {
+    /// Bars must cover `[start, end)` with no gap over 5 min and sit in 0.98..1.02.
+    fn new(bars: Vec<(u64, f64)>, start: u64, end: u64) -> Result<Self> {
+        let first = bars.first().ok_or_else(|| anyhow!("no USDC-USD bars"))?;
+        if first.0 > start {
+            bail!("USDC-USD bars start after the grid start");
+        }
+        if bars.iter().any(|b| !(0.98..=1.02).contains(&b.1)) {
+            bail!("USDC-USD bar outside 0.98..1.02");
+        }
+        if bars.windows(2).any(|w| w[1].0 - w[0].0 > MAX_QUOTE_GAP_MS) {
+            bail!("USDC-USD bar gap over 5 min");
+        }
+        if bars.last().unwrap().0 + MAX_QUOTE_GAP_MS < end {
+            bail!("USDC-USD bars end more than 5 min before the range end");
+        }
+        Ok(Self(bars))
+    }
+
     fn at(&self, t: u64) -> f64 {
         let i = self.0.partition_point(|b| b.0 <= t);
         self.0[i.saturating_sub(1)].1
@@ -293,10 +327,16 @@ fn run_grid(
     ticker: u64,
     from_ms: u64,
     end_ms: u64,
-) -> Vec<(u64, IndexRecord)> {
+) -> (Vec<(u64, IndexRecord)>, GridStats) {
+    let mut stats = GridStats {
+        held_pct: vec![0.0; legs.len()],
+        dropped_pct: vec![0.0; legs.len()],
+    };
+    let (mut held, mut dropped, mut total) = (vec![0u64; legs.len()], vec![0u64; legs.len()], 0u64);
     let start = from_ms.saturating_sub(p.warmup_ms + p.twap_ms) / 1000 * 1000;
     let mut cur = vec![0usize; legs.len()];
     let mut last: Vec<Option<(f64, f64)>> = vec![None; legs.len()];
+    let mut last_ts = vec![0u64; legs.len()];
     let mut samples: Vec<Vec<Sample>> = vec![vec![]; legs.len()];
     let (mut green_since, mut last_mid, mut last_emit): (Option<u64>, Option<f64>, u64) =
         (None, None, 0);
@@ -304,14 +344,24 @@ fn run_grid(
     let mut t = start;
     while t < end_ms {
         let mut views = vec![];
+        total += u64::from(t >= from_ms);
         for (i, l) in legs.iter().enumerate() {
             while cur[i] < l.ev.len() && l.ev[cur[i]].0 <= t {
                 last[i] = Some((l.ev[cur[i]].1, l.ev[cur[i]].2));
+                last_ts[i] = l.ev[cur[i]].0;
                 cur[i] += 1;
             }
             let Some((price, depth_usd)) = last[i] else {
                 continue;
             };
+            let age = t - last_ts[i];
+            if t >= from_ms {
+                held[i] += u64::from(age > p.max_age_ms);
+            }
+            if age > p.hold_cap_ms {
+                dropped[i] += u64::from(t >= from_ms);
+                continue;
+            }
             samples[i].push(Sample {
                 ts_ms: t,
                 price,
@@ -336,9 +386,12 @@ fn run_grid(
                         .any(|l| l.id == *id && (!l.v4 || (p.min_legs == 1 && !l.hooked)))
                 });
             // The live band test is on the pool-quote mid (USDC), before the USD bridge.
-            let band = p
-                .peg
-                .is_none_or(|(a, bps)| ((c.mid / q.at(t) / a - 1.0) * 1e4).abs() <= bps as f64);
+            let usdc = c.mid / q.at(t);
+            let band = match (p.peg, p.sanity) {
+                (Some((a, bps)), _) => ((usdc / a - 1.0) * 1e4).abs() <= bps as f64,
+                (None, Some((lo, hi))) => (lo..=hi).contains(&usdc),
+                (None, None) => true,
+            };
             enough && band
         });
         green_since = if green { green_since.or(Some(t)) } else { None };
@@ -372,22 +425,99 @@ fn run_grid(
         }
         t += 1000;
     }
-    out
+    let pct = |v: &[u64]| {
+        v.iter()
+            .map(|x| 100.0 * *x as f64 / total.max(1) as f64)
+            .collect()
+    };
+    stats.held_pct = pct(&held);
+    stats.dropped_pct = pct(&dropped);
+    (out, stats)
+}
+
+/// Per leg, % of emitted-range grid seconds on a held price older than `max_age_ms`, and
+/// % dropped by the hold cap.
+struct GridStats {
+    held_pct: Vec<f64>,
+    dropped_pct: Vec<f64>,
 }
 
 // ---------- output ----------
 
+fn sidecar_path(out_root: &Path, asset: &str) -> PathBuf {
+    out_root.join(format!("onchain-backfill.{asset}.json"))
+}
+
+fn is_symlink(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Everything that can refuse a run, before any fetch or write.
+fn precheck(
+    out_root: &Path,
+    ticker_id: u64,
+    asset: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+    force: bool,
+    today: NaiveDate,
+) -> Result<PathBuf> {
+    let dir = idx_dir(out_root, ticker_id);
+    for p in [out_root, &out_root.join("indexes"), &dir] {
+        if is_symlink(p) {
+            bail!("refusing symlink {}", p.display());
+        }
+    }
+    if dir.exists() {
+        if !dir.canonicalize()?.starts_with(out_root.canonicalize()?) {
+            bail!("refusing path outside out-root: {}", dir.display());
+        }
+        if let Some((d, _)) = list_shards(&dir, "idx")?
+            .into_iter()
+            .find(|(d, _)| *d >= today)
+        {
+            bail!(
+                "{} holds a shard dated {d} (today or later): live dir, refusing",
+                dir.display()
+            );
+        }
+    }
+    let mut d = from;
+    while d <= to {
+        let path = shard_path(&dir, d, "idx");
+        if path.exists() && !force {
+            bail!("refusing to overwrite {} (use --force)", path.display());
+        }
+        d = d.succ_opt().ok_or_else(|| anyhow!("date overflow"))?;
+    }
+    let sp = sidecar_path(out_root, asset);
+    if sp.exists() && !force {
+        bail!("refusing to overwrite {} (use --force)", sp.display());
+    }
+    Ok(dir)
+}
+
+/// Writes one shard per day with rows; returns (written, days without rows). With `force` a
+/// stale shard on a row-less day is deleted. Fails when nothing is written.
+#[allow(clippy::too_many_arguments)]
 fn write_days(
     out_root: &Path,
     ticker: &str,
     ticker_id: u64,
+    asset: &str,
     recs: &[(u64, IndexRecord)],
     from: NaiveDate,
     to: NaiveDate,
     force: bool,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(Vec<(NaiveDate, PathBuf)>, Vec<NaiveDate>)> {
+    let today = Utc::now().date_naive();
+    precheck(out_root, ticker_id, asset, from, to, force, today)?;
     let dir = idx_dir(out_root, ticker_id);
-    let mut jobs = vec![];
+    std::fs::create_dir_all(&dir)?;
+    precheck(out_root, ticker_id, asset, from, to, force, today)?;
+    let _lock = nxr_sdk::shard::acquire_idx_writer_lock(&dir)
+        .with_context(|| format!("writer lock held on {}", dir.display()))?;
+    let (mut jobs, mut skipped) = (vec![], vec![]);
     let mut d = from;
     while d <= to {
         let (lo, hi) = (
@@ -400,23 +530,24 @@ fn write_days(
             .map(|r| r.1)
             .collect();
         let path = shard_path(&dir, d, "idx");
-        if !path.starts_with(out_root) {
-            bail!("refusing path outside out-root: {}", path.display());
-        }
-        if path.exists() && !force {
-            bail!("refusing to overwrite {} (use --force)", path.display());
-        }
         if rows.is_empty() {
             tracing::warn!(%d, "no records (DQ gate never green); no shard written");
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+            skipped.push(d);
         } else {
             jobs.push((d, path, rows));
         }
         d = d.succ_opt().ok_or_else(|| anyhow!("date overflow"))?;
     }
+    if jobs.is_empty() {
+        bail!("nothing written: the DQ gate was never green in {from}..{to}");
+    }
     let mut written = vec![];
-    for (_, path, rows) in &jobs {
+    for (d, path, rows) in &jobs {
         write_shard_atomic(path, bytemuck::cast_slice(rows))?;
-        written.push(path.clone());
+        written.push((*d, path.clone()));
     }
     let mut m = Manifest::new(ticker.to_string(), ticker_id, "idx");
     let mut entries = vec![];
@@ -425,7 +556,7 @@ fn write_days(
     }
     m.set_shards_batch(entries);
     write_manifest(&manifest_path(&dir), &m)?;
-    Ok(written)
+    Ok((written, skipped))
 }
 
 // ---------- network ----------
@@ -463,6 +594,11 @@ impl Limiter {
     }
 }
 
+/// 429, 408 and 5xx are worth another try; any other 4xx is a request or auth fault.
+fn retryable(code: u16) -> bool {
+    matches!(code, 408 | 429) || code >= 500
+}
+
 struct Hs {
     key: String,
     agent: ureq::Agent,
@@ -483,42 +619,51 @@ impl Hs {
         })
     }
 
-    fn post(&self, chain: u64, body: &Value) -> Result<Value> {
-        let url = format!("https://{chain}.hypersync.xyz/query");
-        let mut last = None;
+    /// One paced request with retry: 429/5xx/transport back off (Retry-After honoured), other 4xx fail.
+    fn call(
+        &self,
+        what: &str,
+        mut f: impl FnMut() -> Result<ureq::Response, ureq::Error>,
+    ) -> Result<Value> {
+        let mut last = String::new();
         for n in 0..4 {
             if n > 0 {
                 self.lim.back_off(std::time::Duration::from_secs(2 * n));
             }
             self.lim.wait();
-            match self
-                .agent
-                .post(&url)
-                .set("Authorization", &format!("Bearer {}", self.key))
-                .send_string(&body.to_string())
-            {
+            match f() {
                 Ok(r) => return Ok(serde_json::from_str(&r.into_string()?)?),
                 Err(ureq::Error::Status(c, r)) => {
                     if let Some(s) = r.header("retry-after").and_then(|v| v.parse::<u64>().ok()) {
                         self.lim
                             .back_off(std::time::Duration::from_secs(s.min(120)));
                     }
-                    last = Some(format!("http {c}"));
+                    if !retryable(c) {
+                        bail!("hypersync {what}: http {c}");
+                    }
+                    last = format!("http {c}");
                 }
-                Err(_) => last = Some("transport error".into()),
+                Err(_) => last = "transport error".into(),
             }
         }
-        bail!("hypersync chain {chain}: {}", last.unwrap_or_default())
+        bail!("hypersync {what}: {last}")
+    }
+
+    fn post(&self, chain: u64, body: &Value) -> Result<Value> {
+        let url = format!("https://{chain}.hypersync.xyz/query");
+        let b = body.to_string();
+        self.call(&format!("chain {chain}"), || {
+            self.agent
+                .post(&url)
+                .set("Authorization", &format!("Bearer {}", self.key))
+                .send_string(&b)
+        })
     }
 
     fn height(&self, chain: u64) -> Result<u64> {
-        self.lim.wait();
-        let r = self
-            .agent
-            .get(&format!("https://{chain}.hypersync.xyz/height"))
-            .call()?;
-        qty(&serde_json::from_str::<Value>(&r.into_string()?)?["height"])
-            .ok_or_else(|| anyhow!("no height"))
+        let url = format!("https://{chain}.hypersync.xyz/height");
+        let v = self.call(&format!("height {chain}"), || self.agent.get(&url).call())?;
+        qty(&v["height"]).ok_or_else(|| anyhow!("no height"))
     }
 
     fn block_ts(&self, chain: u64, n: u64) -> Result<Option<u64>> {
@@ -564,8 +709,7 @@ impl Hs {
         if let Some(a) = address {
             sel["address"] = json!([a]);
         }
-        let (mut cur, mut out) = (from, vec![]);
-        while cur < to {
+        let mut out = paginate(from, to, |cur| {
             let r = self.post(
                 chain,
                 &json!({"from_block": cur, "to_block": to, "logs": [sel],
@@ -573,19 +717,35 @@ impl Hs {
                             "log": ["block_number", "log_index", "data", "topic0", "topic1", "topic2", "topic3"],
                             "block": ["number", "timestamp"]}}),
             )?;
-            let (mut page, next) = parse_response(&r)?;
-            out.append(&mut page);
-            if next <= cur {
-                break;
-            }
-            cur = next;
-        }
+            parse_response(&r)
+        })?;
         out.sort_by_key(|(l, _)| (l.block, l.idx));
         Ok(out)
     }
 }
 
-fn fetch_quote(url: &str, from_ms: u64, to_ms: u64) -> Result<Quote> {
+/// Pages `[from, to)` by `next_block`; no progress or a short walk is an error, never a quiet stop.
+fn paginate<T>(
+    from: u64,
+    to: u64,
+    mut fetch: impl FnMut(u64) -> Result<(Vec<T>, u64)>,
+) -> Result<Vec<T>> {
+    let (mut cur, mut out) = (from, vec![]);
+    while cur < to {
+        let (mut page, next) = fetch(cur)?;
+        out.append(&mut page);
+        if next <= cur {
+            bail!("hypersync made no progress at block {cur} (next_block {next}, to {to})");
+        }
+        cur = next;
+    }
+    if cur < to {
+        bail!("pagination stopped at {cur} before {to}");
+    }
+    Ok(out)
+}
+
+fn fetch_quote(url: &str, from_ms: u64, to_ms: u64, start: u64) -> Result<Quote> {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(60))
         .build();
@@ -617,40 +777,53 @@ fn fetch_quote(url: &str, from_ms: u64, to_ms: u64) -> Result<Quote> {
     }
     bars.sort_by_key(|b| b.0);
     bars.dedup_by_key(|b| b.0);
-    if bars.is_empty() {
-        bail!("no USDC-USD bars for the range");
-    }
-    Ok(Quote(bars))
+    Quote::new(bars, start, to_ms)
 }
 
-/// Base coin index of a Curve pool: `coins(0)` / `coins(1)` over the chain's config RPCs.
+/// `eth_call` at latest over the config RPCs: first answer wins.
+fn eth_call(rpcs: &[RpcRow], to: &str, data: &str) -> Result<String> {
+    for (i, row) in rpcs.iter().enumerate() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                          "params": [{"to": to, "data": data}, "latest"]});
+        let Ok(r) = ureq::post(&row.endpoint().url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send_string(&body.to_string())
+        else {
+            tracing::warn!(rpc = i, "eth_call failed");
+            continue;
+        };
+        let v: Value = serde_json::from_str(&r.into_string()?)?;
+        if let Some(res) = v["result"].as_str() {
+            return Ok(res.to_string());
+        }
+    }
+    bail!("eth_call {to} failed on every rpc")
+}
+
+fn same_addr(word_hex: &str, token: &str) -> bool {
+    word_hex.len() >= 66
+        && word_hex[word_hex.len() - 40..].eq_ignore_ascii_case(token.trim_start_matches("0x"))
+}
+
+/// Base coin index of a Curve pool: `coins(0)` / `coins(1)`.
 fn curve_base_idx(rpcs: &[RpcRow], pool: &str, base_token: &str) -> Result<i128> {
     for k in 0..2u8 {
-        let data = format!("{CURVE_COINS}{:064x}", k);
-        for (i, row) in rpcs.iter().enumerate() {
-            let url = row.endpoint().url;
-            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                              "params": [{"to": pool, "data": data}, "latest"]});
-            let Ok(r) = ureq::post(&url)
-                .timeout(std::time::Duration::from_secs(15))
-                .send_string(&body.to_string())
-            else {
-                tracing::warn!(rpc = i, "eth_call failed");
-                continue;
-            };
-            let v: Value = serde_json::from_str(&r.into_string()?)?;
-            if let Some(res) = v["result"].as_str() {
-                if res.len() >= 66
-                    && res[res.len() - 40..]
-                        .eq_ignore_ascii_case(base_token.trim_start_matches("0x"))
-                {
-                    return Ok(k as i128);
-                }
-                break;
-            }
+        if same_addr(
+            &eth_call(rpcs, pool, &format!("{CURVE_COINS}{k:064x}"))?,
+            base_token,
+        ) {
+            return Ok(k as i128);
         }
     }
     bail!("could not resolve Curve base coin index for {pool}; pass --curve-base-idx")
+}
+
+fn assert_decimals_6(rpcs: &[RpcRow], token: &str) -> Result<()> {
+    let r = eth_call(rpcs, token, DECIMALS_CALL)?;
+    if u64::from_str_radix(r.trim_start_matches("0x"), 16).ok() != Some(DEC as u64) {
+        bail!("token {token} decimals != {DEC}: the backfill math assumes 6");
+    }
+    Ok(())
 }
 
 fn pool_manager(chain: &str) -> Result<&'static str> {
@@ -689,7 +862,14 @@ fn main() -> Result<()> {
     if descs.is_empty() {
         bail!("no v4/curve pools for {asset} in {}", a.config.display());
     }
+    let ticker = format!("{asset}/USD");
+    let ticker_id = resolve_ticker_id(&ticker);
+    // Refuse before any network call.
+    std::fs::create_dir_all(&a.out_root)?;
+    precheck(&a.out_root, ticker_id, &asset, a.from, a.to, a.force, today)?;
     let q = sec.quality.get(&asset);
+    let rate_excluded = q.is_some_and(|q| q.rate.is_some());
+    let peg = q.and_then(|q| q.peg.map(|p| (p, q.band_bps)));
     let params = Params {
         twap_ms: sec.twap_secs * 1000,
         max_age_ms: sec.max_age_ms,
@@ -697,11 +877,39 @@ fn main() -> Result<()> {
         min_depth: sec.depth_floor(&asset, &descs[0].quote),
         warmup_ms: sec.warmup_secs * 1000,
         min_legs: q.and_then(|q| q.min_legs).unwrap_or(sec.min_legs),
-        peg: q.and_then(|q| q.peg.map(|p| (p, q.band_bps))),
+        peg,
+        sanity: (peg.is_none() && rate_excluded).then_some(RATE_SANITY),
+        hold_cap_ms: a.hold_cap_hours * 3_600_000,
     };
-    let rate_excluded = q.is_some_and(|q| q.rate.is_some());
     if rate_excluded {
-        eprintln!("warning: {asset}: vault-rate leg excluded (no free archive RPC); pool composite only, no rate anchor");
+        eprintln!("warning: {asset}: vault-rate leg excluded (no free archive RPC); pool composite only, static band {RATE_SANITY:?} instead of a rate anchor");
+    }
+    // Config sanity: USDC-quoted pools with both tokens named, 6 decimals on-chain.
+    let mut checked = std::collections::HashSet::new();
+    for d in &descs {
+        let (Some(bt), Some(qt)) = (d.base_token.as_deref(), d.quote_token.as_deref()) else {
+            bail!(
+                "pool {} lacks base_token/quote_token",
+                d.locator().unwrap_or("")
+            );
+        };
+        if !d.quote.eq_ignore_ascii_case("USDC") {
+            bail!(
+                "pool {} quote is {}, not USDC",
+                d.locator().unwrap_or(""),
+                d.quote
+            );
+        }
+        let rpcs = &sec
+            .chains
+            .get(&d.chain)
+            .ok_or_else(|| anyhow!("no chain {}", d.chain))?
+            .rpcs;
+        for t in [bt, qt] {
+            if checked.insert((d.chain.clone(), t.to_lowercase())) {
+                assert_decimals_6(rpcs, t)?;
+            }
+        }
     }
     let (from_ms, end_ms) = (
         day_start_ms(a.from) as u64,
@@ -717,6 +925,12 @@ fn main() -> Result<()> {
             Some(b) => *b,
             None => {
                 let h = hs.height(cid)?;
+                let tip = hs
+                    .block_ts(cid, h)?
+                    .ok_or_else(|| anyhow!("no tip block on chain {cid}"))?;
+                if tip * 1000 < end_ms {
+                    bail!("HyperSync tip of chain {cid} (ts {tip}) is before the end of --to: data would be truncated");
+                }
                 let b = (
                     hs.first_block_at(cid, (from_ms - LOOKBACK_MS) / 1000, h)?,
                     hs.first_block_at(cid, end_ms / 1000, h)?,
@@ -733,15 +947,17 @@ fn main() -> Result<()> {
             .hooks
             .as_deref()
             .is_some_and(|h| h.trim_start_matches("0x").bytes().any(|b| b != b'0'));
+        let floor = sec.depth_floor(&d.asset, &d.quote);
         let mut cfg = PoolCfg {
             id: format!("{}:{}:{}", d.chain, d.dex, d.locator().unwrap_or("")),
             kind: d.kind,
             hooked,
             base_is_t0: bt < qt,
             band: sec.depth_band_bps as f64 / 1e4,
-            floor: sec.depth_floor(&d.asset, &d.quote),
+            floor,
             fee: d.fee_bps as f64 / 1e4,
             base_idx: 0,
+            max_sold_raw: (0.01 * 4.0 * floor * 10f64.powi(DEC as i32)) as u128,
         };
         let logs = if d.kind == PoolKind::V4 {
             let id = d
@@ -790,44 +1006,52 @@ fn main() -> Result<()> {
             ev,
         });
     }
+    let grid_start = from_ms.saturating_sub(params.warmup_ms + params.twap_ms) / 1000 * 1000;
     let quote = fetch_quote(
         &a.quote_ohlc_url,
-        from_ms.saturating_sub(params.warmup_ms + params.twap_ms + 120_000),
+        grid_start.saturating_sub(120_000),
         end_ms,
+        grid_start,
     )?;
-    let ticker = format!("{asset}/USD");
-    let ticker_id = resolve_ticker_id(&ticker);
-    let recs = run_grid(&legs, &quote, &params, ticker_id, from_ms, end_ms);
-    let written = write_days(
+    let (recs, stats) = run_grid(&legs, &quote, &params, ticker_id, from_ms, end_ms);
+    let (written, skipped) = write_days(
         &a.out_root,
         &ticker,
         ticker_id,
+        &asset,
         &recs,
         a.from,
         a.to,
         a.force,
     )?;
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".into());
+    let shards: Vec<Value> = written
+        .iter()
+        .map(|(d, p)| Ok(serde_json::to_value(shard_entry_for_idx(*d, p)?)?))
+        .collect::<Result<_>>()?;
     let side = json!({
         "asset": asset, "ticker": ticker, "ticker_id": ticker_id,
         "range": {"from": a.from.to_string(), "to": a.to.to_string()},
         "legs_used": used,
         "legs_excluded": if rate_excluded { vec!["vault rate convertToAssets (no free archive RPC)"] } else { vec![] },
         "peg_band_gate": params.peg.is_some(),
-        "approximations": ["depth: constant event liquidity over the band (v4), 4x floor (curve)",
-                           "curve price from TokenExchange amounts, fee-unbiased by fee_bps",
-                           "no venue trust / chain-dark gates"],
-        "records": recs.len(), "shards": written.len(),
+        "static_sanity_band": params.sanity,
+        "leg_held_price_pct": used.iter().zip(&stats.held_pct).collect::<Vec<_>>(),
+        "leg_dropped_by_hold_cap_pct": used.iter().zip(&stats.dropped_pct).collect::<Vec<_>>(),
+        "hold_cap_hours": a.hold_cap_hours,
+        "curve_swap_cap": "input <= 1% of 4 x depth floor; dust < 1 unit ignored",
+        "skipped_days": skipped.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+        "shards": shards,
+        "records": recs.len(),
+        "notes": ["depth: constant event liquidity over the band (v4), optimistic vs live tick walk; curve depth = 4 x floor",
+                  "curve price is a fill price from TokenExchange amounts, fee-unbiased by fee_bps",
+                  "no venue trust / chain-dark gates; no warmup stall-credit (any red second restarts warmup)"],
         "weights": "default", "backfill": true, "hypersync_max_rps": HS_RPS,
-        "tool_commit": commit, "ts": Utc::now().to_rfc3339(), "source": "hypersync",
+        "config_sha256": series_factory::sharding::sha256_file(&a.config)?,
+        "tool_commit": option_env!("SF_GIT_SHA").unwrap_or("unknown"),
+        "tool_dirty": option_env!("SF_GIT_DIRTY").unwrap_or("unknown"),
+        "ts": Utc::now().to_rfc3339(), "source": "hypersync",
     });
-    let sp = a.out_root.join("onchain-backfill.json");
+    let sp = sidecar_path(&a.out_root, &asset);
     write_shard_atomic(&sp, serde_json::to_string_pretty(&side)?.as_bytes())
         .with_context(|| sp.display().to_string())?;
     eprintln!(
@@ -842,6 +1066,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use series_factory::sharding::read_manifest;
 
     fn pcfg(base_is_t0: bool) -> PoolCfg {
         PoolCfg {
@@ -853,6 +1078,7 @@ mod tests {
             floor: 50_000.0,
             fee: 0.0001,
             base_idx: 0,
+            max_sold_raw: 2_000_000_000,
         }
     }
 
@@ -952,6 +1178,8 @@ mod tests {
             warmup_ms: 300_000,
             min_legs: 1,
             peg: Some((1.0, 10)),
+            sanity: None,
+            hold_cap_ms: 6 * 3_600_000,
         }
     }
 
@@ -992,62 +1220,146 @@ mod tests {
         p
     }
 
+    fn quote_at(day0: u64) -> Quote {
+        Quote(vec![(day0 - 3_600_000, 1.0)])
+    }
+
+    fn day() -> (NaiveDate, u64) {
+        let d: NaiveDate = "2026-10-01".parse().unwrap();
+        (d, day_start_ms(d) as u64)
+    }
+
+    fn grid(legs: &[Leg], p: &Params, day0: u64) -> (Vec<(u64, IndexRecord)>, GridStats) {
+        let id = resolve_ticker_id("USDAT/USD");
+        run_grid(legs, &quote_at(day0), p, id, day0, day0 + MS_PER_DAY as u64)
+    }
+
+    fn mid(r: &(u64, IndexRecord)) -> f64 {
+        let i = r.1.index;
+        i.bid
+    }
+
     #[test]
     fn grid_is_deterministic_and_gated() {
-        let d: NaiveDate = "2026-10-01".parse().unwrap();
-        let day0 = day_start_ms(d) as u64;
-        let q = Quote(vec![(day0 - 3_600_000, 1.0)]);
-        let id = resolve_ticker_id("USDAT/USD");
-        let run = || {
-            run_grid(
-                &legs(day0),
-                &q,
-                &params(),
-                id,
-                day0,
-                day0 + MS_PER_DAY as u64,
-            )
-        };
-        let (r1, r2) = (run(), run());
+        let (_, day0) = day();
+        let (r1, _) = grid(&legs(day0), &params(), day0);
+        let (r2, _) = grid(&legs(day0), &params(), day0);
         let bytes = |r: &Vec<(u64, IndexRecord)>| {
             r.iter()
                 .flat_map(|x| bytemuck::bytes_of(&x.1).to_vec())
                 .collect::<Vec<u8>>()
         };
         assert!(!r1.is_empty() && bytes(&r1) == bytes(&r2));
-        // heartbeat <= 5 s while green, first record at day start (warmup was pre-rolled).
+        // first record at day start: the warmup was pre-rolled.
         assert_eq!(r1[0].0, day0);
-        assert!(r1
-            .windows(2)
-            .all(|w| w[1].0 - w[0].0 <= HEARTBEAT_MS || w[1].0 - w[0].0 > 0));
-        let mid = |r: &(u64, IndexRecord)| {
-            let i = r.1.index;
-            i.bid
-        };
         assert!((mid(&r1[0]) - 1.0).abs() < 1e-6);
-        // the 30 bp excursion of leg a is a deviation outlier vs b (50 bp band keeps it) but the
-        // blended mid stays inside the 10 bp peg band only partially: no record may leave the band.
+        // no record may leave the 10 bp peg band.
         assert!(r1.iter().all(|r| (mid(r) - 1.0).abs() <= 0.0010 + 1e-9));
     }
 
     #[test]
-    fn e2e_writes_shard_manifest_and_refuses_overwrite() {
-        let d: NaiveDate = "2026-10-01".parse().unwrap();
-        let day0 = day_start_ms(d) as u64;
-        let q = Quote(vec![(day0 - 3_600_000, 1.0)]);
-        let id = resolve_ticker_id("USDAT/USD");
-        let recs = run_grid(
-            &legs(day0),
-            &q,
-            &params(),
-            id,
-            day0,
-            day0 + MS_PER_DAY as u64,
+    fn flat_market_heartbeats_every_5s_and_reports_held_price() {
+        let (_, day0) = day();
+        let flat = vec![Leg {
+            id: "a".into(),
+            v4: false,
+            hooked: false,
+            ev: vec![(day0 - 3_600_000, 1.0, 1e6)],
+        }];
+        let mut p = params();
+        p.hold_cap_ms = 48 * 3_600_000;
+        let (r, st) = grid(&flat, &p, day0);
+        assert!(r.windows(2).all(|w| w[1].0 - w[0].0 == HEARTBEAT_MS));
+        assert_eq!(r.len(), MS_PER_DAY as usize / 5000);
+        // the only swap is 1 h old: the price is held (older than max_age) for the whole day.
+        assert!(st.held_pct[0] > 99.9 && st.dropped_pct[0] == 0.0);
+    }
+
+    #[test]
+    fn hold_cap_drops_a_silent_leg() {
+        let (_, day0) = day();
+        let one = vec![Leg {
+            id: "a".into(),
+            v4: false,
+            hooked: false,
+            ev: vec![(day0 - 3_600_000, 1.0, 1e6)],
+        }];
+        let mut p = params();
+        p.hold_cap_ms = 2 * 3_600_000;
+        let (r, st) = grid(&one, &p, day0);
+        // alive until 1 h into the day, then dropped (no leg => no composite).
+        assert!(r.iter().all(|x| x.0 <= day0 + 3_600_000));
+        assert!(st.dropped_pct[0] > 90.0);
+    }
+
+    #[test]
+    fn static_band_gates_a_peg_less_asset() {
+        let (_, day0) = day();
+        let mk = |px: f64| {
+            vec![Leg {
+                id: "a".into(),
+                v4: false,
+                hooked: false,
+                ev: vec![(day0 - 3_600_000, px, 1e6)],
+            }]
+        };
+        let mut p = params();
+        (p.peg, p.sanity) = (None, Some(RATE_SANITY));
+        assert!(!grid(&mk(1.18), &p, day0).0.is_empty());
+        assert!(grid(&mk(0.95), &p, day0).0.is_empty());
+        assert!(grid(&mk(1.5), &p, day0).0.is_empty());
+    }
+
+    #[test]
+    fn paginate_walks_to_the_end_and_bails_without_progress() {
+        let ok = paginate(0, 10, |c| Ok((vec![c], (c + 4).min(10)))).unwrap();
+        assert_eq!(ok, vec![0, 4, 8]);
+        let stuck = paginate(0, 10, |c| Ok((vec![c], c)));
+        assert!(stuck.unwrap_err().to_string().contains("no progress"));
+        assert!(paginate::<u8>(0, 10, |c| Ok((vec![], c.saturating_sub(1)))).is_err());
+    }
+
+    #[test]
+    fn only_rate_limit_and_server_errors_retry() {
+        assert!(retryable(429) && retryable(503) && retryable(408));
+        assert!(!retryable(400) && !retryable(401) && !retryable(404));
+    }
+
+    #[test]
+    fn quote_needs_cover_no_big_gap_and_a_sane_range() {
+        let m = 60_000u64;
+        let bars = |r: std::ops::Range<u64>, v: f64| r.map(|i| (i * m, v)).collect::<Vec<_>>();
+        assert!(Quote::new(bars(10..100, 1.0), 10 * m, 99 * m).is_ok());
+        assert!(
+            Quote::new(bars(11..100, 1.0), 10 * m, 99 * m).is_err(),
+            "starts late"
         );
+        assert!(
+            Quote::new(bars(10..100, 1.05), 10 * m, 99 * m).is_err(),
+            "range"
+        );
+        let mut gap = bars(10..30, 1.0);
+        gap.extend(bars(40..100, 1.0));
+        assert!(Quote::new(gap, 10 * m, 99 * m).is_err(), "gap");
+        assert!(
+            Quote::new(bars(10..50, 1.0), 10 * m, 99 * m).is_err(),
+            "ends early"
+        );
+    }
+
+    fn recs_for(day0: u64) -> Vec<(u64, IndexRecord)> {
+        grid(&legs(day0), &params(), day0).0
+    }
+
+    #[test]
+    fn e2e_writes_shard_manifest_and_refuses_overwrite() {
+        let (d, day0) = day();
+        let id = resolve_ticker_id("USDAT/USD");
+        let recs = recs_for(day0);
         let root = tmp("e2e");
-        let w = write_days(&root, "USDAT/USD", id, &recs, d, d, false).unwrap();
-        assert_eq!(w.len(), 1);
-        let bytes = std::fs::read(&w[0]).unwrap();
+        let (w, skipped) = write_days(&root, "USDAT/USD", id, "USDAT", &recs, d, d, false).unwrap();
+        assert!(skipped.is_empty() && w.len() == 1);
+        let bytes = std::fs::read(&w[0].1).unwrap();
         assert_eq!(bytes.len(), recs.len() * 56);
         let back: &[IndexRecord] = bytemuck::cast_slice(&bytes);
         let (t, f) = {
@@ -1060,9 +1372,67 @@ mod tests {
             FLAG_HISTORICAL_BACKFILL | FLAG_NO_BOOK | FLAG_CONF_ACTIVE
         );
         assert!(manifest_path(&idx_dir(&root, id)).exists());
-        assert!(write_days(&root, "USDAT/USD", id, &recs, d, d, false).is_err());
-        assert!(write_days(&root, "USDAT/USD", id, &recs, d, d, true).is_ok());
+        assert!(write_days(&root, "USDAT/USD", id, "USDAT", &recs, d, d, false).is_err());
+        assert!(write_days(&root, "USDAT/USD", id, "USDAT", &recs, d, d, true).is_ok());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn force_deletes_a_stale_shard_on_a_rowless_day_and_empty_run_fails() {
+        let (d, day0) = day();
+        let d2 = d.succ_opt().unwrap();
+        let id = resolve_ticker_id("USDAT/USD");
+        let recs = recs_for(day0); // rows on d only
+        let root = tmp("stale");
+        write_days(&root, "USDAT/USD", id, "USDAT", &recs, d, d, false).unwrap();
+        let stale = shard_path(&idx_dir(&root, id), d2, "idx");
+        std::fs::write(&stale, [0u8; 56]).unwrap();
+        let (w, skipped) = write_days(&root, "USDAT/USD", id, "USDAT", &recs, d, d2, true).unwrap();
+        assert_eq!((w.len(), skipped), (1, vec![d2]));
+        assert!(!stale.exists());
+        let m = read_manifest(&manifest_path(&idx_dir(&root, id)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.shards.len(), 1);
+        let err = write_days(&root, "USDAT/USD", id, "USDAT", &[], d, d, true).unwrap_err();
+        assert!(err.to_string().contains("nothing written"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuses_a_held_writer_lock_a_symlink_and_a_live_dir() {
+        let (d, day0) = day();
+        let id = resolve_ticker_id("USDAT/USD");
+        let recs = recs_for(day0);
+        // writer lock held elsewhere
+        let root = tmp("lock");
+        let dir = idx_dir(&root, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _held = nxr_sdk::shard::acquire_idx_writer_lock(&dir).unwrap();
+        let e = write_days(&root, "USDAT/USD", id, "USDAT", &recs, d, d, false).unwrap_err();
+        assert!(e.to_string().contains("writer lock"), "{e}");
+        // symlinked ticker dir
+        let root2 = tmp("link");
+        let real = tmp("real");
+        std::fs::create_dir_all(root2.join("indexes")).unwrap();
+        std::os::unix::fs::symlink(&real, idx_dir(&root2, id)).unwrap();
+        let e = write_days(&root2, "USDAT/USD", id, "USDAT", &recs, d, d, false).unwrap_err();
+        assert!(e.to_string().contains("symlink"), "{e}");
+        // a shard dated today marks a live dir
+        let root3 = tmp("live");
+        let dir3 = idx_dir(&root3, id);
+        std::fs::create_dir_all(&dir3).unwrap();
+        let today = Utc::now().date_naive();
+        std::fs::write(shard_path(&dir3, today, "idx"), [0u8; 56]).unwrap();
+        assert!(precheck(&root3, id, "USDAT", d, d, false, today).is_err());
+        // an existing sidecar blocks without --force
+        let root4 = tmp("side");
+        std::fs::write(sidecar_path(&root4, "USDAT"), "{}").unwrap();
+        assert!(precheck(&root4, id, "USDAT", d, d, false, today).is_err());
+        assert!(precheck(&root4, id, "USDAT", d, d, true, today).is_ok());
+        for r in [root, root2, real, root3, root4] {
+            let _ = std::fs::remove_dir_all(r);
+        }
     }
 
     #[test]
