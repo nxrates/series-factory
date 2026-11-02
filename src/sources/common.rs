@@ -10,7 +10,7 @@ use chrono::{Datelike, Duration, NaiveDate};
 use memmap2::Mmap;
 use mitch::Tick;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -19,12 +19,11 @@ use zip::ZipArchive;
 
 // ─── HTTP Agent ───────────────────────────────────────────────────────────────
 
-/// Create a shared HTTP agent with 10-min timeout (large monthly archives can be 300MB+).
-pub fn http_agent() -> Arc<ureq::Agent> {
+/// Shared egress client with 10-min timeout (large monthly archives can be 300MB+): the process-wide
+/// btr-rpc set, direct when no egress is configured.
+pub fn http_agent() -> Arc<btr_rpc::Http> {
     Arc::new(
-        ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(600))
-            .build(),
+        btr_rpc::env_http(std::time::Duration::from_secs(600)).expect("egress config unusable"),
     )
 }
 
@@ -151,66 +150,66 @@ impl Drop for DownloadedArchive {
 /// reports `bytes_got` and `content_length` but does NOT itself decide that a
 /// short read is fatal, so the decision can be retried with backoff.
 pub async fn download_to_file(
-    agent: &Arc<ureq::Agent>,
+    http: &Arc<btr_rpc::Http>,
     url: &str,
     dst_dir: &Path,
 ) -> Result<DownloadedArchive> {
-    let agent = agent.clone();
-    let url = url.to_string();
-    let dst_dir = dst_dir.to_path_buf();
+    debug!("Downloading (stream→disk): {}", url);
+    std::fs::create_dir_all(dst_dir)?;
 
-    tokio::task::spawn_blocking(move || -> Result<DownloadedArchive> {
-        debug!("Downloading (stream→disk): {}", url);
-        std::fs::create_dir_all(&dst_dir)?;
+    let (status, mut resp) = http
+        .get_stream(url, &[])
+        .await
+        .map_err(|e| anyhow::anyhow!("Download failed {}: {}", url, e))?;
+    if status >= 400 {
+        return Err(anyhow::anyhow!("Download failed {}: HTTP {}", url, status));
+    }
 
-        let response = agent
-            .get(&url)
-            .call()
-            .map_err(|e| anyhow::anyhow!("Download failed {}: {}", url, e))?;
+    let content_length = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
 
-        let content_length = response
-            .header("Content-Length")
-            .and_then(|s| s.trim().parse::<u64>().ok());
+    // Unique temp name so concurrent downloads in the same dir don't clash.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = dst_dir.join(format!(".partial-dl-{nonce}-{:x}", url.len()));
 
-        // Unique temp name so concurrent downloads in the same dir don't clash.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp_path = dst_dir.join(format!(".partial-dl-{nonce}-{:x}", url.len()));
-
-        let mut reader = response.into_reader();
-        let out = File::create(&tmp_path)?;
-        let mut writer = BufWriter::with_capacity(DOWNLOAD_STREAM_BUF_BYTES, out);
-        let mut buf = vec![0u8; DOWNLOAD_STREAM_BUF_BYTES];
-        let mut bytes_got: u64 = 0;
-        loop {
-            let n = match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    // Mid-transfer error (the failure mode that lost ETH
-                    // months): drop the partial file, surface as Err so the
-                    // retry loop can re-attempt rather than accept a stub.
-                    let _ = writer.flush();
+    let mut writer = BufWriter::with_capacity(DOWNLOAD_STREAM_BUF_BYTES, File::create(&tmp_path)?);
+    let mut bytes_got: u64 = 0;
+    loop {
+        match resp.chunk().await {
+            Ok(None) => break,
+            Ok(Some(chunk)) => {
+                if let Err(e) = writer.write_all(&chunk) {
                     drop(writer);
                     let _ = std::fs::remove_file(&tmp_path);
-                    return Err(anyhow::anyhow!("stream read failed {}: {}", url, e));
+                    return Err(e.into());
                 }
-            };
-            writer.write_all(&buf[..n])?;
-            bytes_got += n as u64;
+                bytes_got += chunk.len() as u64;
+            }
+            Err(e) => {
+                // Mid-transfer error (the failure mode that lost ETH
+                // months): drop the partial file, surface as Err so the
+                // retry loop can re-attempt rather than accept a stub.
+                let _ = writer.flush();
+                drop(writer);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(anyhow::anyhow!("stream read failed {}: {}", url, e));
+            }
         }
-        writer.flush()?;
-        drop(writer);
+    }
+    writer.flush()?;
+    drop(writer);
 
-        Ok(DownloadedArchive {
-            path: tmp_path,
-            bytes_got,
-            content_length,
-        })
+    Ok(DownloadedArchive {
+        path: tmp_path,
+        bytes_got,
+        content_length,
     })
-    .await?
 }
 
 /// Truncation predicate: a download is truncated iff a `Content-Length` was
@@ -229,7 +228,7 @@ pub fn is_truncated(bytes_got: u64, content_length: Option<u64>) -> bool {
 /// ETH 2024-2025 silent-gap: a partial body that decompressed to few/zero ticks
 /// was previously accepted as "empty month".
 pub async fn download_to_file_retry(
-    agent: &Arc<ureq::Agent>,
+    agent: &Arc<btr_rpc::Http>,
     url: &str,
     dst_dir: &Path,
     max_attempts: usize,
@@ -532,7 +531,7 @@ pub enum Compression {
 /// `.ticks` file is still written (possibly zero-length) so the caller can
 /// decide whether to keep it, delete it, or fall back to the daily archives.
 pub async fn download_and_convert<P>(
-    agent: &Arc<ureq::Agent>,
+    agent: &Arc<btr_rpc::Http>,
     url: &str,
     cache_path: &Path,
     ticker_id: u64,
@@ -689,7 +688,7 @@ fn stream_csv_in_chunks<R: std::io::BufRead>(
 /// `daily(symbol, date)` returns `(url, filename)`.
 /// Monthly downloads get 3 attempts; daily gets 1.
 pub async fn fetch_monthly_daily<P>(
-    agent: &Arc<ureq::Agent>,
+    agent: &Arc<btr_rpc::Http>,
     config: &Config,
     exchange: &str,
     symbol: &str,

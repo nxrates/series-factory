@@ -2036,6 +2036,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "btr-rpc",
  "bytemuck",
  "chrono",
  "clap",
@@ -2052,6 +2053,7 @@ dependencies = [
  "rand_chacha",
  "rand_distr",
  "rayon",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yml",

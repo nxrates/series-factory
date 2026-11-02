@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 pub struct BitgetSource {
-    agent: Arc<ureq::Agent>,
+    agent: Arc<btr_rpc::Http>,
 }
 
 impl BitgetSource {

@@ -95,11 +95,16 @@ async fn probe_one(
     const MAX_PROBE_MONTHS: i32 = 72; // 6y cap
 
     let sym = format!("{}{}", pair.to_uppercase(), quote.to_uppercase());
-    let agent = std::sync::Arc::new(
-        ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(15))
-            .build(),
-    );
+    let Ok(agent) = btr_rpc::env_http(std::time::Duration::from_secs(15)) else {
+        tracing::warn!("egress config unusable: probe refused");
+        return ProbeResult {
+            ticker: pair.to_uppercase(),
+            exchange: exchange.to_string(),
+            has_data: false,
+            first_date: None,
+            last_date: None,
+        };
+    };
 
     // Probe URL template sourced from YAML
     // `cexs.exchanges.<exch>.archive_url_template.probe`.
@@ -212,18 +217,10 @@ fn prev_month(d: NaiveDate) -> NaiveDate {
     }
 }
 
-async fn head_ok(agent: &std::sync::Arc<ureq::Agent>, url: &str) -> bool {
-    let agent = agent.clone();
-    let url = url.to_string();
-    tokio::task::spawn_blocking(move || {
-        let resp = agent.head(&url).call();
-        match resp {
-            Ok(r) => r.status() >= 200 && r.status() < 300,
-            Err(_) => false,
-        }
-    })
-    .await
-    .unwrap_or(false)
+async fn head_ok(http: &btr_rpc::Http, url: &str) -> bool {
+    http.send(reqwest::Method::HEAD, url, &[], None)
+        .await
+        .is_ok_and(|r| (200..300).contains(&r.status))
 }
 
 use nxr_sdk::pipeline_config::PipelineYml as YmlRoot;

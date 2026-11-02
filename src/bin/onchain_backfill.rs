@@ -865,23 +865,24 @@ fn agree(answers: &[String], need: usize) -> Option<String> {
 
 /// `eth_call` at latest: a 32-byte answer that two config RPCs agree on (one if only one is configured).
 fn eth_call(rpcs: &[RpcRow], to: &str, data: &str) -> Result<String> {
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(std::time::Duration::from_secs(15))
-        .build();
+    let http = btr_rpc::env_http(std::time::Duration::from_secs(15))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let need = rpcs.len().min(2);
     let mut answers = vec![];
     for (i, row) in rpcs.iter().enumerate() {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
                           "params": [{"to": to, "data": data}, "latest"]});
-        let Ok(r) = agent
-            .post(&row.endpoint().url)
-            .send_string(&body.to_string())
-        else {
+        let Ok(r) = rt.block_on(http.post_json(&row.endpoint().url, &body)) else {
             tracing::warn!(rpc = i, "eth_call failed");
             continue;
         };
-        let v: Value = serde_json::from_str(&r.into_string()?)?;
+        if !(200..300).contains(&r.status) {
+            tracing::warn!(rpc = i, status = r.status, "eth_call failed");
+            continue;
+        }
+        let v: Value = serde_json::from_slice(&r.body)?;
         if let Some(res) = v["result"].as_str() {
             answers.push(res.to_lowercase());
             if let Some(a) = agree(&answers, need) {

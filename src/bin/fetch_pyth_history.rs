@@ -108,6 +108,18 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Percent-encode a query value (RFC 3986 unreserved passes through).
+fn urlenc(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
     nxr_sdk::logging::init("info");
 
@@ -128,25 +140,30 @@ fn main() -> Result<()> {
     let url = format!("https://pyth.dourolabs.app/v1/{}/history", args.channel);
     info!(symbol, url, from, to, resolution = %args.resolution, "fetching Pyth history");
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
-    let mut req = agent
-        .get(&url)
-        .query("symbol", &symbol)
-        .query("resolution", &args.resolution)
-        .query("from", &from.to_string())
-        .query("to", &to.to_string());
+    let http = btr_rpc::env_http(std::time::Duration::from_secs(30))?;
+    let full = format!(
+        "{url}?symbol={}&resolution={}&from={from}&to={to}",
+        urlenc(&symbol),
+        urlenc(&args.resolution)
+    );
     // Auth becomes mandatory 2026-07-24 (config.yml oracle-relay note) - wire
     // it in now so this tool keeps working past the cutover with no edit.
-    if let Ok(token) = std::env::var("NXR_ORACLE_TOKEN_PYTH") {
-        req = req.set("Authorization", &format!("Bearer {token}"));
-    }
-    let resp = req
-        .call()
+    let bearer = std::env::var("NXR_ORACLE_TOKEN_PYTH")
+        .ok()
+        .map(|t| format!("Bearer {t}"));
+    let hdrs: Vec<(&str, &str)> = bearer.iter().map(|b| ("authorization", b.as_str())).collect();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let resp = rt
+        .block_on(http.get(&full, &hdrs))
         .with_context(|| format!("GET {url} (symbol={symbol})"))?;
-    let raw = resp
-        .into_string()
+    anyhow::ensure!(
+        (200..300).contains(&resp.status),
+        "GET {url} (symbol={symbol}): HTTP {}",
+        resp.status
+    );
+    let raw = String::from_utf8(resp.body)
         .with_context(|| format!("read history response body for {symbol}"))?;
     let body: HistoryResponse = serde_json::from_str(&raw)
         .with_context(|| format!("parse history JSON for {symbol}: {raw}"))?;

@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 pub struct BinanceSource {
-    agent: Arc<ureq::Agent>,
+    agent: Arc<btr_rpc::Http>,
 }
 
 impl BinanceSource {
