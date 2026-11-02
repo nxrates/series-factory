@@ -92,6 +92,10 @@ name = "renko-continuity-check"
 path = "src/bin/renko_continuity_check.rs"
 
 [[bin]]
+name = "onchain-backfill"
+path = "src/bin/onchain_backfill.rs"
+
+[[bin]]
 name = "fetch-pyth-history"
 path = "src/bin/fetch_pyth_history.rs"
 
@@ -140,6 +144,10 @@ nxr-sdk = { path = "../sdk/rust", default-features = false }
 # merge_idx can build a simulated anchor + offset and pass it straight into
 # `update_at` / `compute_vwap_at` without conversion.
 coarsetime = "0.1"
+# Offline on-chain backfill reuses the live poller's pool math + composite.
+nxr-onchain = { path = "../onchain" }
+sha3 = "0.10"
+hex = "0.4"
 
 [profile.dev]
 opt-level = 0
