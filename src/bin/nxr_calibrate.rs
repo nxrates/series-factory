@@ -128,40 +128,139 @@ struct Args {
 /// (the mutex is invisible to it — it is the original lost-update racer).
 /// Mutex first, flock second: that ordering means only one thread of this
 /// process ever holds the flock, so the per-open-fd flock cannot self-deadlock.
+///
+/// Per-ticker outcomes are BATCHED: `stage` queues them and writes at most once
+/// per `flush_every` (60 s in production). Every consumer (nxr-crypto, each
+/// signer) polls the file's mtime at 1 Hz and re-parses all of it on a change;
+/// one write per outcome (~500-2000 a night, up to 1 Hz) starved the 1-CPU
+/// signers into all-feeds-stale 503s on 10-27 (scratch/hva/dark-rca-2026-11-02.md).
+/// Any `update` drains the queue first, so ordering is unchanged; the queue is
+/// flushed on drop (normal return and `?` errors). SIGTERM (activeDeadline),
+/// SIGKILL and a release panic (`panic = "abort"`) skip the drop and lose at most
+/// `flush_every` of outcomes, which the next run resumes. A write whose
+/// bytes equal the file's is skipped, so it never bumps the mtime.
 struct ParamsStore {
     path: PathBuf,
     lock: std::sync::Mutex<()>,
+    pending: std::sync::Mutex<Vec<Staged>>,
+    last_write: std::sync::Mutex<std::time::Instant>,
+    flush_every: std::time::Duration,
+}
+
+/// One queued per-ticker outcome (see `stage_outcome`).
+struct Staged {
+    id_key: String,
+    k_ok: Option<f64>,
+    err: Option<String>,
+    skip: Option<String>,
+    count_in_run: bool,
+    now: u64,
+}
+
+impl Staged {
+    fn apply(&self, w: &mut WeightsFile) {
+        if let Some(k) = self.k_ok {
+            w.renko_k_staged.insert(self.id_key.clone(), k);
+        }
+        let st = w.calibration_status.entry(self.id_key.clone()).or_default();
+        st.last_attempt = Some(self.now);
+        if self.k_ok.is_some() {
+            st.last_success = Some(self.now);
+            st.consecutive_failures = 0;
+            st.last_error = None;
+            st.last_skip_reason = None;
+        } else if let Some(reason) = &self.skip {
+            st.last_skip_reason = Some(reason.clone());
+        } else {
+            st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+            st.last_error = self.err.clone();
+        }
+        if self.count_in_run {
+            if let Some(r) = w.last_run.as_mut() {
+                r.tickers_attempted += 1;
+                if self.k_ok.is_some() {
+                    r.tickers_succeeded += 1;
+                }
+            }
+        }
+    }
 }
 
 impl ParamsStore {
     fn new(path: PathBuf) -> Self {
+        Self::with_flush(path, std::time::Duration::from_secs(60))
+    }
+
+    fn with_flush(path: PathBuf, flush_every: std::time::Duration) -> Self {
         Self {
             path,
             lock: std::sync::Mutex::new(()),
+            pending: std::sync::Mutex::new(Vec::new()),
+            last_write: std::sync::Mutex::new(std::time::Instant::now()),
+            flush_every,
         }
     }
 
     fn read(&self) -> Result<WeightsFile> {
+        Ok(self.read_raw()?.1)
+    }
+
+    fn read_raw(&self) -> Result<(Option<String>, WeightsFile)> {
         if !self.path.exists() {
             warn!(path = %self.path.display(), "ticker-params.json missing — starting from scratch");
-            return Ok(WeightsFile::default());
+            return Ok((None, WeightsFile::default()));
         }
         let raw = std::fs::read_to_string(&self.path)
             .with_context(|| format!("read {}", self.path.display()))?;
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", self.path.display()))
+        let w = serde_json::from_str(&raw).with_context(|| format!("parse {}", self.path.display()))?;
+        Ok((Some(raw), w))
     }
 
-    /// Re-read, mutate ONLY our own fields inside `f`, atomic-rename. The whole
-    /// read-modify-rename runs under the cross-process `ParamsLock`; a lock we
-    /// cannot take is an error (the caller logs it and the ticker is retried next
-    /// cycle) — never a silently dropped write.
+    /// Re-read, apply the queued outcomes, mutate ONLY our own fields inside `f`,
+    /// atomic-rename. The whole read-modify-rename runs under the cross-process
+    /// `ParamsLock`; a lock we cannot take is an error (the caller logs it, the
+    /// queue is kept for the next write) — never a silently dropped write.
     fn update<F: FnOnce(&mut WeightsFile)>(&self, f: F) -> Result<()> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let _flock = nxr_sdk::weights_schema::ParamsLock::acquire(&self.path)
             .with_context(|| format!("lock {}", self.path.display()))?;
-        let mut w = self.read()?;
+        let (raw, mut w) = self.read_raw()?;
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for s in pending.iter() {
+            s.apply(&mut w);
+        }
         f(&mut w);
-        write_atomic_string(&self.path, &serde_json::to_string_pretty(&w)?)
+        let out = serde_json::to_string_pretty(&w)?;
+        if raw.as_deref() != Some(out.as_str()) {
+            write_atomic_string(&self.path, &out)?;
+        }
+        pending.clear();
+        *self.last_write.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Queue one outcome; write when `flush_every` has passed since the last write.
+    fn stage(&self, s: Staged) -> Result<()> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).push(s);
+        let mut last = self.last_write.lock().unwrap_or_else(|e| e.into_inner());
+        if last.elapsed() < self.flush_every {
+            return Ok(());
+        }
+        // Back off a failing write too: the queue is kept and retried a minute later, not per ticker.
+        *last = std::time::Instant::now();
+        drop(last);
+        self.update(|_| {})
+    }
+}
+
+impl Drop for ParamsStore {
+    fn drop(&mut self) {
+        let n = self.pending.get_mut().map(|p| p.len()).unwrap_or(0);
+        if n > 0 {
+            if let Err(e) = self.update(|_| {}) {
+                warn!(queued = n, err = %e, "final staged-result flush failed (these outcomes are retried next run)");
+            }
+        }
     }
 }
 
@@ -1050,11 +1149,11 @@ fn resolve_synth_work(yml_pairs: &[SynthPairYml]) -> Vec<(u64, &'static str, u64
 
 // ── Main run ─────────────────────────────────────────────────────────────────
 
-/// Persist ONE outcome before moving on: staged k (never the live map) +
-/// per-ticker diagnostics, so a kill after this point keeps the work. Serialized
-/// by `ParamsStore` (in-process mutex + flock) so `--parallel` workers and the
-/// `nxr-weights` process cannot lose each other's entries. 35 KB file, so the
-/// per-ticker cost is noise next to a fit.
+/// Stage ONE outcome: staged k (never the live map) + per-ticker diagnostics,
+/// written by `ParamsStore` within `flush_every` (a kill loses at most that much,
+/// the next run resumes it). Serialized by `ParamsStore` (in-process mutex + flock)
+/// so `--parallel` workers and the `nxr-weights` process cannot lose each other's
+/// entries. The file is ~3.9 MB, so batching is what keeps the consumers quiet.
 ///
 /// Shared by all three passes (base loop, synth, inferred-USDC fallback) — the
 /// synth and fallback work used to be unstaged, so a kill in either phase threw
@@ -1079,33 +1178,8 @@ fn stage_outcome(store: &ParamsStore, outcome: &CalOutcome, count_in_run: bool) 
             (ticker_id.to_string(), None, Some(reason.clone()), None)
         }
     };
-    if let Err(e) = store.update(|w| {
-        if let Some(k) = k_ok {
-            w.renko_k_staged.insert(id_key.clone(), k);
-        }
-        let st = w.calibration_status.entry(id_key.clone()).or_default();
-        st.last_attempt = Some(now);
-        if k_ok.is_some() {
-            st.last_success = Some(now);
-            st.consecutive_failures = 0;
-            st.last_error = None;
-            st.last_skip_reason = None;
-        } else if let Some(reason) = skip {
-            st.last_skip_reason = Some(reason);
-        } else {
-            st.consecutive_failures = st.consecutive_failures.saturating_add(1);
-            st.last_error = err;
-        }
-        if count_in_run {
-            if let Some(r) = w.last_run.as_mut() {
-                r.tickers_attempted += 1;
-                if k_ok.is_some() {
-                    r.tickers_succeeded += 1;
-                }
-            }
-        }
-    }) {
-        warn!(ticker_id = %id_key, err = %e, "staged-result write failed (fit result lost for this ticker)");
+    if let Err(e) = store.stage(Staged { id_key: id_key.clone(), k_ok, err, skip, count_in_run, now }) {
+        warn!(ticker_id = %id_key, err = %e, "staged-result write failed (queued; retried on the next write)");
     }
 }
 
@@ -1890,6 +1964,55 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp_params() -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!("cal-store-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("ticker-params.json")
+    }
+
+    fn staged(id: &str, k: Option<f64>) -> Staged {
+        Staged { id_key: id.into(), k_ok: k, err: None, skip: None, count_in_run: true, now: 7 }
+    }
+
+    #[test]
+    fn staged_outcomes_batch_into_one_write_and_flush_on_drop() {
+        let p = tmp_params();
+        let store = ParamsStore::with_flush(p.clone(), std::time::Duration::from_secs(3600));
+        store.update(|w| w.last_run = Some(Default::default())).unwrap();
+        let m0 = std::fs::metadata(&p).unwrap().modified().unwrap();
+        for i in 0..50 {
+            store.stage(staged(&i.to_string(), Some(1.5))).unwrap();
+        }
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), m0, "no write before flush_every");
+        drop(store);
+        let w: WeightsFile = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(w.renko_k_staged.len(), 50);
+        assert_eq!(w.last_run.unwrap().tickers_attempted, 50);
+    }
+
+    #[test]
+    fn update_drains_the_queue_first_and_skips_unchanged_bytes() {
+        let p = tmp_params();
+        let store = ParamsStore::with_flush(p.clone(), std::time::Duration::from_secs(3600));
+        store.stage(staged("1", Some(2.0))).unwrap();
+        // A later update sees the queued outcome (ordering preserved), then may overwrite it.
+        store.update(|w| assert_eq!(w.renko_k_staged.get("1"), Some(&2.0))).unwrap();
+        let m1 = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        store.update(|_| {}).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), m1, "identical bytes must not be rewritten");
+    }
+
+    #[test]
+    fn stage_writes_when_flush_every_elapsed() {
+        let p = tmp_params();
+        let store = ParamsStore::with_flush(p.clone(), std::time::Duration::ZERO);
+        store.stage(staged("9", None)).unwrap();
+        let w: WeightsFile = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(w.calibration_status.get("9").unwrap().consecutive_failures, 1);
+    }
 
     #[test]
     fn seed_isolated_renames_and_keeps_windows_apart() {
