@@ -752,7 +752,8 @@ fn fetch_quote(url: &str, from_ms: u64, to_ms: u64, start: u64) -> Result<Quote>
     let mut bars: Vec<(u64, f64)> = vec![];
     let mut s = from_ms;
     while s < to_ms {
-        let e = (s + 30 * MS_PER_DAY as u64).min(to_ms);
+        // the API caps a reply at 10_000 rows: 5 d of 1 m bars = 7_200
+        let e = (s + 5 * MS_PER_DAY as u64).min(to_ms);
         let body = agent
             .get(&format!(
                 "{}/v1/ohlc/USDC-USD?tf=60&from={s}&to={e}",
