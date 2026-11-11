@@ -1942,6 +1942,29 @@ mod tests {
         assert!(probe_archive(&flaky, &v, from, to, today).await.is_err());
     }
 
+    /// Feeding a long file chunk by chunk keeps every returned batch bounded by
+    /// the chunk plus one open run, whatever the file size.
+    #[test]
+    fn spread_batches_do_not_scale_with_file_size() {
+        let t0 = 1_700_000_000_000i64;
+        let frame = |ms: i64| {
+            TickFrame::new(1, mitch::timestamp::from_epoch_ms(ms), honest_tick(7, 100.0, 1, true))
+        };
+        // 200k frames, 100 per second: runs of 100 per stamp
+        let frames: Vec<TickFrame> = (0..200_000).map(|i| frame(t0 + (i / 100) * 1000)).collect();
+        let mut spread = Spread::new(1000);
+        let mut longest = 0;
+        let mut total = 0;
+        for chunk in frames.chunks(4096) {
+            let out = spread.push_all(chunk);
+            longest = longest.max(out.len());
+            total += out.len();
+        }
+        total += spread.finish().len();
+        assert_eq!(total, frames.len());
+        assert!(longest <= 4096 + 100, "batch {longest}");
+    }
+
     /// A same-second run split over two calls is spread once, in order, and time
     /// never goes back at the seam; a stamp off the resolution is left alone.
     #[test]

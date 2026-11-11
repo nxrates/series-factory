@@ -308,22 +308,29 @@ fn stream_file_into_acc(
         return Ok(());
     }
     let frames: &[TickFrame] = bytemuck::cast_slice(&mmap[..n_frames * rec_size]);
-    fold_ticks(
-        spread.push_all(frames),
-        provider_id,
-        acc,
-        stats,
-        log,
-        next_cycle_ms,
-        last_tick_ms,
-        ingested,
-        rejected,
-        records_written,
-        z_threshold,
-        cycle_ms,
-        window,
-    )
+    // One chunk at a time: memory stays bounded whatever the file size.
+    for chunk in frames.chunks(FOLD_CHUNK) {
+        fold_ticks(
+            spread.push_all(chunk),
+            provider_id,
+            acc,
+            stats,
+            log,
+            next_cycle_ms,
+            last_tick_ms,
+            ingested,
+            rejected,
+            records_written,
+            z_threshold,
+            cycle_ms,
+            window,
+        )?;
+    }
+    Ok(())
 }
+
+/// Frames folded per step.
+const FOLD_CHUNK: usize = 65_536;
 
 /// Fold ticks (`(epoch_ms, tick)`, in time order) into the accumulator, one
 /// record per cycle, inside the window.
