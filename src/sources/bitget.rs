@@ -21,10 +21,11 @@ pub fn venue(config: &Config) -> Result<Option<Venue>> {
         (true, "USDC") => ("CMCBL", format!("{base}PERP")),
         (true, _) => return Ok(None),
     };
-    Venue::new("bitget", perp, sym, FILES, row).map(|v| Some(v.with_product(product)))
+    Venue::new("bitget", perp, sym, FILES, row)
+        .map(|v| Some(v.with_product(product).with_ts_res(1_000_000)))
 }
 
-/// trade_id, timestamp (ms), price, side, volume(quote), size(base).
+/// trade_id, timestamp (whole seconds, in ms), price, side, volume(quote), size(base).
 fn row(r: &csv::StringRecord) -> Option<Row> {
     Some(Row {
         us: ms_to_us(field(r, 1)?),

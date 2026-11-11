@@ -135,39 +135,39 @@ mod tests {
     /// venue x market: (name, constructor, quote, base units per CSV size unit,
     /// the venue's real CSV carrying the same trades).
     ///
-    /// The trades are: buy 0.01 BTC @ 50000.0 at 1700000000.123, sell 0.02 BTC
-    /// @ 50010.5 at 1700000001.456, and a short/garbage row (plus the header row
+    /// The trades are: buy 0.01 BTC @ 50000.0 at 1700000000.5, sell 0.02 BTC
+    /// @ 50010.5 at 1700000001.5, and a short/garbage row (plus the header row
     /// where the venue ships one).
     #[rustfmt::skip]
     const CASES: [(&str, VenueFn, &str, f64, &str); 9] = [
         ("binance", binance::venue, "USDT", 1.0,
          "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker\n\
-          1,50000.0,0.01,1,1,1700000000123,false\n2,50010.5,0.02,2,2,1700000001456,true\n3,500"),
+          1,50000.0,0.01,1,1,1700000000500,false\n2,50010.5,0.02,2,2,1700000001500,true\n3,500"),
         ("binance", binance::venue, "USDT:PERP", 1.0,
-         "1,50000.0,0.01,1,1,1700000000123,false\n2,50010.5,0.02,2,2,1700000001456,true\n3,500"),
+         "1,50000.0,0.01,1,1,1700000000500,false\n2,50010.5,0.02,2,2,1700000001500,true\n3,500"),
         ("bybit", bybit::venue, "USDT", 1.0,
-         "id,timestamp,price,volume,side\n1,1700000000123,50000.0,0.01,buy\n\
-          2,1700000001456,50010.5,0.02,sell\n3,17000"),
+         "id,timestamp,price,volume,side\n1,1700000000500,50000.0,0.01,buy\n\
+          2,1700000001500,50010.5,0.02,sell\n3,17000"),
         ("bybit", bybit::venue, "USDT:PERP", 1.0,
          "timestamp,symbol,side,size,price,tickDirection\n\
-          1700000000.123,BTCUSDT,Buy,0.01,50000.0,PlusTick\n\
-          1700000001.456,BTCUSDT,Sell,0.02,50010.5,MinusTick\n1700000002.5,BTCUSDT,Buy"),
+          1700000000.5,BTCUSDT,Buy,0.01,50000.0,PlusTick\n\
+          1700000001.5,BTCUSDT,Sell,0.02,50010.5,MinusTick\n1700000002.5,BTCUSDT,Buy"),
         ("okx", okx::venue, "USDT", 1.0,
          "instrument_name,trade_id,side,price,size,created_time\n\
-          BTC-USDT,1,buy,50000.0,0.01,1700000000123\nBTC-USDT,2,sell,50010.5,0.02,1700000001456\n\
+          BTC-USDT,1,buy,50000.0,0.01,1700000000500\nBTC-USDT,2,sell,50010.5,0.02,1700000001500\n\
           BTC-USDT,3,buy,5"),
         ("okx", okx::venue, "USDT:PERP", 0.01,
          "instrument_name,trade_id,side,price,size,created_time\n\
-          BTC-USDT-SWAP,1,buy,50000.0,1,1700000000123\n\
-          BTC-USDT-SWAP,2,sell,50010.5,2,1700000001456\nBTC-USDT-SWAP,3,buy,5"),
+          BTC-USDT-SWAP,1,buy,50000.0,1,1700000000500\n\
+          BTC-USDT-SWAP,2,sell,50010.5,2,1700000001500\nBTC-USDT-SWAP,3,buy,5"),
         ("bitget", bitget::venue, "USDT", 1.0,
          "trade_id,timestamp,price,side,volume(quote),size(base)\n\
-          1,1700000000123,50000.0,buy,500.0,0.01\n2,1700000001456,50010.5,sell,1000.21,0.02\n3,17000"),
+          1,1700000000000,50000.0,buy,500.0,0.01\n2,1700000001000,50010.5,sell,1000.21,0.02\n3,17000"),
         ("bitget", bitget::venue, "USDT:PERP", 1.0,
          "trade_id,timestamp,price,side,volume(quote),size(base)\n\
-          1,1700000000123,50000.0,buy,500.0,0.01\n2,1700000001456,50010.5,sell,1000.21,0.02\n3,17000"),
+          1,1700000000000,50000.0,buy,500.0,0.01\n2,1700000001000,50010.5,sell,1000.21,0.02\n3,17000"),
         ("gateio", gateio::venue, "USDT:PERP", 0.0001,
-         "timestamp,id,price,size\n1700000000.123,1,50000.0,100\n1700000001.456,2,50010.5,-200\n\
+         "timestamp,id,price,size\n1700000000.5,1,50000.0,100\n1700000001.5,2,50010.5,-200\n\
           1700000002.5,3"),
     ];
 
@@ -182,12 +182,12 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-            let t = csv_ticks(csv.as_bytes(), 7, name, scale, v.row).unwrap();
+            let t = csv_ticks(csv.as_bytes(), 7, &v, scale).unwrap();
             let id = format!("{name} {quote}");
             assert_eq!(t.len(), 2, "{id}: header and short rows are skipped");
             let want = [
-                (1_700_000_000_123, 50000.0, true, 500),
-                (1_700_000_001_456, 50010.5, false, 1000),
+                (1_700_000_000_500, 50000.0, true, 500),
+                (1_700_000_001_500, 50010.5, false, 1000),
             ];
             for (tick, (ms, px, buy, vol)) in t.iter().zip(want) {
                 let b = tick.body;

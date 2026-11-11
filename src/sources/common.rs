@@ -129,6 +129,11 @@ pub struct Venue {
     pub row: RowFn,
     /// Bitget's `{product}` path segment (UMCBL / CMCBL); empty elsewhere.
     pub product: &'static str,
+    /// Resolution (us) of the venue's timestamps when coarser than a millisecond
+    /// (Bitget stamps whole seconds); 0 otherwise. Trades sharing a stamp are
+    /// spread evenly across that interval instead of all landing at its start,
+    /// which would lead the true time by up to the resolution.
+    pub ts_res_us: u64,
     /// Public REST endpoint + extractor for the base units per contract.
     pub contract: Option<(String, Extract)>,
 }
@@ -160,8 +165,14 @@ impl Venue {
             stems,
             row,
             product: "",
+            ts_res_us: 0,
             contract: None,
         })
+    }
+
+    pub fn with_ts_res(mut self, us: u64) -> Self {
+        self.ts_res_us = us;
+        self
     }
 
     pub fn with_product(mut self, product: &'static str) -> Self {
@@ -407,15 +418,12 @@ async fn rest_json(agent: &Arc<btr_rpc::Http>, url: &str) -> Result<serde_json::
 }
 
 /// Does the archive object exist? 404/403 = no; any other failure is an error
-/// (unknown), never a "no".
+/// (unknown), never a "no". A streamed GET whose body is dropped unread: some
+/// CDNs answer HEAD with the whole body, which the client refuses over its cap.
 async fn head_exists(agent: &Arc<btr_rpc::Http>, url: &str) -> Result<bool> {
     let r = with_retry(BACKOFF, url, || async {
-        let reply = agent.send(reqwest::Method::HEAD, url, &[], None).await?;
-        anyhow::ensure!(
-            (200..300).contains(&reply.status),
-            "{url}: HTTP {}",
-            reply.status
-        );
+        let (status, _body) = agent.get_stream(url, &[]).await?;
+        anyhow::ensure!((200..300).contains(&status), "{url}: HTTP {status}");
         Ok(true)
     })
     .await;
@@ -492,41 +500,50 @@ pub fn honest_tick(ticker_id: u64, price: f64, volume: u32, is_buyer: bool) -> T
 /// `price * size * scale` (`scale` = base units per contract), truncated to whole
 /// quote units, at least 1 (a trade is never sizeless: a cycle of only sub-unit
 /// trades must not read as a zero-depth phantom quote) and saturating at `u32::MAX`.
-pub fn csv_ticks(
-    csv_data: &[u8],
-    ticker_id: u64,
-    provider: &str,
-    scale: f64,
-    row: RowFn,
-) -> Result<Vec<TickFrame>> {
+pub fn csv_ticks(csv_data: &[u8], ticker_id: u64, v: &Venue, scale: f64) -> Result<Vec<TickFrame>> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true) // column counts vary (Bybit `RPI`)
         .from_reader(std::io::Cursor::new(csv_data));
-    let pid = provider_id_for(provider);
-    let mut ticks = Vec::new();
+    let pid = provider_id_for(v.name);
+    let mut rows = Vec::new();
     let mut r = csv::StringRecord::new();
     while rdr.read_record(&mut r)? {
-        let Some(Row {
-            us,
-            price,
-            size,
-            buyer,
-        }) = row(&r)
-        else {
+        let Some(row) = (v.row)(&r) else {
             continue;
         };
-        let notional = price * size * scale;
-        if !(price.is_finite() && price > 0.0 && notional.is_finite() && notional >= 0.0) {
-            continue;
+        let notional = row.price * row.size * scale;
+        if row.price.is_finite() && row.price > 0.0 && notional.is_finite() && notional >= 0.0 {
+            rows.push((row, notional));
         }
-        ticks.push(TickFrame::new(
-            pid,
-            mitch::timestamp::from_epoch_us(us),
-            honest_tick(ticker_id, price, (notional as u32).max(1), buyer),
-        ));
     }
-    Ok(ticks)
+    if v.ts_res_us > 0 {
+        spread_stamps(&mut rows, v.ts_res_us);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|(row, notional)| {
+            TickFrame::new(
+                pid,
+                mitch::timestamp::from_epoch_us(row.us),
+                honest_tick(ticker_id, row.price, (notional as u32).max(1), row.buyer),
+            )
+        })
+        .collect())
+}
+
+/// Spread each run of rows sharing one stamp evenly over `[stamp, stamp + res)`,
+/// in file order, each at the middle of its slot.
+fn spread_stamps(rows: &mut [(Row, f64)], res: u64) {
+    let mut i = 0;
+    while i < rows.len() {
+        let us = rows[i].0.us;
+        let n = rows[i..].iter().take_while(|(r, _)| r.us == us).count();
+        for (k, (row, _)) in rows[i..i + n].iter_mut().enumerate() {
+            row.us = us + (2 * k as u64 + 1) * res / (2 * n as u64);
+        }
+        i += n;
+    }
 }
 
 /// Epoch ms (a microsecond input is normalised to ms first) -> epoch microseconds.
@@ -966,7 +983,7 @@ impl Net for Live {
             cache,
             self.ticker_id,
             compression,
-            &|c, t| csv_ticks(c, t, v.name, scale, v.row),
+            &|c, t| csv_ticks(c, t, v, scale),
         )
         .await
     }
@@ -1510,6 +1527,7 @@ mod tests {
             },
             row: |_| None,
             product: "",
+            ts_res_us: 0,
             contract: None,
         }
     }
@@ -1695,6 +1713,39 @@ mod tests {
         assert!(probe_archive(&flaky, &v, from, to, today).await.is_err());
     }
 
+    /// Trades sharing a coarse stamp are spread over it, in order, mid-slot.
+    #[test]
+    fn coarse_stamps_are_spread_over_their_interval() {
+        let v = Venue {
+            name: "binance",
+            row: |r| {
+                Some(Row {
+                    us: ms_to_us(field(r, 0)?),
+                    price: 100.0,
+                    size: 1.0,
+                    buyer: true,
+                })
+            },
+            ..venue(BOTH).with_ts_res(1_000_000)
+        };
+        let t = csv_ticks(
+            b"1700000000000\n1700000000000\n1700000000000\n1700000000000\n1700000001000\n",
+            7,
+            &v,
+            1.0,
+        )
+        .unwrap();
+        let ms: Vec<i64> = t.iter().map(|f| f.timestamp_ms()).collect();
+        let want: Vec<i64> = [125, 375, 625, 875, 1500]
+            .iter()
+            .map(|d| 1_700_000_000_000 + d)
+            .collect();
+        assert!(
+            ms.iter().zip(&want).all(|(a, b)| (a - b).abs() <= 1),
+            "{ms:?}"
+        );
+    }
+
     /// Placeholders expand identically in stems and file names.
     #[test]
     fn placeholders_expand() {
@@ -1722,13 +1773,17 @@ mod tests {
     /// negative sizes and non-finite timestamps never become ticks.
     #[test]
     fn non_finite_and_invalid_fields_are_rejected() {
-        let row: RowFn = |r| {
-            Some(Row {
-                us: secs_to_us(field(r, 0)?)?,
-                price: field(r, 1)?,
-                size: field(r, 2)?,
-                buyer: true,
-            })
+        let v = Venue {
+            name: "binance",
+            row: |r| {
+                Some(Row {
+                    us: secs_to_us(field(r, 0)?)?,
+                    price: field(r, 1)?,
+                    size: field(r, 2)?,
+                    buyer: true,
+                })
+            },
+            ..venue(BOTH)
         };
         let csv = "1700000000.5,100,1\n\
                    inf,100,1\n\
@@ -1742,10 +1797,10 @@ mod tests {
                    1700000000.5,100,-1\n\
                    1700000000.5,100,1e400\n\
                    1700000000.5,1e308,1e308\n";
-        let t = csv_ticks(csv.as_bytes(), 7, "binance", 1.0, row).unwrap();
+        let t = csv_ticks(csv.as_bytes(), 7, &v, 1.0).unwrap();
         assert_eq!(t.len(), 1, "only the first row is valid");
         assert_eq!({ t[0].body.vask }, 100);
-        let t = csv_ticks(b"1700000000.5,100,0.001\n", 7, "binance", 1.0, row).unwrap();
+        let t = csv_ticks(b"1700000000.5,100,0.001\n", 7, &v, 1.0).unwrap();
         assert_eq!(
             { t[0].body.vask },
             1,
