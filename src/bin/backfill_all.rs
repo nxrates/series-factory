@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! backfill-all /etc/nxr/config.yml --tickers native --from "365 days ago" \
-//!   --to today --resume --parallel 2 --min-free-gib 120 --out-dir /data
+//!   --to today --parallel 2 --min-free-gib 120 --out-dir /data
 //! ```
 //!
 //! `--tickers native` is the CEX subscription manifest ∪ the oracle symbol
@@ -26,7 +26,8 @@
 //!   skip a ticker entirely if no exchange has coverage
 //! - merge / s10 / renko emit daily shards; validate iterates shards via
 //!   `integrity-check` per shard (best-effort)
-//! - resume logic checks manifest sha256 + existence per shard
+//! - lazy: a day whose composite/s10 shard is on disk is never rebuilt, and its
+//!   sources are never refetched (`--rebuild` overrides)
 //!
 //! Bins are discovered via `$PATH` (k8s container installs them under
 //! `/usr/local/bin`). For each (ticker, step) we record start, duration,
@@ -93,9 +94,14 @@ struct Args {
     /// independently bounds concurrent heavy subprocesses for RAM.
     #[arg(long, default_value_t = 2)]
     parallel: usize,
-    /// Skip steps whose output exists and passes integrity-check.
-    #[arg(long)]
+    /// Accepted and ignored: reruns are always lazy (see `--rebuild`).
+    #[arg(long, hide = true)]
     resume: bool,
+    /// Rebuild every day, even days whose composite shard, `.s10` and `.renko`
+    /// are already on disk. By default nothing already on disk is fetched or
+    /// rebuilt again.
+    #[arg(long)]
+    rebuild: bool,
     /// Output data root (contains ticks/, indexes/, bars/, vol/).
     #[arg(long, default_value = "/data")]
     out_dir: PathBuf,
@@ -105,18 +111,13 @@ struct Args {
     /// Print plan and exit.
     #[arg(long)]
     dry_run: bool,
-    /// SINGLE escape-hatch for raw-tick / per-provider-`.idx` purge. Default
-    /// OFF ⇒ purge-as-you-go is ON: t2i deletes each `.ticks` the instant it
-    /// folds it (file-granular) AND `cleanup_ticker_staging` drops the raw dir
-    /// + per-provider `indexes/<exch>/<BASE>-<QUOTE>.idx` once the composite is
-    /// built+validated. The composite `.idx` is self-sufficient (s10 / renko /
-    /// integrity-check all read it, never the raw staging); retaining staging
-    /// after a 31-pair × 5y backfill is what overran the data PVC.
-    ///
-    /// Set `--keep-staging` to retain ALL raw `.ticks` + per-provider `.idx`
-    /// for forensic re-merges. It is the ONLY purge knob — the old separate
-    /// `--cleanup` flag was folded into this one (two flags gating one
-    /// behaviour was the redundancy). Do NOT set in production backfill jobs.
+    /// Keep the sources of each month (raw `.ticks`, per-provider `.idx`) after
+    /// its composite shards are built. Default OFF: they are deleted as soon as
+    /// the composite is built and listed, so peak disk is about one month of
+    /// every venue. The composite `.idx` is self-sufficient (s10 / renko /
+    /// integrity-check read it, never the sources). With the flag, only the last
+    /// processed month's per-provider `.idx` survive (each month starts them
+    /// fresh); raw `.ticks` all stay. For audits; not for production backfills.
     #[arg(long, default_value_t = false)]
     keep_staging: bool,
     /// Skip availability probe (pre-fetch HEAD check). Useful for synthetic
@@ -361,22 +362,6 @@ fn run_step(ticker: &str, bin: &str, args: &[String], out_path: Option<&Path>) -
     }
 }
 
-fn integrity_clean(file: &Path, kind: &str) -> bool {
-    if !file.exists() {
-        return false;
-    }
-    let out = Command::new("integrity-check")
-        .args([kind, file.to_string_lossy().as_ref(), "--json"])
-        .output();
-    // exit 0 = clean, 1 = warnings only (e.g. sparse ticker w/ >60s gaps —
-    // legitimate for stablecoins like USDS/USDe/USDG/PYUSD; not a real error).
-    // exit 2 = errors. Treat 0+1 as clean, only 2 as broken.
-    match out {
-        Ok(o) => matches!(o.status.code(), Some(0) | Some(1)),
-        Err(_) => false,
-    }
-}
-
 // ── Progress markers ─────────────────────────────────────────────────────────
 
 fn progress_dir(out_dir: &Path) -> PathBuf {
@@ -493,39 +478,6 @@ fn sweep_partial_ticks(out_dir: &Path) -> u64 {
     freed
 }
 
-/// Startup orphan sweep: for every planned (ticker × exchange), if the composite
-/// `indexes/<MITCH-ID>/manifest.json` already exists (the ticker is fully built),
-/// the raw `ticks/<exch>/<BASE><QUOTE>` staging is dead weight from a prior
-/// interrupted or killed run. Delete it. Never touches the composite `.idx`,
-/// bars, `.vol`, or any manifest. Returns bytes freed.
-fn sweep_orphaned_staging(out_dir: &Path, tickers: &[String], exchanges: &[String]) -> u64 {
-    let mut freed = 0u64;
-    for t in tickers {
-        let (base, quote) = match nxr_sdk::split_pair_multi(t, &['/', '-']) {
-            Some((b, q)) => (b.to_uppercase(), q.to_uppercase()),
-            None => continue,
-        };
-        let ticker_id = nxr_sdk::resolve_ticker_id(&format!("{}/{}", base, quote));
-        let manifest = nxr_sdk::shard::idx_dir(out_dir, ticker_id).join("manifest.json");
-        if !manifest.exists() {
-            continue; // ticker not yet built → its staging may be live; keep.
-        }
-        freed += delete_month_raw_ticks(out_dir, exchanges, &base, &quote);
-        // Also drop the now-redundant per-exch .idx (the composite supersedes it).
-        for ex in exchanges {
-            let per_idx = out_dir
-                .join("indexes")
-                .join(ex)
-                .join(format!("{}-{}.idx", base, quote));
-            if per_idx.exists() {
-                freed += file_bytes(&per_idx);
-                let _ = fs::remove_file(&per_idx);
-            }
-        }
-    }
-    freed
-}
-
 /// Free bytes available on the filesystem backing `path`, via `statvfs(3)`.
 /// Returns `None` if the syscall fails.
 fn free_bytes(path: &Path) -> Option<u64> {
@@ -613,6 +565,32 @@ fn preflight_disk_guard(
 }
 
 // ── Per-ticker pipeline ──────────────────────────────────────────────────────
+
+/// Days of `[from, to]` whose composite `.idx` shard is not yet done (all of
+/// them under `--rebuild`).
+fn todo_days(dir: &Path, from: NaiveDate, to: NaiveDate, rebuild: bool) -> Vec<NaiveDate> {
+    let rec = std::mem::size_of::<nxr_sdk::IndexRecord>() as u64;
+    if rebuild {
+        return from.iter_days().take_while(|d| *d <= to).collect();
+    }
+    series_factory::sharding::days_todo(dir, "idx", rec, from, to)
+}
+
+/// Dates of the `<date>.<kind>` shards in `dir`.
+fn list_days(dir: &Path, kind: &str) -> Vec<NaiveDate> {
+    let suffix = format!(".{kind}");
+    let mut days: Vec<NaiveDate> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(&suffix)?.parse().ok()
+        })
+        .collect();
+    days.sort_unstable();
+    days
+}
 
 struct PlanCtx {
     args: Args,
@@ -846,55 +824,6 @@ fn probe_availability(
     (result, active)
 }
 
-/// Delete a ticker's raw exchange staging once its composite `.idx` is built
-/// and validated. `ticks/<exch>/<BASE><QUOTE>/` and the per-provider
-/// `indexes/<exch>/<BASE>-<QUOTE>.idx` are fully consumed by `merge-idx` — the
-/// downstream s10 / renko / integrity steps all read the composite `.idx`,
-/// never the raw staging. Purging per-ticker here (rather than once at the end
-/// of the whole batch) keeps the data volume bounded: a 13-ticker x 2y backfill
-/// otherwise accumulates every ticker's raw ticks until the batch finishes,
-/// which overran the 500Gi volume.
-fn cleanup_ticker_staging(
-    out_dir: &std::path::Path,
-    exchanges: &[String],
-    base: &str,
-    quote: &str,
-) -> StepReport {
-    let start = Instant::now();
-    let mut removed_bytes: u64 = 0;
-    let mut errors: Vec<String> = Vec::new();
-    for ex in exchanges {
-        let ticks_dir = out_dir
-            .join("ticks")
-            .join(ex)
-            .join(format!("{}{}", base, quote));
-        if ticks_dir.exists() {
-            removed_bytes += dir_bytes(&ticks_dir);
-            if let Err(e) = fs::remove_dir_all(&ticks_dir) {
-                errors.push(format!("rm -r {}: {}", ticks_dir.display(), e));
-            }
-        }
-        let per_idx = out_dir
-            .join("indexes")
-            .join(ex)
-            .join(format!("{}-{}.idx", base, quote));
-        if per_idx.exists() {
-            removed_bytes += file_bytes(&per_idx);
-            if let Err(e) = fs::remove_file(&per_idx) {
-                errors.push(format!("rm {}: {}", per_idx.display(), e));
-            }
-        }
-    }
-    StepReport {
-        name: "cleanup-staging".to_string(),
-        duration_ms: start.elapsed().as_millis(),
-        exit_code: if errors.is_empty() { 0 } else { 1 },
-        bytes: removed_bytes,
-        skipped: false,
-        errors,
-    }
-}
-
 fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     let (base, quote) = match nxr_sdk::split_pair_multi(ticker, &['/', '-'])
         .map(|(b, q)| (b.to_string(), q.to_string()))
@@ -1019,42 +948,36 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         info!(ticker, active_exchanges = ?active_exchanges, "availability check ok");
     }
 
-    // 1+2) fetch + t2i — DELETE-AS-YOU-GO at FILE granularity.
+    // 1-3) Per month window: fetch -> t2i -> merge -> dispose.
     //
-    // Previously fetch downloaded the WHOLE [from,to) range of raw `.ticks` for
-    // every exchange up-front, and t2i folded them afterwards — so for a 2y x
-    // n-exch backfill the full raw range coexisted on the PVC per ticker (peak
-    // ≈ range × n_exch). That overran the data volume. A first fix bounded it
-    // to ~1 month via a per-month batch delete; deleting as we go removes even
-    // that batch-level peak.
+    // LAZY: a day is done when its composite `.idx` shard is in the manifest and
+    // on disk exactly as recorded (`days_todo`). A month whose days are all done
+    // is skipped outright, whether or not its raw archives or per-provider `.idx`
+    // still exist: a finished composite never triggers a refetch. Otherwise only
+    // the first..last missing day of the month is fetched, folded and merged.
     //
-    // We still iterate per calendar month so fetch never runs more than ~1
-    // month ahead of t2i, but the disk bound is now FILE-granular: t2i runs
-    // with `--delete-after-convert`, removing each `.ticks` the instant it has
-    // been folded into the per-exch `.idx`. So peak raw on disk ≈ 1 archive
-    // file per exchange in flight (the one t2i is currently folding + at most
-    // the one fetch is currently writing), NEVER a whole month or range.
-    //   for each month M in [from,to]:
-    //     fetch-crypto-history --from-date M.start --to-date M.end  (all exch)
-    //     ticks-to-idx <exch> --delete-after-convert  (folds + deletes per file)
-    //     defensive delete of any raw t2i could not remove  (before next month)
+    // BOUNDED: the sources of a month (raw `.ticks`, per-provider `.idx`) are
+    // deleted the moment its composite shards are built and listed, so peak disk
+    // is about one month of every venue, never the whole window. t2i also
+    // deletes each `.ticks` as it folds it. `--keep-staging` keeps them.
     //
-    // t2i's AppendLog::open_buffered appends, and it discovers the .ticks files
-    // present in the dir at call time (ticks_to_idx.rs:136,275), so per-month
-    // invocation composes into one cumulative .idx. The TDWAP accumulator
-    // restarts at each month's first tick; the only artifact is that a single
-    // ≤cycle_ms aggregation cycle straddling a month boundary is split — a
-    // sub-200ms effect on contiguous months, negligible vs the disk win.
-    //
-    // --resume: if the per-exch .idx already exists + integrity-clean for all
-    // active exchanges, skip the whole fetch+t2i loop (preserves prior resume
-    // semantics via the same integrity gate). Otherwise we rebuild fresh: any
-    // stale/partial per-exch .idx is removed first so months are not appended
-    // on top of a half-built log (which would duplicate records). Because t2i
-    // fdatasync-flushes the .idx before deleting each raw file, a crash leaves
-    // the .idx ⊇ every deleted file's records; the fresh-build path then
-    // re-fetches the whole window from empty, so resume never double-counts.
-    if want("fetch") || want("t2i") {
+    // Each month folds cold (the per-provider and composite accumulators restart
+    // at the month's first record); the only artifact is the first seconds of a
+    // month blending just the venues that have traded so far.
+    let fail = |steps: Vec<StepReport>| -> TickerReport {
+        ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
+        ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+        write_marker(&ctx.args.out_dir, ticker, "failed");
+        TickerReport {
+            ticker: ticker.to_string(),
+            status: "failed".to_string(),
+            steps,
+            ticker_availability: availability.clone(),
+            skip_reason: None,
+        }
+    };
+    let mut rebuilt: Vec<NaiveDate> = Vec::new();
+    if want("fetch") || want("t2i") || want("merge") {
         let per_idx_paths: Vec<PathBuf> = active_exchanges
             .iter()
             .map(|ex| {
@@ -1064,328 +987,241 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     .join(format!("{}-{}.idx", base, quote))
             })
             .collect();
+        // Today's shard belongs to the live writer and is never complete.
+        let last_day = ctx.to.min(Utc::now().date_naive() - chrono::Duration::days(1));
+        let (mut fetch_ms, mut merge_ms) = (0u128, 0u128);
+        let mut t2i_ms: BTreeMap<String, u128> = BTreeMap::new();
+        let (mut fetch_err, mut t2i_err, mut merge_err) = (Vec::new(), Vec::new(), Vec::new());
+        let mut months_run = 0usize;
+        let mut hard_fail = false;
 
-        // Resume gate: all per-exch .idx already clean ⇒ skip fetch+t2i entirely.
-        let all_clean = ctx.args.resume
-            && want("t2i")
-            && !per_idx_paths.is_empty()
-            && per_idx_paths.iter().all(|p| integrity_clean(p, "idx"));
-
-        if all_clean {
-            for (ex, p) in active_exchanges.iter().zip(&per_idx_paths) {
-                steps_out.push(StepReport {
-                    name: format!("ticks-to-idx[{}]", ex),
-                    duration_ms: 0,
-                    exit_code: 0,
-                    bytes: file_bytes(p),
-                    skipped: true,
-                    errors: Vec::new(),
-                });
-            }
-            // Defensive: drop any orphaned raw from a prior interrupted run.
-            if !ctx.args.keep_staging {
-                delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
-            }
-        } else {
-            // Fresh build: remove any stale per-exch .idx so monthly appends
-            // start from empty (no record duplication on re-run).
-            if want("t2i") {
-                for p in &per_idx_paths {
-                    if p.exists() {
-                        let _ = fs::remove_file(p);
-                    }
-                }
+        'months: for (m_start, m_end) in month_windows(ctx.from, ctx.to) {
+            let todo = todo_days(&composite_dir, m_start, m_end.min(last_day), ctx.args.rebuild);
+            let (Some(&lo), Some(&hi)) = (todo.first(), todo.last()) else {
+                continue;
+            };
+            months_run += 1;
+            let (lo_s, hi_s) = (lo.to_string(), hi.to_string());
+            // A leftover per-provider `.idx` is from an interrupted run: refold.
+            for p in &per_idx_paths {
+                let _ = fs::remove_file(p);
             }
 
-            let windows = month_windows(ctx.from, ctx.to);
-            let mut fetch_ms: u128 = 0;
-            let mut fetch_err: Vec<String> = Vec::new();
-            let mut t2i_ms: BTreeMap<String, u128> = BTreeMap::new();
-            let mut t2i_err: Vec<String> = Vec::new();
-            let mut total_freed: u64 = 0;
-            let mut hard_fail = false;
-
-            'months: for (m_start, m_end) in &windows {
-                let m_start_s = m_start.format("%Y-%m-%d").to_string();
-                let m_end_s = m_end.format("%Y-%m-%d").to_string();
-
+            if pyth_only && want("pyth") {
                 // Oracle-sourced ticker: Pyth Lazer history is the only source
                 // (no CEX book exists), and it emits `.ticks` in the SAME shape
                 // fetch-crypto-history does, so everything downstream is
                 // unchanged. 1-minute resolution is the floor Pyth serves.
-                if pyth_only && want("pyth") {
-                    let args = vec![
-                        base.clone(),
-                        "--quote".to_string(),
-                        quote.clone(),
-                        "--from-unix".to_string(),
-                        m_start
-                            .and_hms_opt(0, 0, 0)
-                            .map(|d| d.and_utc().timestamp())
-                            .unwrap_or(0)
-                            .to_string(),
-                        "--to-unix".to_string(),
-                        m_end
-                            .and_hms_opt(23, 59, 59)
-                            .map(|d| d.and_utc().timestamp())
-                            .unwrap_or(0)
-                            .to_string(),
-                    ];
-                    let rep = run_step(ticker, "fetch-pyth-history", &args, None);
-                    fetch_ms += rep.duration_ms;
-                    if rep.exit_code == -1 {
-                        fetch_err.extend(rep.errors.clone());
-                        hard_fail = true;
-                        break 'months;
-                    }
+                let unix = |d: NaiveDate, h, m, s| {
+                    d.and_hms_opt(h, m, s)
+                        .map(|t| t.and_utc().timestamp())
+                        .unwrap_or(0)
+                        .to_string()
+                };
+                let args = vec![
+                    base.clone(),
+                    "--quote".to_string(),
+                    quote.clone(),
+                    "--from-unix".to_string(),
+                    unix(lo, 0, 0, 0),
+                    "--to-unix".to_string(),
+                    unix(hi, 23, 59, 59),
+                ];
+                let rep = run_step(ticker, "fetch-pyth-history", &args, None);
+                fetch_ms += rep.duration_ms;
+                if rep.exit_code == -1 {
+                    fetch_err.extend(rep.errors.clone());
+                    hard_fail = true;
+                    break 'months;
                 }
-
-                // fetch this month (all active exchanges)
-                if want("fetch") && !pyth_only {
-                    let args = vec![
-                        cfg.clone(),
-                        "--pairs".to_string(),
-                        base.clone(),
-                        "--exchanges".to_string(),
-                        active_exchanges.join(","),
-                        "--quote".to_string(),
-                        quote.clone(),
-                        "--from-date".to_string(),
-                        m_start_s.clone(),
-                        "--to-date".to_string(),
-                        m_end_s.clone(),
-                    ];
-                    let rep = run_step(ticker, "fetch-crypto-history", &args, None);
-                    fetch_ms += rep.duration_ms;
-                    // A whole-month fetch failure is non-fatal here: some
-                    // exchanges legitimately lack a given month (sparse new
-                    // pairs). t2i soft-skips empty dirs; merge uses whatever
-                    // landed. Only a hard spawn failure (exit -1) tanks.
-                    if rep.exit_code == -1 {
-                        fetch_err.extend(rep.errors.clone());
-                        hard_fail = true;
-                        break 'months;
-                    } else if rep.exit_code != 0 {
-                        fetch_err.push(format!(
-                            "{}: monthly fetch exit {}",
-                            m_start_s, rep.exit_code
-                        ));
-                    }
+            } else if want("fetch") {
+                let args = vec![
+                    cfg.clone(),
+                    "--pairs".to_string(),
+                    base.clone(),
+                    "--exchanges".to_string(),
+                    active_exchanges.join(","),
+                    "--quote".to_string(),
+                    quote.clone(),
+                    "--from-date".to_string(),
+                    lo_s.clone(),
+                    "--to-date".to_string(),
+                    hi_s.clone(),
+                ];
+                let rep = run_step(ticker, "fetch-crypto-history", &args, None);
+                fetch_ms += rep.duration_ms;
+                // A whole-month fetch failure is non-fatal here: some exchanges
+                // legitimately lack a month (sparse new pairs); t2i soft-skips
+                // empty dirs and merge uses whatever landed. Only a spawn failure
+                // (exit -1) tanks.
+                if rep.exit_code == -1 {
+                    fetch_err.extend(rep.errors.clone());
+                    hard_fail = true;
+                    break 'months;
+                } else if rep.exit_code != 0 {
+                    fetch_err.push(format!("{lo_s}..{hi_s}: fetch exit {}", rep.exit_code));
                 }
+            }
 
-                // fold this month into each per-exch .idx (parallel across exch)
-                if want("t2i") {
-                    // delete-as-you-go: unless the operator asked to retain raw
-                    // (`--keep-staging`), t2i deletes each `.ticks` the instant
-                    // it folds it into the `.idx`, so peak raw never exceeds ~1
-                    // file per exchange in flight (true file-granular cleanup,
-                    // not a post-window batch delete).
-                    let delete_as_you_go = !ctx.args.keep_staging;
-                    let reps: Vec<(String, StepReport)> = active_exchanges
-                        .par_iter()
-                        .map(|ex| {
-                            let per_idx = out_dir
-                                .join("indexes")
-                                .join(ex)
-                                .join(format!("{}-{}.idx", base, quote));
-                            let mut args = vec![
-                                ex.clone(),
-                                base.clone(),
-                                quote.clone(),
-                                "--cycle-ms".to_string(),
-                                cycle_ms.clone(),
-                                "--from-date".to_string(),
-                                m_start_s.clone(),
-                                "--to-date".to_string(),
-                                m_end_s.clone(),
-                            ];
-                            if delete_as_you_go {
-                                args.push("--delete-after-convert".to_string());
-                            }
-                            let rep = run_step(ticker, "ticks-to-idx", &args, Some(&per_idx));
-                            (ex.clone(), rep)
-                        })
-                        .collect();
-                    for (ex, rep) in reps {
-                        *t2i_ms.entry(ex.clone()).or_insert(0) += rep.duration_ms;
-                        if rep.exit_code != 0 {
-                            t2i_err.push(format!(
-                                "{} [{}]: t2i exit {}",
-                                m_start_s, ex, rep.exit_code
-                            ));
-                            t2i_err.extend(rep.errors.clone());
-                            hard_fail = true;
+            if want("t2i") {
+                let reps: Vec<(String, StepReport)> = active_exchanges
+                    .par_iter()
+                    .map(|ex| {
+                        let per_idx = out_dir
+                            .join("indexes")
+                            .join(ex)
+                            .join(format!("{}-{}.idx", base, quote));
+                        let mut args = vec![
+                            ex.clone(),
+                            base.clone(),
+                            quote.clone(),
+                            "--cycle-ms".to_string(),
+                            cycle_ms.clone(),
+                            "--from-date".to_string(),
+                            lo_s.clone(),
+                            "--to-date".to_string(),
+                            hi_s.clone(),
+                        ];
+                        if !ctx.args.keep_staging {
+                            args.push("--delete-after-convert".to_string());
                         }
+                        (ex.clone(), run_step(ticker, "ticks-to-idx", &args, Some(&per_idx)))
+                    })
+                    .collect();
+                for (ex, rep) in reps {
+                    *t2i_ms.entry(ex.clone()).or_insert(0) += rep.duration_ms;
+                    if rep.exit_code != 0 {
+                        t2i_err.push(format!("{lo_s} [{ex}]: t2i exit {}", rep.exit_code));
+                        t2i_err.extend(rep.errors.clone());
+                        hard_fail = true;
                     }
                 }
-
-                // Defensive sweep: t2i with --delete-after-convert already
-                // removed each `.ticks` the instant it folded it, so the real
-                // footprint bound is ~1 file per exchange in flight. This mops
-                // up anything t2i could not delete (e.g. a file whose stream
-                // errored mid-fold and was kept for retry, or the whole step
-                // being skipped) before the next month is fetched.
-                if !ctx.args.keep_staging {
-                    total_freed += delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
-                }
-
                 if hard_fail {
                     break 'months;
                 }
             }
 
-            // Emit a single fetch + per-exch t2i StepReport summarising the loop.
-            if want("fetch") {
-                steps_out.push(StepReport {
-                    name: "fetch-crypto-history[monthly]".to_string(),
-                    duration_ms: fetch_ms,
-                    exit_code: if hard_fail && !fetch_err.is_empty() {
-                        -1
-                    } else {
-                        0
-                    },
-                    bytes: total_freed,
-                    skipped: false,
-                    errors: fetch_err,
-                });
-            }
-            if want("t2i") {
+            if want("merge") {
+                if !per_idx_paths.iter().any(|p| p.exists()) {
+                    warn!(ticker, %lo, %hi, "no exchange data in window; nothing to merge");
+                    continue;
+                }
+                let mut args = vec![
+                    base.clone(),
+                    quote.clone(),
+                    "--cycle-ms".to_string(),
+                    cycle_ms.clone(),
+                    "--from-date".to_string(),
+                    lo_s.clone(),
+                    "--to-date".to_string(),
+                    hi_s.clone(),
+                ];
                 for ex in &active_exchanges {
-                    let per_idx = out_dir
-                        .join("indexes")
-                        .join(ex)
-                        .join(format!("{}-{}.idx", base, quote));
-                    let exit_code = if t2i_err.iter().any(|e| e.contains(&format!("[{}]", ex))) {
-                        1
-                    } else {
-                        0
-                    };
-                    steps_out.push(StepReport {
-                        name: format!("ticks-to-idx[{}]", ex),
-                        duration_ms: *t2i_ms.get(ex).unwrap_or(&0),
-                        exit_code,
-                        bytes: file_bytes(&per_idx),
-                        skipped: false,
-                        errors: Vec::new(),
-                    });
+                    args.push("--exchange".to_string());
+                    args.push(ex.clone());
+                }
+                let rep = run_step(ticker, "merge-idx", &args, Some(&composite_dir));
+                merge_ms += rep.duration_ms;
+                if rep.exit_code != 0 {
+                    merge_err.extend(rep.errors.clone());
+                    hard_fail = true;
+                    break 'months;
+                }
+                // Verified = the manifest now vouches for the days it built; a
+                // day still todo had no data, and `gaps` reports it.
+                let still = todo_days(&composite_dir, lo, hi, false);
+                rebuilt.extend(todo.iter().filter(|d| !still.contains(d)));
+                if !still.is_empty() {
+                    warn!(ticker, days = ?still, "days without composite data in window");
                 }
             }
 
-            if hard_fail {
-                // P1.4: clean raw staging even on the failure path so a killed
-                // ticker doesn't orphan its raw `.ticks` forever.
-                if !ctx.args.keep_staging {
-                    steps_out.push(cleanup_ticker_staging(
-                        out_dir,
-                        &active_exchanges,
-                        &base,
-                        &quote,
-                    ));
+            // Dispose: the month's sources are no longer needed.
+            if !ctx.args.keep_staging {
+                let freed = delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
+                for p in &per_idx_paths {
+                    let _ = fs::remove_file(p);
                 }
-                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-                write_marker(&ctx.args.out_dir, ticker, "failed");
-                return TickerReport {
-                    ticker: ticker.to_string(),
-                    status: "failed".to_string(),
-                    steps: steps_out,
-                    ticker_availability: availability,
-                    skip_reason: None,
-                };
+                info!(ticker, %lo, %hi, freed_bytes = freed, "month sources disposed");
             }
         }
-    }
 
-    // 3) merge → sharded composite_dir
-    if want("merge") {
-        // resume: manifest exists + every shard hash matches recorded sha256
-        if ctx.args.resume && manifest_ok(&composite_dir, "idx") {
+        if want("fetch") {
+            steps_out.push(StepReport {
+                name: "fetch-crypto-history[monthly]".to_string(),
+                duration_ms: fetch_ms,
+                exit_code: if hard_fail && !fetch_err.is_empty() { -1 } else { 0 },
+                bytes: 0,
+                skipped: months_run == 0,
+                errors: fetch_err,
+            });
+        }
+        if want("t2i") {
+            for ex in &active_exchanges {
+                let failed = t2i_err.iter().any(|e| e.contains(&format!("[{ex}]")));
+                steps_out.push(StepReport {
+                    name: format!("ticks-to-idx[{ex}]"),
+                    duration_ms: *t2i_ms.get(ex).unwrap_or(&0),
+                    exit_code: i32::from(failed),
+                    bytes: 0,
+                    skipped: months_run == 0,
+                    errors: Vec::new(),
+                });
+            }
+        }
+        if want("merge") {
+            steps_out.push(StepReport {
+                name: "merge-idx".to_string(),
+                duration_ms: merge_ms,
+                exit_code: if merge_err.is_empty() { 0 } else { 1 },
+                bytes: dir_bytes(&composite_dir),
+                skipped: months_run == 0,
+                errors: merge_err,
+            });
+        }
+        if hard_fail {
+            return fail(steps_out);
+        }
+        if want("merge") && !manifest_ok(&composite_dir, "idx") {
             steps_out.push(StepReport {
                 name: "merge-idx".to_string(),
                 duration_ms: 0,
-                exit_code: 0,
-                bytes: dir_bytes(&composite_dir),
-                skipped: true,
-                errors: Vec::new(),
+                exit_code: 1,
+                bytes: 0,
+                skipped: false,
+                errors: vec!["no composite shards: no exchange had data in the window".into()],
             });
-        } else {
-            let args = vec![
-                base.clone(),
-                quote.clone(),
-                "--cycle-ms".to_string(),
-                cycle_ms.clone(),
-            ];
-            let rep = run_step(ticker, "merge-idx", &args, Some(&composite_dir));
-            let failed = rep.exit_code != 0;
-            steps_out.push(rep);
-            if failed {
-                // P1.4: sweep raw + per-exch .idx even on failure (never the
-                // composite/bars/.vol). Raw was already month-deleted; this
-                // mops up the per-provider .idx + any orphan.
-                if !ctx.args.keep_staging {
-                    steps_out.push(cleanup_ticker_staging(
-                        out_dir,
-                        &active_exchanges,
-                        &base,
-                        &quote,
-                    ));
-                }
-                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-                write_marker(&ctx.args.out_dir, ticker, "failed");
-                return TickerReport {
-                    ticker: ticker.to_string(),
-                    status: "failed".to_string(),
-                    steps: steps_out,
-                    ticker_availability: availability,
-                    skip_reason: None,
-                };
-            }
+            return fail(steps_out);
         }
-        // post-merge: validate each shard strictly. If any fails → ticker failed.
-        let shard_check = validate_shards(ticker, &composite_dir, "idx");
-        steps_out.push(shard_check.clone());
-        if shard_check.exit_code != 0 {
-            if !ctx.args.keep_staging {
-                steps_out.push(cleanup_ticker_staging(
-                    out_dir,
-                    &active_exchanges,
-                    &base,
-                    &quote,
-                ));
+        if want("merge") && !rebuilt.is_empty() {
+            // post-merge: validate the shards just built. Any failure fails the ticker.
+            let shard_check = validate_shards(ticker, &composite_dir, "idx", Some(&rebuilt));
+            steps_out.push(shard_check.clone());
+            if shard_check.exit_code != 0 {
+                return fail(steps_out);
             }
-            ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-            write_marker(&ctx.args.out_dir, ticker, "failed");
-            return TickerReport {
-                ticker: ticker.to_string(),
-                status: "failed".to_string(),
-                steps: steps_out,
-                ticker_availability: availability,
-                skip_reason: None,
-            };
-        }
-
-        // Composite .idx built + validated — the raw ticks/<exch> staging and
-        // per-provider .idx are now fully consumed. Purge them immediately,
-        // per-ticker, so a long multi-ticker backfill keeps the data volume
-        // bounded instead of hoarding every ticker's raw ticks until the end.
-        // Purge ON by default; the single `--keep-staging` flag opts out.
-        if !ctx.args.keep_staging {
-            steps_out.push(cleanup_ticker_staging(
-                out_dir,
-                &active_exchanges,
-                &base,
-                &quote,
-            ));
-        } else {
-            info!(ticker, "staging cleanup skipped (--keep-staging)");
         }
     }
 
-    // 4) s10 → sharded bars_dir/*.s10
+    // 4) s10 -> sharded bars_dir/*.s10. s10-from-idx leaves fresh days alone; the
+    // step is skipped outright when every day is fresh.
+    let idx_days = |dir: &Path| -> Vec<NaiveDate> {
+        list_days(dir, "idx").into_iter().filter(|d| *d >= ctx.from && *d <= ctx.to).collect()
+    };
+    let mut s10_days: Vec<NaiveDate> = Vec::new();
     if want("s10") {
-        if ctx.args.resume && manifest_ok(&bars_dir, "s10") {
+        let stale: Vec<NaiveDate> = idx_days(&composite_dir)
+            .into_iter()
+            .filter(|d| {
+                ctx.args.rebuild
+                    || !series_factory::sharding::fresh(
+                        &bars_dir.join(format!("{d}.s10")),
+                        &composite_dir.join(format!("{d}.idx")),
+                        96,
+                    )
+            })
+            .collect();
+        if stale.is_empty() {
             steps_out.push(StepReport {
                 name: "s10-from-idx".to_string(),
                 duration_ms: 0,
@@ -1399,49 +1235,48 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             // `--to-date` the regen rewrites it atomically and leaves that
             // writer appending to an unlinked inode, so the day's live bars
             // vanish until the pod restarts. Stop at yesterday, always.
-            let args = vec![
+            let mut args = vec![
                 cfg.clone(),
                 format!("{}-{}", base, quote),
                 "--to-date".to_string(),
                 (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).to_string(),
             ];
+            if ctx.args.rebuild {
+                args.push("--force".to_string());
+            }
             let rep = run_step(ticker, "s10-from-idx", &args, Some(&bars_dir));
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
-                if !ctx.args.keep_staging {
-                    steps_out.push(cleanup_ticker_staging(
-                        out_dir,
-                        &active_exchanges,
-                        &base,
-                        &quote,
-                    ));
-                }
-                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-                write_marker(&ctx.args.out_dir, ticker, "failed");
-                return TickerReport {
-                    ticker: ticker.to_string(),
-                    status: "failed".to_string(),
-                    steps: steps_out,
-                    ticker_availability: availability,
-                    skip_reason: None,
-                };
+                return fail(steps_out);
             }
+            s10_days = stale;
         }
     }
 
-    // 5) renko → sharded bars_dir/*.renko
-    // ⚠ M2 (renko-bpd-regression): this spawns `renko-from-idx`, which applies ONE
-    // live calibrated k UNIFORMLY across all history → wrong bpd in past vol regimes
-    // (1k-15k bpd vs ~300 target). The correct tool is `renko-trailing-from-idx`
-    // (per-UTC-day CAUSAL k re-calibration — see its module doc). The swap is
-    // deferred: it needs the trailing binaryâs --config/--base/--quote contract +
-    // daily-sharded output wired here AND a verification backfill run on the cluster
-    // before trusting output (data-affecting). Until done, regenerate historical
-    // renko via `renko-trailing-from-idx` explicitly, NOT this path.
+    // 5) renko -> sharded bars_dir/*.renko. Fresh when its shards are not older
+    // than the newest composite shard or the calibration they were built with.
+    let mut renko_ran = false;
     if want("renko") {
-        if ctx.args.resume && manifest_ok(&bars_dir, "renko") {
+        let newest = |dir: &Path, ext: &str| -> Option<std::time::SystemTime> {
+            fs::read_dir(dir)
+                .ok()?
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(ext))
+                .filter_map(|e| e.metadata().ok()?.modified().ok())
+                .max()
+        };
+        let oldest_renko = fs::read_dir(&bars_dir).ok().and_then(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".renko"))
+                .filter_map(|e| e.metadata().ok()?.modified().ok())
+                .min()
+        });
+        let params = fs::metadata(&nxr_sdk::NxrConfig::from_env().ticker_params_path)
+            .and_then(|m| m.modified())
+            .ok();
+        let inputs = newest(&composite_dir, ".idx").max(params);
+        if !ctx.args.rebuild && oldest_renko.is_some() && oldest_renko >= inputs {
             steps_out.push(StepReport {
                 name: "renko-from-idx".to_string(),
                 duration_ms: 0,
@@ -1455,9 +1290,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             let mut rep = run_step(ticker, "renko-from-idx", &args, Some(&bars_dir));
             // renko-from-idx exits 0 without bricks for a series with no calibrated k
             // (or inside the vol bootstrap): say so instead of reporting a quiet "ok".
-            if rep.exit_code == 0 && !fs::read_dir(&bars_dir).is_ok_and(|mut rd| {
-                rd.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().ends_with(".renko")))
-            }) {
+            if rep.exit_code == 0 && newest(&bars_dir, ".renko").is_none() {
                 let msg = "no renko shards: no calibrated k for this series or the window is inside the vol bootstrap (run nxr-calibrate, then --steps renko)";
                 warn!(ticker, "{msg}");
                 rep.errors.push(msg.to_string());
@@ -1465,51 +1298,32 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
-                if !ctx.args.keep_staging {
-                    steps_out.push(cleanup_ticker_staging(
-                        out_dir,
-                        &active_exchanges,
-                        &base,
-                        &quote,
-                    ));
-                }
-                ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-                ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-                write_marker(&ctx.args.out_dir, ticker, "failed");
-                return TickerReport {
-                    ticker: ticker.to_string(),
-                    status: "failed".to_string(),
-                    steps: steps_out,
-                    ticker_availability: availability,
-                    skip_reason: None,
-                };
+                return fail(steps_out);
             }
+            renko_ran = true;
         }
     }
 
-    // 6) validate per-shard for s10/renko + vol (best-effort: scan shard dir)
+    // 6) validate what was built this run: idx shards were checked right after
+    // the merge; s10 and renko shards are checked when their step ran.
     if want("validate") {
-        // idx already validated post-merge; re-emit for symmetry only if we
-        // didn't already run it (e.g. resume skipped merge step).
-        if !steps_out
-            .iter()
-            .any(|s| s.name == "integrity-check-shards[idx]")
-        {
-            steps_out.push(validate_shards(ticker, &composite_dir, "idx"));
+        if !s10_days.is_empty() {
+            steps_out.push(validate_shards(ticker, &bars_dir, "s10", Some(&s10_days)));
         }
-        steps_out.push(validate_shards(ticker, &bars_dir, "s10"));
-        steps_out.push(validate_shards(ticker, &bars_dir, "renko"));
-        // vol (single legacy file)
-        if vol_path.exists() {
-            let args = vec![
-                "vol".to_string(),
-                vol_path.to_string_lossy().to_string(),
-                "--strict".to_string(),
-                "--json".to_string(),
-            ];
-            let mut rep = run_step(ticker, "integrity-check", &args, Some(&vol_path));
-            rep.name = "integrity-check[vol]".to_string();
-            steps_out.push(rep);
+        if renko_ran {
+            steps_out.push(validate_shards(ticker, &bars_dir, "renko", None));
+            // vol (single legacy file)
+            if vol_path.exists() {
+                let args = vec![
+                    "vol".to_string(),
+                    vol_path.to_string_lossy().to_string(),
+                    "--strict".to_string(),
+                    "--json".to_string(),
+                ];
+                let mut rep = run_step(ticker, "integrity-check", &args, Some(&vol_path));
+                rep.name = "integrity-check[vol]".to_string();
+                steps_out.push(rep);
+            }
         }
     }
 
@@ -1594,7 +1408,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     }
 }
 
-/// Cheap resume gate: manifest.json present in ticker_dir AND ≥1 shard of
+/// Cheap gate: manifest.json present in ticker_dir AND ≥1 shard of
 /// `kind` extension on disk. Full sha256 verification belongs to
 /// integrity-check; this only short-circuits the producer step when output
 /// is trivially complete.
@@ -1619,7 +1433,12 @@ fn manifest_ok(ticker_dir: &Path, kind: &str) -> bool {
 
 /// Run integrity-check on every shard in `ticker_dir` matching `kind`.
 /// Returns aggregate StepReport (first failure flips exit_code to 1).
-fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
+fn validate_shards(
+    ticker: &str,
+    ticker_dir: &Path,
+    kind: &str,
+    only: Option<&[NaiveDate]>,
+) -> StepReport {
     let name = format!("integrity-check-shards[{}]", kind);
     let start = Instant::now();
     let suffix = format!(".{}", kind);
@@ -1628,7 +1447,12 @@ fn validate_shards(ticker: &str, ticker_dir: &Path, kind: &str) -> StepReport {
         for entry in rd.flatten() {
             let path = entry.path();
             if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
-                if n.ends_with(&suffix) {
+                let wanted = only.is_none_or(|days| {
+                    n.strip_suffix(&suffix)
+                        .and_then(|d| d.parse::<NaiveDate>().ok())
+                        .is_some_and(|d| days.contains(&d))
+                });
+                if n.ends_with(&suffix) && wanted {
                     shards.push(path);
                 }
             }
@@ -1839,19 +1663,8 @@ fn main() -> Result<()> {
     // composite/.idx/bars/.vol.
     {
         let part_freed = sweep_partial_ticks(&args.out_dir);
-        let orphan_freed = if args.keep_staging {
-            0
-        } else {
-            sweep_orphaned_staging(&args.out_dir, &tickers, &ctx.exchanges)
-        };
-        let total = part_freed + orphan_freed;
-        if total > 0 {
-            info!(
-                partial_bytes = part_freed,
-                orphan_bytes = orphan_freed,
-                total_gib = total as f64 / (1024.0 * 1024.0 * 1024.0),
-                "startup staging sweep reclaimed"
-            );
+        if part_freed > 0 {
+            info!(partial_bytes = part_freed, "startup sweep reclaimed torn downloads");
         }
     }
 
@@ -1991,6 +1804,33 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A day listed in the manifest and on disk is never todo again, even with
+    /// every source gone; `--rebuild` makes every day todo.
+    #[test]
+    fn done_days_are_not_todo_unless_rebuilding() {
+        use series_factory::sharding::{manifest_path, shard_path, write_manifest, Manifest, ShardEntry};
+        let dir = std::env::temp_dir().join(format!("bf-todo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rec = std::mem::size_of::<nxr_sdk::IndexRecord>();
+        let day = |n| NaiveDate::from_ymd_opt(2024, 1, n).unwrap();
+        fs::write(shard_path(&dir, day(1), "idx"), vec![0u8; rec * 2]).unwrap();
+        let mut m = Manifest::new("T".into(), 1, "idx");
+        m.set_shards_batch(vec![ShardEntry {
+            date: "2024-01-01".into(),
+            first_ts: 0,
+            last_ts: 0,
+            n_records: 2,
+            size_bytes: (rec * 2) as u64,
+            sha256: String::new(),
+        }]);
+        write_manifest(&manifest_path(&dir), &m).unwrap();
+        assert_eq!(todo_days(&dir, day(1), day(3), false), [day(2), day(3)]);
+        assert_eq!(todo_days(&dir, day(1), day(3), true), [day(1), day(2), day(3)]);
+        assert_eq!(list_days(&dir, "idx"), [day(1)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// The disk projection follows the window (not a fixed month) and is larger for perps.
     #[test]
