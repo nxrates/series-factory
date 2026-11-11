@@ -222,10 +222,7 @@ impl TargetResolver {
                         &yml.cexs.crypto_majors,
                         DEFAULT_CRYPTO_MAJORS,
                     )),
-                    stablecoins: to_owned(effective_list(
-                        &yml.cexs.pegged,
-                        DEFAULT_STABLECOINS,
-                    )),
+                    stablecoins: to_owned(effective_list(&yml.cexs.pegged, DEFAULT_STABLECOINS)),
                     fx_majors: to_owned(effective_list(&yml.cexs.fx_majors, DEFAULT_FX_MAJORS)),
                 }
             }
@@ -2365,21 +2362,9 @@ mod tests {
     /// (rejected=0) defaults, so tests targeting the freshness/price chain don't
     /// have to spell out the new args. Depth/reject tests call `eval_invariant`
     /// directly to vary those bytes.
-    fn eval_inv(
-        bid: f64,
-        ask: f64,
-        flags: u8,
-        confidence: u8,
-        accepted: u8,
-    ) -> InvariantOutcome {
+    fn eval_inv(bid: f64, ask: f64, flags: u8, confidence: u8, accepted: u8) -> InvariantOutcome {
         eval_invariant(
-            bid,
-            ask,
-            flags,
-            confidence,
-            accepted,
-            /*rejected*/ 0,
-            /*vbid*/ 100,
+            bid, ask, flags, confidence, accepted, /*rejected*/ 0, /*vbid*/ 100,
             /*vask*/ 100,
         )
     }
@@ -2608,16 +2593,7 @@ mod tests {
         // DEPTH IS METRIC-ONLY for NXR's price+confidence model. vbid==0 && vask==0
         // is BY DESIGN for inferred pairs (triangulator.rs:143) + volume-less FX:
         // it sets the `zero_depth` count flag but is NEVER a `reason` (verdict input).
-        let both = eval_invariant(
-            100.0,
-            100.1,
-            0,
-            1,
-            1,
-            0,
-            /*vbid*/ 0,
-            /*vask*/ 0,
-        );
+        let both = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 0, /*vask*/ 0);
         assert!(
             both.reason.is_none(),
             "both-zero depth must NOT FAIL: {:?}",
@@ -2630,31 +2606,13 @@ mod tests {
         assert!(!both.depth_one_sided, "both-zero is NOT one-sided");
 
         // One-sided zero → metric flag, no FAIL.
-        let bid_side = eval_invariant(
-            100.0,
-            100.1,
-            0,
-            1,
-            1,
-            0,
-            /*vbid*/ 0,
-            /*vask*/ 50,
-        );
+        let bid_side = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 0, /*vask*/ 50);
         assert!(bid_side.reason.is_none(), "one-sided depth must NOT FAIL");
         assert!(bid_side.depth_one_sided, "one-sided depth metric flag set");
         assert!(!bid_side.zero_depth, "one-sided is NOT zero_depth");
 
         // Healthy two-sided depth → no depth signal at all.
-        let ok = eval_invariant(
-            100.0,
-            100.1,
-            0,
-            1,
-            1,
-            0,
-            /*vbid*/ 10,
-            /*vask*/ 10,
-        );
+        let ok = eval_invariant(100.0, 100.1, 0, 1, 1, 0, /*vbid*/ 10, /*vask*/ 10);
         assert!(
             !ok.zero_depth && !ok.depth_one_sided,
             "healthy depth → no signal"
@@ -2671,14 +2629,7 @@ mod tests {
     fn reject_dominant_is_warn_not_fail() {
         // 5 rejected vs 2 accepted → dominant WARN, no FAIL.
         let dom = eval_invariant(
-            100.0,
-            100.1,
-            0,
-            1,
-            /*accepted*/ 2,
-            /*rejected*/ 5,
-            100,
-            100,
+            100.0, 100.1, 0, 1, /*accepted*/ 2, /*rejected*/ 5, 100, 100,
         );
         assert!(
             dom.reject_dominant,
