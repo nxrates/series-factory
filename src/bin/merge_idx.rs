@@ -8,6 +8,9 @@
 //! `boundary_ts.utc_date()`. All
 //! artifacts are sharded by `open_ts.date_utc()` — daily granularity.
 //!
+//! Every exchange needs a weight (`cexs.exchanges.<name>.weight` or `--weight`);
+//! one without is an error, never a silent 1.0. Relay providers are exempt.
+//!
 //! Default weights (locked in for the BTC/USDT offline replay):
 //!   binance=40, okx=20, bybit=30, bitget=10
 //! Override at runtime with `--weight <exchange>=<w>` (repeatable) or by
@@ -95,6 +98,12 @@ fn main() -> Result<()> {
 
     // resolve providers + weights (YAML-driven, NO hardcoded list)
     let weight_map = resolve_weights(&args)?;
+    // Relay providers (oracle, broker) carry no merge weight: sole source per ticker.
+    let relay: Vec<String> = nxr_sdk::pipeline_config::PipelineYml::load_default(
+        nxr_sdk::pipeline_config::ConfigHint::Bin,
+    )
+    .map(|y| y.relay_providers().into_iter().collect())
+    .unwrap_or_default();
     let exchanges: Vec<String> = if args.exchanges.is_empty() {
         // Default provider set = the YAML `cexs.exchanges` map (loaded via
         // resolve_weights above) ∪ the relay sections (`oracles.providers`,
@@ -105,11 +114,7 @@ fn main() -> Result<()> {
         // primaries no matter how complete their staging was.
         // Falls through to empty if neither CLI flag nor YAML supplied.
         let mut v: Vec<String> = weight_map.keys().cloned().collect();
-        if let Ok(y) = nxr_sdk::pipeline_config::PipelineYml::load_default(
-            nxr_sdk::pipeline_config::ConfigHint::Bin,
-        ) {
-            v.extend(y.relay_providers());
-        }
+        v.extend(relay.iter().cloned());
         v.sort();
         v.dedup();
         v
@@ -163,14 +168,17 @@ fn main() -> Result<()> {
             .join(format!("{}-{}.idx", base_uc, quote_uc));
         let provider_id = nxr_sdk::providers::get_market_provider_id_by_name(exch)
             .with_context(|| format!("unknown exchange {}", exch))?;
-        // A relay provider (oracle, broker) has no `cexs.exchanges.<name>.weight`
-        // and never will: it is the sole source for its tickers, so its weight is
-        // only ever compared against itself. Bailing here meant a single missing
-        // CEX weight entry also killed every oracle/broker merge.
-        let base_weight = weight_map
-            .get(exch.as_str())
-            .copied()
-            .unwrap_or(FALLBACK_EQUAL_WEIGHT);
+        // A relay provider (oracle, broker) has no weight and never will: it is
+        // the sole source for its tickers. A CEX without one would silently blend
+        // at 1.0 against the others' configured weights, so it is an error.
+        let base_weight = match weight_map.get(exch.as_str()) {
+            Some(w) => *w,
+            None if relay.contains(exch) => FALLBACK_EQUAL_WEIGHT,
+            None => anyhow::bail!(
+                "no merge weight for exchange '{exch}': set cexs.exchanges.{exch}.weight \
+                 in the config or pass --weight {exch}=<n>"
+            ),
+        };
         match SourceStream::load(&path, provider_id, base_weight) {
             Ok(s) => {
                 info!(
