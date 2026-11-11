@@ -201,18 +201,12 @@ struct TargetResolver {
     crypto_majors: Vec<String>,
     stablecoins: Vec<String>,
     fx_majors: Vec<String>,
-    /// CLI fallback when `config.yml` cannot be loaded at all. Read only by the
-    /// flat-fallback `target_for`; main now uses `target_for_resolved` (FIX #5)
-    /// so the field/method are retained as documented API but not on the hot path.
-    #[allow(dead_code)]
-    fallback_target_bpd: f64,
 }
 
 impl TargetResolver {
     /// Load the calibration config + operator lists once. On any load failure,
-    /// every `target_for` returns `fallback_target_bpd` (the CLI value) so the
-    /// cert degrades to the old flat-anchor behavior rather than panicking.
-    fn load(fallback_target_bpd: f64) -> Self {
+    /// every lookup resolves to `None` and the caller falls back to the CLI value.
+    fn load() -> Self {
         use nxr_sdk::asset_class::{
             effective_list, DEFAULT_CRYPTO_MAJORS, DEFAULT_FX_MAJORS, DEFAULT_STABLECOINS,
         };
@@ -233,7 +227,6 @@ impl TargetResolver {
                         DEFAULT_STABLECOINS,
                     )),
                     fx_majors: to_owned(effective_list(&yml.cexs.fx_majors, DEFAULT_FX_MAJORS)),
-                    fallback_target_bpd,
                 }
             }
             Err(_) => TargetResolver {
@@ -241,7 +234,6 @@ impl TargetResolver {
                 crypto_majors: Vec::new(),
                 stablecoins: Vec::new(),
                 fx_majors: Vec::new(),
-                fallback_target_bpd,
             },
         }
     }
@@ -261,19 +253,12 @@ impl TargetResolver {
     /// Per-ticker `target_bpd`. Resolves the pair sym + asset-class bucket the
     /// same way `nxr_calibrate` does, then applies `target_for_pair_classed`.
     /// Falls back to the flat CLI target when the pair can't be reconstructed.
-    #[allow(dead_code)]
-    fn target_for(&self, ticker_id: u64) -> f64 {
-        self.target_for_resolved(ticker_id)
-            .unwrap_or(self.fallback_target_bpd)
-    }
-
     /// Per-ticker `target_bpd`, returning `None` when the pair sym / target
     /// CANNOT be resolved (config.yml absent OR the id's legs aren't in the
     /// MITCH by-id table — e.g. a synth target). FIX #5: the caller must NOT
     /// silently substitute the flat 300 for the bpd-off-band verdict (that
     /// produces a false PASS/FAIL); it emits `renko_target_unresolved` (WARN)
-    /// and SKIPs the bpd-band gate instead. `target_for` keeps the flat-fallback
-    /// behavior for the (display-only) legacy ratio + per-ticker target field.
+    /// and SKIPs the bpd-band gate instead.
     fn target_for_resolved(&self, ticker_id: u64) -> Option<f64> {
         use nxr_sdk::asset_class::bucket_for_pair;
         let cal = self.cal.as_ref()?;
@@ -2286,7 +2271,7 @@ fn main() -> Result<()> {
     // Per-ticker calibration target + stable-pair identity, resolved exactly the
     // way the calibrator + live producer do (config.yml per-pair/per-class). The
     // flat `--target-bpd` is only a fallback when config.yml can't be loaded.
-    let target_resolver = TargetResolver::load(cli.target_bpd);
+    let target_resolver = TargetResolver::load();
 
     // FIX #6: the calibrator's renko-k envelope (`mult_bounds = [K_FLOOR, ceiling]`)
     // when config.yml is loadable, so the absolute-k plausibility gate compares
