@@ -59,37 +59,49 @@ cexs:
 
   # Per-exchange metadata for the archive sources implemented in this repo.
   #   weight               - TDWAP merge weight (merge-idx); relative units.
-  #   archive_url_template - historical archive URL stems; each field is the
-  #                          URL up to the trailing '/', with {sym}, {y:04},
-  #                          {m:02}, {ds}, {seq:03} interpolated by the source.
+  #   archive_url_template - URL stems of the historical archives: everything up
+  #                          to the file name, ending in '/'. The file name is the
+  #                          venue's layout, in sources/<venue>.rs. Spot stems sit
+  #                          directly under the key, perp stems under `perp:`.
+  #                          Placeholders: {sym} {y:04} {m:02} {d:02} {ds}
+  #                          (YYYYMMDD) {product} (Bitget perp: UMCBL | CMCBL).
+  #                          A granularity the venue does not publish is omitted.
   exchanges:
     binance:
       weight: 30
       archive_url_template:
         monthly: https://data.binance.vision/data/spot/monthly/aggTrades/{sym}/
         daily: https://data.binance.vision/data/spot/daily/aggTrades/{sym}/
-        probe: https://data.binance.vision/data/spot/monthly/aggTrades/{sym}/{sym}-aggTrades-{y:04}-{m:02}.zip
+        perp:
+          monthly: https://data.binance.vision/data/futures/um/monthly/aggTrades/{sym}/
+          daily: https://data.binance.vision/data/futures/um/daily/aggTrades/{sym}/
     bybit:
       weight: 15
       archive_url_template:
         monthly: https://public.bybit.com/spot/{sym}/
         daily: https://public.bybit.com/spot/{sym}/
-        probe: https://public.bybit.com/trading/{sym}/{sym}{y:04}-{m:02}.csv.gz
+        perp:
+          daily: https://public.bybit.com/trading/{sym}/
     bitget:
       weight: 10
       archive_url_template:
-        monthly: ''
         daily: https://img.bitgetimg.com/online/trades/SPBL/{sym}/
-        probe: https://img.bitgetimg.com/online/trades/SPBL/{sym}/{ds}_{seq:03}.zip
-    # Perp-only archive (no spot source): merge weight for BASE/USDT:PERP.
+        perp:
+          daily: https://img.bitgetimg.com/online/trades/{product}/{sym}/
+    # Perp-only archive (no spot): merge weight for BASE/USDT:PERP.
     gateio:
       weight: 5
+      archive_url_template:
+        perp:
+          monthly: https://download.gatedata.org/futures_usdt/trades/{y:04}{m:02}/
     okx:
       weight: 10
       archive_url_template:
         monthly: https://static.okx.com/cdn/okex/traderecords/trades/monthly/{y:04}{m:02}/
         daily: https://static.okx.com/cdn/okex/traderecords/trades/daily/{ds}/
-        probe: https://static.okx.com/cdn/okex/traderecords/trades/monthly/{y:04}{m:02}/{sym}-trades-{y:04}-{m:02}.zip
+        perp:
+          monthly: https://static.okx.com/cdn/okex/traderecords/trades/monthly/{y:04}{m:02}/
+          daily: https://static.okx.com/cdn/okex/traderecords/trades/daily/{ds}/
 
 # ── Network ──────────────────────────────────────────────────────────────────
 network:

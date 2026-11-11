@@ -1,19 +1,24 @@
-//! Shared exchange infrastructure - download, decompress, parse, tick I/O.
+//! Shared archive-source infrastructure: one code path for every venue and market.
 //!
-//! All exchange sources share: HTTP download, tick file I/O (native TickFrame),
-//! ZIP/GZIP decompression, bid/ask inference from trade data, batch sending,
-//! and date iteration helpers.
+//! A venue file (`binance.rs`, ...) only states its archive layout (file-name
+//! patterns), the symbol spelling and a row mapper; everything else lives here:
+//! URL expansion, monthly -> daily granularity, download + retry + missing
+//! classification, CSV -> tick conversion (validation, quote volume, ordering),
+//! caching, availability probing and the `.ticks` replay into a channel.
 
+use crate::sources::{provider_id_for, series_key, TickSource};
 use crate::types::{Config, TickFrame};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, NaiveDate};
 use memmap2::Mmap;
 use mitch::Tick;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OnceCell};
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
 
@@ -32,89 +37,195 @@ pub fn http_agent() -> Arc<btr_rpc::Http> {
     )
 }
 
-// ─── Archive URL resolver ───────────────────────────────────────────────────
+// ─── Archive layout ───────────────────────────────────────────────────────────
 //
-// Per-exchange `archive_url_template.{monthly,daily,probe}` is YAML-driven
-// (see `nxr_sdk::pipeline_config::ExchangeYml::archive_url_template`).
-// Cached at first read; PipelineYml resolution honours `NXR_CONFIG`.
+// URL = stem + file. The stem (everything up to the file name) is YAML, spot in
+// `cexs.exchanges.<name>.archive_url_template.{monthly,daily}`, perps in
+// `...archive_url_template.perp.{monthly,daily}`; the file-name pattern is the
+// venue's layout and lives in its source file. Both use the same placeholders:
+// `{sym}` `{y:04}` `{m:02}` `{d:02}` `{ds}` (YYYYMMDD) `{seq:03}` `{product}`.
 
-#[derive(Clone, Default)]
-pub struct ArchiveUrls {
+#[derive(Clone, Default, Deserialize)]
+pub struct Stems {
+    #[serde(default)]
     pub monthly: String,
+    #[serde(default)]
     pub daily: String,
-    pub probe: String,
 }
 
-fn archive_urls_for(exch: &str) -> ArchiveUrls {
-    use nxr_sdk::pipeline_config::{
-        ConfigHint, PipelineYml, DEFAULT_ARCHIVE_URL_BINANCE_DAILY,
-        DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY, DEFAULT_ARCHIVE_URL_BINANCE_PROBE,
-        DEFAULT_ARCHIVE_URL_BITGET_DAILY, DEFAULT_ARCHIVE_URL_BITGET_MONTHLY,
-        DEFAULT_ARCHIVE_URL_BITGET_PROBE, DEFAULT_ARCHIVE_URL_BYBIT_DAILY,
-        DEFAULT_ARCHIVE_URL_BYBIT_MONTHLY, DEFAULT_ARCHIVE_URL_BYBIT_PROBE,
-        DEFAULT_ARCHIVE_URL_OKX_DAILY, DEFAULT_ARCHIVE_URL_OKX_MONTHLY,
-        DEFAULT_ARCHIVE_URL_OKX_PROBE,
-    };
-    let (def_m, def_d, def_p) = match exch {
-        "binance" => (
-            DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY,
-            DEFAULT_ARCHIVE_URL_BINANCE_DAILY,
-            DEFAULT_ARCHIVE_URL_BINANCE_PROBE,
-        ),
-        "bybit" => (
-            DEFAULT_ARCHIVE_URL_BYBIT_MONTHLY,
-            DEFAULT_ARCHIVE_URL_BYBIT_DAILY,
-            DEFAULT_ARCHIVE_URL_BYBIT_PROBE,
-        ),
-        "bitget" => (
-            DEFAULT_ARCHIVE_URL_BITGET_MONTHLY,
-            DEFAULT_ARCHIVE_URL_BITGET_DAILY,
-            DEFAULT_ARCHIVE_URL_BITGET_PROBE,
-        ),
-        "okx" => (
-            DEFAULT_ARCHIVE_URL_OKX_MONTHLY,
-            DEFAULT_ARCHIVE_URL_OKX_DAILY,
-            DEFAULT_ARCHIVE_URL_OKX_PROBE,
-        ),
-        _ => ("", "", ""),
-    };
-    let yaml = PipelineYml::load_default(ConfigHint::Bin)
-        .ok()
-        .and_then(|pl| pl.cexs.exchanges.get(exch).cloned());
-    let tpl = yaml.and_then(|ex| ex.archive_url_template);
-    let monthly = tpl
-        .as_ref()
-        .and_then(|t| t.monthly.clone())
-        .unwrap_or_else(|| def_m.to_string());
-    let daily = tpl
-        .as_ref()
-        .and_then(|t| t.daily.clone())
-        .unwrap_or_else(|| def_d.to_string());
-    let probe = tpl
-        .as_ref()
-        .and_then(|t| t.probe.clone())
-        .unwrap_or_else(|| def_p.to_string());
-    ArchiveUrls {
-        monthly,
-        daily,
-        probe,
+#[derive(Default, Deserialize)]
+struct Template {
+    #[serde(flatten)]
+    spot: Stems,
+    #[serde(default)]
+    perp: Stems,
+}
+
+#[derive(Default, Deserialize)]
+struct Exchange {
+    #[serde(default)]
+    archive_url_template: Template,
+}
+
+#[derive(Default, Deserialize)]
+struct Cexs {
+    #[serde(default)]
+    exchanges: BTreeMap<String, Exchange>,
+}
+
+#[derive(Default, Deserialize)]
+struct Doc {
+    #[serde(default)]
+    cexs: Cexs,
+}
+
+/// URL stems of one venue × market from the pipeline config (`NXR_CONFIG`, else
+/// `config.yml`). A config that cannot be read is an error, never a silent default.
+fn stems(exchange: &str, perp: bool) -> Result<Stems> {
+    use nxr_sdk::pipeline_config::{ConfigHint, PipelineYml};
+    let path = PipelineYml::resolve_path(ConfigHint::Bin);
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("read config {}", path.display()))?;
+    let mut doc: Doc =
+        serde_yml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
+    let t = doc
+        .cexs
+        .exchanges
+        .remove(exchange)
+        .unwrap_or_default()
+        .archive_url_template;
+    Ok(if perp { t.perp } else { t.spot })
+}
+
+/// File-name patterns of one venue × market; `""` = that granularity is not published.
+#[derive(Clone, Copy)]
+pub struct Files {
+    pub monthly: &'static str,
+    pub daily: &'static str,
+    /// Hours east of UTC at which the venue cuts its archive days and months: the
+    /// file of day `D` covers UTC `[D - tz_h, D + 1d - tz_h)` (0 for UTC archives).
+    pub tz_h: i64,
+}
+
+/// One CSV row as a venue states it. `size` is in the venue's own unit (base
+/// units for spot, contracts for contract-sized swaps); [`Venue::scale`] turns it into base.
+pub struct Row {
+    pub us: u64,
+    pub price: f64,
+    pub size: f64,
+    pub buyer: bool,
+}
+
+pub type RowFn = fn(&csv::StringRecord) -> Option<Row>;
+type Extract = Box<dyn Fn(&serde_json::Value) -> Result<f64> + Send + Sync>;
+
+/// Everything a venue contributes for one (base, quote): the sections above.
+pub struct Venue {
+    pub name: &'static str,
+    pub sym: String,
+    pub perp: bool,
+    pub files: Files,
+    pub stems: Stems,
+    pub row: RowFn,
+    /// Bitget's `{product}` path segment (UMCBL / CMCBL); empty elsewhere.
+    pub product: &'static str,
+    /// Public REST endpoint + extractor for the base units per contract.
+    pub contract: Option<(String, Extract)>,
+}
+
+impl Venue {
+    pub fn new(
+        name: &'static str,
+        perp: bool,
+        sym: String,
+        files: Files,
+        row: RowFn,
+    ) -> Result<Self> {
+        let stems = stems(name, perp)?;
+        for (kind, file, stem) in [
+            ("monthly", files.monthly, &stems.monthly),
+            ("daily", files.daily, &stems.daily),
+        ] {
+            anyhow::ensure!(
+                file.is_empty() || (stem.ends_with('/') && Compression::of(file).is_some()),
+                "{name}: config cexs.exchanges.{name}.archive_url_template{}.{kind} must be a URL stem ending in '/' (and the file pattern {file:?} .zip or .csv.gz)",
+                if perp { ".perp" } else { "" },
+            );
+        }
+        Ok(Self {
+            name,
+            sym,
+            perp,
+            files,
+            stems,
+            row,
+            product: "",
+            contract: None,
+        })
+    }
+
+    pub fn with_product(mut self, product: &'static str) -> Self {
+        self.product = product;
+        self
+    }
+
+    pub fn with_contract(
+        mut self,
+        url: String,
+        extract: impl Fn(&serde_json::Value) -> Result<f64> + Send + Sync + 'static,
+    ) -> Self {
+        self.contract = Some((url, Box::new(extract)));
+        self
+    }
+
+    fn url(&self, stem: &str, file: &str, day: NaiveDate, seq: u32) -> (String, String) {
+        let file = expand(file, self, day, seq);
+        (format!("{}{file}", expand(stem, self, day, seq)), file)
+    }
+
+    /// `(url, file name)` of the monthly archive of `first`'s month; `None` when not published.
+    pub fn monthly(&self, first: NaiveDate) -> Option<(String, String)> {
+        (!self.files.monthly.is_empty())
+            .then(|| self.url(&self.stems.monthly, self.files.monthly, first, 1))
+    }
+
+    /// `(url, file name)` of the daily archive (chunk `seq` when chunked).
+    pub fn daily(&self, day: NaiveDate, seq: u32) -> Option<(String, String)> {
+        (!self.files.daily.is_empty())
+            .then(|| self.url(&self.stems.daily, self.files.daily, day, seq))
+    }
+
+    /// Daily archives come in numbered chunks (`_001.zip`, `_002.zip`, ...).
+    fn chunked(&self) -> bool {
+        self.files.daily.contains("{seq")
     }
 }
 
-/// Resolve archive URLs for an exchange (cached per-exchange).
-pub fn archive_urls(exch: &'static str) -> &'static ArchiveUrls {
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<&'static str, &'static ArchiveUrls>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("archive_urls cache lock");
-    if let Some(v) = guard.get(exch).copied() {
-        return v;
+fn expand(t: &str, v: &Venue, d: NaiveDate, seq: u32) -> String {
+    t.replace("{sym}", &v.sym)
+        .replace("{product}", v.product)
+        .replace("{y:04}", &format!("{:04}", d.year()))
+        .replace("{m:02}", &format!("{:02}", d.month()))
+        .replace("{d:02}", &format!("{:02}", d.day()))
+        .replace("{ds}", &d.format("%Y%m%d").to_string())
+        .replace("{seq:03}", &format!("{seq:03}"))
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Compression {
+    Zip,
+    Gzip,
+}
+
+impl Compression {
+    /// Compression of an archive name and the name without its extension.
+    fn of(name: &str) -> Option<(Self, &str)> {
+        if let Some(s) = name.strip_suffix(".csv.gz") {
+            Some((Self::Gzip, s))
+        } else {
+            name.strip_suffix(".zip").map(|s| (Self::Zip, s))
+        }
     }
-    let urls = Box::leak(Box::new(archive_urls_for(exch)));
-    guard.insert(exch, urls);
-    urls
 }
 
 /// Streaming copy buffer size. Bounds peak resident memory during a download
@@ -231,75 +342,87 @@ pub fn is_missing(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
     msg.ends_with("HTTP 404") || msg.ends_with("HTTP 403")
 }
+/// Attempts per request: the one retry policy of every archive and REST call.
+const ATTEMPTS: usize = 3;
+const BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run `op` up to `ATTEMPTS` times, sleeping `backoff * attempt` between tries.
+/// A missing object ([`is_missing`]) is final and returned at once; any other
+/// error is retried and the last one returned.
+async fn with_retry<T, F, Fut>(backoff: std::time::Duration, what: &str, mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(backoff * attempt as u32).await;
+        }
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_missing(&e) => return Err(e),
+            Err(e) => {
+                warn!("Attempt {}/{ATTEMPTS} failed: {what}: {e:#}", attempt + 1);
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.expect("ATTEMPTS > 0"))
+}
 
 /// Stream-download to disk with retry + truncation detection.
 ///
 /// A download whose written byte count falls short of the advertised
-/// `Content-Length` is treated as a FAILED transfer (retried up to
-/// `max_attempts`), NOT as a valid-but-empty archive. This is the fix for the
-/// ETH 2024-2025 silent-gap: a partial body that decompressed to few/zero ticks
-/// was previously accepted as "empty month".
+/// `Content-Length` is a FAILED transfer (retried), NOT a valid-but-empty
+/// archive: the ETH 2024-2025 silent gap was a partial body that decompressed
+/// to few/zero ticks and was accepted as an empty month.
 pub async fn download_to_file_retry(
     agent: &Arc<btr_rpc::Http>,
     url: &str,
     dst_dir: &Path,
-    max_attempts: usize,
 ) -> Result<DownloadedArchive> {
-    let mut last_err = None;
-    for attempt in 0..max_attempts {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
-        }
-        match download_to_file(agent, url, dst_dir).await {
-            Ok(dl) => {
-                if is_truncated(dl.bytes_got, dl.content_length) {
-                    let expected = dl.content_length.unwrap_or(0);
-                    {
-                        warn!(
-                            bytes_got = dl.bytes_got,
-                            bytes_expected = expected,
-                            url,
-                            "TRUNCATED download (short of Content-Length) — \
-                             treating as failed transfer, NOT empty archive",
-                        );
-                        last_err = Some(anyhow::anyhow!(
-                            "truncated download {}: got {} of {} bytes",
-                            url,
-                            dl.bytes_got,
-                            expected
-                        ));
-                        // `dl` drops here → temp file removed before retry.
-                        if attempt + 1 < max_attempts {
-                            warn!(
-                                "Attempt {}/{} truncated: {} - retrying",
-                                attempt + 1,
-                                max_attempts,
-                                url
-                            );
-                        }
-                        continue;
-                    }
-                }
-                return Ok(dl);
-            }
-            Err(e) => {
-                // 403/404 = missing object: final, not a transfer fault.
-                if is_missing(&e) {
-                    return Err(e);
-                }
-                if attempt + 1 < max_attempts {
-                    warn!(
-                        "Attempt {}/{} failed: {} - retrying",
-                        attempt + 1,
-                        max_attempts,
-                        url
-                    );
-                }
-                last_err = Some(e);
-            }
-        }
+    with_retry(BACKOFF, url, || async {
+        let dl = download_to_file(agent, url, dst_dir).await?;
+        // A truncated `dl` drops here, removing its temp file before the retry.
+        anyhow::ensure!(
+            !is_truncated(dl.bytes_got, dl.content_length),
+            "truncated download {url}: got {} of {} bytes",
+            dl.bytes_got,
+            dl.content_length.unwrap_or(0)
+        );
+        Ok(dl)
+    })
+    .await
+}
+
+/// JSON of a public REST endpoint, with the archive retry policy.
+async fn rest_json(agent: &Arc<btr_rpc::Http>, url: &str) -> Result<serde_json::Value> {
+    with_retry(BACKOFF, url, || async {
+        let reply = agent.get(url, &[]).await?;
+        anyhow::ensure!(reply.status == 200, "{url}: HTTP {}", reply.status);
+        Ok(serde_json::from_slice(&reply.body)?)
+    })
+    .await
+}
+
+/// Does the archive object exist? 404/403 = no; any other failure is an error
+/// (unknown), never a "no".
+async fn head_exists(agent: &Arc<btr_rpc::Http>, url: &str) -> Result<bool> {
+    let r = with_retry(BACKOFF, url, || async {
+        let reply = agent.send(reqwest::Method::HEAD, url, &[], None).await?;
+        anyhow::ensure!(
+            (200..300).contains(&reply.status),
+            "{url}: HTTP {}",
+            reply.status
+        );
+        Ok(true)
+    })
+    .await;
+    match r {
+        Err(e) if is_missing(&e) => Ok(false),
+        r => r,
     }
-    Err(last_err.unwrap())
 }
 
 // ─── Tick file I/O (native TickFrame) ─────────────────────────────────────────
@@ -361,32 +484,47 @@ pub fn honest_tick(ticker_id: u64, price: f64, volume: u32, is_buyer: bool) -> T
         vask: if is_buyer { volume } else { 0 },
     }
 }
-
-/// Parse one CSV chunk into ticks. `row` maps a record to
-/// `(epoch_us, price, quote_notional, is_buyer)`, or `None` to skip it: header
-/// rows, short rows and unparseable fields all land there, so a chunk that
-/// starts on the header or is cut mid-row never panics or poisons the parse.
+/// Parse one CSV chunk into ticks. `row` maps a record to a [`Row`], or `None`
+/// to skip it: header rows, short rows and unparseable fields all land there,
+/// so a chunk that starts on the header or is cut mid-row never panics or
+/// poisons the parse. Every venue shares the rest: a non-finite or non-positive
+/// price, or a non-finite or negative size, is dropped, and the quote volume is
+/// `price * size * scale` (`scale` = base units per contract), truncated to whole
+/// quote units, at least 1 (a trade is never sizeless: a cycle of only sub-unit
+/// trades must not read as a zero-depth phantom quote) and saturating at `u32::MAX`.
 pub fn csv_ticks(
     csv_data: &[u8],
     ticker_id: u64,
     provider: &str,
-    row: impl Fn(&csv::StringRecord) -> Option<(u64, f64, f64, bool)>,
+    scale: f64,
+    row: RowFn,
 ) -> Result<Vec<TickFrame>> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true) // column counts vary (Bybit `RPI`)
         .from_reader(std::io::Cursor::new(csv_data));
-    let pid = super::provider_id_for(provider);
+    let pid = provider_id_for(provider);
     let mut ticks = Vec::new();
     let mut r = csv::StringRecord::new();
     while rdr.read_record(&mut r)? {
-        if let Some((us, price, notional, is_buyer)) = row(&r) {
-            ticks.push(TickFrame::new(
-                pid,
-                mitch::timestamp::from_epoch_us(us),
-                honest_tick(ticker_id, price, notional as u32, is_buyer),
-            ));
+        let Some(Row {
+            us,
+            price,
+            size,
+            buyer,
+        }) = row(&r)
+        else {
+            continue;
+        };
+        let notional = price * size * scale;
+        if !(price.is_finite() && price > 0.0 && notional.is_finite() && notional >= 0.0) {
+            continue;
         }
+        ticks.push(TickFrame::new(
+            pid,
+            mitch::timestamp::from_epoch_us(us),
+            honest_tick(ticker_id, price, (notional as u32).max(1), buyer),
+        ));
     }
     Ok(ticks)
 }
@@ -396,9 +534,9 @@ pub fn ms_to_us(ts: i64) -> u64 {
     normalize_timestamp_ms(ts).max(0) as u64 * 1000
 }
 
-/// Fractional epoch seconds -> epoch microseconds.
+/// Fractional epoch seconds -> epoch microseconds; `None` for a non-finite or non-positive value.
 pub fn secs_to_us(ts: f64) -> Option<u64> {
-    (ts > 0.0).then(|| (ts * 1e6).round() as u64)
+    (ts.is_finite() && ts > 0.0).then(|| (ts * 1e6).round() as u64)
 }
 
 /// Field `i` of a record parsed as `T`; `None` when missing or malformed.
@@ -553,13 +691,7 @@ async fn stream_as_tick_frames(
     Ok(())
 }
 
-// ─── Shared exchange download infrastructure ────────────────────────────────
-
-#[derive(Clone, Copy)]
-pub enum Compression {
-    Zip,
-    Gzip,
-}
+// ─── Download + convert ──────────────────────────────────────────────────────
 
 /// Download archive (streamed to disk), stream-decompress from disk +
 /// stream-parse CSV, stream-write the `.ticks` cache file. Peak resident memory
@@ -599,7 +731,6 @@ pub async fn download_and_convert<P>(
     cache_path: &Path,
     ticker_id: u64,
     compression: Compression,
-    max_attempts: usize,
     parse_csv: &P,
 ) -> Result<u64>
 where
@@ -615,7 +746,7 @@ where
     // below; it is never held in RAM as a Vec<u8>. `archive` drops at end of
     // scope → temp file removed (delete-as-you-go scratch).
     let dst_dir = cache_path.parent().unwrap_or_else(|| Path::new("."));
-    let archive = download_to_file_retry(agent, url, dst_dir, max_attempts).await?;
+    let archive = download_to_file_retry(agent, url, dst_dir).await?;
     let archive_path = archive.path.clone();
     let archive_bytes = archive.bytes_got;
     let tmp_path = cache_path.with_extension("ticks.partial");
@@ -792,262 +923,341 @@ fn stream_csv_in_chunks<R: std::io::BufRead>(
     }
     Ok(())
 }
+// ─── Archive fetch: plan, cache, download ────────────────────────────────────
 
-/// Shared monthly-first, daily-fallback tick file fetcher.
-///
-/// `monthly(symbol, year, month)` returns `(url, filename)`.
-/// `daily(symbol, date)` returns `(url, filename)`.
-/// Every download gets 3 attempts with backoff; a 404/403 is final and quiet,
-/// any other failure that survives the retries is logged at `warn`. A closure that returns an
-/// empty url means the venue publishes no such granularity: it is skipped.
-pub async fn fetch_monthly_daily<P>(
-    agent: &Arc<btr_rpc::Http>,
-    config: &Config,
-    exchange: &str,
-    symbol: &str,
-    dir_name: &str,
-    ticker_id: u64,
-    cache_ext: &str,
-    compression: Compression,
-    monthly: impl Fn(&str, i32, u32) -> (String, String),
-    daily: impl Fn(&str, NaiveDate) -> (String, String),
-    parse_csv: &P,
-) -> Result<Vec<PathBuf>>
-where
-    P: Fn(&[u8], u64) -> Result<Vec<TickFrame>> + Sync,
-{
-    let today = chrono::Utc::now().date_naive();
-    let ticks_dir = config.ticks_dir.join(exchange).join(dir_name);
+/// Network side of a fetch, injectable so the planning logic runs offline.
+#[async_trait::async_trait]
+pub trait Net: Sync {
+    /// Base units per contract (1.0 when the venue sizes in base units).
+    async fn scale(&self, v: &Venue) -> Result<f64>;
+    /// Download `url`, convert it to `cache`, return the tick count.
+    async fn download(&self, v: &Venue, url: &str, cache: &Path, scale: f64) -> Result<u64>;
+    /// Does the archive object exist?
+    async fn exists(&self, url: &str) -> Result<bool>;
+}
+
+/// The real network.
+pub struct Live {
+    pub agent: Arc<btr_rpc::Http>,
+    pub ticker_id: u64,
+}
+
+#[async_trait::async_trait]
+impl Net for Live {
+    async fn scale(&self, v: &Venue) -> Result<f64> {
+        let Some((url, extract)) = &v.contract else {
+            return Ok(1.0);
+        };
+        let k = extract(&rest_json(&self.agent, url).await?)?;
+        anyhow::ensure!(
+            k.is_finite() && k > 0.0,
+            "{}: contract size {k} from {url}",
+            v.name
+        );
+        Ok(k)
+    }
+
+    async fn download(&self, v: &Venue, url: &str, cache: &Path, scale: f64) -> Result<u64> {
+        let (compression, _) =
+            Compression::of(url).context("archive url is not .zip or .csv.gz")?;
+        download_and_convert(
+            &self.agent,
+            url,
+            cache,
+            self.ticker_id,
+            compression,
+            &|c, t| csv_ticks(c, t, v.name, scale, v.row),
+        )
+        .await
+    }
+
+    async fn exists(&self, url: &str) -> Result<bool> {
+        head_exists(&self.agent, url).await
+    }
+}
+
+/// Monthly archive to use for `[start, end]` (clipped to one month), if any: a
+/// completed month, fetched whole when the window covers it or when the venue
+/// has no daily archive to cut it with.
+fn monthly_for(
+    v: &Venue,
+    start: NaiveDate,
+    end: NaiveDate,
+    today: NaiveDate,
+) -> Option<(String, String)> {
+    let first = start.with_day(1)?;
+    let last = last_day_of_month(start.year(), start.month());
+    let covered = start == first && end == last;
+    (last < today && (covered || v.files.daily.is_empty()))
+        .then(|| v.monthly(first))
+        .flatten()
+}
+
+fn cache_of(dir: &Path, file: &str) -> PathBuf {
+    let (_, stem) = Compression::of(file).expect("validated in Venue::new");
+    dir.join(format!("{stem}.ticks"))
+}
+
+fn cached(p: &Path) -> bool {
+    fs::metadata(p).is_ok_and(|m| m.len() > 0)
+}
+
+/// Fetch `[from, to]` (inclusive days) into `dir` and return the `.ticks` files
+/// covering it, oldest first. Per calendar month: the monthly archive when the
+/// window covers the whole completed month, else daily archives; a monthly that
+/// is missing, failed or empty falls back to daily. A file already in `dir` is
+/// not fetched again; a zero-tick download is never kept. 404/403 is quiet
+/// (`debug`), any other failure that survives the retries is a `warn`.
+pub async fn fetch_archive(
+    net: &dyn Net,
+    v: &Venue,
+    dir: &Path,
+    from: NaiveDate,
+    to: NaiveDate,
+    today: NaiveDate,
+) -> Result<Vec<PathBuf>> {
+    let scale = OnceCell::new();
+    // The contract size is looked up on the first download only: a fully cached window needs none.
+    let scale = &scale;
+    let get = move |url: String, cache: PathBuf| async move {
+        let k = *scale.get_or_try_init(|| net.scale(v)).await?;
+        Ok::<_, anyhow::Error>(net.download(v, &url, &cache, k).await)
+    };
     let mut files = Vec::new();
+    for (start, end) in month_ranges(from, to) {
+        let (year, month) = (start.year(), start.month());
+        let complete = last_day_of_month(year, month) < today;
+        let before = files.len();
+        let mut ticks = 0u64;
 
-    for (month_start, month_end) in month_ranges(config.from.date_naive(), config.to.date_naive()) {
-        let year = month_start.year();
-        let month = month_start.month();
-        // Track whether THIS month yielded any data at all, across the monthly
-        // archive + daily fallback. A completed month that produces nothing for
-        // a liquid pair is the silent-gap signature (e.g. recurring "ETH older
-        // months empty"); we emit a single per-month warning so it can never
-        // disappear unnoticed at the default INFO log level again.
-        let files_before_month = files.len();
-        let mut month_ticks: u64 = 0;
-        let mut used_cached_month = false;
-
-        // Try monthly archive for completed months
-        let (murl, mfile) = monthly(symbol, year, month);
-        if last_day_of_month(year, month) < today && !murl.is_empty() {
-            let (url, filename) = (murl, mfile);
-            let cache_path = ticks_dir.join(filename.replace(cache_ext, ".ticks"));
-
-            if cache_path.exists() {
-                debug!("Cached: {}", cache_path.display());
-                files.push(cache_path);
-                // A pre-existing cache file is trusted as non-empty here (it
-                // was validated when written); skip the daily fallback.
-                used_cached_month = true;
-            } else {
-                info!("Downloading monthly: {}", filename);
-                match download_and_convert(
-                    agent,
-                    &url,
-                    &cache_path,
-                    ticker_id,
-                    compression,
-                    3,
-                    parse_csv,
-                )
-                .await
-                {
-                    // Zero-tick monthly is NOT a success: drop the empty cache
-                    // file and fall through to the daily archives, which may
-                    // carry the data the monthly archive lacked (or confirm a
-                    // real gap day-by-day). This is the fix for monthly archives
-                    // that download cleanly but parse to nothing.
-                    Ok(0) => {
-                        warn!(
-                            "Monthly {} yielded ZERO ticks; removing empty cache and trying daily",
-                            filename
-                        );
-                        let _ = std::fs::remove_file(&cache_path);
-                    }
-                    Ok(n) => {
-                        month_ticks += n;
-                        files.push(cache_path);
-                        used_cached_month = true;
-                    }
-                    Err(e) if is_missing(&e) => debug!("No monthly {}, trying daily", filename),
-                    Err(e) => warn!("Monthly failed {}: {:#}, trying daily", filename, e),
+        let first = start.with_day(1).expect("day 1 exists");
+        // A cached monthly is a superset of any window inside it.
+        if let Some((_, file)) = complete.then(|| v.monthly(first)).flatten() {
+            let cache = cache_of(dir, &file);
+            if cached(&cache) {
+                files.push(cache);
+                continue;
+            }
+        }
+        if let Some((url, file)) = monthly_for(v, start, end, today) {
+            let cache = cache_of(dir, &file);
+            info!("Downloading monthly: {file}");
+            match get(url, cache.clone()).await? {
+                Ok(0) => {
+                    warn!(
+                        "Monthly {file} yielded ZERO ticks; removing empty cache and trying daily"
+                    );
+                    let _ = fs::remove_file(&cache);
                 }
+                Ok(_) => {
+                    files.push(cache);
+                    continue;
+                }
+                Err(e) if is_missing(&e) => debug!("No monthly {file}, trying daily"),
+                Err(e) => warn!("Monthly failed {file}: {e:#}, trying daily"),
             }
         }
 
-        // Daily fallback (current month, failed monthly, or zero-tick monthly)
-        if !used_cached_month {
-            let end = month_end.min(config.to.date_naive());
-            let mut day = month_start;
+        if v.files.daily.is_empty() {
+            if !complete {
+                warn!(
+                    "{} publishes monthly files only: {year}-{month:02} is not complete yet",
+                    v.name
+                );
+            }
+        } else {
+            let mut day = start;
             while day <= end {
-                let (url, filename) = daily(symbol, day);
-                if url.is_empty() {
-                    break;
-                }
-                let cache_path = ticks_dir.join(filename.replace(cache_ext, ".ticks"));
-
-                if !cache_path.exists() {
-                    info!("Downloading daily: {}", filename);
-                    match download_and_convert(
-                        agent,
-                        &url,
-                        &cache_path,
-                        ticker_id,
-                        compression,
-                        3,
-                        parse_csv,
-                    )
-                    .await
-                    {
-                        Ok(0) => {
-                            // Empty daily archive — drop it, don't push.
-                            let _ = std::fs::remove_file(&cache_path);
-                            debug!("Empty {} daily archive for {}", exchange, day);
-                        }
-                        Ok(n) => {
-                            month_ticks += n;
-                            files.push(cache_path);
-                        }
-                        Err(e) if is_missing(&e) => debug!("No {} data for {}", exchange, day),
-                        Err(e) => warn!(
-                            "{} {} {} failed after retries: {:#}",
-                            exchange, symbol, day, e
-                        ),
-                    }
-                } else {
-                    debug!("Cached: {}", cache_path.display());
-                    files.push(cache_path);
-                }
+                ticks += fetch_day(&get, v, dir, day, &mut files).await?;
                 day += Duration::days(1);
             }
         }
 
-        // Per-month silent-gap guard: a COMPLETED month (older than today) that
-        // produced no fresh file and no ticks is almost certainly a fetch defect
-        // for a liquid pair, not a real absence. Warn so backfill logs flag the
-        // hole instead of silently skipping it.
-        let produced_files = files.len() > files_before_month;
-        let month_is_complete = last_day_of_month(year, month) < today;
-        if month_is_complete && !used_cached_month && month_ticks == 0 && !produced_files {
+        // A completed month that produced nothing is the silent-gap signature of a
+        // fetch defect for a liquid pair, not necessarily a real absence: say so.
+        if complete && files.len() == before && ticks == 0 {
             warn!(
-                exchange,
-                symbol,
+                exchange = v.name,
+                symbol = %v.sym,
                 year,
                 month,
-                "no ticks fetched for completed month (monthly + daily both empty) — \
+                "no ticks fetched for completed month (monthly + daily both empty) - \
                  possible silent archive/parse gap, NOT necessarily a real data absence",
             );
         }
     }
-
+    // A venue cutting its days east of UTC ends its last file before the window
+    // does: the next day's file holds the rest.
+    let tail = to + Duration::days(1);
+    if v.files.tz_h > 0 && tail <= today {
+        fetch_day(&get, v, dir, tail, &mut files).await?;
+    }
     Ok(files)
+}
+
+/// Fetch one archive day (one file, or numbered chunks until one is missing or
+/// empty) into `files`; returns the ticks downloaded.
+async fn fetch_day<G, Fut>(
+    get: &G,
+    v: &Venue,
+    dir: &Path,
+    day: NaiveDate,
+    files: &mut Vec<PathBuf>,
+) -> Result<u64>
+where
+    G: Fn(String, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<Result<u64>>>,
+{
+    let mut ticks = 0;
+    let mut seq = 1;
+    while let Some((url, file)) = v.daily(day, seq) {
+        let cache = cache_of(dir, &file);
+        if cached(&cache) {
+            files.push(cache);
+        } else {
+            match get(url, cache.clone()).await? {
+                Ok(0) => {
+                    let _ = fs::remove_file(&cache);
+                    debug!("Empty {} archive {file}", v.name);
+                    break;
+                }
+                Ok(n) => {
+                    ticks += n;
+                    files.push(cache);
+                }
+                Err(e) if is_missing(&e) => {
+                    debug!("No {} data for {day}", v.name);
+                    break;
+                }
+                Err(e) => {
+                    warn!("{} {} {day} failed after retries: {e:#}", v.name, v.sym);
+                    break;
+                }
+            }
+        }
+        if !v.chunked() {
+            break;
+        }
+        seq += 1;
+    }
+    Ok(ticks)
+}
+
+/// Upper bound on probe requests per (venue, symbol): a longer window is sampled
+/// at an even stride so a dead symbol costs a bounded number of HEADs.
+const PROBE_MAX: usize = 120;
+
+/// First and last archive date found in `[from, to]`, `None` when the venue
+/// publishes nothing for the symbol there. Probes the units [`fetch_archive`]
+/// would fetch (monthly where it would, else daily), newest first then oldest
+/// first, stopping at the first hit; `Err` means a transport fault, not "absent".
+pub async fn probe_archive(
+    net: &dyn Net,
+    v: &Venue,
+    from: NaiveDate,
+    to: NaiveDate,
+    today: NaiveDate,
+) -> Result<Option<(NaiveDate, NaiveDate)>> {
+    let mut units: Vec<(NaiveDate, String)> = Vec::new();
+    for (start, end) in month_ranges(from, to) {
+        if let Some((url, _)) = monthly_for(v, start, end, today) {
+            units.push((start.with_day(1).expect("day 1 exists"), url));
+        } else {
+            let mut day = start;
+            while day <= end {
+                units.extend(v.daily(day, 1).map(|(url, _)| (day, url)));
+                day += Duration::days(1);
+            }
+        }
+    }
+    let stride = units.len().div_ceil(PROBE_MAX).max(1);
+    let n = units.len();
+    let sample: Vec<&(NaiveDate, String)> = units
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % stride == 0 || *i == n - 1)
+        .map(|(_, u)| u)
+        .collect();
+    for last in sample.iter().rev() {
+        if net.exists(&last.1).await? {
+            for first in &sample {
+                if net.exists(&first.1).await? {
+                    return Ok(Some((first.0, last.0)));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The single [`TickSource`] of every archive venue; the venue picks its layout per (base, quote).
+pub struct ArchiveSource {
+    agent: Arc<btr_rpc::Http>,
+    /// `Ok(None)`: the venue publishes no archive for this market.
+    venue: fn(&Config) -> Result<Option<Venue>>,
+}
+
+impl ArchiveSource {
+    pub fn new(venue: fn(&Config) -> Result<Option<Venue>>) -> Self {
+        Self {
+            agent: http_agent(),
+            venue,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TickSource for ArchiveSource {
+    async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
+        let v = (self.venue)(config)?
+            .with_context(|| format!("no archive for {} on this venue", config.quote))?;
+        let (dir, ticker_id) = series_key(config);
+        info!("Fetching {} data for {}", v.name, v.sym);
+        let net = Live {
+            agent: self.agent.clone(),
+            ticker_id,
+        };
+        let files = fetch_archive(
+            &net,
+            &v,
+            &config.ticks_dir.join(v.name).join(dir),
+            config.from.date_naive(),
+            config.to.date_naive(),
+            chrono::Utc::now().date_naive(),
+        )
+        .await?;
+        info!("Processing {} tick files", files.len());
+        fetch_cached_ticks(&files, provider_id_for(v.name), tx).await;
+        Ok(())
+    }
+
+    async fn probe(&self, config: &Config) -> Result<Option<(NaiveDate, NaiveDate)>> {
+        let Some(v) = (self.venue)(config)? else {
+            return Ok(None);
+        };
+        let net = Live {
+            agent: self.agent.clone(),
+            ticker_id: series_key(config).1,
+        };
+        probe_archive(
+            &net,
+            &v,
+            config.from.date_naive(),
+            config.to.date_naive(),
+            chrono::Utc::now().date_naive(),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
-    use nxr_sdk::pipeline_config::{
-        DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY, DEFAULT_ARCHIVE_URL_OKX_MONTHLY,
-    };
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
-    }
-
-    /// Replica of `BinanceSource`'s monthly URL/filename builder (sources are
-    /// closures, not exported fns). Kept byte-identical so this test guards the
-    /// real symbol→URL mapping.
-    fn binance_monthly(sym: &str, y: i32, m: u32) -> (String, String) {
-        let prefix = DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY;
-        let f = format!("{}-aggTrades-{:04}-{:02}.zip", sym, y, m);
-        let url = format!("{}{}", prefix.replace("{sym}", sym), f);
-        (url, f)
-    }
-
-    fn okx_monthly(sym: &str, y: i32, m: u32) -> (String, String) {
-        let prefix = DEFAULT_ARCHIVE_URL_OKX_MONTHLY;
-        let f = format!("{}-trades-{:04}-{:02}.zip", sym, y, m);
-        let url = format!(
-            "{}{}",
-            prefix
-                .replace("{y:04}", &format!("{:04}", y))
-                .replace("{m:02}", &format!("{:02}", m)),
-            f,
-        );
-        (url, f)
-    }
-
-    /// ETH-USDT must build the SAME well-formed Binance monthly path as
-    /// BNB-USDT / SOL-USDT — differing ONLY in the symbol token. This pins the
-    /// invariant behind the recurring "ETH older months empty" reports: the
-    /// fetcher applies no per-symbol date floor, alias, or special-casing, so a
-    /// missing ETH 2024 month can NEVER be a URL/mapping defect — it would be a
-    /// real upstream gap (which it is not — these archives exist + 200-OK).
-    #[test]
-    fn binance_monthly_url_symbol_parity_eth_bnb_sol() {
-        for &(y, m) in &[(2024, 6), (2024, 12), (2025, 6), (2026, 2)] {
-            let (eth_url, eth_f) = binance_monthly("ETHUSDT", y, m);
-            let (bnb_url, _) = binance_monthly("BNBUSDT", y, m);
-            let (sol_url, _) = binance_monthly("SOLUSDT", y, m);
-
-            // ETH path is structurally identical to BNB/SOL once the symbol is
-            // normalised out — proving no ETH-specific divergence by month.
-            let norm = |s: &str| {
-                s.replace("ETHUSDT", "§")
-                    .replace("BNBUSDT", "§")
-                    .replace("SOLUSDT", "§")
-            };
-            assert_eq!(
-                norm(&eth_url),
-                norm(&bnb_url),
-                "ETH vs BNB url diverged @ {y}-{m:02}"
-            );
-            assert_eq!(
-                norm(&eth_url),
-                norm(&sol_url),
-                "ETH vs SOL url diverged @ {y}-{m:02}"
-            );
-
-            // Well-formed: exact expected ETH path for every month (no floor).
-            assert_eq!(
-                eth_url,
-                format!(
-                    "https://data.binance.vision/data/spot/monthly/aggTrades/ETHUSDT/ETHUSDT-aggTrades-{y:04}-{m:02}.zip"
-                ),
-            );
-            assert_eq!(eth_f, format!("ETHUSDT-aggTrades-{y:04}-{m:02}.zip"));
-        }
-    }
-
-    /// OKX uses a dashed symbol (`ETH-USDT`) + date-keyed bucket. Same parity
-    /// guarantee: ETH differs from BNB/SOL only by symbol token, across months.
-    #[test]
-    fn okx_monthly_url_symbol_parity_eth_bnb_sol() {
-        for &(y, m) in &[(2024, 6), (2025, 6), (2026, 2)] {
-            let (eth_url, _) = okx_monthly("ETH-USDT", y, m);
-            let (bnb_url, _) = okx_monthly("BNB-USDT", y, m);
-            let (sol_url, _) = okx_monthly("SOL-USDT", y, m);
-            let norm = |s: &str| {
-                s.replace("ETH-USDT", "§")
-                    .replace("BNB-USDT", "§")
-                    .replace("SOL-USDT", "§")
-            };
-            assert_eq!(norm(&eth_url), norm(&bnb_url));
-            assert_eq!(norm(&eth_url), norm(&sol_url));
-            assert_eq!(
-                eth_url,
-                format!(
-                    "https://static.okx.com/cdn/okex/traderecords/trades/monthly/{y:04}{m:02}/ETH-USDT-trades-{y:04}-{m:02}.zip"
-                ),
-            );
-        }
     }
 
     /// Truncation predicate: short-of-Content-Length ⇒ truncated (failed
@@ -1186,73 +1396,6 @@ mod tests {
         assert_eq!(flip(&v), (want, true));
     }
 
-    fn cfg(from: (i32, u32, u32), to: (i32, u32, u32), root: &Path) -> Config {
-        let d = |(y, m, dd): (i32, u32, u32)| {
-            NaiveDate::from_ymd_opt(y, m, dd)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
-        };
-        Config {
-            base: "BTC".into(),
-            quote: "USDT".into(),
-            sources: vec![],
-            from: d(from),
-            to: d(to),
-            agg_mode: crate::types::AggregationMode::Time,
-            agg_step: 60_000.0,
-            cycle_ms: 200,
-            stale_secs: 30.0,
-            z_threshold: 6.0,
-            ticks_dir: root.to_path_buf(),
-            bars_dir: root.to_path_buf(),
-        }
-    }
-
-    /// Non-empty (spot-style) closures are never skipped: cached monthly and
-    /// daily files are picked up; an empty-URL granularity is skipped.
-    #[tokio::test]
-    async fn empty_url_skip_does_not_touch_non_empty_closures() {
-        let root = std::env::temp_dir().join(format!("sf-skip-{}", std::process::id()));
-        let dir = root.join("x").join("BTCUSDT");
-        std::fs::create_dir_all(&dir).unwrap();
-        let agent = http_agent();
-        let parse = |_: &[u8], _: u64| -> Result<Vec<TickFrame>> { Ok(vec![]) };
-        let run = |monthly_url: &'static str, daily_url: &'static str, to: u32| {
-            let (agent, root) = (agent.clone(), root.clone());
-            async move {
-                fetch_monthly_daily(
-                    &agent,
-                    &cfg((2024, 1, 1), (2024, 1, to), &root),
-                    "x",
-                    "BTCUSDT",
-                    "BTCUSDT",
-                    7,
-                    ".zip",
-                    Compression::Zip,
-                    |_, _, _| (monthly_url.into(), "M-2024-01.zip".into()),
-                    |_, d| (daily_url.into(), format!("D-{}.zip", d.format("%d"))),
-                    &parse,
-                )
-                .await
-                .unwrap()
-            }
-        };
-        std::fs::write(dir.join("M-2024-01.ticks"), b"").unwrap();
-        for d in ["01", "02", "03"] {
-            std::fs::write(dir.join(format!("D-{d}.ticks")), b"").unwrap();
-        }
-        // non-empty monthly, cached: used, daily never reached
-        assert_eq!(run("http://invalid/", "http://invalid/", 3).await.len(), 1);
-        // empty monthly: falls to the (non-empty) daily closure, 3 cached days
-        assert_eq!(run("", "http://invalid/", 3).await.len(), 3);
-        // empty daily: nothing to fetch for the days, no cached monthly either
-        std::fs::remove_file(dir.join("M-2024-01.ticks")).unwrap();
-        assert_eq!(run("", "", 3).await.len(), 0);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// `month_ranges` tiles [from,to] contiguously with no per-symbol logic —
     /// every ETH month in a 2024-06..2026-02 backfill is enumerated exactly
     /// once, so no month can be silently skipped at the iteration layer.
@@ -1266,5 +1409,347 @@ mod tests {
         for pair in r.windows(2) {
             assert_eq!(pair[1].0, pair[0].1 + Duration::days(1));
         }
+    }
+    fn http_err(code: u16) -> anyhow::Error {
+        anyhow::anyhow!("http u: HTTP {code}")
+    }
+
+    /// Retry/missing classification: the missing codes are final, anything else is
+    /// retried up to `ATTEMPTS` and the last error surfaces.
+    #[tokio::test]
+    async fn retry_stops_at_missing_and_exhausts_on_faults() {
+        let zero = std::time::Duration::ZERO;
+        for (code, want) in [(404, 1), (403, 1), (500, ATTEMPTS), (429, ATTEMPTS)] {
+            let n = AtomicUsize::new(0);
+            let r: Result<()> = with_retry(zero, "t", || async {
+                n.fetch_add(1, Ordering::Relaxed);
+                Err(http_err(code))
+            })
+            .await;
+            assert_eq!(n.load(Ordering::Relaxed), want, "HTTP {code}");
+            assert_eq!(is_missing(&r.unwrap_err()), want == 1);
+        }
+        let n = AtomicUsize::new(0);
+        let r = with_retry(zero, "t", || async {
+            if n.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(http_err(502))
+            } else {
+                Ok(7)
+            }
+        })
+        .await;
+        assert_eq!((r.unwrap(), n.load(Ordering::Relaxed)), (7, 2));
+    }
+
+    /// Offline network: replies by file name, records every request.
+    struct Fake {
+        reply: fn(&str) -> Result<u64>,
+        calls: Mutex<Vec<String>>,
+        scales: AtomicUsize,
+    }
+
+    impl Fake {
+        fn new(reply: fn(&str) -> Result<u64>) -> Self {
+            Self {
+                reply,
+                calls: Mutex::new(vec![]),
+                scales: AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            std::mem::take(&mut self.calls.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Net for Fake {
+        async fn scale(&self, _: &Venue) -> Result<f64> {
+            self.scales.fetch_add(1, Ordering::Relaxed);
+            Ok(1.0)
+        }
+        async fn download(&self, _: &Venue, url: &str, cache: &Path, _: f64) -> Result<u64> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(url.rsplit('/').next().unwrap().into());
+            let n = (self.reply)(url)?;
+            if n > 0 {
+                ensure_parent_dir(cache)?;
+                fs::write(cache, b"t")?;
+            }
+            Ok(n)
+        }
+        async fn exists(&self, url: &str) -> Result<bool> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(url.rsplit('/').next().unwrap().into());
+            match (self.reply)(url) {
+                Ok(_) => Ok(true),
+                Err(e) if is_missing(&e) => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    const BOTH: Files = Files {
+        monthly: "{sym}-{y:04}-{m:02}.zip",
+        daily: "{sym}-{y:04}-{m:02}-{d:02}.zip",
+        tz_h: 0,
+    };
+
+    fn venue(files: Files) -> Venue {
+        Venue {
+            name: "x",
+            sym: "BTCUSDT".into(),
+            perp: false,
+            files,
+            stems: Stems {
+                monthly: "http://h/m/{sym}/".into(),
+                daily: "http://h/d/{sym}/".into(),
+            },
+            row: |_| None,
+            product: "",
+            contract: None,
+        }
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "sf-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&p);
+        p
+    }
+
+    fn ok(_: &str) -> Result<u64> {
+        Ok(5)
+    }
+
+    /// Run one fetch; returns (requests, cached file names).
+    async fn run(
+        files: Files,
+        reply: fn(&str) -> Result<u64>,
+        from: NaiveDate,
+        to: NaiveDate,
+        today: NaiveDate,
+    ) -> (Vec<String>, Vec<String>) {
+        let (net, dir) = (Fake::new(reply), tmp("fetch"));
+        let got = fetch_archive(&net, &venue(files), &dir, from, to, today)
+            .await
+            .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let names = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into())
+            .collect();
+        (net.calls(), names)
+    }
+
+    /// A completed month the window covers is one monthly request; a partial
+    /// window inside it is cut with daily archives and never downloads the month.
+    #[tokio::test]
+    async fn granularity_follows_window_coverage() {
+        let today = d(2024, 3, 1);
+        let (calls, files) = run(BOTH, ok, d(2024, 1, 1), d(2024, 1, 31), today).await;
+        assert_eq!(calls, ["BTCUSDT-2024-01.zip"]);
+        assert_eq!(files, ["BTCUSDT-2024-01.ticks"]);
+        let (calls, files) = run(BOTH, ok, d(2024, 1, 5), d(2024, 1, 6), today).await;
+        assert_eq!(calls, ["BTCUSDT-2024-01-05.zip", "BTCUSDT-2024-01-06.zip"]);
+        assert_eq!(files.len(), 2);
+    }
+
+    /// A monthly that is missing, failed or empty falls back to the dailies.
+    #[tokio::test]
+    async fn monthly_miss_fault_or_empty_falls_back_to_daily() {
+        let today = d(2024, 3, 1);
+        let cases: [fn(&str) -> Result<u64>; 3] = [
+            |u| {
+                if u.contains("/m/") {
+                    Err(http_err(404))
+                } else {
+                    Ok(5)
+                }
+            },
+            |u| {
+                if u.contains("/m/") {
+                    Err(http_err(500))
+                } else {
+                    Ok(5)
+                }
+            },
+            |u| Ok(if u.contains("/m/") { 0 } else { 5 }),
+        ];
+        for reply in cases {
+            let (calls, files) = run(BOTH, reply, d(2024, 2, 1), d(2024, 2, 29), today).await;
+            assert_eq!(calls[0], "BTCUSDT-2024-02.zip");
+            assert_eq!(files.len(), 29, "29 daily files after the monthly miss");
+        }
+    }
+
+    /// The current month has no monthly archive; a day the archive lacks (today) is skipped.
+    #[tokio::test]
+    async fn current_month_is_daily_and_a_missing_day_is_skipped() {
+        let reply: fn(&str) -> Result<u64> = |u| {
+            if u.ends_with("03-03.zip") {
+                Err(http_err(404))
+            } else {
+                Ok(5)
+            }
+        };
+        let (calls, files) = run(BOTH, reply, d(2024, 3, 1), d(2024, 3, 3), d(2024, 3, 3)).await;
+        assert_eq!(calls.len(), 3);
+        assert!(calls
+            .iter()
+            .all(|c| c.len() == "BTCUSDT-2024-03-01.zip".len()));
+        assert_eq!(files.len(), 2);
+    }
+
+    /// A monthly-only venue fetches the whole month for any window inside it,
+    /// and has nothing for a month that is not complete.
+    #[tokio::test]
+    async fn monthly_only_venue() {
+        let only = Files { daily: "", ..BOTH };
+        let (calls, _) = run(only, ok, d(2024, 1, 5), d(2024, 1, 6), d(2024, 3, 1)).await;
+        assert_eq!(calls, ["BTCUSDT-2024-01.zip"]);
+        let (calls, files) = run(only, ok, d(2024, 3, 1), d(2024, 3, 2), d(2024, 3, 3)).await;
+        assert!((calls, files) == (vec![], vec![]));
+    }
+
+    /// Chunked daily archives are read in order until a chunk is missing or empty.
+    #[tokio::test]
+    async fn chunked_daily_stops_at_missing_or_empty_chunk() {
+        let chunked = Files {
+            monthly: "",
+            daily: "{ds}_{seq:03}.zip",
+            tz_h: 0,
+        };
+        let reply: fn(&str) -> Result<u64> = |u| match u.rsplit('_').next().unwrap() {
+            "001.zip" | "002.zip" => Ok(5),
+            "003.zip" => Ok(0),
+            _ => Err(http_err(403)),
+        };
+        let (calls, files) = run(chunked, reply, d(2024, 1, 5), d(2024, 1, 5), d(2024, 3, 1)).await;
+        assert_eq!(
+            calls,
+            ["20240105_001.zip", "20240105_002.zip", "20240105_003.zip"]
+        );
+        assert_eq!(files, ["20240105_001.ticks", "20240105_002.ticks"]);
+    }
+
+    /// A venue whose days run east of UTC also needs the day after the window,
+    /// unless that day has not started yet.
+    #[tokio::test]
+    async fn east_of_utc_venue_fetches_the_next_day_too() {
+        let east = Files { tz_h: 8, ..BOTH };
+        let (calls, _) = run(east, ok, d(2024, 1, 5), d(2024, 1, 6), d(2024, 3, 1)).await;
+        assert_eq!(calls.len(), 3);
+        assert!(calls[2].ends_with("01-07.zip"));
+        let (calls, _) = run(east, ok, d(2024, 3, 1), d(2024, 3, 2), d(2024, 3, 2)).await;
+        assert_eq!(calls.len(), 2, "03-03 has not started");
+    }
+
+    /// Cached files are never refetched; the contract size is looked up once, on
+    /// the first download, and not at all for a fully cached window.
+    #[tokio::test]
+    async fn cache_skips_download_and_contract_lookup() {
+        let (net, dir) = (Fake::new(ok), tmp("cache"));
+        let v = venue(BOTH);
+        let window = (d(2024, 1, 5), d(2024, 1, 7), d(2024, 3, 1));
+        for expect in [(3, 1), (0, 1)] {
+            fetch_archive(&net, &v, &dir, window.0, window.1, window.2)
+                .await
+                .unwrap();
+            assert_eq!(
+                (net.calls().len(), net.scales.load(Ordering::Relaxed)),
+                expect
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Probe: first and last archive in the window; none for a dead symbol; a
+    /// transport fault is an error, never "absent".
+    #[tokio::test]
+    async fn probe_reports_coverage_and_faults() {
+        let v = venue(BOTH);
+        let (from, to, today) = (d(2024, 1, 5), d(2024, 1, 9), d(2024, 3, 1));
+        let net = Fake::new(|u| {
+            if u.ends_with("01-07.zip") || u.ends_with("01-08.zip") {
+                Ok(1)
+            } else {
+                Err(http_err(404))
+            }
+        });
+        let got = probe_archive(&net, &v, from, to, today).await.unwrap();
+        assert_eq!(got, Some((d(2024, 1, 7), d(2024, 1, 8))));
+        let dead = Fake::new(|_| Err(http_err(403)));
+        assert_eq!(
+            probe_archive(&dead, &v, from, to, today).await.unwrap(),
+            None
+        );
+        let flaky = Fake::new(|_| Err(http_err(503)));
+        assert!(probe_archive(&flaky, &v, from, to, today).await.is_err());
+    }
+
+    /// Placeholders expand identically in stems and file names.
+    #[test]
+    fn placeholders_expand() {
+        let v = Venue {
+            product: "UMCBL",
+            ..venue(Files {
+                monthly: "",
+                daily: "{ds}_{seq:03}.zip",
+                tz_h: 0,
+            })
+        };
+        let day = d(2024, 1, 5);
+        assert_eq!(
+            expand(
+                "{product}/{sym}/{y:04}{m:02}{d:02}/{ds}_{seq:03}",
+                &v,
+                day,
+                2
+            ),
+            "UMCBL/BTCUSDT/20240105/20240105_002"
+        );
+    }
+
+    /// Shared validation: non-finite or non-positive prices, non-finite or
+    /// negative sizes and non-finite timestamps never become ticks.
+    #[test]
+    fn non_finite_and_invalid_fields_are_rejected() {
+        let row: RowFn = |r| {
+            Some(Row {
+                us: secs_to_us(field(r, 0)?)?,
+                price: field(r, 1)?,
+                size: field(r, 2)?,
+                buyer: true,
+            })
+        };
+        let csv = "1700000000.5,100,1\n\
+                   inf,100,1\n\
+                   NaN,100,1\n\
+                   1700000000.5,inf,1\n\
+                   1700000000.5,NaN,1\n\
+                   1700000000.5,0,1\n\
+                   1700000000.5,-5,1\n\
+                   1700000000.5,100,inf\n\
+                   1700000000.5,100,NaN\n\
+                   1700000000.5,100,-1\n\
+                   1700000000.5,100,1e400\n\
+                   1700000000.5,1e308,1e308\n";
+        let t = csv_ticks(csv.as_bytes(), 7, "binance", 1.0, row).unwrap();
+        assert_eq!(t.len(), 1, "only the first row is valid");
+        assert_eq!({ t[0].body.vask }, 100);
+        let t = csv_ticks(b"1700000000.5,100,0.001\n", 7, "binance", 1.0, row).unwrap();
+        assert_eq!(
+            { t[0].body.vask },
+            1,
+            "a sub-unit trade keeps one unit of size"
+        );
     }
 }

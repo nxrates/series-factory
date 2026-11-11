@@ -15,7 +15,7 @@
 //! bin before any binary that depends on pre-populated `.ticks` archives.
 
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use clap::Parser;
 use serde::Serialize;
 use series_factory::{
@@ -83,144 +83,6 @@ struct ProbeResult {
     last_date: Option<String>,
 }
 
-/// HEAD-check archive availability for one (pair, exchange) over the window.
-/// Returns earliest + latest month w/ a 200 OK monthly archive. Bounded:
-/// scans at most `MAX_PROBE_MONTHS` chronological months in each direction.
-async fn probe_one(
-    pair: &str,
-    quote: &str,
-    exchange: &str,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> ProbeResult {
-    use chrono::Datelike;
-    const MAX_PROBE_MONTHS: i32 = 72; // 6y cap
-
-    let sym = format!("{}{}", pair.to_uppercase(), quote.to_uppercase());
-    // A broken egress config is not "no data": fail loudly.
-    let agent = btr_rpc::env_http(std::time::Duration::from_secs(15))
-        .expect("egress config unusable")
-        .missing_403();
-
-    // Probe URL template sourced from YAML
-    // `cexs.exchanges.<exch>.archive_url_template.probe`.
-    // `{sym}` / `{y:04}` / `{m:02}` are filled at probe time.
-    let probe_tpl: Option<String> = match exchange {
-        // Perp archives have their own paths: no probe, the fetcher discovers coverage.
-        _ if series_factory::sources::split_quote(quote).1 => None,
-        "binance" | "bybit" => {
-            let t = series_factory::sources::common::archive_urls(if exchange == "binance" {
-                "binance"
-            } else {
-                "bybit"
-            })
-            .probe
-            .clone();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        }
-        // bitget/okx have no easily-HEADable monthly archive convention
-        // (per-day only) — return None to skip probing; fetcher itself
-        // will discover coverage on attempt.
-        _ => None,
-    };
-    let url_for = |y: i32, m: u32| -> Option<String> {
-        probe_tpl.as_ref().map(|t| {
-            t.replace("{sym}", &sym)
-                .replace("{y:04}", &format!("{:04}", y))
-                .replace("{m:02}", &format!("{:02}", m))
-        })
-    };
-
-    // walk forward to find first available month
-    let mut first: Option<NaiveDate> = None;
-    let mut last: Option<NaiveDate> = None;
-    let mut cursor = NaiveDate::from_ymd_opt(from.year(), from.month(), 1).unwrap();
-    let stop = NaiveDate::from_ymd_opt(to.year(), to.month(), 1).unwrap();
-    let mut scanned = 0;
-    while cursor <= stop && scanned < MAX_PROBE_MONTHS {
-        scanned += 1;
-        let url = match url_for(cursor.year(), cursor.month()) {
-            Some(u) => u,
-            None => {
-                // unknown probe mapping → bail w/ has_data=true (don't block)
-                return ProbeResult {
-                    ticker: pair.to_string(),
-                    exchange: exchange.to_string(),
-                    has_data: true,
-                    first_date: None,
-                    last_date: None,
-                };
-            }
-        };
-        let ok = head_ok(&agent, &url).await;
-        if ok {
-            first = Some(cursor);
-            break;
-        }
-        cursor = next_month(cursor);
-    }
-    if first.is_none() {
-        return ProbeResult {
-            ticker: pair.to_string(),
-            exchange: exchange.to_string(),
-            has_data: false,
-            first_date: None,
-            last_date: None,
-        };
-    }
-    // walk backward from `to` to find last available
-    let mut cursor = stop;
-    let mut scanned = 0;
-    while scanned < MAX_PROBE_MONTHS {
-        scanned += 1;
-        let url = match url_for(cursor.year(), cursor.month()) {
-            Some(u) => u,
-            None => break,
-        };
-        if head_ok(&agent, &url).await {
-            last = Some(cursor);
-            break;
-        }
-        cursor = prev_month(cursor);
-        if cursor < first.unwrap() {
-            break;
-        }
-    }
-    ProbeResult {
-        ticker: pair.to_string(),
-        exchange: exchange.to_string(),
-        has_data: true,
-        first_date: first.map(|d| d.format("%Y-%m-%d").to_string()),
-        last_date: last.map(|d| d.format("%Y-%m-%d").to_string()),
-    }
-}
-
-fn next_month(d: NaiveDate) -> NaiveDate {
-    if d.month() == 12 {
-        NaiveDate::from_ymd_opt(d.year() + 1, 1, 1).unwrap()
-    } else {
-        NaiveDate::from_ymd_opt(d.year(), d.month() + 1, 1).unwrap()
-    }
-}
-
-fn prev_month(d: NaiveDate) -> NaiveDate {
-    if d.month() == 1 {
-        NaiveDate::from_ymd_opt(d.year() - 1, 12, 1).unwrap()
-    } else {
-        NaiveDate::from_ymd_opt(d.year(), d.month() - 1, 1).unwrap()
-    }
-}
-
-async fn head_ok(http: &btr_rpc::Http, url: &str) -> bool {
-    http.send(reqwest::Method::HEAD, url, &[], None)
-        .await
-        .is_ok_and(|r| (200..300).contains(&r.status))
-}
-
 use nxr_sdk::pipeline_config::PipelineYml as YmlRoot;
 
 fn midnight_utc_today() -> DateTime<Utc> {
@@ -277,9 +139,8 @@ async fn main() -> Result<()> {
                     .and_utc())
             };
             let from = parse_day(f)?;
-            // `--to-date` is inclusive; `fetch_monthly_daily`'s daily loop runs
-            // `day <= config.to.date_naive()`, so the naive date of `to` must be
-            // the last day we want. Midnight of that day satisfies that.
+            // `--to-date` is inclusive: the fetch covers `day <= config.to.date_naive()`,
+            // so the naive date of `to` is the last day wanted.
             let to = parse_day(t)?;
             (from, to)
         }
@@ -292,12 +153,43 @@ async fn main() -> Result<()> {
     let nxr_cfg = nxr_sdk::NxrConfig::from_env();
     let ticks_dir = PathBuf::from(&nxr_cfg.ticks_dir);
 
-    // probe-only mode: HEAD-check every (pair, exchange) → JSON stdout
+    let config_for = |pair: &str, exchange: &str| Config {
+        base: pair.to_uppercase(),
+        quote: args.quote.to_uppercase(),
+        sources: vec![exchange.to_string()],
+        from,
+        to,
+        agg_mode: AggregationMode::Time,
+        agg_step: 60_000.0,
+        cycle_ms: 200,
+        stale_secs: 30.0,
+        z_threshold: 6.0,
+        ticks_dir: ticks_dir.clone(),
+        bars_dir: PathBuf::from(&nxr_cfg.bars_dir),
+    };
+
+    // probe-only mode: HEAD-check every (pair, exchange) -> JSON stdout
     if args.probe {
         let mut results: Vec<ProbeResult> = Vec::new();
         for pair in &pairs {
             for exchange in &exchanges {
-                let r = probe_one(pair, &args.quote, exchange, from, to).await;
+                let source = create_source(&DataSource::Exchange(exchange.clone())).await?;
+                let (has_data, found) = match source.probe(&config_for(pair, exchange)).await {
+                    Ok(found) => (found.is_some(), found),
+                    // A transport fault says nothing about coverage: never drop the venue on it.
+                    Err(e) => {
+                        warn!("[{exchange}/{pair}] probe failed, assuming coverage: {e:#}");
+                        (true, None)
+                    }
+                };
+                let day = |d: NaiveDate| d.format("%Y-%m-%d").to_string();
+                let r = ProbeResult {
+                    ticker: pair.clone(),
+                    exchange: exchange.clone(),
+                    has_data,
+                    first_date: found.map(|f| day(f.0)),
+                    last_date: found.map(|f| day(f.1)),
+                };
                 info!(
                     ticker = %r.ticker,
                     exchange = %r.exchange,
@@ -328,20 +220,7 @@ async fn main() -> Result<()> {
 
     for pair in &pairs {
         for exchange in &exchanges {
-            let cfg = Config {
-                base: pair.to_uppercase(),
-                quote: args.quote.to_uppercase(),
-                sources: vec![exchange.clone()],
-                from,
-                to,
-                agg_mode: AggregationMode::Time,
-                agg_step: 60_000.0,
-                cycle_ms: 200,
-                stale_secs: 30.0,
-                z_threshold: 6.0,
-                ticks_dir: ticks_dir.clone(),
-                bars_dir: PathBuf::from(&nxr_cfg.bars_dir),
-            };
+            let cfg = config_for(pair, exchange);
             let permit = sem.clone().acquire_owned().await.unwrap();
             let exchange = exchange.clone();
             let pair = pair.clone();
