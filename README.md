@@ -50,7 +50,9 @@ daily-sharded bars             <root>/bars/<MITCH_ID>/<YYYY-MM-DD>.{s10,renko}
 PASS/FAIL certification
 ```
 
-`backfill-all` orchestrates the full chain for many tickers in parallel, with resume logic, availability probing, and a JSON report.
+`backfill-all` orchestrates the full chain for many tickers in parallel, with availability probing, lazy reruns, bounded disk and a JSON report.
+
+**Lazy and bounded.** A day is done when its composite `.idx` shard is in the manifest and on disk exactly as recorded; a partial or unlisted shard is redone. Done days are never refetched or rebuilt, even when their sources are long deleted: a month whose days are all done is skipped, otherwise only its first-to-last missing day is fetched, folded and merged. `.s10` days are rebuilt only when older than their composite shard, `.renko` only when older than the composite or the calibration. `--rebuild` overrides. Each month's sources (raw `.ticks`, per-provider `.idx`) are deleted as soon as its composite is built and listed (`--keep-staging` keeps them), so peak disk is about one month of every venue. Each month folds cold: its first seconds blend only the venues that have traded so far. Renko needs a calibrated `k` (`nxr-calibrate`) and a history beyond the vol bootstrap; without them the step reports that no bricks were built.
 
 ## On-chain backfill
 
@@ -73,10 +75,10 @@ Every new symbol, leg or source needs >= 7 d of history in the rollout (`docs/in
 
 | Binary | Purpose |
 |--------|---------|
-| `fetch-crypto-history` | Download aggTrades/tick archives per (pair, exchange) into `.ticks` files; `--probe` mode HEAD-checks archive coverage |
+| `fetch-crypto-history` | Download aggTrades/tick archives per (pair, exchange) into `.ticks` files; `--probe` mode HEAD-checks archive coverage (spot and perp) |
 | `ticks-to-idx` | Replay raw `.ticks` into a per-provider `.idx` AppendLog (200 ms cycle, z-score outlier gate) |
 | `merge-idx` | TDWAP-merge per-provider `.idx` files into a composite daily-sharded `.idx` directory |
-| `backfill-all` | Orchestrator: fetch, ticks-to-idx, merge, s10, renko, validate; parallel tickers, resume, JSON report |
+| `backfill-all` | Orchestrator: fetch, ticks-to-idx, merge, s10, renko, validate; parallel tickers, lazy reruns, JSON report |
 | `synth-backfill-from-idx` | Rebuild synthetic cross-pair bars (e.g. ETH-BTC) from the two leg `.idx` streams |
 
 ### Bar construction
@@ -110,21 +112,41 @@ Every new symbol, leg or source needs >= 7 d of history in the rollout (`docs/in
 
 ## Data Sources
 
-| Exchange | Spot | Perp | Archive granularity (perp) | Perp size unit |
-|----------|------|------|----------------------------|----------------|
-| Binance | yes | USDT/USDC-margined (USD-M) | monthly for completed months, daily otherwise | base |
-| Bybit | yes | USDT/USDC-margined (linear) | daily | base |
-| OKX | yes | USDT/USDC-margined swaps | monthly, daily | contracts, scaled by the swap's `ctVal` |
-| Bitget | yes | USDT/USDC-margined | daily, sequential chunks (001-N) | base |
-| Gate.io (`gateio`) | no | USDT-margined | monthly | contracts, scaled by `quanto_multiplier` |
+One code path serves every venue and market (`sources/common.rs`); a venue file only states its archive file names, its symbol spelling and a row mapper. Spot and perp are selected by the quote (`USDT` vs `USDT:PERP`) and behave identically.
 
-Spot archive URL templates are YAML-driven (`cexs.exchanges.<name>.archive_url_template` in the pipeline config). Perp stems are constants in the source (`sources/*.rs`): the archive layout and the parser are one unit. Sources convert trades to ticks pessimistically: market sells set the bid, market buys set the ask, and the other side is forward-filled.
+| Exchange | Spot | Perp | Monthly | Daily | Contract size |
+|----------|------|------|---------|-------|---------------|
+| Binance | yes | USDT/USDC (USD-M) | yes | yes | base |
+| Bybit | yes | USDT/USDC (linear) | spot only | yes | base |
+| OKX | yes | USDT/USDC swaps | yes | yes | contracts x `ctVal` |
+| Bitget | yes | USDT/USDC | no | yes, chunked `_001..N` | base |
+| Gate.io (`gateio`) | no | USDT | yes | no | contracts x `quanto_multiplier` |
+
+Guarantees, for every row above:
+
+- **Granularity.** Per calendar month: the monthly archive when the window covers the whole completed month (or the venue has no daily archive), otherwise daily archives; a monthly that is missing, failed or empty falls back to daily. A window inside a month never downloads the month.
+- **Missing vs failed.** 404 and 403 mean the archive has no such object: final, quiet. Every other failure (and a download shorter than its `Content-Length`) is retried 3 times with backoff and then logged as a warning. A zero-tick download is never kept. A completed month that yields nothing is warned about.
+- **Caching.** A non-empty `.ticks` file is never fetched again; files are written atomically, so a torn download is never mistaken for a cache hit. The contract-size lookup (OKX, Gate.io) happens only when something is actually downloaded.
+- **Windows.** OKX and Bitget cut their days and months at UTC+8: a day's file starts at 16:00 UTC the day before. The fetch therefore also takes the day after the window, and `ticks-to-idx --from-date/--to-date` folds exactly the UTC window (`backfill-all` passes it), so every venue covers the same UTC days. Bitget stamps whole seconds; trades sharing a stamp are spread evenly over that second in file order, else the venue leads real time by up to a second.
+- **Rows.** Header, short and unparseable rows are skipped. A row with a non-finite or non-positive price, or a non-finite or negative size, is dropped. The side is the taker's side. Quote volume is `price x size x contract size`, truncated to whole quote units and saturating at `u32::MAX`. Output is ascending in time (a newest-first file is reversed).
+- **Probe.** `fetch-crypto-history --probe` HEAD-checks the same archive units a fetch would use, newest then oldest first, and reports first and last archive date; a long window is sampled at an even stride. A transport fault is reported as unknown, never as no coverage.
+
+Archive URLs are `stem + file name`. The stem is config (`cexs.exchanges.<name>.archive_url_template.{monthly,daily}` for spot, `.perp.{monthly,daily}` for perps); the file name is the venue's layout. Sources convert trades to ticks pessimistically: market sells set the bid, market buys set the ask, and the other side is forward-filled.
 
 **No public bulk trade history** (probed on 2026-11-11, unauthenticated; re-probe before relying on it): Hyperliquid (requester-pays S3), Aster, MEXC, XT.com, WhiteBIT (login-gated downloads), CoinW (also hard-excluded from index construction), Toobit, Ourbit, Lighter (account-scoped export, REST only), Variational (per-user CSV only). Only REST recent-trades or vendor-paid history exists for these, so no fetcher is provided.
 
 ## Perpetual series
 
 A perp series is the same pipeline with the quote spelled `USDT:PERP` (or `USDC:PERP`), the SDK's `BASE/QUOTE:PERP` convention. The MITCH ticker id then carries the PERP instrument type, so spot and perp of one pair never share an id, a raw-tick directory (`ticks/<exchange>/BTCUSDT:PERP/`), a per-provider `.idx` (`indexes/<exchange>/BTC-USDT:PERP.idx`) or a composite directory (`indexes/<MITCH_ID>/`). `merge-idx` blends several perp venues exactly as it does spot, with the same `cexs.exchanges.<name>.weight`.
+
+Backfill (fetch, per-provider idx, merge, s10, renko, validate):
+
+```bash
+backfill-all config.yml --tickers BTC-USDT:PERP,ETH-USDT:PERP --exchanges binance,bybit,okx,bitget,gateio \
+  --from 2026-10-01 --to 2026-10-31
+```
+
+or stage by stage:
 
 ```bash
 fetch-crypto-history config.yml --pairs BTC --exchanges binance,bybit,okx,bitget,gateio --quote USDT:PERP --days 30
@@ -134,14 +156,16 @@ s10-from-idx config.yml BTC-USDT:PERP
 ```
 
 Notes:
+- `backfill-all` needs explicit `--tickers`: the default pair set includes stablecoin bases that have no perps. `gateio` is perp-only and not in the default exchange list; add it explicitly.
+- The availability probe runs for perps as for spot: a venue with no such contract is dropped with a warning, and a perp ticker no venue covers is skipped, never re-sourced from Pyth (Pyth history is spot-only). Without the probe (`--skip-probe`) a venue with no contract fails its fetch and the ticker continues on the others.
+- Perp volume per day is several times spot's: the disk guard scales its per-day estimate accordingly.
 - The raw-tick directory and `.idx` file names contain a colon.
 - Contract-sized venues (OKX, Gate.io) convert contracts to base units with the multiplier read from the venue's public instrument endpoint at fetch time; a historical change of that multiplier is not reflected.
-- Per-tick volume is quote notional truncated to whole units (`u32`); a single perp trade cannot overflow it. Sub-unit trades truncate to zero, as for spot.
+- A trade smaller than one quote unit carries one unit of volume, as for spot.
 - Perp provider ids in `.idx` headers are the spot venue's ids (the series is told apart by ticker id and path, not by provider id).
 - Contracts quoted per 1000 units (e.g. Binance `1000PEPEUSDT`) are not rescaled.
-- `backfill-all` for perps needs explicit `--tickers BTC-USDT:PERP,…` and `--exchanges …` (this path has not been exercised end to end against perps): the default pair set includes stablecoin bases that have no perps, and `gateio` is not in the default exchange list.
-- `merge-idx` requires a weight for every exchange (`cexs.exchanges.<name>.weight` in the config or `--weight name=n`) and fails naming the venue otherwise; relay providers are exempt. A config copied without `gateio` therefore errors instead of blending it at an arbitrary weight.
-- `--probe` skips perp series (coverage is discovered while fetching).
+- `merge-idx` requires a weight for every exchange (`cexs.exchanges.<name>.weight` in the config or `--weight name=n`) and fails naming the venue otherwise; relay providers are exempt.
+- Gate.io publishes complete months only: a window that ends in the current month has nothing from it, and a window inside a completed month downloads the whole month (the raw `.ticks` then hold the full month).
 - Funding, mark and index prices are not part of any trade archive and are not ingested.
 
 ## Synthetic Models
@@ -212,7 +236,7 @@ renko-from-idx config.yml BTC USDT
 Or run the whole chain for a ticker set:
 
 ```bash
-backfill-all config.yml --tickers BTC-USDT,ETH-USDT --from 2024-01-01 --resume
+backfill-all config.yml --tickers BTC-USDT,ETH-USDT --from 2024-01-01
 ```
 
 Validate:
