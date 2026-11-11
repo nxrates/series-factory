@@ -4,7 +4,7 @@
 //! patterns), the symbol spelling and a row mapper; everything else lives here:
 //! URL expansion, monthly -> daily granularity, download + retry + missing
 //! classification, CSV -> tick conversion (validation, quote volume, ordering),
-//! caching, availability probing and the `.ticks` replay into a channel.
+//! caching and availability probing.
 
 use crate::sources::{provider_id_for, series_key, TickSource};
 use crate::types::{Config, TickFrame};
@@ -477,16 +477,6 @@ pub fn read_tick_file(path: &Path) -> Result<Vec<TickFrame>> {
     Ok(frames.to_vec())
 }
 
-/// Re-stamp every frame's header with `provider_id`. Used after reading
-/// cached .ticks files (older caches were written with provider_id=0 before
-/// sources plumbed their MITCH id through parse_csv).
-#[inline]
-pub fn stamp_provider_id(frames: &mut [TickFrame], provider_id: u16) {
-    for f in frames {
-        f.header.set_provider_id(provider_id);
-    }
-}
-
 // ─── Trade → tick (NO book fabrication) ─────────────────────────────────────
 
 /// Build a tick from an EXECUTED TRADE with honest no-book semantics.
@@ -581,10 +571,6 @@ pub fn field<T: std::str::FromStr>(r: &csv::StringRecord, i: usize) -> Option<T>
     r.get(i)?.parse().ok()
 }
 
-// ─── Batch sending ─────────────────────────────────────────────────────────────
-
-const BATCH_SIZE: usize = 10_000;
-
 // ─── Date helpers ──────────────────────────────────────────────────────────────
 
 /// First day of the next month.
@@ -636,98 +622,6 @@ pub fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Send ticks read from cached tick files through the channel.
-///
-/// Streams files **sequentially** and emits `BATCH_SIZE`-tick batches sliced
-/// directly from each mmap, so peak RSS per source is one batch (~480 KiB)
-/// plus the kernel's working set for the current file (trimmed by
-/// `MADV_SEQUENTIAL`). The previous version used `par_iter().collect()`,
-/// which read every file for the source into an owned `Vec<TickFrame>`
-/// concurrently — for 30 days × 4 sources this pulled ≥10 GiB resident and
-/// OOM-killed the host on 2026-04-23.
-///
-/// Each emitted batch has its header provider_id re-stamped so the
-/// downstream aggregator can route per-provider regardless of whether the
-/// cache predates provider-aware parse_csv writes.
-pub async fn fetch_cached_ticks(
-    files: &[std::path::PathBuf],
-    provider_id: u16,
-    tx: mpsc::Sender<Vec<TickFrame>>,
-) {
-    for path in files {
-        if let Err(e) = stream_tick_file_to_channel(path, provider_id, &tx).await {
-            warn!("Error streaming tick file {:?}: {}", path, e);
-        }
-    }
-}
-
-async fn stream_tick_file_to_channel(
-    path: &Path,
-    provider_id: u16,
-    tx: &mpsc::Sender<Vec<TickFrame>>,
-) -> Result<()> {
-    // Chunked `File::read` (NOT `Mmap::map`): on macOS, mmap'd pages that
-    // we touch are counted against our RSS and `MADV_SEQUENTIAL` is a weak
-    // hint; reading a 1.7 GiB bybit monthly via mmap once OOM-killed the
-    // host at a 2 GiB cap. Explicit read keeps resident use to ~1 batch.
-    let tick_frame_size = std::mem::size_of::<TickFrame>();
-    let mut file = File::open(path)?;
-    let len = file.metadata()?.len() as usize;
-    if len == 0 {
-        return Ok(());
-    }
-    if len % tick_frame_size != 0 {
-        anyhow::bail!(
-            "File size ({}) is not a multiple of TickFrame ({}): {}",
-            len,
-            tick_frame_size,
-            path.display(),
-        );
-    }
-    stream_as_tick_frames(&mut file, tick_frame_size, provider_id, tx).await
-}
-
-/// Stream a native `TickFrame` (48 B) file batch-by-batch through the channel.
-async fn stream_as_tick_frames(
-    file: &mut File,
-    frame_size: usize,
-    provider_id: u16,
-    tx: &mpsc::Sender<Vec<TickFrame>>,
-) -> Result<()> {
-    use std::io::Read;
-    let mut buf: Vec<u8> = vec![0u8; BATCH_SIZE * frame_size];
-    loop {
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            match file.read(&mut buf[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if filled == 0 {
-            break;
-        }
-        if filled % frame_size != 0 {
-            anyhow::bail!(
-                "short read {} bytes not aligned to TickFrame {}",
-                filled,
-                frame_size
-            );
-        }
-        let frames: &[TickFrame] = bytemuck::cast_slice(&buf[..filled]);
-        let mut owned: Vec<TickFrame> = frames.to_vec();
-        stamp_provider_id(&mut owned, provider_id);
-        if tx.send(owned).await.is_err() {
-            return Ok(());
-        }
-        if filled < buf.len() {
-            break;
-        }
-    }
-    Ok(())
-}
-
 // ─── Download + convert ──────────────────────────────────────────────────────
 
 /// Download archive (streamed to disk), stream-decompress from disk +
@@ -735,7 +629,7 @@ async fn stream_as_tick_frames(
 /// is bounded to:
 ///   * one `DOWNLOAD_STREAM_BUF_BYTES` copy buffer (8 MiB) during download
 ///   * one `CSV_CHUNK_BYTES` line-aligned chunk (~1 MiB)
-///   * one `BATCH_SIZE`-tick parsed batch (~480 KiB)
+///   * one parsed CSV chunk
 ///
 /// Critically, the compressed archive is NEVER held in RAM as a `Vec<u8>`:
 /// it is streamed to a temp file on the ticks PVC and decompressed from disk.
@@ -1052,7 +946,7 @@ pub async fn fetch_archive(
     from: NaiveDate,
     to: NaiveDate,
     today: NaiveDate,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Fetched> {
     let scale = OnceCell::new();
     // The contract size is looked up on the first download only: a fully cached window needs none.
     let scale = &scale;
@@ -1060,19 +954,23 @@ pub async fn fetch_archive(
         let k = *scale.get_or_try_init(|| net.scale(v)).await?;
         Ok::<_, anyhow::Error>(net.download(v, &url, &cache, k).await)
     };
-    let mut files = Vec::new();
+    let mut out = Fetched::default();
+    // One outcome per unit fetched, in time order: a monthly file, or a day.
+    let mut units: Vec<(String, Unit)> = Vec::new();
     for (start, end) in month_ranges(from, to) {
         let (year, month) = (start.year(), start.month());
         let complete = last_day_of_month(year, month) < today;
-        let before = files.len();
+        let before = out.files.len();
         let mut ticks = 0u64;
+        let mut monthly_fault = None;
 
         let first = start.with_day(1).expect("day 1 exists");
         // A cached monthly is a superset of any window inside it.
         if let Some((_, file)) = complete.then(|| v.monthly(first)).flatten() {
             let cache = cache_of(dir, &file);
             if cached(&cache) {
-                files.push(cache);
+                out.files.push(cache);
+                units.push((format!("{year}-{month:02}"), Unit::Got));
                 continue;
             }
         }
@@ -1087,32 +985,43 @@ pub async fn fetch_archive(
                     let _ = fs::remove_file(&cache);
                 }
                 Ok(_) => {
-                    files.push(cache);
+                    out.files.push(cache);
+                    units.push((format!("{year}-{month:02}"), Unit::Got));
                     continue;
                 }
                 Err(e) if is_missing(&e) => debug!("No monthly {file}, trying daily"),
-                Err(e) => warn!("Monthly failed {file}: {e:#}, trying daily"),
+                Err(e) => {
+                    warn!("Monthly failed {file}: {e:#}, trying daily");
+                    monthly_fault = Some(format!("monthly {file} failed: {e:#}"));
+                }
             }
         }
 
         if v.files.daily.is_empty() {
-            if !complete {
-                warn!(
-                    "{} publishes monthly files only: {year}-{month:02} is not complete yet",
+            // Monthly-only venue: a month it has not published yet (the current
+            // one, or a just-finished one) is held, never finalised without it.
+            let lag = last_day_of_month(year, month) + Duration::days(PUBLISH_LAG_DAYS) >= today;
+            if let Some(f) = monthly_fault {
+                out.faults.push(f);
+            } else if out.files.len() == before && (!complete || lag) {
+                out.faults.push(format!(
+                    "{} publishes monthly files only: {year}-{month:02} is not published yet",
                     v.name
-                );
+                ));
             }
         } else {
             let mut day = start;
             while day <= end {
-                ticks += fetch_day(&get, v, dir, day, &mut files).await?;
+                let (n, unit) = fetch_day(&get, v, dir, day, &mut out.files).await?;
+                ticks += n;
+                units.push((day.to_string(), unit));
                 day += Duration::days(1);
             }
         }
 
         // A completed month that produced nothing is the silent-gap signature of a
         // fetch defect for a liquid pair, not necessarily a real absence: say so.
-        if complete && files.len() == before && ticks == 0 {
+        if complete && out.files.len() == before && ticks == 0 {
             warn!(
                 exchange = v.name,
                 symbol = %v.sym,
@@ -1124,33 +1033,104 @@ pub async fn fetch_archive(
         }
     }
     // A venue cutting its days east of UTC ends its last file before the window
-    // does: the next day's file holds the rest.
+    // does: the next day's file holds the rest, and the last day is not complete
+    // without it.
     let tail = to + Duration::days(1);
     if v.files.tz_h > 0 && tail <= today {
-        fetch_day(&get, v, dir, tail, &mut files).await?;
+        let (_, unit) = fetch_day(&get, v, dir, tail, &mut out.files).await?;
+        let last_got = matches!(units.last(), Some((_, Unit::Got)));
+        match unit {
+            Unit::Got => {}
+            Unit::Failed(e) => out.faults.push(format!("tail day {tail}: {e}")),
+            Unit::Missing if last_got => out.faults.push(format!(
+                "tail day {tail} is not published, so {to} is incomplete"
+            )),
+            Unit::Missing => {}
+        }
     }
-    Ok(files)
+    out.faults.extend(unit_faults(&units));
+    Ok(out)
+}
+
+/// What a fetch produced: the `.ticks` files covering the window, and why it may
+/// be incomplete. Any fault means the venue's data for the window must not be
+/// treated as final.
+#[derive(Default)]
+pub struct Fetched {
+    pub files: Vec<PathBuf>,
+    pub faults: Vec<String>,
+}
+
+/// Archive units are final a few days after their period ends; a missing one
+/// inside this lag is "not published yet", not "absent".
+const PUBLISH_LAG_DAYS: i64 = 5;
+
+/// Outcome of one fetched unit.
+enum Unit {
+    Got,
+    /// 404/403, or an empty archive.
+    Missing,
+    /// A failure that survived the retries.
+    Failed(String),
+}
+
+/// Faults over a run of units: every failure, and every run of two or more
+/// missing units between present ones. A single missing day is an archive hole;
+/// a run is what a block looks like (403 is also how Bitget says "missing", so
+/// status alone cannot tell them apart). Missing units before the first or after
+/// the last present one are the venue's listing and archive ends, not faults.
+fn unit_faults(units: &[(String, Unit)]) -> Vec<String> {
+    let mut faults: Vec<String> = units
+        .iter()
+        .filter_map(|(l, u)| match u {
+            Unit::Failed(e) => Some(format!("{l}: {e}")),
+            _ => None,
+        })
+        .collect();
+    let present = |u: &Unit| matches!(u, Unit::Got);
+    let (Some(first), Some(last)) = (
+        units.iter().position(|(_, u)| present(u)),
+        units.iter().rposition(|(_, u)| present(u)),
+    ) else {
+        return faults;
+    };
+    let mut run = 0;
+    for (l, u) in &units[first..=last] {
+        if matches!(u, Unit::Missing) {
+            run += 1;
+            if run == 2 {
+                faults.push(format!(
+                    "missing run inside coverage from {l} (block or archive hole)"
+                ));
+            }
+        } else {
+            run = 0;
+        }
+    }
+    faults
 }
 
 /// Fetch one archive day (one file, or numbered chunks until one is missing or
-/// empty) into `files`; returns the ticks downloaded.
+/// empty) into `files`; returns the ticks downloaded and the day's outcome.
 async fn fetch_day<G, Fut>(
     get: &G,
     v: &Venue,
     dir: &Path,
     day: NaiveDate,
     files: &mut Vec<PathBuf>,
-) -> Result<u64>
+) -> Result<(u64, Unit)>
 where
     G: Fn(String, PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<Result<u64>>>,
 {
     let mut ticks = 0;
     let mut seq = 1;
+    let mut got = false;
     while let Some((url, file)) = v.daily(day, seq) {
         let cache = cache_of(dir, &file);
         if cached(&cache) {
             files.push(cache);
+            got = true;
         } else {
             match get(url, cache.clone()).await? {
                 Ok(0) => {
@@ -1161,14 +1141,15 @@ where
                 Ok(n) => {
                     ticks += n;
                     files.push(cache);
+                    got = true;
                 }
                 Err(e) if is_missing(&e) => {
-                    debug!("No {} data for {day}", v.name);
+                    debug!("No {} data for {day} chunk {seq}", v.name);
                     break;
                 }
                 Err(e) => {
                     warn!("{} {} {day} failed after retries: {e:#}", v.name, v.sym);
-                    break;
+                    return Ok((ticks, Unit::Failed(format!("{file}: {e:#}"))));
                 }
             }
         }
@@ -1177,7 +1158,7 @@ where
         }
         seq += 1;
     }
-    Ok(ticks)
+    Ok((ticks, if got { Unit::Got } else { Unit::Missing }))
 }
 
 /// Upper bound on probe requests per (venue, symbol): a longer window is sampled
@@ -1245,7 +1226,7 @@ impl ArchiveSource {
 
 #[async_trait::async_trait]
 impl TickSource for ArchiveSource {
-    async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
+    async fn fetch_ticks(&self, config: &Config, _tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
         let v = (self.venue)(config)?
             .with_context(|| format!("no archive for {} on this venue", config.quote))?;
         anyhow::ensure!(
@@ -1261,7 +1242,7 @@ impl TickSource for ArchiveSource {
             agent: self.agent.clone(),
             ticker_id,
         };
-        let files = fetch_archive(
+        let fetched = fetch_archive(
             &net,
             &v,
             &config.ticks_dir.join(v.name).join(dir),
@@ -1270,8 +1251,16 @@ impl TickSource for ArchiveSource {
             chrono::Utc::now().date_naive(),
         )
         .await?;
-        info!("Processing {} tick files", files.len());
-        fetch_cached_ticks(&files, provider_id_for(v.name), tx).await;
+        info!("{} tick files for {}", fetched.files.len(), v.sym);
+        // The files are the output; no tick batches are sent. A fault fails the
+        // fetch so the caller never treats the window as final.
+        anyhow::ensure!(
+            fetched.faults.is_empty(),
+            "{} {} incomplete: {}",
+            v.name,
+            v.sym,
+            fetched.faults.join("; ")
+        );
         Ok(())
     }
 
@@ -1588,7 +1577,8 @@ mod tests {
         let (net, dir) = (Fake::new(reply), tmp("fetch"));
         let got = fetch_archive(&net, &venue(files), &dir, from, to, today)
             .await
-            .unwrap();
+            .unwrap()
+            .files;
         let _ = fs::remove_dir_all(&dir);
         let names = got
             .iter()
@@ -1698,6 +1688,161 @@ mod tests {
         assert!(calls[2].ends_with("01-07.zip"));
         let (calls, _) = run(east, ok, d(2024, 3, 1), d(2024, 3, 2), d(2024, 3, 2)).await;
         assert_eq!(calls.len(), 2, "03-03 has not started");
+    }
+
+    /// Faults of one fetch.
+    async fn faults(
+        files: Files,
+        reply: fn(&str) -> Result<u64>,
+        from: NaiveDate,
+        to: NaiveDate,
+        today: NaiveDate,
+    ) -> Vec<String> {
+        let (net, dir) = (Fake::new(reply), tmp("faults"));
+        let got = fetch_archive(&net, &venue(files), &dir, from, to, today)
+            .await
+            .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        got.faults
+    }
+
+    /// A failure that survives the retries makes the fetch incomplete, in the
+    /// middle of a chunked day as well as on a plain day.
+    #[tokio::test]
+    async fn a_failed_download_is_a_fault() {
+        let today = d(2024, 3, 1);
+        let f = faults(
+            BOTH,
+            |u| {
+                if u.ends_with("01-06.zip") {
+                    Err(http_err(500))
+                } else {
+                    Ok(5)
+                }
+            },
+            d(2024, 1, 5),
+            d(2024, 1, 7),
+            today,
+        )
+        .await;
+        assert_eq!(f.len(), 1, "{f:?}");
+        let chunked = Files {
+            monthly: "",
+            daily: "{ds}_{seq:03}.zip",
+            tz_h: 0,
+        };
+        let f = faults(
+            chunked,
+            |u| match u.rsplit('_').next().unwrap() {
+                "001.zip" => Ok(5),
+                _ => Err(http_err(502)),
+            },
+            d(2024, 1, 5),
+            d(2024, 1, 5),
+            today,
+        )
+        .await;
+        assert_eq!(f.len(), 1, "half a day is a fault: {f:?}");
+    }
+
+    /// One missing day between present ones is an archive hole; two in a row look
+    /// like a block. Missing days before the first or after the last present one
+    /// are the venue's listing and archive ends.
+    #[tokio::test]
+    async fn missing_runs_inside_coverage_are_faults() {
+        let today = d(2024, 3, 1);
+        let run = |reply: fn(&str) -> Result<u64>| {
+            faults(BOTH, reply, d(2024, 1, 3), d(2024, 1, 9), today)
+        };
+        let miss =
+            |u: &str, days: &[&str]| days.iter().any(|d| u.ends_with(&format!("01-{d}.zip")));
+        let hole = run(|u| {
+            if u.ends_with("01-05.zip") {
+                Err(http_err(404))
+            } else {
+                Ok(5)
+            }
+        })
+        .await;
+        assert!(hole.is_empty(), "{hole:?}");
+        let block = run(|u| {
+            if u.ends_with("01-05.zip") || u.ends_with("01-06.zip") {
+                Err(http_err(403))
+            } else {
+                Ok(5)
+            }
+        })
+        .await;
+        assert_eq!(block.len(), 1, "{block:?}");
+        let ends = run(|u| {
+            if u.ends_with("01-03.zip")
+                || u.ends_with("01-04.zip")
+                || u.ends_with("01-08.zip")
+                || u.ends_with("01-09.zip")
+            {
+                Err(http_err(403))
+            } else {
+                Ok(5)
+            }
+        })
+        .await;
+        assert!(ends.is_empty(), "{ends:?}");
+    }
+
+    /// An east-of-UTC venue's last day is incomplete without the next day's file.
+    #[tokio::test]
+    async fn missing_tail_file_is_a_fault() {
+        let east = Files { tz_h: 8, ..BOTH };
+        let today = d(2024, 3, 1);
+        let f = faults(
+            east,
+            |u| {
+                if u.ends_with("01-07.zip") {
+                    Err(http_err(403))
+                } else {
+                    Ok(5)
+                }
+            },
+            d(2024, 1, 5),
+            d(2024, 1, 6),
+            today,
+        )
+        .await;
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(faults(east, ok, d(2024, 1, 5), d(2024, 1, 6), today)
+            .await
+            .is_empty());
+    }
+
+    /// A monthly-only venue's month is held until it is published and old enough.
+    #[tokio::test]
+    async fn monthly_only_month_is_held_until_published() {
+        let only = Files { daily: "", ..BOTH };
+        let miss: fn(&str) -> Result<u64> = |_| Err(http_err(404));
+        // current month, and a month that ended 2 days ago: held
+        assert_eq!(
+            faults(only, miss, d(2024, 3, 1), d(2024, 3, 2), d(2024, 3, 3))
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            faults(only, miss, d(2024, 2, 1), d(2024, 2, 29), d(2024, 3, 2))
+                .await
+                .len(),
+            1
+        );
+        // an old month it never had: absent, not held
+        assert!(
+            faults(only, miss, d(2024, 1, 1), d(2024, 1, 31), d(2024, 3, 20))
+                .await
+                .is_empty()
+        );
+        assert!(
+            faults(only, ok, d(2024, 2, 1), d(2024, 2, 29), d(2024, 3, 2))
+                .await
+                .is_empty()
+        );
     }
 
     /// Cached files are never refetched; the contract size is looked up once, on
