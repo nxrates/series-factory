@@ -145,6 +145,19 @@ fn idx_good_file_clean() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The check failing is not the file failing: an unreadable file and a usage
+/// error exit 3, never 1 (clean with warnings) or 2 (the file has errors).
+#[test]
+fn check_failures_exit_three() {
+    if skip_if_no_bin() {
+        return;
+    }
+    let (code, _, _) = run(&["idx", "/nonexistent/none.idx", "--json"]);
+    assert_eq!(code, 3, "unreadable file");
+    let (code, _, _) = run(&["--no-such-flag"]);
+    assert_eq!(code, 3, "usage error");
+}
+
 #[test]
 fn idx_truncated_file_errors() {
     if skip_if_no_bin() {

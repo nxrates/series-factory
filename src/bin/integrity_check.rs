@@ -7,6 +7,9 @@
 //! ## Subcommands
 //!
 //! ```text
+//! Exit codes: 0 clean, 1 warnings only, 2 the file has errors, 3 the check itself
+//! failed (see `main`).
+//!
 //! integrity-check idx  <path.idx>  [--strict] [--json]
 //! integrity-check s10  <path.s10>  [--strict] [--json]
 //! integrity-check bars <path.bars> [--strict] [--json]
@@ -1708,10 +1711,28 @@ fn check_dir(
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-fn main() -> Result<()> {
+/// Exit-code contract (the one place it is defined; `backfill-all` relies on it):
+/// 0 clean, 1 warnings only, 2 the checked file has errors (a JSON report with
+/// them is on stdout under `--json`), 3 the check itself failed (unreadable
+/// file, bad usage, internal error): it says nothing about the file.
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("integrity-check: {e:#}");
+        std::process::exit(3);
+    }
+}
+
+fn run() -> Result<()> {
     nxr_sdk::logging::init("info");
     nxr_sdk::memory::apply_safe_cap();
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) if e.use_stderr() => {
+            eprint!("{e}");
+            std::process::exit(3);
+        }
+        Err(e) => e.exit(),
+    };
 
     match cli.cmd {
         Cmd::Idx { path, strict, json } => {
