@@ -81,6 +81,9 @@ cexs:
         monthly: ''
         daily: https://img.bitgetimg.com/online/trades/SPBL/{sym}/
         probe: https://img.bitgetimg.com/online/trades/SPBL/{sym}/{ds}_{seq:03}.zip
+    # Perp-only archive (no spot source): merge weight for BASE/USDT:PERP.
+    gateio:
+      weight: 5
     okx:
       weight: 10
       archive_url_template:

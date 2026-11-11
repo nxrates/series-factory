@@ -4,6 +4,7 @@ pub mod synthetic;
 
 pub mod bitget;
 pub mod bybit;
+pub mod gateio;
 pub mod okx;
 
 use crate::types::{Config, DataSource, TickFrame};
@@ -76,9 +77,10 @@ pub async fn create_source(source: &DataSource) -> Result<Box<dyn TickSource>> {
             "binance" => Ok(Box::new(binance::BinanceSource::new())),
             "bitget" => Ok(Box::new(bitget::BitgetSource::new())),
             "bybit" => Ok(Box::new(bybit::BybitSource::new())),
+            "gateio" => Ok(Box::new(gateio::GateioSource::new())),
             "okx" => Ok(Box::new(okx::OKXSource::new())),
             _ => anyhow::bail!(
-                "Unsupported exchange: {} (available: binance, bybit, bitget, okx)",
+                "Unsupported exchange: {} (available: binance, bybit, bitget, okx, gateio)",
                 name
             ),
         },
