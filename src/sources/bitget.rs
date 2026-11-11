@@ -1,5 +1,5 @@
 use crate::sources::common::*;
-use crate::sources::{provider_id_for, TickSource};
+use crate::sources::{provider_id_for, series_key, split_quote, TickSource};
 use crate::types::{Config, TickFrame};
 use anyhow::Result;
 use csv::ReaderBuilder;
@@ -56,15 +56,20 @@ impl BitgetSource {
 impl TickSource for BitgetSource {
     async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
         // Uppercase symbol for URL + dir consistency (see binance.rs).
-        let sym = format!(
-            "{}{}",
-            config.base.to_uppercase(),
-            config.quote.to_uppercase()
-        );
-        let tid = nxr_sdk::resolve_ticker_id(&sym);
+        let (quote, perp) = split_quote(&config.quote);
+        let base = config.base.to_uppercase();
+        let (dir, tid) = series_key(config);
+        // Perps: same CSV, own product-type path (UMCBL = USDT-margined, CMCBL =
+        // USDC-margined, symbol `<BASE>PERP`).
+        let (product, sym) = match (perp, quote.to_uppercase().as_str()) {
+            (false, q) => ("SPBL", format!("{base}{q}")),
+            (true, "USDT") => ("UMCBL", format!("{base}USDT")),
+            (true, "USDC") => ("CMCBL", format!("{base}PERP")),
+            (true, q) => anyhow::bail!("Bitget perp archive has no {q}-margined product"),
+        };
         info!("Fetching Bitget data for {}", sym);
 
-        let ticks_dir = config.ticks_dir.join("bitget").join(&sym);
+        let ticks_dir = config.ticks_dir.join("bitget").join(&dir);
         let mut files = Vec::new();
         let mut day = config.from.date_naive();
         let end = config.to.date_naive();
@@ -72,7 +77,7 @@ impl TickSource for BitgetSource {
         // Daily-only archive URL prefix sourced from YAML
         // `cexs.exchanges.bitget.archive_url_template.daily`.
         let urls = crate::sources::common::archive_urls("bitget");
-        let daily_prefix = urls.daily.replace("{sym}", &sym);
+        let daily_prefix = urls.daily.replace("SPBL", product).replace("{sym}", &sym);
 
         while day <= end {
             let ds = day.format("%Y%m%d").to_string();
@@ -121,5 +126,20 @@ impl TickSource for BitgetSource {
         info!("Processing {} tick files", files.len());
         fetch_cached_ticks(&files, provider_id_for("bitget"), tx).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Perp files use the spot columns; the header row is skipped.
+    #[test]
+    fn perp_csv_same_columns_as_spot() {
+        let csv = "trade_id,timestamp,price,side,volume(quote),size(base)\n\
+                   1390652026650378240,1767283200000,87980.5,sell,1161.3426,0.0132\n";
+        let t = BitgetSource::parse_csv(csv.as_bytes(), 7).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!({ t[0].body.vbid }, 1161);
     }
 }

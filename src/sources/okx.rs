@@ -1,5 +1,5 @@
 use crate::sources::common::*;
-use crate::sources::{provider_id_for, TickSource};
+use crate::sources::{provider_id_for, series_key, split_quote, TickSource};
 use crate::types::{Config, TickFrame};
 use anyhow::Result;
 use csv::ReaderBuilder;
@@ -19,7 +19,9 @@ impl OKXSource {
         }
     }
 
-    fn parse_csv(csv_data: &[u8], ticker_id: u64) -> Result<Vec<TickFrame>> {
+    /// `ct_val` converts the OKX `size` to base units: 1.0 for spot, the swap's
+    /// contract value (`ctVal`, e.g. 0.01 BTC) for perps.
+    fn parse_csv(csv_data: &[u8], ticker_id: u64, ct_val: f64) -> Result<Vec<TickFrame>> {
         // Header-tolerant: `has_headers(false)` + parse-or-skip so streaming
         // chunks work whether or not they start on the header row.
         let mut rdr = ReaderBuilder::new()
@@ -48,10 +50,26 @@ impl OKXSource {
             ticks.push(TickFrame::new(
                 pid,
                 mitch::timestamp::from_epoch_ms(ts),
-                honest_tick(ticker_id, price, (size * price) as u32, is_buyer),
+                honest_tick(ticker_id, price, (size * ct_val * price) as u32, is_buyer),
             ));
         }
         Ok(ticks)
+    }
+}
+
+impl OKXSource {
+    /// Contract value of a swap (base units per contract) from the public
+    /// instruments endpoint. The archive rows carry contracts, not base units.
+    async fn swap_ct_val(&self, inst_id: &str) -> Result<f64> {
+        let url =
+            format!("https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst_id}");
+        let reply = self.agent.get(&url, &[]).await?;
+        let j: serde_json::Value = serde_json::from_slice(&reply.body)?;
+        j["data"][0]["ctVal"]
+            .as_str()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| *v > 0.0)
+            .ok_or_else(|| anyhow::anyhow!("OKX {inst_id}: no ctVal in instruments reply"))
     }
 }
 
@@ -59,19 +77,16 @@ impl OKXSource {
 impl TickSource for OKXSource {
     async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
         // Uppercase symbol for URL + dir consistency (see binance.rs).
-        let sym = format!(
-            "{}-{}",
-            config.base.to_uppercase(),
-            config.quote.to_uppercase()
-        );
-        let dir = format!(
-            "{}{}",
-            config.base.to_uppercase(),
-            config.quote.to_uppercase()
-        );
-        let tid = nxr_sdk::resolve_ticker_id(&sym);
+        let (quote, perp) = split_quote(&config.quote);
+        let mut sym = format!("{}-{}", config.base.to_uppercase(), quote.to_uppercase());
+        let (dir, tid) = series_key(config);
+        let mut ct_val = 1.0;
+        if perp {
+            sym.push_str("-SWAP");
+            ct_val = self.swap_ct_val(&sym).await?;
+        }
         info!("Fetching OKX data for {}", sym);
-        let parse: fn(&[u8], u64) -> Result<Vec<TickFrame>> = Self::parse_csv;
+        let parse = |c: &[u8], t: u64| Self::parse_csv(c, t, ct_val);
         // Archive URL prefixes sourced from YAML
         // `cexs.exchanges.okx.archive_url_template.{monthly,daily}`.
         let urls = crate::sources::common::archive_urls("okx");
@@ -112,5 +127,26 @@ impl TickSource for OKXSource {
         info!("Processing {} tick files", files.len());
         fetch_cached_ticks(&files, provider_id_for("okx"), tx).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Swap rows are contracts: notional = size * ctVal * price.
+    #[test]
+    fn swap_size_scaled_by_ct_val() {
+        let csv = "instrument_name,trade_id,side,price,size,created_time\n\
+                   BTC-USDT-SWAP,703698429,buy,42800.0,6.0,1704124800014\n";
+        let swap = OKXSource::parse_csv(csv.as_bytes(), 7, 0.01).unwrap();
+        assert_eq!(swap.len(), 1);
+        assert_eq!(
+            { swap[0].body.vask },
+            2568,
+            "6 contracts x 0.01 BTC x 42800"
+        );
+        let spot = OKXSource::parse_csv(csv.as_bytes(), 7, 1.0).unwrap();
+        assert_eq!({ spot[0].body.vask }, 256_800);
     }
 }

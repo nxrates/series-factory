@@ -636,6 +636,7 @@ where
         // drop writer + out_file here so the rename below sees a closed fd.
     }
 
+    reverse_if_descending(&tmp_path)?;
     // Atomic rename so a partial/interrupted download leaves the old cache
     // file intact rather than a half-written target.
     std::fs::rename(&tmp_path, cache_path)?;
@@ -659,6 +660,45 @@ where
     }
     drop(archive); // remove temp compressed archive (delete-as-you-go scratch)
     Ok(total_ticks)
+}
+
+/// Flip a `.ticks` file written newest-first (Bybit perp archives) to the
+/// oldest-first order every downstream reader assumes. Streams backward in
+/// bounded blocks, so memory stays O(block) whatever the day's trade count.
+fn reverse_if_descending(path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    const F: usize = std::mem::size_of::<TickFrame>();
+    const BLOCK_FRAMES: usize = 16_384;
+    let mut src = File::open(path)?;
+    let len = src.metadata()?.len();
+    if (len as usize) < 2 * F {
+        return Ok(());
+    }
+    let mut frame = [0u8; F];
+    src.read_exact(&mut frame)?;
+    let first = bytemuck::pod_read_unaligned::<TickFrame>(&frame).timestamp();
+    src.seek(SeekFrom::End(-(F as i64)))?;
+    src.read_exact(&mut frame)?;
+    if first <= bytemuck::pod_read_unaligned::<TickFrame>(&frame).timestamp() {
+        return Ok(());
+    }
+    let tmp = path.with_extension("ticks.reversed");
+    let mut out = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
+    let mut block: Vec<TickFrame> = vec![bytemuck::Zeroable::zeroed(); BLOCK_FRAMES];
+    let mut end = len as usize;
+    while end > 0 {
+        let n = end.min(BLOCK_FRAMES * F);
+        src.seek(SeekFrom::Start((end - n) as u64))?;
+        let frames = &mut block[..n / F];
+        src.read_exact(bytemuck::cast_slice_mut(frames))?;
+        frames.reverse();
+        out.write_all(bytemuck::cast_slice(frames))?;
+        end -= n;
+    }
+    out.flush()?;
+    drop(out);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Read from `reader` in line-aligned chunks of ~`chunk_bytes` each and
@@ -699,7 +739,8 @@ fn stream_csv_in_chunks<R: std::io::BufRead>(
 ///
 /// `monthly(symbol, year, month)` returns `(url, filename)`.
 /// `daily(symbol, date)` returns `(url, filename)`.
-/// Monthly downloads get 3 attempts; daily gets 1.
+/// Monthly downloads get 3 attempts; daily gets 1. A closure that returns an
+/// empty url means the venue publishes no such granularity: it is skipped.
 pub async fn fetch_monthly_daily<P>(
     agent: &Arc<btr_rpc::Http>,
     config: &Config,
@@ -733,8 +774,9 @@ where
         let mut used_cached_month = false;
 
         // Try monthly archive for completed months
-        if last_day_of_month(year, month) < today {
-            let (url, filename) = monthly(symbol, year, month);
+        let (murl, mfile) = monthly(symbol, year, month);
+        if last_day_of_month(year, month) < today && !murl.is_empty() {
+            let (url, filename) = (murl, mfile);
             let cache_path = ticks_dir.join(filename.replace(cache_ext, ".ticks"));
 
             if cache_path.exists() {
@@ -784,6 +826,9 @@ where
             let mut day = month_start;
             while day <= end {
                 let (url, filename) = daily(symbol, day);
+                if url.is_empty() {
+                    break;
+                }
                 let cache_path = ticks_dir.join(filename.replace(cache_ext, ".ticks"));
 
                 if !cache_path.exists() {
@@ -1008,6 +1053,44 @@ mod tests {
             "truncated gz must fail to decompress, not yield a partial-accepted result",
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A newest-first `.ticks` file (Bybit perp) is flipped to oldest-first;
+    /// an ascending one is left byte-identical.
+    #[test]
+    fn descending_ticks_file_is_reversed() {
+        let frames = |ms: &[i64]| -> Vec<TickFrame> {
+            ms.iter()
+                .map(|&t| {
+                    TickFrame::new(
+                        1,
+                        mitch::timestamp::from_epoch_ms(t),
+                        honest_tick(7, 100.0, 1, true),
+                    )
+                })
+                .collect()
+        };
+        let dir = std::env::temp_dir().join(format!("sf-rev-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts = |p: &Path| -> Vec<i64> {
+            read_tick_file(p)
+                .unwrap()
+                .iter()
+                .map(|f| f.timestamp_ms())
+                .collect()
+        };
+        let base = 1_800_000_000_000i64;
+        let p = dir.join("d.ticks");
+        let desc: Vec<i64> = (0..40_000).rev().map(|i| base + i * 1000).collect();
+        std::fs::write(&p, bytemuck::cast_slice(&frames(&desc))).unwrap();
+        reverse_if_descending(&p).unwrap();
+        let mut asc = desc.clone();
+        asc.reverse();
+        assert_eq!(ts(&p), asc, "spans several blocks");
+        let before = std::fs::read(&p).unwrap();
+        reverse_if_descending(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), before, "ascending untouched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

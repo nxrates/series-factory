@@ -9,7 +9,7 @@
 //! archives that already exist on disk.
 //!
 //! Usage: fetch-crypto-history <config.yml> [--pairs BTC,ETH] [--exchanges binance,bybit]
-//!                              [--days 545] [--quote USDT] [--parallelism 4]
+//!                              [--days 545] [--quote USDT|USDT:PERP] [--parallelism 4]
 //!
 //! FX has no public historical source, so calibration is crypto-only. Run this
 //! bin before any binary that depends on pre-populated `.ticks` archives.
@@ -56,7 +56,9 @@ struct Args {
     #[arg(long)]
     to_date: Option<String>,
 
-    /// Quote asset (most crypto aggTrades archives are vs USDT).
+    /// Quote asset (most crypto aggTrades archives are vs USDT). Spell it
+    /// `USDT:PERP` (or `USDC:PERP`) for the perpetual-swap series; every later
+    /// stage takes the same spelling as its QUOTE.
     #[arg(long, default_value = "USDT")]
     quote: String,
 
@@ -104,6 +106,8 @@ async fn probe_one(
     // `cexs.exchanges.<exch>.archive_url_template.probe`.
     // `{sym}` / `{y:04}` / `{m:02}` are filled at probe time.
     let probe_tpl: Option<String> = match exchange {
+        // Perp archives have their own paths: no probe, the fetcher discovers coverage.
+        _ if series_factory::sources::split_quote(quote).1 => None,
         "binance" | "bybit" => {
             let t = series_factory::sources::common::archive_urls(if exchange == "binance" {
                 "binance"

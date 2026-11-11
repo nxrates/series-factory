@@ -42,7 +42,7 @@ struct Args {
     exchange: String,
     /// Base asset symbol (e.g. BTC).
     base: String,
-    /// Quote asset symbol (e.g. USDT).
+    /// Quote asset symbol (e.g. USDT; `USDT:PERP` for the perpetual series).
     quote: String,
     /// Aggregation cycle in milliseconds. Default matches prod forwarder
     /// cadence (200 ms = 5 Hz, `network.aggregation_interval_ms`). MUST match
