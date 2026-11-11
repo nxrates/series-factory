@@ -1720,8 +1720,12 @@ fn verdict(code: Option<i32>, stdout: &[u8]) -> Verdict {
     match code {
         Some(0) | Some(1) => Verdict::Clean,
         Some(2) => {
-            let has_errors = serde_json::from_slice::<serde_json::Value>(stdout)
-                .ok()
+            // The report starts at the first line that opens an object: a log line
+            // in front of it must not hide the verdict.
+            let text = String::from_utf8_lossy(stdout);
+            let json = text.find("\n{").map(|i| &text[i + 1..]).or_else(|| text.starts_with('{').then_some(&*text));
+            let has_errors = json
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
                 .and_then(|v| {
                     v.get("errors")
                         .and_then(|e| e.as_array())
@@ -2167,6 +2171,10 @@ mod tests {
         assert_eq!(verdict(Some(0), b""), Verdict::Clean);
         assert_eq!(verdict(Some(1), b""), Verdict::Clean);
         assert_eq!(verdict(Some(2), report), Verdict::Bad);
+        // log lines in front of the report (the real binary's stdout before the fix)
+        let noisy = b"2026-11-11T17:00:00Z  WARN nxr_sdk::memory: setrlimit failed\n2026-11-11 INFO installed cap\n{\n  \"errors\": [\"bad record\"]\n}\n";
+        assert_eq!(verdict(Some(2), noisy), Verdict::Bad);
+        assert_eq!(verdict(Some(2), b"log only\n"), Verdict::Unknown);
         // exit 2 without a parseable verdict (a usage error from an older binary)
         assert_eq!(verdict(Some(2), b""), Verdict::Unknown);
         assert_eq!(verdict(Some(2), br#"{"errors":[]}"#), Verdict::Unknown);

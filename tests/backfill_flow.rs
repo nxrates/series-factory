@@ -319,7 +319,7 @@ fn validation_deletes_only_on_the_validators_error_verdict() {
     let shard = |r: &Rig| r.data(&format!("indexes/{tid}/2026-08-10.idx"));
 
     let bad = Rig::new("val-bad", &st, 0, 0);
-    bad.validator("echo '{\"errors\":[\"bad record\"],\"warnings\":[]}'; exit 2");
+    bad.validator("echo '2026-11-11T00:00:00Z  INFO a log line before the report'; echo '{\"errors\":[\"bad record\"],\"warnings\":[]}'; exit 2");
     bad.run(&OLD, STEPS);
     assert!(
         !shard(&bad).exists(),

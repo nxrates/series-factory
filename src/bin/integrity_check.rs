@@ -1713,7 +1713,7 @@ fn check_dir(
 
 /// Exit-code contract (the one place it is defined; `backfill-all` relies on it):
 /// 0 clean, 1 warnings only, 2 the checked file has errors (a JSON report with
-/// them is on stdout under `--json`), 3 the check itself failed (unreadable
+/// them is the only thing on stdout under `--json`; logs go to stderr), 3 the check itself failed (unreadable
 /// file, bad usage, internal error): it says nothing about the file.
 fn main() {
     if let Err(e) = run() {
@@ -1723,7 +1723,16 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    nxr_sdk::logging::init("info");
+    // With `--json` stdout carries the report and nothing else: logs go to stderr.
+    if std::env::args().any(|a| a == "--json") {
+        use tracing_subscriber::EnvFilter;
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        nxr_sdk::logging::init("info");
+    }
     nxr_sdk::memory::apply_safe_cap();
     let cli = match Cli::try_parse() {
         Ok(c) => c,

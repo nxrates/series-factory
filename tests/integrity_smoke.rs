@@ -158,6 +158,24 @@ fn check_failures_exit_three() {
     assert_eq!(code, 3, "usage error");
 }
 
+/// The REAL binary on a bad file: exit 2, and stdout is the report alone (logs on
+/// stderr), so a caller can parse the verdict.
+#[test]
+fn json_report_is_alone_on_stdout_and_lists_the_errors() {
+    if skip_if_no_bin() {
+        return;
+    }
+    // crossed quote: ask < bid is a structural error
+    let recs = [good_record(1_700_000_000_000, 100.0, 100.1), good_record(1_700_000_000_200, 101.0, 100.0)];
+    let path = write_file("bad-json.idx", bytemuck::cast_slice(&recs));
+    let (code, stdout, _stderr) = run(&["idx", path.to_str().unwrap(), "--json"]);
+    assert_eq!(code, 2);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout is not the bare report ({e}): {stdout}"));
+    assert!(report["errors"].as_array().is_some_and(|e| !e.is_empty()), "{stdout}");
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn idx_truncated_file_errors() {
     if skip_if_no_bin() {
