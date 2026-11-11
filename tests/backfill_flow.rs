@@ -40,12 +40,14 @@ impl Rig {
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         };
         fs::write(root.join("states.json"), states).unwrap();
+        fs::write(root.join("probe.json"), "[]").unwrap();
         script(
             "fetch-crypto-history",
             &format!(
-                "mkdir -p {d}/ticks/binance/BTCUSDT && : > {d}/ticks/binance/BTCUSDT/a.ticks\ncat {s}\nexit {fetch_exit}",
+                "case \"$*\" in *--probe*) cat {p}; exit 0;; esac\nmkdir -p {d}/ticks/binance/BTCUSDT && : > {d}/ticks/binance/BTCUSDT/a.ticks\ncat {s}\nexit {fetch_exit}",
                 d = data.display(),
-                s = root.join("states.json").display()
+                s = root.join("states.json").display(),
+                p = root.join("probe.json").display()
             ),
         );
         script(
@@ -55,16 +57,25 @@ impl Rig {
                 d = data.display()
             ),
         );
-        // merge: `--from-date A --to-date B` -> one 56-byte shard per day, plus the manifest
+        // merge: `--from-date A --to-date B` -> one 56-byte shard per day, plus the
+        // manifest. The day list comes from a file (no date arithmetic in the shell).
+        let days: Vec<String> = chrono::NaiveDate::from_ymd_opt(2020, 1, 1)
+            .unwrap()
+            .iter_days()
+            .take(4000)
+            .map(|d| d.to_string())
+            .collect();
+        fs::write(root.join("days.txt"), days.join("\n")).unwrap();
         script(
             "merge-idx",
             &format!(
                 r#"[ {merge_exit} -ne 0 ] && exit {merge_exit}
 while [ $# -gt 0 ]; do case $1 in --from-date) A=$2;; --to-date) B=$2;; esac; shift; done
-mkdir -p {c}; d=$A; E=""
-while :; do head -c 56 /dev/zero > {c}/$d.idx; E="$E{{\"date\":\"$d\",\"first_ts\":0,\"last_ts\":0,\"n_records\":1,\"size_bytes\":56,\"sha256\":\"\"}},"; [ "$d" = "$B" ] && break; d=$(date -j -v+1d -f %Y-%m-%d $d +%Y-%m-%d); done
+mkdir -p {c}; E=""
+for d in $(awk -v a=$A -v b=$B '$0>=a && $0<=b' {days}); do head -c 56 /dev/zero > {c}/$d.idx; E="$E{{\"date\":\"$d\",\"first_ts\":0,\"last_ts\":0,\"n_records\":1,\"size_bytes\":56,\"sha256\":\"\"}},"; done
 echo "{{\"ticker\":\"T\",\"ticker_id\":1,\"kind\":\"idx\",\"shards\":[${{E%,}}],\"first_ts\":0,\"last_ts\":0,\"last_updated\":0,\"schema_version\":1}}" > {c}/manifest.json"#,
-                c = comp.display()
+                c = comp.display(),
+                days = root.join("days.txt").display()
             ),
         );
         script("integrity-check", "exit 0");
@@ -78,6 +89,15 @@ echo "{{\"ticker\":\"T\",\"ticker_id\":1,\"kind\":\"idx\",\"shards\":[${{E%,}}],
     }
 
     fn run(&self, window: &[&str], steps: &str) -> std::process::Output {
+        self.run_with(window, steps, &["--skip-probe"])
+    }
+
+    fn run_with_probe_rebuild(&self, from: &str, to: &str, probe: &str) -> std::process::Output {
+        fs::write(self.root.join("probe.json"), probe).unwrap();
+        self.run_with(&["--from", from, "--to", to], STEPS, &["--rebuild"])
+    }
+
+    fn run_with(&self, window: &[&str], steps: &str, extra: &[&str]) -> std::process::Output {
         let data = self.root.join("data");
         let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap());
         Command::new(env!("CARGO_BIN_EXE_backfill-all"))
@@ -87,10 +107,10 @@ echo "{{\"ticker\":\"T\",\"ticker_id\":1,\"kind\":\"idx\",\"shards\":[${{E%,}}],
                 "BTC-USDT",
                 "--exchanges",
                 "binance,bitget",
-                "--skip-probe",
                 "--min-free-gib",
                 "0",
             ])
+            .args(extra)
             .args(["--steps", steps])
             .args(window)
             .args(["--out-dir", data.to_str().unwrap()])
@@ -198,7 +218,11 @@ fn recent_days_are_held_while_a_venue_is_missing() {
     );
     let st = states("\"got\"", "\"missing\"", &[&a.to_string(), &b.to_string()]);
     let r = Rig::new("held", &st, 0, 0);
-    let out = r.run(&["--from", &a.to_string(), "--to", &b.to_string()], STEPS);
+    let out = r.run_with(
+        &["--from", &a.to_string(), "--to", &b.to_string()],
+        STEPS,
+        &["--skip-probe", "--rebuild"],
+    );
     assert!(out.status.success(), "held days must not fail the run");
     assert!(!r.calls().contains("merge-idx"), "{}", r.calls());
     assert!(
@@ -211,9 +235,13 @@ fn recent_days_are_held_while_a_venue_is_missing() {
 /// A transport failure holds only its day: the days around it are still built.
 #[test]
 fn a_failed_day_is_split_out_of_the_run() {
+    let row = |ex: &str, d11: &str| {
+        format!("{{\"ticker\":\"BTC\",\"exchange\":\"{ex}\",\"days\":{{\"2026-08-10\":\"got\",\"2026-08-11\":{d11},\"2026-08-12\":\"got\"}}}}")
+    };
     let st = format!(
-        "[{}]",
-        "{\"ticker\":\"BTC\",\"exchange\":\"binance\",\"days\":{\"2026-08-10\":\"got\",\"2026-08-11\":{\"failed\":\"boom\"},\"2026-08-12\":\"got\"}}"
+        "[{},{}]",
+        row("binance", "{\"failed\":\"boom\"}"),
+        row("bitget", "\"got\"")
     );
     let r = Rig::new("split", &st, 0, 0);
     r.run(&["--from", "2026-08-10", "--to", "2026-08-12"], STEPS);
@@ -291,7 +319,7 @@ fn validation_deletes_only_on_the_validators_error_verdict() {
     let shard = |r: &Rig| r.data(&format!("indexes/{tid}/2026-08-10.idx"));
 
     let bad = Rig::new("val-bad", &st, 0, 0);
-    bad.validator("exit 2");
+    bad.validator("echo '{\"errors\":[\"bad record\"],\"warnings\":[]}'; exit 2");
     bad.run(&OLD, STEPS);
     assert!(
         !shard(&bad).exists(),
@@ -303,4 +331,134 @@ fn validation_deletes_only_on_the_validators_error_verdict() {
     killed.run(&OLD, STEPS);
     assert!(shard(&killed).exists(), "a tool failure deleted good data");
     assert!(killed.report().contains("\"failed\""), "the step must fail");
+}
+
+/// States JSON for binance and bitget over `[from, to]`: binance has every day,
+/// bitget only those at or before `bitget_until`.
+fn ranged_states(
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+    bitget_until: chrono::NaiveDate,
+) -> String {
+    let days: Vec<chrono::NaiveDate> = from.iter_days().take_while(|d| *d <= to).collect();
+    let row = |ex: &str, f: &dyn Fn(&chrono::NaiveDate) -> &'static str| {
+        let d: Vec<String> = days.iter().map(|d| format!("\"{d}\":{}", f(d))).collect();
+        format!(
+            "{{\"ticker\":\"BTC\",\"exchange\":\"{ex}\",\"days\":{{{}}}}}",
+            d.join(",")
+        )
+    };
+    format!(
+        "[{},{}]",
+        row("binance", &|_| "\"got\""),
+        row("bitget", &|d| if *d <= bitget_until {
+            "\"got\""
+        } else {
+            "\"missing\""
+        })
+    )
+}
+
+const PROBE_NO_BITGET: &str = r#"[{"ticker":"BTC","exchange":"binance","has_data":true,"first_date":null,"last_date":null},{"ticker":"BTC","exchange":"bitget","has_data":false,"first_date":null,"last_date":null}]"#;
+
+/// With the probe on, a run of only recent days never drops a venue: it has not
+/// published them yet. The days are held, the probe is not even asked, and nothing
+/// is re-sourced from Pyth.
+#[test]
+fn probe_cannot_drop_a_venue_on_recent_days() {
+    let today = chrono::Utc::now().date_naive();
+    let (a, b) = (
+        today - chrono::Duration::days(3),
+        today - chrono::Duration::days(2),
+    );
+    let st = states("\"got\"", "\"missing\"", &[&a.to_string(), &b.to_string()]);
+    let r = Rig::new("probe-recent", &st, 0, 0);
+    // --rebuild: exactly the two recent days, no widening
+    let out = r.run_with_probe_rebuild(&a.to_string(), &b.to_string(), PROBE_NO_BITGET);
+    assert!(out.status.success());
+    let calls = r.calls();
+    assert!(
+        !calls.contains("--probe"),
+        "probe judged recent days: {calls}"
+    );
+    assert!(!calls.contains("pyth"), "{calls}");
+    assert!(
+        !calls.contains("merge-idx"),
+        "finalised without bitget: {calls}"
+    );
+    assert!(r.report().contains("held-days"), "{}", r.report());
+}
+
+/// A mixed run: the probe judges only the published days, which finalise; the
+/// recent days stay held while bitget lacks them.
+#[test]
+fn mixed_run_finalises_old_days_and_holds_new_ones() {
+    let today = chrono::Utc::now().date_naive();
+    let edge = today - chrono::Duration::days(5);
+    let (from, to) = (
+        edge - chrono::Duration::days(3),
+        today - chrono::Duration::days(2),
+    );
+    let st = ranged_states(from, to, edge);
+    let r = Rig::new("probe-mixed", &st, 0, 0);
+    let probe = r#"[{"ticker":"BTC","exchange":"binance","has_data":true,"first_date":null,"last_date":null},{"ticker":"BTC","exchange":"bitget","has_data":true,"first_date":null,"last_date":null}]"#;
+    r.run_with_probe_rebuild(&from.to_string(), &to.to_string(), probe);
+    let calls = r.calls();
+    assert!(
+        calls.contains(&format!("--to-date {edge} --probe"))
+            || calls.contains(&format!("--to-date {edge}")),
+        "{calls}"
+    );
+    let merge = calls
+        .lines()
+        .find(|l| l.starts_with("merge-idx"))
+        .expect("old days merged");
+    assert!(
+        merge.contains(&format!("--from-date {from} --to-date {edge}")),
+        "{merge}"
+    );
+    assert!(r.report().contains("held-days"), "{}", r.report());
+}
+
+/// A fetch that prints no usable state report must not pass every venue.
+#[test]
+fn an_empty_or_cut_off_fetch_report_fails_open_no_more() {
+    for (tag, report) in [
+        ("empty", ""),
+        (
+            "cut",
+            "[{\"ticker\":\"BTC\",\"exchange\":\"binance\",\"days\":{\"2026-08-1",
+        ),
+    ] {
+        let r = Rig::new(&format!("report-{tag}"), report, 0, 0);
+        r.run(&OLD, STEPS);
+        assert!(
+            !r.calls().contains("merge-idx"),
+            "{tag}: merged without a report: {}",
+            r.calls()
+        );
+        assert!(r.report().contains("venue-faults"), "{tag}: {}", r.report());
+    }
+}
+
+/// A window ending inside the lag is widened; `--rebuild` is exact.
+#[test]
+fn short_window_is_widened_unless_rebuilding() {
+    let today = chrono::Utc::now().date_naive();
+    let from = (today - chrono::Duration::days(7)).to_string();
+    let r = Rig::new("widen", "[]", 0, 0);
+    r.run(&["--from", &from, "--to", "today"], "fetch");
+    let want = format!("--from-date {}", today - chrono::Duration::days(19));
+    assert!(r.calls().contains(&want), "{want} in {}", r.calls());
+    let r = Rig::new("exact", "[]", 0, 0);
+    r.run_with(
+        &["--from", &from, "--to", "today"],
+        "fetch",
+        &["--skip-probe", "--rebuild"],
+    );
+    assert!(
+        r.calls().contains(&format!("--from-date {from}")),
+        "{}",
+        r.calls()
+    );
 }

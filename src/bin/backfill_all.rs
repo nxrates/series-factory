@@ -573,6 +573,27 @@ fn preflight_disk_guard(
 /// pass unfinalised: use at least 12 days for a weekly run.
 const PUBLISH_LAG_DAYS: i64 = 5;
 
+/// The part of a run the probe may judge: its days at or older than the lag edge.
+fn probe_window(
+    (lo, hi): (NaiveDate, NaiveDate),
+    lag_edge: NaiveDate,
+) -> Option<(NaiveDate, NaiveDate)> {
+    (lo <= lag_edge).then(|| (lo, hi.min(lag_edge)))
+}
+
+/// A window ending inside the publish lag is widened back far enough that days
+/// held now are still inside the next run's window (the lazy rerun makes the
+/// overlap free). `--rebuild` redoes exactly what was asked, so it is not widened.
+fn widen_from(from: NaiveDate, to: NaiveDate, today: NaiveDate, rebuild: bool) -> NaiveDate {
+    let lag = chrono::Duration::days(PUBLISH_LAG_DAYS);
+    let reach = to - chrono::Duration::days(PUBLISH_LAG_DAYS + 14);
+    if !rebuild && to > today - lag && from > reach {
+        reach
+    } else {
+        from
+    }
+}
+
 /// What `fetch-crypto-history` printed: the archive's state per venue and day.
 fn parse_day_states(stdout: &[u8]) -> BTreeMap<String, BTreeMap<NaiveDate, Day>> {
     #[derive(Deserialize)]
@@ -1037,9 +1058,17 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     // CEX book at all. Before the `pyth` step existed this was a hard skip, so
     // the "backfill everything" entry point silently covered crypto only.
     let mut pyth_only = false;
-    if !ctx.args.skip_probe && want("fetch") && !runs.is_empty() {
+    // The probe may drop a venue only on days old enough to be published: a venue
+    // that has nothing for a recent day has not published it yet, which the hold
+    // below handles. With only recent days every requested venue stays active.
+    let lag_edge = today - chrono::Duration::days(PUBLISH_LAG_DAYS);
+    let probe_runs: Vec<(NaiveDate, NaiveDate)> = runs
+        .iter()
+        .filter_map(|r| probe_window(*r, lag_edge))
+        .collect();
+    if !ctx.args.skip_probe && want("fetch") && !probe_runs.is_empty() {
         let (mut av, mut active): (Vec<AvailabilityEntry>, Vec<String>) = (Vec::new(), Vec::new());
-        for run in &runs {
+        for run in &probe_runs {
             let (a, act) = probe_availability(ctx, &venues, &base, &quote, *run);
             av.extend(a);
             for e in act {
@@ -1173,19 +1202,31 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     break 'months;
                 } else if rep.exit_code != 0 {
                     // A venue could not even be asked (config, contract lookup): a
-                    // real error. The run's sources stay for the next attempt.
+                    // real error. Deliberate: what was fetched stays on disk and is
+                    // reused by the next attempt (the fetch skips files already
+                    // there), rather than being deleted and downloaded again.
                     fetch_err.push(format!("{lo_s}..{hi_s}: fetch exit {}", rep.exit_code));
                     fetch_err.extend(rep.errors.clone());
                     fetch_faulty = true;
                     continue;
                 }
                 states = parse_day_states(&stdout);
+                // A venue the fetch did not report on is unknown, never present:
+                // treat it as failed for the run (an empty or cut-off report must
+                // not pass every venue).
+                for ex in &active_exchanges {
+                    states.entry(ex.clone()).or_insert_with(|| {
+                        lo.iter_days()
+                            .take_while(|d| *d <= hi)
+                            .map(|d| (d, Day::Failed("fetch reported no state".into())))
+                            .collect()
+                    });
+                }
             }
 
             // Which days may be finalised. A day is held while a venue is missing
             // a unit for it and the day is inside the publish-lag window; a
             // transport failure holds it for this run at any age.
-            let lag_edge = today - chrono::Duration::days(PUBLISH_LAG_DAYS);
             let mut ok_days: Vec<NaiveDate> = Vec::new();
             for d in lo.iter_days().take_while(|d| *d <= hi) {
                 let mut reason: Option<String> = None;
@@ -1313,7 +1354,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                         }
                         who.insert(*d, got);
                     }
-                    if let Err(e) = series_factory::sharding::record_venues(&composite_dir, &who) {
+                    // A day of this sub-run without a shard (a rebuild that produced
+                    // nothing) must not keep a stale record.
+                    let forget: Vec<NaiveDate> = still.clone();
+                    if let Err(e) =
+                        series_factory::sharding::record_venues(&composite_dir, &who, &forget)
+                    {
                         merge_err.push(format!("record venues: {e:#}"));
                         hard_fail = true;
                         break 'months;
@@ -1658,9 +1704,11 @@ fn manifest_ok(ticker_dir: &Path, kind: &str) -> bool {
 
 /// Run integrity-check on every shard in `ticker_dir` matching `kind`.
 /// Returns aggregate StepReport (first failure flips exit_code to 1).
-/// What `integrity-check` said about a shard. Its exit code contract
-/// (`integrity_check.rs::exit_code`): 0 clean, 1 warnings only, 2 errors. Anything
-/// else (a signal, a panic's 101, a failed spawn) says nothing about the shard.
+/// What `integrity-check` said about a shard. Its exit-code contract is defined
+/// in `integrity_check.rs` (`main`): 0 clean, 1 warnings only, 2 the file has
+/// errors, 3 the check itself failed. Only 2 together with a parseable JSON
+/// report that lists errors condemns the shard; anything else (3, a signal, a
+/// panic's 101, a failed spawn, unparseable output) says nothing about it.
 #[derive(Debug, PartialEq)]
 enum Verdict {
     Clean,
@@ -1668,10 +1716,24 @@ enum Verdict {
     Unknown,
 }
 
-fn verdict(code: Option<i32>) -> Verdict {
+fn verdict(code: Option<i32>, stdout: &[u8]) -> Verdict {
     match code {
         Some(0) | Some(1) => Verdict::Clean,
-        Some(2) => Verdict::Bad,
+        Some(2) => {
+            let has_errors = serde_json::from_slice::<serde_json::Value>(stdout)
+                .ok()
+                .and_then(|v| {
+                    v.get("errors")
+                        .and_then(|e| e.as_array())
+                        .map(|e| !e.is_empty())
+                })
+                .unwrap_or(false);
+            if has_errors {
+                Verdict::Bad
+            } else {
+                Verdict::Unknown
+            }
+        }
         _ => Verdict::Unknown,
     }
 }
@@ -1737,11 +1799,11 @@ fn validate_shards(
         // 2 = errors. Drop --strict so warnings ! tank tickers.
         let out = Command::new("integrity-check").args(&args).output();
         match out {
-            Ok(o) if verdict(o.status.code()) == Verdict::Clean => {}
+            Ok(o) if verdict(o.status.code(), &o.stdout) == Verdict::Clean => {}
             Ok(o) => {
                 any_fail = true;
                 // Only the validator's own error verdict condemns the shard.
-                if verdict(o.status.code()) == Verdict::Bad {
+                if verdict(o.status.code(), &o.stdout) == Verdict::Bad {
                     failed.push(shard.clone());
                 }
                 let stderr = String::from_utf8_lossy(&o.stderr);
@@ -1828,6 +1890,15 @@ fn main() -> Result<()> {
         Some(s) => parse_date(s)?,
         None => to - chrono::Duration::days(365),
     };
+    let widened = widen_from(from, to, Utc::now().date_naive(), args.rebuild);
+    if widened != from {
+        warn!(
+            from = %from,
+            widened = %widened,
+            "window ends inside the publish lag: widened so days held now are revisited"
+        );
+    }
+    let from = widened;
     let exchanges = split_csv(&args.exchanges);
     let steps = split_csv(&args.steps);
     let tickers: Vec<String> = match args.tickers.as_deref() {
@@ -2066,12 +2137,42 @@ mod tests {
     /// Only the validator's error verdict (exit 2) condemns a shard; a signal,
     /// a panic code or no code leaves it alone.
     #[test]
-    fn only_exit_two_condemns_a_shard() {
-        assert_eq!(verdict(Some(0)), Verdict::Clean);
-        assert_eq!(verdict(Some(1)), Verdict::Clean);
-        assert_eq!(verdict(Some(2)), Verdict::Bad);
-        for code in [None, Some(101), Some(-1), Some(137)] {
-            assert_eq!(verdict(code), Verdict::Unknown, "{code:?}");
+    fn probe_judges_only_published_days() {
+        let d = |n| NaiveDate::from_ymd_opt(2024, 1, n).unwrap();
+        assert_eq!(probe_window((d(1), d(10)), d(6)), Some((d(1), d(6))));
+        assert_eq!(probe_window((d(1), d(3)), d(6)), Some((d(1), d(3))));
+        assert_eq!(probe_window((d(7), d(10)), d(6)), None, "recent-only run");
+    }
+
+    #[test]
+    fn short_windows_ending_in_the_lag_are_widened_but_not_for_rebuild() {
+        let d = |n| NaiveDate::from_ymd_opt(2024, 2, n).unwrap();
+        let today = d(20);
+        // weekly: 7 days back, ending today -> reach back lag+14
+        let w = widen_from(d(13), d(20), today, false);
+        assert_eq!(w, d(20) - chrono::Duration::days(PUBLISH_LAG_DAYS + 14));
+        assert_eq!(
+            widen_from(d(13), d(20), today, true),
+            d(13),
+            "rebuild is exact"
+        );
+        // a long window, or one ending before the lag, is left alone
+        assert_eq!(widen_from(d(1), d(20), today, false), d(1));
+        assert_eq!(widen_from(d(8), d(12), today, false), d(8));
+    }
+
+    #[test]
+    fn only_exit_two_with_a_verdict_condemns_a_shard() {
+        let report = br#"{"errors":["bad record"],"warnings":[]}"#;
+        assert_eq!(verdict(Some(0), b""), Verdict::Clean);
+        assert_eq!(verdict(Some(1), b""), Verdict::Clean);
+        assert_eq!(verdict(Some(2), report), Verdict::Bad);
+        // exit 2 without a parseable verdict (a usage error from an older binary)
+        assert_eq!(verdict(Some(2), b""), Verdict::Unknown);
+        assert_eq!(verdict(Some(2), br#"{"errors":[]}"#), Verdict::Unknown);
+        assert_eq!(verdict(Some(2), b"not json"), Verdict::Unknown);
+        for code in [None, Some(3), Some(101), Some(-1), Some(137)] {
+            assert_eq!(verdict(code, report), Verdict::Unknown, "{code:?}");
         }
     }
 
