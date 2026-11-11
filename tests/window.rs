@@ -181,3 +181,58 @@ fn t2i_spreads_a_coarse_stamp_run_across_files() {
     let in_second = ts.iter().filter(|t| **t > s && **t <= s + 1000).count();
     assert_eq!(in_second, 4, "four trades, four slots: {ts:?}");
 }
+
+fn touch_later(p: &Path) {
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+}
+
+/// A fresh `.s10` day between two stale ones is left alone: the gapless fill
+/// does not run across it.
+#[test]
+fn s10_does_not_rewrite_a_fresh_day_between_stale_days() {
+    let r = root("s10");
+    let (inp, out) = (r.join("in"), r.join("out"));
+    std::fs::create_dir_all(&inp).unwrap();
+    for (i, day) in ["2026-08-10", "2026-08-11", "2026-08-12"]
+        .iter()
+        .enumerate()
+    {
+        let rec = idx_record(D10 + i as i64 * DAY_MS + 1_000);
+        std::fs::write(inp.join(format!("{day}.idx")), bytemuck::bytes_of(&rec)).unwrap();
+    }
+    let cfg = concat!(env!("CARGO_MANIFEST_DIR"), "/config.yml");
+    let go = || {
+        run(
+            env!("CARGO_BIN_EXE_s10-from-idx"),
+            &r,
+            &[
+                cfg,
+                "BTC-USDT",
+                "--in-dir",
+                inp.to_str().unwrap(),
+                "--out-dir",
+                out.to_str().unwrap(),
+            ],
+        )
+    };
+    go();
+    let mid = out.join("2026-08-11.s10");
+    let before = (
+        std::fs::read(&mid).unwrap(),
+        std::fs::metadata(&mid).unwrap().modified().unwrap(),
+    );
+    touch_later(&inp.join("2026-08-10.idx"));
+    touch_later(&inp.join("2026-08-12.idx"));
+    go();
+    let after = (
+        std::fs::read(&mid).unwrap(),
+        std::fs::metadata(&mid).unwrap().modified().unwrap(),
+    );
+    assert_eq!(before, after, "the fresh middle day was rewritten");
+}

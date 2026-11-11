@@ -140,6 +140,7 @@ fn main() -> Result<()> {
     // the closest earlier shard on disk.
     let rec = std::mem::size_of::<Bar>() as u64;
     let all = shards.len();
+    let all_dates: Vec<NaiveDate> = shards.iter().map(|(d, _)| *d).collect();
     let shards: Vec<_> = shards
         .into_iter()
         .filter(|(d, p)| args.force || !fresh(&shard_path(&out_dir, *d, "s10"), p, rec))
@@ -149,146 +150,162 @@ fn main() -> Result<()> {
         to_build = shards.len(),
         "input shard scan done"
     );
-    let Some((first_date, _)) = shards.first() else {
+    if shards.is_empty() {
         info!("every s10 shard is fresh; nothing to build");
         return Ok(());
-    };
-    let seed = list_shards(&out_dir, "s10")?
-        .into_iter()
-        .rev()
-        .find(|(d, _)| d < first_date)
-        .and_then(|(_, p)| last_bar(&p));
-
-    let t0 = std::time::Instant::now();
-    let mut accum = BarAccumulator::new();
-    let mut bars_by_date: BTreeMap<NaiveDate, Vec<Bar>> = BTreeMap::new();
-    let mut cur_bucket: Option<i64> = seed.map(|b| b.open_time_ms());
-    // Last emitted close — seeds `flat_bar` for empty (zero-tick) buckets so the
-    // offline series is GAPLESS, byte-identical to the live `bars_s10` producer
-    // (its flush_all cursor loop). Without this, quiet windows drop buckets
-    // and offline-s10-resampled vol diverges from live on those windows.
-    let mut last_close: f64 = seed.map_or(0.0, |b| b.close);
-    let mut n_input: u64 = 0;
-    let mut n_skipped: u64 = 0;
-    let mut n_flat: u64 = 0;
-
-    let flush_bar = |bars_by_date: &mut BTreeMap<NaiveDate, Vec<Bar>>, bar: Bar| {
-        // route by open_ts.utc_date()
-        let date = ts_ms_to_utc_date(bar.open_time_ms());
-        bars_by_date.entry(date).or_default().push(bar);
-    };
-
-    // Emit flat bars for every empty 10s bucket in `(from, to)` (exclusive both
-    // ends), each seeded with `last_close`. Mirrors the live producer, which
-    // fires one `flat_bar` per ticker per 10s boundary that received no ticks.
-    let fill_gap = |bars_by_date: &mut BTreeMap<NaiveDate, Vec<Bar>>,
-                    from: i64,
-                    to: i64,
-                    last_close: f64,
-                    n_flat: &mut u64| {
-        if last_close <= 0.0 {
-            return;
+    }
+    // A done day between two stale ones is not rebuilt, so the gapless fill must
+    // not run across it: each run of stale days is built on its own.
+    let mut runs: Vec<Vec<(NaiveDate, PathBuf)>> = Vec::new();
+    for (d, p) in shards {
+        let split = runs
+            .last()
+            .and_then(|r| r.last())
+            .is_none_or(|(prev, _)| all_dates.iter().any(|x| x > prev && *x < d));
+        if split {
+            runs.push(Vec::new());
         }
-        let mut b = from + args.bucket_ms;
-        while b < to {
-            flush_bar(bars_by_date, flat_bar(b, last_close));
-            *n_flat += 1;
-            b += args.bucket_ms;
-        }
-    };
+        runs.last_mut().unwrap().push((d, p));
+    }
+    for shards in runs {
+        let first_date = shards[0].0;
+        let seed = list_shards(&out_dir, "s10")?
+            .into_iter()
+            .rev()
+            .find(|(d, _)| *d < first_date)
+            .and_then(|(_, p)| last_bar(&p));
 
-    for (date, path) in &shards {
-        info!(date = %date, path = %path.display(), "reading input shard");
-        let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
-        while let Some(chunk) = stream.next_chunk()? {
-            for rec in chunk {
-                // SEAM PARITY: skip heartbeat sentinels (mirror live bars_s10.rs:198).
-                // Sentinels carry stale bid/ask; ingesting offline (but not live)
-                // poisons the s10 OHLC → vol-ring σ → hist↔live seam drift.
-                if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
-                    n_skipped += 1;
-                    continue;
-                }
-                let ts_ms = timestamp::to_epoch_ms(rec.header.get_timestamp());
-                let idx = rec.index;
-                let bid = idx.bid;
-                let ask = idx.ask;
-                let mid = (bid + ask) * 0.5;
-                if !(mid.is_finite() && mid > 0.0) {
-                    n_skipped += 1;
-                    continue;
-                }
-                n_input += 1;
+        let t0 = std::time::Instant::now();
+        let mut accum = BarAccumulator::new();
+        let mut bars_by_date: BTreeMap<NaiveDate, Vec<Bar>> = BTreeMap::new();
+        let mut cur_bucket: Option<i64> = seed.map(|b| b.open_time_ms());
+        // Last emitted close — seeds `flat_bar` for empty (zero-tick) buckets so the
+        // offline series is GAPLESS, byte-identical to the live `bars_s10` producer
+        // (its flush_all cursor loop). Without this, quiet windows drop buckets
+        // and offline-s10-resampled vol diverges from live on those windows.
+        let mut last_close: f64 = seed.map_or(0.0, |b| b.close);
+        let mut n_input: u64 = 0;
+        let mut n_skipped: u64 = 0;
+        let mut n_flat: u64 = 0;
 
-                let bucket = ts_ms.div_euclid(args.bucket_ms) * args.bucket_ms;
-                match cur_bucket {
-                    None => {
-                        cur_bucket = Some(bucket);
-                    }
-                    Some(cb) if bucket > cb => {
-                        if let Some(mut bar) = accum.flush() {
-                            bar.kind = BarKind::Kline as u8;
-                            // Grid-snap to the closed bucket `cb` (offline == live).
-                            stamp_grid(&mut bar, cb, args.bucket_ms);
-                            if bar.close > 0.0 && bar.close.is_finite() {
-                                last_close = bar.close;
-                            }
-                            flush_bar(&mut bars_by_date, bar);
-                        }
-                        // GAPLESS fill: emit a flat bar for each empty bucket strictly
-                        // between the just-closed bucket and the new one.
-                        fill_gap(&mut bars_by_date, cb, bucket, last_close, &mut n_flat);
-                        cur_bucket = Some(bucket);
-                    }
-                    Some(cb) if bucket < cb => {
+        let flush_bar = |bars_by_date: &mut BTreeMap<NaiveDate, Vec<Bar>>, bar: Bar| {
+            // route by open_ts.utc_date()
+            let date = ts_ms_to_utc_date(bar.open_time_ms());
+            bars_by_date.entry(date).or_default().push(bar);
+        };
+
+        // Emit flat bars for every empty 10s bucket in `(from, to)` (exclusive both
+        // ends), each seeded with `last_close`. Mirrors the live producer, which
+        // fires one `flat_bar` per ticker per 10s boundary that received no ticks.
+        let fill_gap = |bars_by_date: &mut BTreeMap<NaiveDate, Vec<Bar>>,
+                        from: i64,
+                        to: i64,
+                        last_close: f64,
+                        n_flat: &mut u64| {
+            if last_close <= 0.0 {
+                return;
+            }
+            let mut b = from + args.bucket_ms;
+            while b < to {
+                flush_bar(bars_by_date, flat_bar(b, last_close));
+                *n_flat += 1;
+                b += args.bucket_ms;
+            }
+        };
+
+        for (date, path) in &shards {
+            info!(date = %date, path = %path.display(), "reading input shard");
+            let mut stream = ShardStream::<nxr_sdk::IndexRecord>::open(path)?;
+            while let Some(chunk) = stream.next_chunk()? {
+                for rec in chunk {
+                    // SEAM PARITY: skip heartbeat sentinels (mirror live bars_s10.rs:198).
+                    // Sentinels carry stale bid/ask; ingesting offline (but not live)
+                    // poisons the s10 OHLC → vol-ring σ → hist↔live seam drift.
+                    if rec.index.flags & nxr_sdk::shard::FLAG_HEARTBEAT_SENTINEL != 0 {
                         n_skipped += 1;
                         continue;
                     }
-                    _ => {}
-                }
+                    let ts_ms = timestamp::to_epoch_ms(rec.header.get_timestamp());
+                    let idx = rec.index;
+                    let bid = idx.bid;
+                    let ask = idx.ask;
+                    let mid = (bid + ask) * 0.5;
+                    if !(mid.is_finite() && mid > 0.0) {
+                        n_skipped += 1;
+                        continue;
+                    }
+                    n_input += 1;
 
-                let ci_ubp = nxr_sdk::tdwap::decode_ci_ubp(idx.ci);
-                accum.ingest(
-                    bid,
-                    ask,
-                    idx.vbid,
-                    idx.vask,
-                    ts_ms,
-                    ci_ubp,
-                    idx.accepted as u32,
-                    idx.rejected as u32,
-                );
+                    let bucket = ts_ms.div_euclid(args.bucket_ms) * args.bucket_ms;
+                    match cur_bucket {
+                        None => {
+                            cur_bucket = Some(bucket);
+                        }
+                        Some(cb) if bucket > cb => {
+                            if let Some(mut bar) = accum.flush() {
+                                bar.kind = BarKind::Kline as u8;
+                                // Grid-snap to the closed bucket `cb` (offline == live).
+                                stamp_grid(&mut bar, cb, args.bucket_ms);
+                                if bar.close > 0.0 && bar.close.is_finite() {
+                                    last_close = bar.close;
+                                }
+                                flush_bar(&mut bars_by_date, bar);
+                            }
+                            // GAPLESS fill: emit a flat bar for each empty bucket strictly
+                            // between the just-closed bucket and the new one.
+                            fill_gap(&mut bars_by_date, cb, bucket, last_close, &mut n_flat);
+                            cur_bucket = Some(bucket);
+                        }
+                        Some(cb) if bucket < cb => {
+                            n_skipped += 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    let ci_ubp = nxr_sdk::tdwap::decode_ci_ubp(idx.ci);
+                    accum.ingest(
+                        bid,
+                        ask,
+                        idx.vbid,
+                        idx.vask,
+                        ts_ms,
+                        ci_ubp,
+                        idx.accepted as u32,
+                        idx.rejected as u32,
+                    );
+                }
             }
         }
-    }
-    // flush final open bucket (no trailing gap-fill: gapless only spans
-    // first..last observed, matching live which fills only past boundaries).
-    if let Some(mut bar) = accum.flush() {
-        bar.kind = BarKind::Kline as u8;
-        if let Some(cb) = cur_bucket {
-            stamp_grid(&mut bar, cb, args.bucket_ms);
+        // flush final open bucket (no trailing gap-fill: gapless only spans
+        // first..last observed, matching live which fills only past boundaries).
+        if let Some(mut bar) = accum.flush() {
+            bar.kind = BarKind::Kline as u8;
+            if let Some(cb) = cur_bucket {
+                stamp_grid(&mut bar, cb, args.bucket_ms);
+            }
+            flush_bar(&mut bars_by_date, bar);
         }
-        flush_bar(&mut bars_by_date, bar);
-    }
 
-    let total_bars: usize = bars_by_date.values().map(|v| v.len()).sum();
-    info!(
-        input_records = n_input,
-        skipped = n_skipped,
-        flat_filled = n_flat,
-        bars = total_bars,
-        out_shards = bars_by_date.len(),
-        "s10 pass done (gapless) in {}ms",
-        t0.elapsed().as_millis()
-    );
+        let total_bars: usize = bars_by_date.values().map(|v| v.len()).sum();
+        info!(
+            input_records = n_input,
+            skipped = n_skipped,
+            flat_filled = n_flat,
+            bars = total_bars,
+            out_shards = bars_by_date.len(),
+            "s10 pass done (gapless) in {}ms",
+            t0.elapsed().as_millis()
+        );
 
-    // write daily shards atomically
-    std::fs::create_dir_all(&out_dir)?;
-    for (date, bars) in &bars_by_date {
-        let path = shard_path(&out_dir, *date, "s10");
-        let bytes: &[u8] = bytemuck::cast_slice(bars);
-        write_shard_atomic(&path, bytes)?;
-        info!(date = %date, n = bars.len(), path = %path.display(), "wrote s10 shard");
+        // write daily shards atomically
+        std::fs::create_dir_all(&out_dir)?;
+        for (date, bars) in &bars_by_date {
+            let path = shard_path(&out_dir, *date, "s10");
+            let bytes: &[u8] = bytemuck::cast_slice(bars);
+            write_shard_atomic(&path, bytes)?;
+            info!(date = %date, n = bars.len(), path = %path.display(), "wrote s10 shard");
+        }
     }
 
     // update manifest (merge w/ any existing renko/bars entries)
