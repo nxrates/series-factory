@@ -1305,11 +1305,10 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                             })
                             .cloned()
                             .collect();
-                        if got.len() < active_exchanges.len() {
-                            let missing: Vec<&String> = active_exchanges
-                                .iter()
-                                .filter(|e| !got.contains(e))
-                                .collect();
+                        // Against the venues asked for, so a venue the probe dropped counts too.
+                        if got.len() < venues.len() {
+                            let missing: Vec<&String> =
+                                venues.iter().filter(|e| !got.contains(e)).collect();
                             degraded.push(format!("{d}: without {missing:?}"));
                         }
                         who.insert(*d, got);
