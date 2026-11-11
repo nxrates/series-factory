@@ -21,7 +21,6 @@
 //! - per-step start/done structured logs w/ duration_ms, exit_code, bytes
 //! - per-ticker boundary logs + progress markers on disk under
 //!   `<out_dir>/backfill/progress/<ticker>.{start,done,failed}`
-//! - 60s heartbeat thread emits active/completed counters
 //! - pre-fetch availability probe (HEAD-only) drops dead exchanges + may
 //!   skip a ticker entirely if no exchange has coverage
 //! - merge / s10 / renko emit daily shards; validate iterates shards via
@@ -39,10 +38,8 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, Utc};
@@ -95,6 +92,7 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     parallel: usize,
     /// Accepted and ignored: reruns are always lazy (see `--rebuild`).
+    // ponytail: no-op; drop once ops/k0s/services/nxr-backfill.yaml stops passing it.
     #[arg(long, hide = true)]
     resume: bool,
     /// Rebuild every day, even days whose composite shard, `.s10` and `.renko`
@@ -131,7 +129,7 @@ struct Args {
     #[arg(long, default_value_t = 45)]
     gap_window_days: i64,
     /// Hard floor on free space (GiB) for the filesystem backing `--out-dir`.
-    /// Checked before every ticker and by the heartbeat: the run ABORTS rather
+    /// Checked before every ticker: the run ABORTS rather
     /// than writing the node into disk pressure. A cascade on 2026-07-30
     /// evicted 61 pods and took price serving down; a backfill must never be
     /// able to cause that.
@@ -380,33 +378,7 @@ fn write_marker(out_dir: &Path, ticker: &str, suffix: &str) {
 
 // ── Monthly window helpers (raw-footprint bound) ───────────────────────────────
 
-/// First day of the next calendar month.
-fn next_month_start(d: NaiveDate) -> NaiveDate {
-    use chrono::Datelike;
-    if d.month() == 12 {
-        NaiveDate::from_ymd_opt(d.year() + 1, 1, 1).unwrap()
-    } else {
-        NaiveDate::from_ymd_opt(d.year(), d.month() + 1, 1).unwrap()
-    }
-}
-
-/// Split `[from, to]` (inclusive) into per-calendar-month `(start, end)` windows,
-/// both bounds inclusive. The orchestrator fetches + folds + deletes raw one
-/// window at a time so peak raw `.ticks` is bounded to ~1 month × n_exch instead
-/// of the full backfill range.
-fn month_windows(from: NaiveDate, to: NaiveDate) -> Vec<(NaiveDate, NaiveDate)> {
-    use chrono::Datelike;
-    let mut out = Vec::new();
-    let mut cur = NaiveDate::from_ymd_opt(from.year(), from.month(), 1)
-        .unwrap()
-        .max(from);
-    while cur <= to {
-        let month_end = next_month_start(cur) - chrono::Duration::days(1);
-        out.push((cur, month_end.min(to)));
-        cur = next_month_start(cur);
-    }
-    out
-}
+use series_factory::sources::common::month_ranges as month_windows;
 
 /// Delete all raw `.ticks` for a ticker across every exchange staging dir.
 /// Called immediately after each month's t2i append succeeds so the raw never
@@ -566,14 +538,25 @@ fn preflight_disk_guard(
 
 // ── Per-ticker pipeline ──────────────────────────────────────────────────────
 
+/// The runs of consecutive days in a sorted day list, as `(first, last)`.
+fn contiguous_runs(days: &[NaiveDate]) -> Vec<(NaiveDate, NaiveDate)> {
+    let mut runs: Vec<(NaiveDate, NaiveDate)> = Vec::new();
+    for &d in days {
+        match runs.last_mut() {
+            Some((_, last)) if *last + chrono::Duration::days(1) == d => *last = d,
+            _ => runs.push((d, d)),
+        }
+    }
+    runs
+}
+
 /// Days of `[from, to]` whose composite `.idx` shard is not yet done (all of
 /// them under `--rebuild`).
 fn todo_days(dir: &Path, from: NaiveDate, to: NaiveDate, rebuild: bool) -> Vec<NaiveDate> {
-    let rec = std::mem::size_of::<nxr_sdk::IndexRecord>() as u64;
     if rebuild {
         return from.iter_days().take_while(|d| *d <= to).collect();
     }
-    series_factory::sharding::days_todo(dir, "idx", rec, from, to)
+    series_factory::sharding::days_todo(dir, "idx", from, to)
 }
 
 /// Dates of the `<date>.<kind>` shards in `dir`.
@@ -598,7 +581,6 @@ struct PlanCtx {
     to: NaiveDate,
     exchanges: Vec<String>,
     steps: Vec<String>,
-    counters: Arc<Counters>,
     /// 0 = normal pass, 1 = the narrowed re-run a `repair` spawned. Bounds the
     /// recursion at one level: a day that is still missing after one repair is
     /// unrecoverable from the sources we have, and retrying cannot change that.
@@ -730,24 +712,6 @@ fn detect_gaps(
     )
 }
 
-struct Counters {
-    active: AtomicUsize,
-    completed: AtomicU64,
-    failed: AtomicU64,
-    skipped: AtomicU64,
-}
-
-impl Counters {
-    fn new() -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            completed: AtomicU64::new(0),
-            failed: AtomicU64::new(0),
-            skipped: AtomicU64::new(0),
-        }
-    }
-}
-
 /// HEAD-probe each exchange via fetch-crypto-history --probe. Returns the
 /// availability vec + filtered exchanges that have coverage.
 fn probe_availability(
@@ -755,6 +719,7 @@ fn probe_availability(
     exchanges: &[String],
     base: &str,
     quote: &str,
+    (lo, hi): (NaiveDate, NaiveDate),
 ) -> (Vec<AvailabilityEntry>, Vec<String>) {
     let args = vec![
         ctx.args.config.to_string_lossy().to_string(),
@@ -765,9 +730,9 @@ fn probe_availability(
         "--quote".to_string(),
         quote.to_string(),
         "--from-date".to_string(),
-        ctx.from.to_string(),
+        lo.to_string(),
         "--to-date".to_string(),
-        ctx.to.to_string(),
+        hi.to_string(),
         "--probe".to_string(),
     ];
     let out = Command::new("fetch-crypto-history").args(&args).output();
@@ -825,9 +790,27 @@ fn probe_availability(
     (result, active)
 }
 
+/// Exclusive per-ticker lock for the life of a ticker's run, so two backfills
+/// (a one-off Job and the CronJob) cannot delete each other's staging or rebuild
+/// the same shards. Released when the returned file is dropped.
+fn lock_ticker(out_dir: &Path, ticker: &str) -> Result<fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let dir = out_dir.join("backfill");
+    fs::create_dir_all(&dir)?;
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(format!("{ticker}.lock")))?;
+    // SAFETY: plain flock(2) on a descriptor this function owns.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(anyhow!("{ticker} is being backfilled by another process"));
+    }
+    Ok(f)
+}
+
 /// A one-step failed report for a ticker that never started.
 fn failed_report(ctx: &PlanCtx, ticker: &str, step: &str, error: String) -> TickerReport {
-    ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
     write_marker(&ctx.args.out_dir, ticker, "failed");
     TickerReport {
         ticker: ticker.to_string(),
@@ -877,7 +860,15 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     };
 
     let perp = series_factory::sources::split_quote(&quote).1;
-    ctx.counters.active.fetch_add(1, Ordering::Relaxed);
+    // The repair pass runs inside the outer run, which already holds the lock.
+    let _lock = if ctx.repair_pass == 0 {
+        match lock_ticker(&ctx.args.out_dir, ticker) {
+            Ok(l) => Some(l),
+            Err(e) => return failed_report(ctx, ticker, "lock", format!("{e:#}")),
+        }
+    } else {
+        None
+    };
     write_marker(&ctx.args.out_dir, ticker, "start");
     info!(ticker, "ticker start");
 
@@ -913,8 +904,6 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             floor_gib = ctx.args.min_free_gib,
             "DISK FLOOR breached; aborting ticker"
         );
-        ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-        ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
         write_marker(&ctx.args.out_dir, ticker, "failed");
         return TickerReport {
             ticker: ticker.to_string(),
@@ -952,13 +941,34 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         Ok(v) => v,
         Err(err) => return failed_report(ctx, ticker, "config", format!("{err:#}")),
     };
+    // Today's shard belongs to the live writer, and the newest days are not
+    // final: OKX and Bitget cut their days at UTC+8, so a day's tail file exists
+    // only after ~16:00 UTC the next day. Stop two days short of today.
+    let last_day = ctx.to.min(Utc::now().date_naive() - chrono::Duration::days(2));
+    // The runs of consecutive missing days: nothing between them is touched, and
+    // only they are probed.
+    let runs: Vec<(NaiveDate, NaiveDate)> = month_windows(ctx.from, ctx.to)
+        .into_iter()
+        .flat_map(|(s, e)| {
+            contiguous_runs(&todo_days(&composite_dir, s, e.min(last_day), ctx.args.rebuild))
+        })
+        .collect();
     let mut active_exchanges = venues.clone();
     // An oracle-relayed symbol (FX, metals, equities, stablecoin pegs) has no
     // CEX book at all. Before the `pyth` step existed this was a hard skip, so
     // the "backfill everything" entry point silently covered crypto only.
     let mut pyth_only = false;
-    if !ctx.args.skip_probe && want("fetch") {
-        let (av, active) = probe_availability(ctx, &venues, &base, &quote);
+    if !ctx.args.skip_probe && want("fetch") && !runs.is_empty() {
+        let (mut av, mut active): (Vec<AvailabilityEntry>, Vec<String>) = (Vec::new(), Vec::new());
+        for run in &runs {
+            let (a, act) = probe_availability(ctx, &venues, &base, &quote, *run);
+            av.extend(a);
+            for e in act {
+                if !active.contains(&e) {
+                    active.push(e);
+                }
+            }
+        }
         availability = av;
         // Pyth history is spot-only: a perp series with no coverage is skipped, never re-sourced.
         if active.is_empty() && want("pyth") && !perp {
@@ -967,8 +977,6 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             active_exchanges = vec!["pyth".to_string()];
         } else if active.is_empty() {
             warn!(ticker, "all exchanges report no coverage; skipping ticker");
-            ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-            ctx.counters.skipped.fetch_add(1, Ordering::Relaxed);
             write_marker(&ctx.args.out_dir, ticker, "done");
             return TickerReport {
                 ticker: ticker.to_string(),
@@ -1000,8 +1008,6 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     // at the month's first record); the only artifact is the first seconds of a
     // month blending just the venues that have traded so far.
     let fail = |steps: Vec<StepReport>| -> TickerReport {
-        ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
-        ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
         write_marker(&ctx.args.out_dir, ticker, "failed");
         TickerReport {
             ticker: ticker.to_string(),
@@ -1022,24 +1028,21 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     .join(format!("{}-{}.idx", base, quote))
             })
             .collect();
-        // Today's shard belongs to the live writer and is never complete.
-        let last_day = ctx.to.min(Utc::now().date_naive() - chrono::Duration::days(1));
         let (mut fetch_ms, mut merge_ms) = (0u128, 0u128);
         let mut t2i_ms: BTreeMap<String, u128> = BTreeMap::new();
         let (mut fetch_err, mut t2i_err, mut merge_err) = (Vec::new(), Vec::new(), Vec::new());
         let mut months_run = 0usize;
         let mut hard_fail = false;
+        let mut fetch_faulty = false;
 
-        'months: for (m_start, m_end) in month_windows(ctx.from, ctx.to) {
-            let todo = todo_days(&composite_dir, m_start, m_end.min(last_day), ctx.args.rebuild);
-            let (Some(&lo), Some(&hi)) = (todo.first(), todo.last()) else {
-                continue;
-            };
+        'months: for &(lo, hi) in &runs {
             months_run += 1;
             let (lo_s, hi_s) = (lo.to_string(), hi.to_string());
             // A leftover per-provider `.idx` is from an interrupted run: refold.
-            for p in &per_idx_paths {
-                let _ = fs::remove_file(p);
+            if want("t2i") {
+                for p in &per_idx_paths {
+                    let _ = fs::remove_file(p);
+                }
             }
 
             if pyth_only && want("pyth") {
@@ -1094,7 +1097,12 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     hard_fail = true;
                     break 'months;
                 } else if rep.exit_code != 0 {
+                    // Some venue's window is incomplete (see `Fetched::faults`): its
+                    // days must not become done, and its sources must stay.
                     fetch_err.push(format!("{lo_s}..{hi_s}: fetch exit {}", rep.exit_code));
+                    fetch_err.extend(rep.errors.clone());
+                    fetch_faulty = true;
+                    continue;
                 }
             }
 
@@ -1165,27 +1173,32 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 // Verified = the manifest now vouches for the days it built; a
                 // day still todo had no data, and `gaps` reports it.
                 let still = todo_days(&composite_dir, lo, hi, false);
-                rebuilt.extend(todo.iter().filter(|d| !still.contains(d)));
+                rebuilt.extend(lo.iter_days().take_while(|d| *d <= hi).filter(|d| !still.contains(d)));
                 if !still.is_empty() {
                     warn!(ticker, days = ?still, "days without composite data in window");
                 }
+                // Dispose: this run's merge succeeded and vouches for the days, so
+                // their sources are no longer needed.
+                if !ctx.args.keep_staging {
+                    let freed = delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
+                    for p in &per_idx_paths {
+                        let _ = fs::remove_file(p);
+                    }
+                    info!(ticker, %lo, %hi, freed_bytes = freed, "sources disposed");
+                }
             }
 
-            // Dispose: the month's sources are no longer needed.
-            if !ctx.args.keep_staging {
-                let freed = delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
-                for p in &per_idx_paths {
-                    let _ = fs::remove_file(p);
-                }
-                info!(ticker, %lo, %hi, freed_bytes = freed, "month sources disposed");
-            }
         }
 
         if want("fetch") {
             steps_out.push(StepReport {
                 name: "fetch-crypto-history[monthly]".to_string(),
                 duration_ms: fetch_ms,
-                exit_code: if hard_fail && !fetch_err.is_empty() { -1 } else { 0 },
+                exit_code: if hard_fail && !fetch_err.is_empty() {
+                    -1
+                } else {
+                    i32::from(fetch_faulty)
+                },
                 bytes: 0,
                 skipped: months_run == 0,
                 errors: fetch_err,
@@ -1230,9 +1243,13 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         }
         if want("merge") && !rebuilt.is_empty() {
             // post-merge: validate the shards just built. Any failure fails the ticker.
-            let shard_check = validate_shards(ticker, &composite_dir, "idx", Some(&rebuilt));
+            let (shard_check, bad) =
+                validate_shards(ticker, &composite_dir, "idx", Some(&rebuilt));
             steps_out.push(shard_check.clone());
             if shard_check.exit_code != 0 {
+                // A shard that fails validation is not done: unlist and delete it
+                // so the next run rebuilds it.
+                series_factory::sharding::unlist_shards(&composite_dir, &bad);
                 return fail(steps_out);
             }
         }
@@ -1343,10 +1360,14 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     // the merge; s10 and renko shards are checked when their step ran.
     if want("validate") {
         if !s10_days.is_empty() {
-            steps_out.push(validate_shards(ticker, &bars_dir, "s10", Some(&s10_days)));
+            let (rep, bad) = validate_shards(ticker, &bars_dir, "s10", Some(&s10_days));
+            for p in bad {
+                let _ = fs::remove_file(p); // not fresh any more: rebuilt next run
+            }
+            steps_out.push(rep);
         }
         if renko_ran {
-            steps_out.push(validate_shards(ticker, &bars_dir, "renko", None));
+            steps_out.push(validate_shards(ticker, &bars_dir, "renko", None).0);
             // vol (single legacy file)
             if vol_path.exists() {
                 let args = vec![
@@ -1388,7 +1409,6 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     .filter(|s| want(s) || **s == "gaps")
                     .map(|s| s.to_string())
                     .collect(),
-                counters: Arc::clone(&ctx.counters),
                 repair_pass: 1,
             };
             let sub_rep = run_ticker(&sub, ticker);
@@ -1418,18 +1438,14 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
 
     let n_steps = steps_out.len();
     info!(ticker, status, n_steps, "ticker done");
-    ctx.counters.active.fetch_sub(1, Ordering::Relaxed);
     match status {
         "ok" => {
-            ctx.counters.completed.fetch_add(1, Ordering::Relaxed);
             write_marker(&ctx.args.out_dir, ticker, "done");
         }
         "skipped" => {
-            ctx.counters.skipped.fetch_add(1, Ordering::Relaxed);
             write_marker(&ctx.args.out_dir, ticker, "done");
         }
         _ => {
-            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
             write_marker(&ctx.args.out_dir, ticker, "failed");
         }
     }
@@ -1473,7 +1489,7 @@ fn validate_shards(
     ticker_dir: &Path,
     kind: &str,
     only: Option<&[NaiveDate]>,
-) -> StepReport {
+) -> (StepReport, Vec<PathBuf>) {
     let name = format!("integrity-check-shards[{}]", kind);
     let start = Instant::now();
     let suffix = format!(".{}", kind);
@@ -1500,18 +1516,19 @@ fn validate_shards(
         // site we already filter to dirs that should contain output; treat
         // empty as a soft warning here.
         warn!(ticker, kind, dir = %ticker_dir.display(), "no shards to validate");
-        return StepReport {
+        return (StepReport {
             name,
             duration_ms: start.elapsed().as_millis(),
             exit_code: 0,
             bytes: 0,
             skipped: true,
             errors: vec!["no shards present".into()],
-        };
+        }, Vec::new());
     }
     let mut errors: Vec<String> = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut any_fail = false;
+    let mut failed: Vec<PathBuf> = Vec::new();
     for shard in &shards {
         total_bytes += file_bytes(shard);
         let args = vec![
@@ -1526,6 +1543,7 @@ fn validate_shards(
             Ok(o) if matches!(o.status.code(), Some(0) | Some(1)) => {}
             Ok(o) => {
                 any_fail = true;
+                failed.push(shard.clone());
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 for line in stderr.lines().rev().take(5) {
                     errors.push(format!("{}: {}", shard.display(), line));
@@ -1540,6 +1558,7 @@ fn validate_shards(
             }
             Err(e) => {
                 any_fail = true;
+                failed.push(shard.clone());
                 errors.push(format!("{}: spawn {}", shard.display(), e));
             }
         }
@@ -1553,14 +1572,17 @@ fn validate_shards(
         duration_ms = start.elapsed().as_millis() as u64,
         "shard validate done"
     );
-    StepReport {
+    (
+        StepReport {
         name,
         duration_ms: start.elapsed().as_millis(),
         exit_code,
         bytes: total_bytes,
         skipped: false,
         errors,
-    }
+        },
+        failed,
+    )
 }
 
 /// Every natively aggregated ticker: the CEX subscription manifest
@@ -1658,14 +1680,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let counters = Arc::new(Counters::new());
     let ctx = PlanCtx {
         args: args.clone(),
         from,
         to,
         exchanges,
         steps,
-        counters: counters.clone(),
         repair_pass: 0,
     };
 
@@ -1730,29 +1750,6 @@ fn main() -> Result<()> {
         )?;
     }
 
-    // heartbeat thread — emits every 60s while pool runs
-    let heartbeat_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let hb_stop = heartbeat_stop.clone();
-    let hb_counters = counters.clone();
-    let n_tickers = tickers.len();
-    let heartbeat = thread::spawn(move || {
-        while !hb_stop.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_secs(60));
-            if hb_stop.load(Ordering::Relaxed) {
-                break;
-            }
-            info!(
-                msg = "heartbeat",
-                active_tickers = hb_counters.active.load(Ordering::Relaxed),
-                completed = hb_counters.completed.load(Ordering::Relaxed),
-                failed = hb_counters.failed.load(Ordering::Relaxed),
-                skipped = hb_counters.skipped.load(Ordering::Relaxed),
-                total = n_tickers,
-                "heartbeat"
-            );
-        }
-    });
-
     let pool = ThreadPoolBuilder::new()
         .num_threads(args.parallel.max(1))
         .build()
@@ -1765,7 +1762,6 @@ fn main() -> Result<()> {
             let rep = match res {
                 Ok(r) => r,
                 Err(_) => {
-                    ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
                     write_marker(&ctx.args.out_dir, t, "failed");
                     TickerReport {
                         ticker: t.clone(),
@@ -1787,8 +1783,6 @@ fn main() -> Result<()> {
         });
     });
 
-    heartbeat_stop.store(true, Ordering::Relaxed);
-    let _ = heartbeat.join();
 
     let results_vec: Vec<TickerReport> = results.into_inner().unwrap().into_values().collect();
     let mut ok = 0usize;
@@ -1867,6 +1861,30 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A second backfill of the same ticker is refused until the first is done.
+    #[test]
+    fn ticker_lock_is_exclusive() {
+        let dir = std::env::temp_dir().join(format!("bf-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let first = lock_ticker(&dir, "BTC-USDT:PERP").unwrap();
+        assert!(lock_ticker(&dir, "BTC-USDT:PERP").is_err());
+        assert!(lock_ticker(&dir, "ETH-USDT").is_ok());
+        drop(first);
+        assert!(lock_ticker(&dir, "BTC-USDT:PERP").is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contiguous_runs_split_on_gaps() {
+        let day = |n| NaiveDate::from_ymd_opt(2024, 1, n).unwrap();
+        let days = [day(3), day(9), day(10), day(11), day(20)];
+        assert_eq!(
+            contiguous_runs(&days),
+            [(day(3), day(3)), (day(9), day(11)), (day(20), day(20))]
+        );
+        assert!(contiguous_runs(&[]).is_empty());
+    }
+
     /// The disk projection follows the window (not a fixed month) and is larger for perps.
     #[test]
     fn projected_peak_scales_with_window_and_perp() {
@@ -1876,64 +1894,5 @@ mod tests {
         assert_eq!(projected_peak(100, 4, 2, 30, true), spot(30) * PERP_DAY_FACTOR);
     }
 
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, day).unwrap()
-    }
 
-    #[test]
-    fn month_windows_full_calendar_months() {
-        // Jan 1 .. Mar 31 → 3 inclusive month windows.
-        let w = month_windows(d(2024, 1, 1), d(2024, 3, 31));
-        assert_eq!(
-            w,
-            vec![
-                (d(2024, 1, 1), d(2024, 1, 31)),
-                (d(2024, 2, 1), d(2024, 2, 29)), // 2024 is a leap year
-                (d(2024, 3, 1), d(2024, 3, 31)),
-            ]
-        );
-    }
-
-    #[test]
-    fn month_windows_partial_first_and_last() {
-        // Mid-month start + mid-month end clamp to the requested bounds.
-        let w = month_windows(d(2023, 1, 15), d(2023, 3, 10));
-        assert_eq!(
-            w,
-            vec![
-                (d(2023, 1, 15), d(2023, 1, 31)),
-                (d(2023, 2, 1), d(2023, 2, 28)),
-                (d(2023, 3, 1), d(2023, 3, 10)),
-            ]
-        );
-    }
-
-    #[test]
-    fn month_windows_single_partial_month() {
-        let w = month_windows(d(2025, 6, 5), d(2025, 6, 9));
-        assert_eq!(w, vec![(d(2025, 6, 5), d(2025, 6, 9))]);
-    }
-
-    #[test]
-    fn month_windows_year_boundary() {
-        let w = month_windows(d(2023, 12, 1), d(2024, 1, 31));
-        assert_eq!(
-            w,
-            vec![
-                (d(2023, 12, 1), d(2023, 12, 31)),
-                (d(2024, 1, 1), d(2024, 1, 31)),
-            ]
-        );
-    }
-
-    #[test]
-    fn windows_cover_range_contiguously_no_gap_no_overlap() {
-        // Property: windows tile [from,to] exactly — each next start = prev end+1.
-        let w = month_windows(d(2022, 3, 17), d(2023, 5, 2));
-        assert_eq!(w.first().unwrap().0, d(2022, 3, 17));
-        assert_eq!(w.last().unwrap().1, d(2023, 5, 2));
-        for pair in w.windows(2) {
-            assert_eq!(pair[1].0, pair[0].1 + chrono::Duration::days(1));
-        }
-    }
 }

@@ -57,24 +57,17 @@ mod tests {
 
 /// Days of `[from, to]` the manifest at `dir` does not vouch for: a day is done
 /// only when the manifest lists it and the file on disk is exactly the recorded
-/// size, a whole number of `rec_size` records. A shard a crashed or interrupted
+/// size. A shard a crashed or interrupted
 /// writer left behind differs from its entry (or has none) and is redone.
-pub fn days_todo(
-    dir: &Path,
-    kind: &str,
-    rec_size: u64,
-    from: NaiveDate,
-    to: NaiveDate,
-) -> Vec<NaiveDate> {
+pub fn days_todo(dir: &Path, kind: &str, from: NaiveDate, to: NaiveDate) -> Vec<NaiveDate> {
     let manifest = read_manifest(&manifest_path(dir)).ok().flatten();
     let listed = |d: NaiveDate| {
         manifest.as_ref().is_some_and(|m| {
             let key = d.format("%Y-%m-%d").to_string();
             m.shards.iter().any(|e| {
-                e.date == key && e.size_bytes > 0 && e.size_bytes % rec_size == 0 && {
-                    std::fs::metadata(shard_path(dir, d, kind))
+                e.date == key
+                    && std::fs::metadata(shard_path(dir, d, kind))
                         .is_ok_and(|f| f.len() == e.size_bytes)
-                }
             })
         })
     };
@@ -87,6 +80,23 @@ pub fn days_todo(
         d += chrono::Duration::days(1);
     }
     out
+}
+
+/// Delete the given shard files and drop their manifest entries, so the days
+/// are todo again.
+pub fn unlist_shards(dir: &Path, shards: &[PathBuf]) {
+    let stems: Vec<String> = shards
+        .iter()
+        .filter_map(|p| p.file_stem()?.to_str().map(String::from))
+        .collect();
+    for p in shards {
+        let _ = std::fs::remove_file(p);
+    }
+    let path = manifest_path(dir);
+    if let Ok(Some(mut m)) = read_manifest(&path) {
+        m.shards.retain(|e| !stems.contains(&e.date));
+        let _ = write_manifest(&path, &m);
+    }
 }
 
 /// A derived shard is fresh when it is a whole, non-empty number of `rec_size`
@@ -115,7 +125,6 @@ mod done_tests {
         let dir = std::env::temp_dir().join(format!("sf-done-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let rec = 56u64;
         let write = |d: u32, n: usize| {
             std::fs::write(shard_path(&dir, day(d), "idx"), vec![1u8; n]).unwrap()
         };
@@ -135,9 +144,34 @@ mod done_tests {
         write_manifest(&manifest_path(&dir), &m).unwrap();
         write(2, 56 * 2 + 10);
         assert_eq!(
-            days_todo(&dir, "idx", rec, day(1), day(5)),
+            days_todo(&dir, "idx", day(1), day(5)),
             [day(2), day(3), day(4), day(5)]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shard that failed validation is deleted and unlisted: todo again.
+    #[test]
+    fn unlist_makes_a_done_day_todo_again() {
+        let dir = std::env::temp_dir().join(format!("sf-unlist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = shard_path(&dir, day(1), "idx");
+        std::fs::write(&p, vec![1u8; 56]).unwrap();
+        let mut m = Manifest::new("T".into(), 1, "idx");
+        m.set_shards_batch(vec![ShardEntry {
+            date: "2024-01-01".into(),
+            first_ts: 0,
+            last_ts: 0,
+            n_records: 1,
+            size_bytes: 56,
+            sha256: String::new(),
+        }]);
+        write_manifest(&manifest_path(&dir), &m).unwrap();
+        assert!(days_todo(&dir, "idx", day(1), day(1)).is_empty());
+        unlist_shards(&dir, &[p.clone()]);
+        assert!(!p.exists());
+        assert_eq!(days_todo(&dir, "idx", day(1), day(1)), [day(1)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
