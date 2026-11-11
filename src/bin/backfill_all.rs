@@ -461,8 +461,8 @@ fn delete_month_raw_ticks(out_dir: &Path, exchanges: &[String], base: &str, quot
 
 // ── Startup sweep + pre-flight disk guard (P1.4 / P1.5 / P2.2) ─────────────────
 
-/// Recursively delete every `*.ticks.partial` under `ticks/`. These are torn
-/// half-downloads left by a killed `download_and_convert` (common.rs:383) — the
+/// Recursively delete every `*.ticks.partial` and `.partial-dl-*` under `ticks/`.
+/// These are torn half-downloads left by a killed `download_and_convert`: the
 /// atomic rename never completed. They are never read by any step and otherwise
 /// orphan forever. Returns bytes freed.
 fn sweep_partial_ticks(out_dir: &Path) -> u64 {
@@ -478,7 +478,7 @@ fn sweep_partial_ticks(out_dir: &Path) -> u64 {
             } else if p
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.ends_with(".ticks.partial"))
+                .map(|n| n.ends_with(".ticks.partial") || n.starts_with(".partial-dl-"))
                 .unwrap_or(false)
             {
                 *freed += file_bytes(&p);
@@ -541,30 +541,43 @@ fn free_bytes(path: &Path) -> Option<u64> {
     Some(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
-/// Pre-flight disk-headroom guard (P2.2). With delete-as-you-go (t2i removes
-/// each `.ticks` the instant it folds it into the `.idx`) the peak raw
-/// footprint is bounded to roughly ONE archive file per exchange in flight:
-///   1 file × n_exch × parallel × bytes_per_exchange_day × PEAK_FILE_DAYS,
-/// where `PEAK_FILE_DAYS` sizes the single largest archive unit. The worst
-/// case is a completed-month monthly archive (~31 days of one exchange's
-/// ticks in one file). Abort if that projection exceeds
+/// Raw `.ticks` of a perp series per exchange-day against the spot figure
+/// `bytes_per_exchange_day` is sized for: BTC perp on a calm day is already ~0.9x
+/// that spot bound on OKX (measured), and busy days run several times calm ones.
+// ponytail: fixed factor; move into `series.pipeline.backfill` once the SDK struct can carry it.
+const PERP_DAY_FACTOR: u64 = 3;
+
+/// In-flight raw peak: each month window fetches every day of it for every
+/// exchange before t2i folds and deletes it, so
+/// `(window_days + 1) × n_exch × parallel × bytes_per_exchange_day` (× `PERP_DAY_FACTOR`),
+/// where `window_days` is the longest month window of the run (up to 31) and the
+/// `+ 1` is the extra day a venue cut at UTC+8 fetches.
+fn projected_peak(
+    bytes_per_exchange_day: u64,
+    n_exch: usize,
+    parallel: usize,
+    window_days: u64,
+    perp: bool,
+) -> u64 {
+    bytes_per_exchange_day
+        .saturating_mul(if perp { PERP_DAY_FACTOR } else { 1 })
+        .saturating_mul(n_exch as u64)
+        .saturating_mul(parallel.max(1) as u64)
+        .saturating_mul(window_days + 1)
+}
+
+/// Pre-flight disk-headroom guard (P2.2): abort if [`projected_peak`] exceeds
 /// `free * headroom_safety_factor`. Knobs are YAML-sourced
 /// (`series.pipeline.backfill`), never hardcoded.
 fn preflight_disk_guard(
     out_dir: &Path,
     n_exch: usize,
     parallel: usize,
+    window_days: u64,
+    perp: bool,
     cfg: &nxr_sdk::pipeline_config::BackfillDiskYml,
 ) -> Result<()> {
-    // One monthly archive is the largest single `.ticks` unit a fetch can land
-    // before t2i folds+deletes it. A daily-fallback file is 1 day; a completed
-    // month is up to 31. Size the in-flight peak at the worst single file.
-    const PEAK_FILE_DAYS: u64 = 31;
-    let projected = cfg
-        .bytes_per_exchange_day
-        .saturating_mul(n_exch as u64)
-        .saturating_mul(parallel.max(1) as u64)
-        .saturating_mul(PEAK_FILE_DAYS);
+    let projected = projected_peak(cfg.bytes_per_exchange_day, n_exch, parallel, window_days, perp);
     let free = match free_bytes(out_dir) {
         Some(f) => f,
         None => {
@@ -581,6 +594,8 @@ fn preflight_disk_guard(
         safety_factor = cfg.headroom_safety_factor,
         n_exch,
         parallel,
+        window_days,
+        perp,
         "pre-flight disk headroom check"
     );
     if projected > budget {
@@ -770,8 +785,10 @@ fn probe_availability(
         ctx.exchanges.join(","),
         "--quote".to_string(),
         quote.to_string(),
-        "--days".to_string(),
-        (ctx.to - ctx.from).num_days().max(1).to_string(),
+        "--from-date".to_string(),
+        ctx.from.to_string(),
+        "--to-date".to_string(),
+        ctx.to.to_string(),
         "--probe".to_string(),
     ];
     let out = Command::new("fetch-crypto-history").args(&args).output();
@@ -909,6 +926,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         }
     };
 
+    let perp = series_factory::sources::split_quote(&quote).1;
     ctx.counters.active.fetch_add(1, Ordering::Relaxed);
     write_marker(&ctx.args.out_dir, ticker, "start");
     info!(ticker, "ticker start");
@@ -978,7 +996,8 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     if !ctx.args.skip_probe && want("fetch") {
         let (av, active) = probe_availability(ctx, &base, &quote);
         availability = av;
-        if active.is_empty() && want("pyth") {
+        // Pyth history is spot-only: a perp series with no coverage is skipped, never re-sourced.
+        if active.is_empty() && want("pyth") && !perp {
             info!(ticker, "no CEX coverage; routing to pyth history");
             pyth_only = true;
             active_exchanges = vec!["pyth".to_string()];
@@ -1064,7 +1083,9 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 });
             }
             // Defensive: drop any orphaned raw from a prior interrupted run.
-            delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
+            if !ctx.args.keep_staging {
+                delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
+            }
         } else {
             // Fresh build: remove any stale per-exch .idx so monthly appends
             // start from empty (no record duplication on re-run).
@@ -1173,6 +1194,10 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                                 quote.clone(),
                                 "--cycle-ms".to_string(),
                                 cycle_ms.clone(),
+                                "--from-date".to_string(),
+                                m_start_s.clone(),
+                                "--to-date".to_string(),
+                                m_end_s.clone(),
                             ];
                             if delete_as_you_go {
                                 args.push("--delete-after-convert".to_string());
@@ -1200,7 +1225,9 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 // up anything t2i could not delete (e.g. a file whose stream
                 // errored mid-fold and was kept for retry, or the whole step
                 // being skipped) before the next month is fetched.
-                total_freed += delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
+                if !ctx.args.keep_staging {
+                    total_freed += delete_month_raw_ticks(out_dir, &active_exchanges, &base, &quote);
+                }
 
                 if hard_fail {
                     break 'months;
@@ -1425,7 +1452,16 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             });
         } else {
             let args = vec![cfg.clone(), base.clone(), quote.clone()];
-            let rep = run_step(ticker, "renko-from-idx", &args, Some(&bars_dir));
+            let mut rep = run_step(ticker, "renko-from-idx", &args, Some(&bars_dir));
+            // renko-from-idx exits 0 without bricks for a series with no calibrated k
+            // (or inside the vol bootstrap): say so instead of reporting a quiet "ok".
+            if rep.exit_code == 0 && !fs::read_dir(&bars_dir).is_ok_and(|mut rd| {
+                rd.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().ends_with(".renko")))
+            }) {
+                let msg = "no renko shards: no calibrated k for this series or the window is inside the vol bootstrap (run nxr-calibrate, then --steps renko)";
+                warn!(ticker, "{msg}");
+                rep.errors.push(msg.to_string());
+            }
             let failed = rep.exit_code != 0;
             steps_out.push(rep);
             if failed {
@@ -1803,7 +1839,11 @@ fn main() -> Result<()> {
     // composite/.idx/bars/.vol.
     {
         let part_freed = sweep_partial_ticks(&args.out_dir);
-        let orphan_freed = sweep_orphaned_staging(&args.out_dir, &tickers, &ctx.exchanges);
+        let orphan_freed = if args.keep_staging {
+            0
+        } else {
+            sweep_orphaned_staging(&args.out_dir, &tickers, &ctx.exchanges)
+        };
         let total = part_freed + orphan_freed;
         if total > 0 {
             info!(
@@ -1823,7 +1863,23 @@ fn main() -> Result<()> {
         let disk_cfg = nxr_sdk::pipeline_config::PipelineYml::load(&args.config)
             .map(|y| y.series.pipeline.backfill)
             .unwrap_or_default();
-        preflight_disk_guard(&args.out_dir, ctx.exchanges.len(), args.parallel, &disk_cfg)?;
+        let window_days = month_windows(from, to)
+            .iter()
+            .map(|(a, b)| (*b - *a).num_days() as u64 + 1)
+            .max()
+            .unwrap_or(0);
+        let perp = tickers.iter().any(|t| {
+            nxr_sdk::split_pair_multi(t, &['/', '-'])
+                .is_some_and(|(_, q)| series_factory::sources::split_quote(q).1)
+        });
+        preflight_disk_guard(
+            &args.out_dir,
+            ctx.exchanges.len(),
+            args.parallel,
+            window_days,
+            perp,
+            &disk_cfg,
+        )?;
     }
 
     // heartbeat thread — emits every 60s while pool runs
@@ -1935,6 +1991,15 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The disk projection follows the window (not a fixed month) and is larger for perps.
+    #[test]
+    fn projected_peak_scales_with_window_and_perp() {
+        let spot = |days| projected_peak(100, 4, 2, days, false);
+        assert_eq!(spot(30), 100 * 4 * 2 * 31);
+        assert_eq!(spot(2), 100 * 4 * 2 * 3);
+        assert_eq!(projected_peak(100, 4, 2, 30, true), spot(30) * PERP_DAY_FACTOR);
+    }
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
