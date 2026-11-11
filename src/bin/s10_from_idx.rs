@@ -23,12 +23,23 @@ use nxr_sdk::bar_builder::flat_bar;
 use nxr_sdk::shard::ShardStream;
 use nxr_sdk::{resolve_ticker_id, BarAccumulator};
 use series_factory::sharding::{
-    bars_dir, idx_dir, list_shards, manifest_path, read_manifest, shard_path, ts_ms_to_utc_date,
-    write_manifest, write_shard_atomic, Manifest,
+    bars_dir, fresh, idx_dir, list_shards, manifest_path, read_manifest, shard_path,
+    ts_ms_to_utc_date, write_manifest, write_shard_atomic, Manifest,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tracing::info;
+
+/// Last bar of an `.s10` shard.
+fn last_bar(path: &Path) -> Option<Bar> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = std::mem::size_of::<Bar>() as i64;
+    f.seek(SeekFrom::End(-n)).ok()?;
+    let mut buf = vec![0u8; n as usize];
+    f.read_exact(&mut buf).ok()?;
+    Some(bytemuck::pod_read_unaligned(&buf))
+}
 
 /// Grid-stamp a flushed s10 bar's open/close timestamps to the bucket boundary,
 /// mirroring the live producer's `stamp_s10_bucket` so the offline series is
@@ -68,6 +79,10 @@ struct Args {
     /// would leave its writer appending to an unlinked inode.
     #[arg(long = "to-date")]
     to_date: Option<chrono::NaiveDate>,
+    /// Rebuild every day, even those whose `.s10` is already fresh. By default a
+    /// day whose shard is whole and not older than its input shard is left alone.
+    #[arg(long)]
+    force: bool,
 }
 
 fn main() -> Result<()> {
@@ -121,17 +136,38 @@ fn main() -> Result<()> {
     if shards.is_empty() {
         anyhow::bail!("no input shards in {}", in_dir.display());
     }
-    info!(input_shards = shards.len(), "input shard scan done");
+    // Done days stay as they are; the gapless fill resumes from the last bar of
+    // the closest earlier shard on disk.
+    let rec = std::mem::size_of::<Bar>() as u64;
+    let all = shards.len();
+    let shards: Vec<_> = shards
+        .into_iter()
+        .filter(|(d, p)| args.force || !fresh(&shard_path(&out_dir, *d, "s10"), p, rec))
+        .collect();
+    info!(
+        input_shards = all,
+        to_build = shards.len(),
+        "input shard scan done"
+    );
+    let Some((first_date, _)) = shards.first() else {
+        info!("every s10 shard is fresh; nothing to build");
+        return Ok(());
+    };
+    let seed = list_shards(&out_dir, "s10")?
+        .into_iter()
+        .rev()
+        .find(|(d, _)| d < first_date)
+        .and_then(|(_, p)| last_bar(&p));
 
     let t0 = std::time::Instant::now();
     let mut accum = BarAccumulator::new();
     let mut bars_by_date: BTreeMap<NaiveDate, Vec<Bar>> = BTreeMap::new();
-    let mut cur_bucket: Option<i64> = None;
+    let mut cur_bucket: Option<i64> = seed.map(|b| b.open_time_ms());
     // Last emitted close — seeds `flat_bar` for empty (zero-tick) buckets so the
     // offline series is GAPLESS, byte-identical to the live `bars_s10` producer
     // (its flush_all cursor loop). Without this, quiet windows drop buckets
     // and offline-s10-resampled vol diverges from live on those windows.
-    let mut last_close: f64 = 0.0;
+    let mut last_close: f64 = seed.map_or(0.0, |b| b.close);
     let mut n_input: u64 = 0;
     let mut n_skipped: u64 = 0;
     let mut n_flat: u64 = 0;

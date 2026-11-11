@@ -82,6 +82,14 @@ struct Args {
     /// Override the output directory (per-ticker shard root).
     #[arg(long)]
     out_dir: Option<PathBuf>,
+    /// Merge only records on or after this UTC day. With `--to-date`, shards of
+    /// days outside the window are never touched (a window is how a rerun leaves
+    /// finished days alone).
+    #[arg(long)]
+    from_date: Option<chrono::NaiveDate>,
+    /// Merge only records on or before this UTC day (inclusive).
+    #[arg(long)]
+    to_date: Option<chrono::NaiveDate>,
 }
 
 fn main() -> Result<()> {
@@ -218,6 +226,12 @@ fn main() -> Result<()> {
     let mut writer = ShardedWriter::new(out_dir.clone())?;
 
     let cycle_ms = args.cycle_ms as i64;
+    let day_ms =
+        |d: chrono::NaiveDate| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+    let window = (
+        args.from_date.map_or(i64::MIN, day_ms),
+        args.to_date.map_or(i64::MAX, |d| day_ms(d) + 86_400_000),
+    );
     let mut next_cycle_ms: Option<i64> = None;
     let mut dirty = false;
     let mut composites_written: u64 = 0;
@@ -228,6 +242,12 @@ fn main() -> Result<()> {
     }) = heap.pop()
     {
         let rec = sources[source_idx].pop().unwrap();
+        if ts_ms < window.0 || ts_ms >= window.1 {
+            if let Some(next_ts) = sources[source_idx].peek_ts() {
+                heap.push(HeapEntry::new(next_ts, source_idx));
+            }
+            continue;
+        }
         updates += 1;
         let now = sim_now(ts_ms);
 

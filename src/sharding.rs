@@ -53,6 +53,119 @@ mod tests {
     }
 }
 
+// ── Done-ness: what makes a day shard "already on disk" ─────────────────────
+
+/// Days of `[from, to]` the manifest at `dir` does not vouch for: a day is done
+/// only when the manifest lists it and the file on disk is exactly the recorded
+/// size, a whole number of `rec_size` records. A shard a crashed or interrupted
+/// writer left behind differs from its entry (or has none) and is redone.
+pub fn days_todo(
+    dir: &Path,
+    kind: &str,
+    rec_size: u64,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Vec<NaiveDate> {
+    let manifest = read_manifest(&manifest_path(dir)).ok().flatten();
+    let listed = |d: NaiveDate| {
+        manifest.as_ref().is_some_and(|m| {
+            let key = d.format("%Y-%m-%d").to_string();
+            m.shards.iter().any(|e| {
+                e.date == key && e.size_bytes > 0 && e.size_bytes % rec_size == 0 && {
+                    std::fs::metadata(shard_path(dir, d, kind))
+                        .is_ok_and(|f| f.len() == e.size_bytes)
+                }
+            })
+        })
+    };
+    let mut out = Vec::new();
+    let mut d = from;
+    while d <= to {
+        if !listed(d) {
+            out.push(d);
+        }
+        d += chrono::Duration::days(1);
+    }
+    out
+}
+
+/// A derived shard is fresh when it is a whole, non-empty number of `rec_size`
+/// records and not older than the `input` it was built from.
+pub fn fresh(out: &Path, input: &Path, rec_size: u64) -> bool {
+    let (Ok(o), Ok(i)) = (std::fs::metadata(out), std::fs::metadata(input)) else {
+        return false;
+    };
+    o.len() > 0
+        && o.len() % rec_size == 0
+        && matches!((o.modified(), i.modified()), (Ok(a), Ok(b)) if a >= b)
+}
+
+#[cfg(test)]
+mod done_tests {
+    use super::*;
+
+    fn day(d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2024, 1, d).unwrap()
+    }
+
+    /// Done = listed in the manifest and exactly as recorded; a partial, missing
+    /// or unlisted shard is todo.
+    #[test]
+    fn days_todo_redoes_partial_missing_and_unlisted_shards() {
+        let dir = std::env::temp_dir().join(format!("sf-done-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = 56u64;
+        let write = |d: u32, n: usize| {
+            std::fs::write(shard_path(&dir, day(d), "idx"), vec![1u8; n]).unwrap()
+        };
+        write(1, 56 * 3); // done
+        write(2, 56 * 3); // done, then truncated mid-record below
+        write(3, 56 * 3); // on disk, never listed
+        let mut m = Manifest::new("T".into(), 1, "idx");
+        let entry = |d: u32| ShardEntry {
+            date: day(d).format("%Y-%m-%d").to_string(),
+            first_ts: 0,
+            last_ts: 0,
+            n_records: 3,
+            size_bytes: 56 * 3,
+            sha256: String::new(),
+        };
+        m.set_shards_batch(vec![entry(1), entry(2), entry(4)]); // day 4 listed, file missing
+        write_manifest(&manifest_path(&dir), &m).unwrap();
+        write(2, 56 * 2 + 10);
+        assert_eq!(
+            days_todo(&dir, "idx", rec, day(1), day(5)),
+            [day(2), day(3), day(4), day(5)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_needs_whole_records_not_older_than_input() {
+        let dir = std::env::temp_dir().join(format!("sf-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (i, o) = (dir.join("in"), dir.join("out"));
+        std::fs::write(&i, b"x").unwrap();
+        assert!(!fresh(&o, &i, 96), "missing output");
+        std::fs::write(&o, vec![0u8; 100]).unwrap();
+        assert!(!fresh(&o, &i, 96), "partial record");
+        std::fs::write(&o, vec![0u8; 96]).unwrap();
+        assert!(fresh(&o, &i, 96));
+        std::fs::write(&i, b"newer").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&i)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(!fresh(&o, &i, 96), "input rebuilt after the output");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 // ── Shared offline .idx shard writing (extracted from merge_idx 2026-07-08) ──
 
 use anyhow::{Context, Result};
