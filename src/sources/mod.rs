@@ -79,6 +79,41 @@ pub fn next_synthetic_id() -> u16 {
     SYNTHETIC_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn venue_fn(name: &str) -> Result<fn(&Config) -> Result<Option<common::Venue>>> {
+    Ok(match name {
+        "binance" => binance::venue,
+        "bitget" => bitget::venue,
+        "bybit" => bybit::venue,
+        "gateio" => gateio::venue,
+        "okx" => okx::venue,
+        _ => anyhow::bail!(
+            "Unsupported exchange: {} (available: binance, bybit, bitget, okx, gateio)",
+            name
+        ),
+    })
+}
+
+/// Can the venue serve this series at all (does it publish an archive for this
+/// market and quote)? `Ok(false)` is "no such market on this venue", not a fault;
+/// an unknown venue or a config problem is an error.
+pub fn supports(exchange: &str, base: &str, quote: &str) -> Result<bool> {
+    let config = Config {
+        base: base.to_uppercase(),
+        quote: quote.to_uppercase(),
+        sources: vec![],
+        from: chrono::Utc::now(),
+        to: chrono::Utc::now(),
+        agg_mode: crate::types::AggregationMode::Time,
+        agg_step: 60_000.0,
+        cycle_ms: 200,
+        stale_secs: 30.0,
+        z_threshold: 6.0,
+        ticks_dir: Default::default(),
+        bars_dir: Default::default(),
+    };
+    Ok(venue_fn(exchange)?(&config)?.is_some())
+}
+
 /// Construct a historical tick source by enum tag.
 ///
 /// Closed set by design: every archive venue is one `ArchiveSource` over its
@@ -87,17 +122,7 @@ pub fn next_synthetic_id() -> u16 {
 pub async fn create_source(source: &DataSource) -> Result<Box<dyn TickSource>> {
     match source {
         DataSource::Exchange(name) => {
-            let venue: fn(&Config) -> Result<Option<common::Venue>> = match name.as_str() {
-                "binance" => binance::venue,
-                "bitget" => bitget::venue,
-                "bybit" => bybit::venue,
-                "gateio" => gateio::venue,
-                "okx" => okx::venue,
-                _ => anyhow::bail!(
-                    "Unsupported exchange: {} (available: binance, bybit, bitget, okx, gateio)",
-                    name
-                ),
-            };
+            let venue = venue_fn(name)?;
             Ok(Box::new(common::ArchiveSource::new(venue)))
         }
         DataSource::Synthetic(model) => {
@@ -278,6 +303,20 @@ mod tests {
         ] {
             assert!(venue(&cfg(quote)).unwrap().is_none(), "{quote}");
         }
+    }
+
+    /// Which venues can serve which market, from the existing `venue()` answers.
+    #[test]
+    fn supports_follows_the_venue_markets() {
+        assert!(supports("binance", "BTC", "USDT").unwrap());
+        assert!(supports("binance", "BTC", "USDT:PERP").unwrap());
+        assert!(
+            !supports("gateio", "BTC", "USDT").unwrap(),
+            "gate has no spot"
+        );
+        assert!(supports("gateio", "BTC", "USDT:PERP").unwrap());
+        assert!(!supports("okx", "BTC", "EUR:PERP").unwrap());
+        assert!(supports("nosuch", "BTC", "USDT").is_err());
     }
 
     /// A pair in the venue's `exclude_symbols` is never probed or fetched.

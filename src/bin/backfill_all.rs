@@ -1020,21 +1020,45 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     // 0) availability probe — drops dead exchanges before fetch
     let mut availability = Vec::new();
     // A venue that lists this pair as an unrelated asset (`exclude_symbols`) never contributes.
+    // A venue with no archive for this market and quote (gateio on spot, say) can
+    // never serve the series: it is dropped first and reported once, not a fault.
+    let mut unsupported: Vec<String> = Vec::new();
     let venues: Vec<String> = match ctx
         .exchanges
         .iter()
-        .filter_map(
-            |e| match series_factory::sources::excluded(e, &base, &quote) {
-                Ok(true) => None,
-                Ok(false) => Some(Ok(e.clone())),
+        .filter_map(|e| {
+            let keep = series_factory::sources::excluded(e, &base, &quote).and_then(|ex| {
+                if ex {
+                    return Ok(false);
+                }
+                series_factory::sources::supports(e, &base, &quote)
+            });
+            match keep {
+                Ok(true) => Some(Ok(e.clone())),
+                Ok(false) => {
+                    if !series_factory::sources::excluded(e, &base, &quote).unwrap_or(false) {
+                        unsupported.push(format!("{e}: no archive for {base}/{quote}"));
+                    }
+                    None
+                }
                 Err(err) => Some(Err(err)),
-            },
-        )
+            }
+        })
         .collect::<Result<_>>()
     {
         Ok(v) => v,
         Err(err) => return failed_report(ctx, ticker, "config", format!("{err:#}")),
     };
+    if !unsupported.is_empty() {
+        steps_out.push(StepReport {
+            name: "unsupported-venues".to_string(),
+            duration_ms: 0,
+            exit_code: 0,
+            bytes: 0,
+            skipped: false,
+            errors: unsupported,
+        });
+    }
     // Today's shard belongs to the live writer and is never complete. Newer days
     // are held, not skipped, while a venue lacks a unit for them (see the policy
     // at `PUBLISH_LAG_DAYS`).
@@ -1074,6 +1098,22 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             for e in act {
                 if !active.contains(&e) {
                     active.push(e);
+                }
+            }
+        }
+        // Nothing found on the published days: a symbol listed only a few days ago
+        // looks the same as one no venue has. The recent days tell them apart, and
+        // they decide which venues to wait for; only a series with no archive
+        // anywhere is a pyth or skip case.
+        if active.is_empty() {
+            for (rlo, rhi) in runs.iter().filter(|(_, hi)| *hi > lag_edge) {
+                let recent = ((*rlo).max(lag_edge + chrono::Duration::days(1)), *rhi);
+                let (a, act) = probe_availability(ctx, &venues, &base, &quote, recent);
+                av.extend(a);
+                for e in act {
+                    if !active.contains(&e) {
+                        active.push(e);
+                    }
                 }
             }
         }
@@ -1215,12 +1255,11 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                 // treat it as failed for the run (an empty or cut-off report must
                 // not pass every venue).
                 for ex in &active_exchanges {
-                    states.entry(ex.clone()).or_insert_with(|| {
-                        lo.iter_days()
-                            .take_while(|d| *d <= hi)
-                            .map(|d| (d, Day::Failed("fetch reported no state".into())))
-                            .collect()
-                    });
+                    let rows = states.entry(ex.clone()).or_default();
+                    for d in lo.iter_days().take_while(|d| *d <= hi) {
+                        rows.entry(d)
+                            .or_insert_with(|| Day::Failed("fetch reported no state".into()));
+                    }
                 }
             }
 
@@ -1723,7 +1762,10 @@ fn verdict(code: Option<i32>, stdout: &[u8]) -> Verdict {
             // The report starts at the first line that opens an object: a log line
             // in front of it must not hide the verdict.
             let text = String::from_utf8_lossy(stdout);
-            let json = text.find("\n{").map(|i| &text[i + 1..]).or_else(|| text.starts_with('{').then_some(&*text));
+            let json = text
+                .find("\n{")
+                .map(|i| &text[i + 1..])
+                .or_else(|| text.starts_with('{').then_some(&*text));
             let has_errors = json
                 .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
                 .and_then(|v| {

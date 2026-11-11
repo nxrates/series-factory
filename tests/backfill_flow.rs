@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 struct Rig {
+    exchanges: std::cell::RefCell<String>,
     root: PathBuf,
     bin: PathBuf,
     log: PathBuf,
@@ -41,13 +42,16 @@ impl Rig {
         };
         fs::write(root.join("states.json"), states).unwrap();
         fs::write(root.join("probe.json"), "[]").unwrap();
+        fs::write(root.join("probe_recent.json"), "[]").unwrap();
         script(
             "fetch-crypto-history",
             &format!(
-                "case \"$*\" in *--probe*) cat {p}; exit 0;; esac\nmkdir -p {d}/ticks/binance/BTCUSDT && : > {d}/ticks/binance/BTCUSDT/a.ticks\ncat {s}\nexit {fetch_exit}",
+                "case \"$*\" in *--probe*) F=$(echo \"$*\" | sed 's/.*--from-date \\([0-9-]*\\).*/\\1/'); if [ -f {e} ] && [ $(expr \"$F\" \\> \"$(cat {e})\") = 1 ]; then cat {pr}; else cat {p}; fi; exit 0;; esac\nmkdir -p {d}/ticks/binance/BTCUSDT && : > {d}/ticks/binance/BTCUSDT/a.ticks\ncat {s}\nexit {fetch_exit}",
                 d = data.display(),
                 s = root.join("states.json").display(),
-                p = root.join("probe.json").display()
+                p = root.join("probe.json").display(),
+                pr = root.join("probe_recent.json").display(),
+                e = root.join("edge.txt").display()
             ),
         );
         script(
@@ -79,7 +83,12 @@ echo "{{\"ticker\":\"T\",\"ticker_id\":1,\"kind\":\"idx\",\"shards\":[${{E%,}}],
             ),
         );
         script("integrity-check", "exit 0");
-        Self { root, bin, log }
+        Self {
+            exchanges: std::cell::RefCell::new("binance,bitget".into()),
+            root,
+            bin,
+            log,
+        }
     }
 
     /// Replace the fake validator's behaviour (a shell snippet).
@@ -106,7 +115,7 @@ echo "{{\"ticker\":\"T\",\"ticker_id\":1,\"kind\":\"idx\",\"shards\":[${{E%,}}],
                 "--tickers",
                 "BTC-USDT",
                 "--exchanges",
-                "binance,bitget",
+                &self.exchanges.borrow(),
                 "--min-free-gib",
                 "0",
             ])
@@ -389,35 +398,133 @@ fn probe_cannot_drop_a_venue_on_recent_days() {
     assert!(r.report().contains("held-days"), "{}", r.report());
 }
 
-/// A mixed run: the probe judges only the published days, which finalise; the
-/// recent days stay held while bitget lacks them.
+/// A mixed run with a venue the probe finds nothing on: only the published days
+/// are probed, the venue is dropped on them, so the recent days are NOT held on
+/// its account; everything finalises and `venues.json` records it without the venue.
 #[test]
-fn mixed_run_finalises_old_days_and_holds_new_ones() {
+fn mixed_run_drops_a_dead_venue_and_holds_nothing_for_it() {
     let today = chrono::Utc::now().date_naive();
     let edge = today - chrono::Duration::days(5);
     let (from, to) = (
         edge - chrono::Duration::days(3),
         today - chrono::Duration::days(2),
     );
-    let st = ranged_states(from, to, edge);
+    let st = ranged_states(from, to, from - chrono::Duration::days(1)); // bitget has nothing
     let r = Rig::new("probe-mixed", &st, 0, 0);
-    let probe = r#"[{"ticker":"BTC","exchange":"binance","has_data":true,"first_date":null,"last_date":null},{"ticker":"BTC","exchange":"bitget","has_data":true,"first_date":null,"last_date":null}]"#;
-    r.run_with_probe_rebuild(&from.to_string(), &to.to_string(), probe);
+    r.run_with_probe_rebuild(&from.to_string(), &to.to_string(), PROBE_NO_BITGET);
     let calls = r.calls();
     assert!(
-        calls.contains(&format!("--to-date {edge} --probe"))
-            || calls.contains(&format!("--to-date {edge}")),
-        "{calls}"
+        calls.contains(&format!("--to-date {edge} --probe")),
+        "probe window: {calls}"
     );
     let merge = calls
         .lines()
         .find(|l| l.starts_with("merge-idx"))
-        .expect("old days merged");
+        .expect("merged");
     assert!(
-        merge.contains(&format!("--from-date {from} --to-date {edge}")),
+        merge.contains(&format!("--from-date {from} --to-date {to}")),
         "{merge}"
     );
-    assert!(r.report().contains("held-days"), "{}", r.report());
+    assert!(
+        !r.report().contains("held-days"),
+        "held on a dropped venue's account: {}",
+        r.report()
+    );
+    let tid = nxr_sdk::resolve_ticker_id("BTC/USDT");
+    let venues = fs::read_to_string(r.data(&format!("indexes/{tid}/venues.json"))).unwrap();
+    for d in [from, edge, to] {
+        assert!(
+            venues.contains(&d.to_string()),
+            "{d} not recorded: {venues}"
+        );
+    }
+    assert!(
+        venues.contains("binance") && !venues.contains("bitget"),
+        "{venues}"
+    );
+}
+
+/// A listing a few days old looks, on the published days, like a symbol nobody has.
+/// The recent days tell them apart: the venues that have them stay, no Pyth, no skip.
+#[test]
+fn a_new_listing_is_not_routed_to_pyth() {
+    let today = chrono::Utc::now().date_naive();
+    let edge = today - chrono::Duration::days(5);
+    let (from, to) = (
+        edge - chrono::Duration::days(3),
+        today - chrono::Duration::days(2),
+    );
+    let st = ranged_states(from, to, from - chrono::Duration::days(1));
+    let r = Rig::new("new-listing", &st, 0, 0);
+    fs::write(r.root.join("edge.txt"), edge.to_string()).unwrap();
+    fs::write(r.root.join("probe_recent.json"), PROBE_NO_BITGET).unwrap();
+    r.run_with_probe_rebuild(&from.to_string(), &to.to_string(), "[{\"ticker\":\"BTC\",\"exchange\":\"binance\",\"has_data\":false,\"first_date\":null,\"last_date\":null},{\"ticker\":\"BTC\",\"exchange\":\"bitget\",\"has_data\":false,\"first_date\":null,\"last_date\":null}]");
+    let calls = r.calls();
+    assert!(!calls.contains("pyth"), "routed to pyth: {calls}");
+    assert!(calls.contains("merge-idx"), "skipped: {calls}");
+    assert!(r.report().contains("\"status\": \"ok\""), "{}", r.report());
+}
+
+/// A venue with no archive for the market is dropped first and reported once, not a fault.
+#[test]
+fn an_unsupported_venue_is_reported_once_and_does_not_fail_the_run() {
+    let today = chrono::Utc::now().date_naive();
+    let (a, b) = (
+        today - chrono::Duration::days(3),
+        today - chrono::Duration::days(2),
+    );
+    let st = states("\"got\"", "\"got\"", &[&a.to_string(), &b.to_string()]);
+    let r = Rig::new("unsupported", &st, 0, 0);
+    *r.exchanges.borrow_mut() = "binance,bitget,gateio".into();
+    let out = r.run_with(
+        &["--from", &a.to_string(), "--to", &b.to_string()],
+        STEPS,
+        &["--rebuild"],
+    );
+    assert!(out.status.success());
+    let fetch = r
+        .calls()
+        .lines()
+        .find(|l| l.starts_with("fetch-crypto-history"))
+        .unwrap()
+        .to_string();
+    assert!(
+        fetch.contains("--exchanges binance,bitget ")
+            || fetch.contains("--exchanges binance,bitget\n"),
+        "{fetch}"
+    );
+    let rep = r.report();
+    assert_eq!(
+        rep.matches("gateio: no archive for BTC/USDT").count(),
+        1,
+        "{rep}"
+    );
+    assert!(!rep.contains("venue-faults"), "{rep}");
+}
+
+/// A report that covers one venue fully and another partially: the missing
+/// venue-day is failed, not fine.
+#[test]
+fn a_partial_fetch_report_fails_the_missing_venue_day() {
+    let full = "{\"ticker\":\"BTC\",\"exchange\":\"binance\",\"days\":{\"2026-08-10\":\"got\",\"2026-08-11\":\"got\"}}";
+    let part = "{\"ticker\":\"BTC\",\"exchange\":\"bitget\",\"days\":{\"2026-08-10\":\"got\"}}";
+    let r = Rig::new("partial", &format!("[{full},{part}]"), 0, 0);
+    r.run(&OLD, STEPS);
+    let merge = r
+        .calls()
+        .lines()
+        .find(|l| l.starts_with("merge-idx"))
+        .unwrap()
+        .to_string();
+    assert!(
+        merge.contains("--from-date 2026-08-10 --to-date 2026-08-10"),
+        "{merge}"
+    );
+    assert!(
+        r.report().contains("2026-08-11") && r.report().contains("venue-faults"),
+        "{}",
+        r.report()
+    );
 }
 
 /// A fetch that prints no usable state report must not pass every venue.
