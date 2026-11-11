@@ -70,6 +70,13 @@ struct Args {
     /// the backfill orchestrator sets it for production disk-bounding.
     #[arg(long)]
     delete_after_convert: bool,
+    /// Fold only ticks on or after this UTC day (YYYY-MM-DD). With `--to-date`,
+    /// cuts the archive files (some venues cut their days at UTC+8) to a UTC window.
+    #[arg(long)]
+    from_date: Option<chrono::NaiveDate>,
+    /// Fold only ticks on or before this UTC day (inclusive).
+    #[arg(long)]
+    to_date: Option<chrono::NaiveDate>,
 }
 
 fn main() -> Result<()> {
@@ -155,6 +162,12 @@ fn main() -> Result<()> {
         .with_context(|| format!("open AppendLog {}", out_path.display()))?;
     let cycle_ms = args.cycle_ms as i64;
     let z_threshold = args.z;
+    let day_ms =
+        |d: chrono::NaiveDate| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+    let window = (
+        args.from_date.map_or(i64::MIN, day_ms),
+        args.to_date.map_or(i64::MAX, |d| day_ms(d) + 86_400_000),
+    );
 
     let mut next_cycle_ms: Option<i64> = None;
     let mut last_tick_ms: i64 = 0;
@@ -187,6 +200,7 @@ fn main() -> Result<()> {
             &mut records_written,
             z_threshold,
             cycle_ms,
+            window,
         ) {
             Ok(()) => true,
             Err(e) => {
@@ -246,6 +260,7 @@ fn stream_file_into_acc(
     records_written: &mut u64,
     z_threshold: f64,
     cycle_ms: i64,
+    window: (i64, i64),
 ) -> Result<()> {
     let rec_size = core::mem::size_of::<TickFrame>();
     let file = File::open(path)?;
@@ -272,6 +287,9 @@ fn stream_file_into_acc(
     let frames: &[TickFrame] = bytemuck::cast_slice(&mmap[..n_frames * rec_size]);
     for tf in frames {
         let ts_ms = tf.timestamp_ms();
+        if ts_ms < window.0 || ts_ms >= window.1 {
+            continue;
+        }
         let body = tf.body;
         if !(body.bid > 0.0 && body.ask > 0.0 && body.ask >= body.bid) {
             continue;
