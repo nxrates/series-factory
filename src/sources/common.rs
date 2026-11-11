@@ -106,8 +106,11 @@ fn stems(exchange: &str, perp: bool) -> Result<Stems> {
     let path = PipelineYml::resolve_path(ConfigHint::Bin);
     let text =
         fs::read_to_string(&path).with_context(|| format!("read config {}", path.display()))?;
-    let mut doc: Doc =
-        serde_yml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
+    stems_from(&text, exchange, perp).with_context(|| format!("config {}", path.display()))
+}
+
+pub(crate) fn stems_from(text: &str, exchange: &str, perp: bool) -> Result<Stems> {
+    let mut doc: Doc = serde_yml::from_str(text).context("parse")?;
     let t = doc
         .cexs
         .exchanges
@@ -115,6 +118,22 @@ fn stems(exchange: &str, perp: bool) -> Result<Stems> {
         .unwrap_or_default()
         .archive_url_template;
     Ok(if perp { t.perp } else { t.spot })
+}
+
+/// Every granularity a venue's files declare needs a stem ending in '/' in the
+/// config, and its files must be `.zip` or `.csv.gz`.
+pub(crate) fn check_stems(name: &str, perp: bool, files: &Files, stems: &Stems) -> Result<()> {
+    for (kind, file, stem) in [
+        ("monthly", files.monthly, &stems.monthly),
+        ("daily", files.daily, &stems.daily),
+    ] {
+        anyhow::ensure!(
+            file.is_empty() || (stem.ends_with('/') && Compression::of(file).is_some()),
+            "{name}: config cexs.exchanges.{name}.archive_url_template{}.{kind} must be a URL stem ending in '/' (and the file pattern {file:?} .zip or .csv.gz)",
+            if perp { ".perp" } else { "" },
+        );
+    }
+    Ok(())
 }
 
 /// File-name patterns of one venue × market; `""` = that granularity is not published.
@@ -162,16 +181,7 @@ impl Venue {
         row: RowFn,
     ) -> Result<Self> {
         let stems = stems(name, perp)?;
-        for (kind, file, stem) in [
-            ("monthly", files.monthly, &stems.monthly),
-            ("daily", files.daily, &stems.daily),
-        ] {
-            anyhow::ensure!(
-                file.is_empty() || (stem.ends_with('/') && Compression::of(file).is_some()),
-                "{name}: config cexs.exchanges.{name}.archive_url_template{}.{kind} must be a URL stem ending in '/' (and the file pattern {file:?} .zip or .csv.gz)",
-                if perp { ".perp" } else { "" },
-            );
-        }
+        check_stems(name, perp, &files, &stems)?;
         Ok(Self {
             name,
             sym,
@@ -1303,6 +1313,11 @@ impl TickSource for ArchiveSource {
             v.sym,
             fetched.faults.join("; ")
         );
+        Ok(())
+    }
+
+    fn check(&self, config: &Config) -> Result<()> {
+        (self.venue)(config)?;
         Ok(())
     }
 

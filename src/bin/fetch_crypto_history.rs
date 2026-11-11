@@ -174,7 +174,10 @@ async fn main() -> Result<()> {
         for pair in &pairs {
             for exchange in &exchanges {
                 let source = create_source(&DataSource::Exchange(exchange.clone())).await?;
-                let (has_data, found) = match source.probe(&config_for(pair, exchange)).await {
+                let cfg = config_for(pair, exchange);
+                // A setup error (missing config key) is fatal, not "no coverage".
+                source.check(&cfg)?;
+                let (has_data, found) = match source.probe(&cfg).await {
                     Ok(found) => (found.is_some(), found),
                     // A transport fault says nothing about coverage: never drop the venue on it.
                     Err(e) => {

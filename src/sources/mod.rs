@@ -19,6 +19,12 @@ use tokio::sync::mpsc;
 pub trait TickSource: Send + Sync {
     async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()>;
 
+    /// Validate what the source needs for this series (its config), apart from
+    /// the network: a failure here is a setup error, never "no coverage".
+    fn check(&self, _config: &Config) -> Result<()> {
+        Ok(())
+    }
+
     /// First and last archive date the source has in `[config.from, config.to]`,
     /// `None` when it has nothing for the series. `Err` is a transport fault
     /// (unknown), never "absent". Default: a source without archives is always available.
@@ -281,5 +287,26 @@ mod tests {
             .fetch_ticks(&c, tokio::sync::mpsc::channel(1).0)
             .await
             .is_err());
+    }
+
+    /// A venue whose config lacks its stems is a setup error that names the key.
+    #[test]
+    fn missing_config_stems_name_the_key() {
+        let files = common::Files {
+            monthly: "{sym}.zip",
+            daily: "",
+            tz_h: 0,
+        };
+        let stems = common::stems_from(
+            "cexs:\n  exchanges:\n    binance:\n      weight: 1\n",
+            "binance",
+            true,
+        )
+        .unwrap();
+        let msg = format!(
+            "{:#}",
+            common::check_stems("binance", true, &files, &stems).unwrap_err()
+        );
+        assert!(msg.contains("archive_url_template.perp.monthly"), "{msg}");
     }
 }
