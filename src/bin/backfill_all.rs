@@ -1059,6 +1059,16 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             errors: unsupported,
         });
     }
+    if venues.is_empty() {
+        write_marker(&ctx.args.out_dir, ticker, "done");
+        return TickerReport {
+            ticker: ticker.to_string(),
+            status: "skipped".to_string(),
+            steps: steps_out,
+            ticker_availability: Vec::new(),
+            skip_reason: Some("no requested venue can serve this series".into()),
+        };
+    }
     // Today's shard belongs to the live writer and is never complete. Newer days
     // are held, not skipped, while a venue lacks a unit for them (see the policy
     // at `PUBLISH_LAG_DAYS`).
@@ -1102,18 +1112,16 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
             }
         }
         // Nothing found on the published days: a symbol listed only a few days ago
-        // looks the same as one no venue has. The recent days tell them apart, and
-        // they decide which venues to wait for; only a series with no archive
-        // anywhere is a pyth or skip case.
+        // looks the same as one no venue has. The recent days only answer whether
+        // the series exists anywhere; they must not choose the venues (one that
+        // has not published yet would be dropped), so all requested stay active.
         if active.is_empty() {
             for (rlo, rhi) in runs.iter().filter(|(_, hi)| *hi > lag_edge) {
                 let recent = ((*rlo).max(lag_edge + chrono::Duration::days(1)), *rhi);
                 let (a, act) = probe_availability(ctx, &venues, &base, &quote, recent);
                 av.extend(a);
-                for e in act {
-                    if !active.contains(&e) {
-                        active.push(e);
-                    }
+                if !act.is_empty() {
+                    active = venues.clone();
                 }
             }
         }
@@ -1170,6 +1178,7 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
     let mut held: Vec<String> = Vec::new();
     let mut venue_faults: Vec<String> = Vec::new();
     let mut degraded: Vec<String> = Vec::new();
+    let mut not_built: Vec<String> = Vec::new();
     if want("fetch") || want("t2i") || want("merge") {
         let per_idx_paths: Vec<PathBuf> = active_exchanges
             .iter()
@@ -1371,6 +1380,20 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
                     if !still.is_empty() {
                         warn!(ticker, days = ?still, "days without composite data in window");
                     }
+                    // A day still todo that has a shard on disk was written wrong
+                    // (it does not match the manifest): remove it, so nothing reads
+                    // a short shard (s10 lists by directory), and say so.
+                    let bad: Vec<PathBuf> = still
+                        .iter()
+                        .map(|d| composite_dir.join(format!("{d}.idx")))
+                        .filter(|p| p.exists())
+                        .collect();
+                    if !bad.is_empty() {
+                        series_factory::sharding::unlist_shards(&composite_dir, &bad);
+                        not_built.extend(bad.iter().map(|p| {
+                            format!("{}: shard did not match its manifest entry; removed, rebuilt next run", p.display())
+                        }));
+                    }
                     // Record who contributed to each day, so a day finalised with
                     // fewer venues than asked for is visible and can be rebuilt.
                     let mut who: BTreeMap<NaiveDate, Vec<String>> = BTreeMap::new();
@@ -1469,6 +1492,9 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
         };
         if !held.is_empty() {
             steps_out.push(info_step("held-days", &held, 0));
+        }
+        if !not_built.is_empty() {
+            steps_out.push(info_step("days-not-built", &not_built, 1));
         }
         if !venue_faults.is_empty() {
             steps_out.push(info_step("venue-faults", &venue_faults, 1));
@@ -1762,10 +1788,11 @@ fn verdict(code: Option<i32>, stdout: &[u8]) -> Verdict {
             // The report starts at the first line that opens an object: a log line
             // in front of it must not hide the verdict.
             let text = String::from_utf8_lossy(stdout);
-            let json = text
-                .find("\n{")
-                .map(|i| &text[i + 1..])
-                .or_else(|| text.starts_with('{').then_some(&*text));
+            let json = if text.starts_with('{') {
+                Some(&*text)
+            } else {
+                text.find("\n{").map(|i| &text[i + 1..])
+            };
             let has_errors = json
                 .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
                 .and_then(|v| {
@@ -2217,6 +2244,11 @@ mod tests {
         let noisy = b"2026-11-11T17:00:00Z  WARN nxr_sdk::memory: setrlimit failed\n2026-11-11 INFO installed cap\n{\n  \"errors\": [\"bad record\"]\n}\n";
         assert_eq!(verdict(Some(2), noisy), Verdict::Bad);
         assert_eq!(verdict(Some(2), b"log only\n"), Verdict::Unknown);
+        // a report whose own text has a line starting with `{`
+        assert_eq!(
+            verdict(Some(2), b"{\"errors\":[\"x\"],\"s\":[\n{\"a\":1}\n]}"),
+            Verdict::Bad
+        );
         // exit 2 without a parseable verdict (a usage error from an older binary)
         assert_eq!(verdict(Some(2), b""), Verdict::Unknown);
         assert_eq!(verdict(Some(2), br#"{"errors":[]}"#), Verdict::Unknown);

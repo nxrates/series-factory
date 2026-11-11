@@ -463,6 +463,14 @@ fn a_new_listing_is_not_routed_to_pyth() {
     assert!(!calls.contains("pyth"), "routed to pyth: {calls}");
     assert!(calls.contains("merge-idx"), "skipped: {calls}");
     assert!(r.report().contains("\"status\": \"ok\""), "{}", r.report());
+    // the recent probe only says the series exists: every requested venue stays, so
+    // bitget (Missing on the recent days) holds them
+    let fetch = calls
+        .lines()
+        .find(|l| l.starts_with("fetch-crypto-history") && !l.contains("--probe"))
+        .unwrap();
+    assert!(fetch.contains("--exchanges binance,bitget "), "{fetch}");
+    assert!(r.report().contains("held-days"), "{}", r.report());
 }
 
 /// A venue with no archive for the market is dropped first and reported once, not a fault.
@@ -568,4 +576,51 @@ fn short_window_is_widened_unless_rebuilding() {
         "{}",
         r.calls()
     );
+}
+
+/// No requested venue can serve the series: skipped with a reason, fetch never called.
+#[test]
+fn zero_supported_venues_skips_the_ticker() {
+    let today = chrono::Utc::now().date_naive();
+    let (a, b) = (
+        today - chrono::Duration::days(3),
+        today - chrono::Duration::days(2),
+    );
+    let r = Rig::new("zero-venues", "[]", 0, 0);
+    *r.exchanges.borrow_mut() = "gateio".into();
+    let out = r.run_with(
+        &["--from", &a.to_string(), "--to", &b.to_string()],
+        STEPS,
+        &["--rebuild"],
+    );
+    assert!(out.status.success());
+    assert!(!r.calls().contains("fetch-crypto-history"), "{}", r.calls());
+    assert!(
+        r.report().contains("\"status\": \"skipped\"") && r.report().contains("no requested venue"),
+        "{}",
+        r.report()
+    );
+}
+
+/// A shard the merge wrote that does not match its manifest entry is removed and
+/// reported, so a short shard cannot feed s10; the day stays todo.
+#[test]
+fn a_shard_not_matching_its_manifest_is_removed_and_reported() {
+    let st = states("\"got\"", "\"got\"", &["2026-08-10", "2026-08-11"]);
+    let r = Rig::new("short-shard", &st, 0, 0);
+    let merge = r.bin.join("merge-idx");
+    let tid = nxr_sdk::resolve_ticker_id("BTC/USDT");
+    let comp = r.data(&format!("indexes/{tid}"));
+    let mut script = fs::read_to_string(&merge).unwrap();
+    script.push_str(&format!(
+        "\nfor f in {}/*.idx; do head -c 30 $f > $f.t; mv $f.t $f; done\n",
+        comp.display()
+    ));
+    fs::write(&merge, script).unwrap();
+    r.run(&OLD, STEPS);
+    assert!(
+        !comp.join("2026-08-10.idx").exists(),
+        "short shard left for s10 to read"
+    );
+    assert!(r.report().contains("days-not-built"), "{}", r.report());
 }

@@ -115,10 +115,11 @@ fn run(args: &[&str]) -> (i32, String, String) {
 }
 
 fn skip_if_no_bin() -> bool {
-    if bin_path().is_none() {
-        eprintln!("SKIP: CARGO_BIN_EXE_integrity-check not set (bin not wired)");
-        return true;
-    }
+    // Never skip: a test that silently does not run proves nothing.
+    assert!(
+        bin_path().is_some(),
+        "CARGO_BIN_EXE_integrity-check is not set: the integrity-check bin is not wired in Cargo.toml"
+    );
     false
 }
 
