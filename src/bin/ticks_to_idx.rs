@@ -30,6 +30,7 @@ use nxr_sdk::{
     ipc::record::IndexRecord,
     resolve_ticker_id,
 };
+use series_factory::sources::common::Spread;
 use series_factory::TickFrame;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -169,6 +170,7 @@ fn main() -> Result<()> {
         args.to_date.map_or(i64::MAX, |d| day_ms(d) + 86_400_000),
     );
 
+    let mut spread = Spread::new(series_factory::sources::common::ts_res_ms(&args.exchange));
     let mut next_cycle_ms: Option<i64> = None;
     let mut last_tick_ms: i64 = 0;
     let mut ingested: u64 = 0;
@@ -189,6 +191,7 @@ fn main() -> Result<()> {
         // file (up to ~2 GiB of TickFrames) never sits resident at once.
         let folded = match stream_file_into_acc(
             path,
+            &mut spread,
             provider_id,
             &mut acc,
             &mut stats,
@@ -222,6 +225,23 @@ fn main() -> Result<()> {
         });
     }
 
+    // The last same-stamp run is still open (coarse-stamped venues only).
+    fold_ticks(
+        spread.finish(),
+        provider_id,
+        &mut acc,
+        &mut stats,
+        &mut log,
+        &mut next_cycle_ms,
+        &mut last_tick_ms,
+        &mut ingested,
+        &mut rejected,
+        &mut records_written,
+        z_threshold,
+        cycle_ms,
+        window,
+    )?;
+
     // Final flush — close out whatever is in the last partial cycle, unless its
     // stamp falls past the window.
     let final_ms = last_tick_ms.max(next_cycle_ms.unwrap_or(0));
@@ -251,6 +271,7 @@ fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn stream_file_into_acc(
     path: &Path,
+    spread: &mut Spread,
     provider_id: u16,
     acc: &mut TickAccumulator,
     stats: &mut RunningStats,
@@ -287,12 +308,45 @@ fn stream_file_into_acc(
         return Ok(());
     }
     let frames: &[TickFrame] = bytemuck::cast_slice(&mmap[..n_frames * rec_size]);
-    for tf in frames {
-        let ts_ms = tf.timestamp_ms();
+    fold_ticks(
+        spread.push_all(frames),
+        provider_id,
+        acc,
+        stats,
+        log,
+        next_cycle_ms,
+        last_tick_ms,
+        ingested,
+        rejected,
+        records_written,
+        z_threshold,
+        cycle_ms,
+        window,
+    )
+}
+
+/// Fold ticks (`(epoch_ms, tick)`, in time order) into the accumulator, one
+/// record per cycle, inside the window.
+#[allow(clippy::too_many_arguments)]
+fn fold_ticks(
+    ticks: Vec<(i64, mitch::Tick)>,
+    provider_id: u16,
+    acc: &mut TickAccumulator,
+    stats: &mut RunningStats,
+    log: &mut AppendLog<IndexRecord>,
+    next_cycle_ms: &mut Option<i64>,
+    last_tick_ms: &mut i64,
+    ingested: &mut u64,
+    rejected: &mut u64,
+    records_written: &mut u64,
+    z_threshold: f64,
+    cycle_ms: i64,
+    window: (i64, i64),
+) -> Result<()> {
+    for (ts_ms, body) in ticks {
         if ts_ms < window.0 || ts_ms >= window.1 {
             continue;
         }
-        let body = tf.body;
         if !(body.bid > 0.0 && body.ask > 0.0 && body.ask >= body.bid) {
             continue;
         }

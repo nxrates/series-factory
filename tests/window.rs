@@ -25,10 +25,17 @@ fn run(bin: &str, root: &Path, args: &[&str]) {
     let out = Command::new(bin)
         .args(args)
         .env("NXR_DATA_ROOT", root)
-        .env("NXR_CONFIG", concat!(env!("CARGO_MANIFEST_DIR"), "/config.yml"))
+        .env(
+            "NXR_CONFIG",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.yml"),
+        )
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn idx_ts(path: &Path) -> Vec<i64> {
@@ -65,9 +72,24 @@ fn merge_final_flush_stays_inside_the_window() {
     run(
         env!("CARGO_BIN_EXE_merge-idx"),
         &r,
-        &["BTC", "USDT", "--exchange", "binance", "--out-dir", out.to_str().unwrap(), "--from-date", "2026-08-10", "--to-date", "2026-08-10"],
+        &[
+            "BTC",
+            "USDT",
+            "--exchange",
+            "binance",
+            "--out-dir",
+            out.to_str().unwrap(),
+            "--from-date",
+            "2026-08-10",
+            "--to-date",
+            "2026-08-10",
+        ],
     );
-    assert_eq!(std::fs::read(&next).unwrap(), before, "next day's shard was touched");
+    assert_eq!(
+        std::fs::read(&next).unwrap(),
+        before,
+        "next day's shard was touched"
+    );
     let ts = idx_ts(&out.join("2026-08-10.idx"));
     assert!(!ts.is_empty() && ts.iter().all(|t| *t < D10 + DAY_MS));
 }
@@ -82,21 +104,80 @@ fn t2i_window_drops_outside_ticks_and_final_stamp() {
         TickFrame::new(
             101,
             from_epoch_ms(ms),
-            mitch::Tick { ticker: 1, bid: 100.0, ask: 100.0, vbid: 0, vask: 5 },
+            mitch::Tick {
+                ticker: 1,
+                bid: 100.0,
+                ask: 100.0,
+                vbid: 0,
+                vask: 5,
+            },
         )
     };
-    let ticks: Vec<TickFrame> = [D10 - 500, D10 + 1_000, D10 + 2_000, D10 + DAY_MS - 100, D10 + DAY_MS + 500]
-        .iter()
-        .map(|&t| tick(t))
-        .collect();
+    let ticks: Vec<TickFrame> = [
+        D10 - 500,
+        D10 + 1_000,
+        D10 + 2_000,
+        D10 + DAY_MS - 100,
+        D10 + DAY_MS + 500,
+    ]
+    .iter()
+    .map(|&t| tick(t))
+    .collect();
     std::fs::write(dir.join("a.ticks"), bytemuck::cast_slice(&ticks)).unwrap();
     let out = r.join("out.idx");
     run(
         env!("CARGO_BIN_EXE_ticks-to-idx"),
         &r,
-        &["binance", "BTC", "USDT", "--out", out.to_str().unwrap(), "--from-date", "2026-08-10", "--to-date", "2026-08-10"],
+        &[
+            "binance",
+            "BTC",
+            "USDT",
+            "--out",
+            out.to_str().unwrap(),
+            "--from-date",
+            "2026-08-10",
+            "--to-date",
+            "2026-08-10",
+        ],
     );
     let ts = idx_ts(&out);
     assert!(!ts.is_empty());
     assert!(ts.iter().all(|t| *t >= D10 && *t < D10 + DAY_MS), "{ts:?}");
+}
+
+/// A same-second run of a whole-second venue (Bitget) split over two files is
+/// spread once across the second: one record per slot, time never going back.
+#[test]
+fn t2i_spreads_a_coarse_stamp_run_across_files() {
+    let r = root("spread");
+    let dir = r.join("ticks/bitget/BTCUSDT");
+    std::fs::create_dir_all(&dir).unwrap();
+    let s = D10 + 10_000;
+    let tick = |ms: i64| {
+        TickFrame::new(
+            102,
+            from_epoch_ms(ms),
+            mitch::Tick {
+                ticker: 1,
+                bid: 100.0,
+                ask: 100.0,
+                vbid: 0,
+                vask: 5,
+            },
+        )
+    };
+    let a = [tick(s), tick(s)];
+    let b = [tick(s), tick(s), tick(s + 1000)];
+    std::fs::write(dir.join("20260810_001.ticks"), bytemuck::cast_slice(&a)).unwrap();
+    std::fs::write(dir.join("20260810_002.ticks"), bytemuck::cast_slice(&b)).unwrap();
+    let out = r.join("out.idx");
+    run(
+        env!("CARGO_BIN_EXE_ticks-to-idx"),
+        &r,
+        &["bitget", "BTC", "USDT", "--out", out.to_str().unwrap()],
+    );
+    let ts = idx_ts(&out);
+    assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ts:?}");
+    let in_second = ts.iter().filter(|t| **t > s && **t <= s + 1000).count();
+    assert_eq!(in_second, 4, "four trades, four slots: {ts:?}");
 }

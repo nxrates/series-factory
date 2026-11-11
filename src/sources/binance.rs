@@ -21,7 +21,7 @@ pub fn venue(config: &Config) -> Result<Option<Venue>> {
 /// files), is_buyer_maker. Old files have no header row, recent ones do.
 fn row(r: &csv::StringRecord) -> Option<Row> {
     Some(Row {
-        us: ms_to_us(field(r, 5)?),
+        us: ms_to_us(field(r, 5)?)?,
         price: field(r, 1)?,
         size: field(r, 2)?,
         // is_buyer_maker=true -> the taker sold

@@ -163,10 +163,10 @@ mod tests {
           BTC-USDT-SWAP,2,sell,50010.5,2,1700000001500\nBTC-USDT-SWAP,3,buy,5"),
         ("bitget", bitget::venue, "USDT", 1.0,
          "trade_id,timestamp,price,side,volume(quote),size(base)\n\
-          1,1700000000000,50000.0,buy,500.0,0.01\n2,1700000001000,50010.5,sell,1000.21,0.02\n3,17000"),
+          1,1700000000500,50000.0,buy,500.0,0.01\n2,1700000001500,50010.5,sell,1000.21,0.02\n3,17000"),
         ("bitget", bitget::venue, "USDT:PERP", 1.0,
          "trade_id,timestamp,price,side,volume(quote),size(base)\n\
-          1,1700000000000,50000.0,buy,500.0,0.01\n2,1700000001000,50010.5,sell,1000.21,0.02\n3,17000"),
+          1,1700000000500,50000.0,buy,500.0,0.01\n2,1700000001500,50010.5,sell,1000.21,0.02\n3,17000"),
         ("gateio", gateio::venue, "USDT:PERP", 0.0001,
          "timestamp,id,price,size\n1700000000.5,1,50000.0,100\n1700000001.5,2,50010.5,-200\n\
           1700000002.5,3"),

@@ -35,7 +35,7 @@ pub fn venue(config: &Config) -> Result<Option<Venue>> {
 /// Spot: id, timestamp (ms), price, volume (base), side, [rpi].
 fn spot_row(r: &csv::StringRecord) -> Option<Row> {
     Some(Row {
-        us: ms_to_us(field(r, 1)?),
+        us: ms_to_us(field(r, 1)?)?,
         price: field(r, 2)?,
         size: field(r, 3)?,
         buyer: r.get(4)?.eq_ignore_ascii_case("buy"),

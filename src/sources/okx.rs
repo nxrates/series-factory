@@ -45,7 +45,7 @@ pub fn venue(config: &Config) -> Result<Option<Venue>> {
 /// instrument_name, trade_id, side, price, size (contracts on swaps), created_time (ms).
 fn row(r: &csv::StringRecord) -> Option<Row> {
     Some(Row {
-        us: ms_to_us(field(r, 5)?),
+        us: ms_to_us(field(r, 5)?)?,
         price: field(r, 3)?,
         size: field(r, 4)?,
         buyer: r.get(2)?.eq_ignore_ascii_case("buy"),

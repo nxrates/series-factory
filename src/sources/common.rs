@@ -149,11 +149,6 @@ pub struct Venue {
     pub row: RowFn,
     /// Bitget's `{product}` path segment (UMCBL / CMCBL); empty elsewhere.
     pub product: &'static str,
-    /// Resolution (us) of the venue's timestamps when coarser than a millisecond
-    /// (Bitget stamps whole seconds); 0 otherwise. Trades sharing a stamp are
-    /// spread evenly across that interval instead of all landing at its start,
-    /// which would lead the true time by up to the resolution.
-    pub ts_res_us: u64,
     /// Public REST endpoint + extractor for the base units per contract.
     pub contract: Option<(String, Extract)>,
 }
@@ -185,14 +180,8 @@ impl Venue {
             stems,
             row,
             product: "",
-            ts_res_us: 0,
             contract: None,
         })
-    }
-
-    pub fn with_ts_res(mut self, us: u64) -> Self {
-        self.ts_res_us = us;
-        self
     }
 
     pub fn with_product(mut self, product: &'static str) -> Self {
@@ -527,38 +516,91 @@ pub fn csv_ticks(csv_data: &[u8], ticker_id: u64, v: &Venue, scale: f64) -> Resu
             rows.push((row, notional));
         }
     }
-    if v.ts_res_us > 0 {
-        spread_stamps(&mut rows, v.ts_res_us);
-    }
     Ok(rows
         .into_iter()
         .map(|(row, notional)| {
             TickFrame::new(
                 pid,
                 mitch::timestamp::from_epoch_us(row.us),
-                honest_tick(ticker_id, row.price, (notional as u32).max(1), row.buyer),
+                honest_tick(
+                    ticker_id,
+                    row.price,
+                    (notional.round() as u32).max(1),
+                    row.buyer,
+                ),
             )
         })
         .collect())
 }
 
-/// Spread each run of rows sharing one stamp evenly over `[stamp, stamp + res)`,
-/// in file order, each at the middle of its slot.
-fn spread_stamps(rows: &mut [(Row, f64)], res: u64) {
-    let mut i = 0;
-    while i < rows.len() {
-        let us = rows[i].0.us;
-        let n = rows[i..].iter().take_while(|(r, _)| r.us == us).count();
-        for (k, (row, _)) in rows[i..i + n].iter_mut().enumerate() {
-            row.us = us + (2 * k as u64 + 1) * res / (2 * n as u64);
-        }
-        i += n;
+/// Resolution (ms) of an exchange's trade timestamps when coarser than a
+/// millisecond, 0 otherwise. Bitget stamps whole seconds.
+pub fn ts_res_ms(exchange: &str) -> i64 {
+    if exchange == "bitget" {
+        1000
+    } else {
+        0
     }
 }
 
-/// Epoch ms (a microsecond input is normalised to ms first) -> epoch microseconds.
-pub fn ms_to_us(ts: i64) -> u64 {
-    normalize_timestamp_ms(ts).max(0) as u64 * 1000
+/// Spreads runs of trades that share a coarse stamp evenly over the stamp's
+/// interval, in file order, each at the middle of its slot: else the venue leads
+/// real time by up to the resolution. State carries across calls, so a run
+/// split over two files (or chunks) is spread once, and time never goes back at
+/// the seam. A stamp that is not a whole multiple of the resolution is left alone.
+pub struct Spread {
+    res_ms: i64,
+    stamp: i64,
+    run: Vec<Tick>,
+}
+
+impl Spread {
+    pub fn new(res_ms: i64) -> Self {
+        Self {
+            res_ms,
+            stamp: 0,
+            run: Vec::new(),
+        }
+    }
+
+    /// Feed ticks in time order; returns those now final, as `(epoch_ms, tick)`.
+    pub fn push_all(&mut self, frames: &[TickFrame]) -> Vec<(i64, Tick)> {
+        let mut out = Vec::with_capacity(frames.len());
+        for f in frames {
+            let ts = f.timestamp_ms();
+            if self.res_ms <= 0 || ts % self.res_ms != 0 {
+                self.drain(&mut out);
+                out.push((ts, f.body));
+                continue;
+            }
+            if ts != self.stamp {
+                self.drain(&mut out);
+                self.stamp = ts;
+            }
+            self.run.push(f.body);
+        }
+        out
+    }
+
+    /// The open run, once no more ticks follow.
+    pub fn finish(&mut self) -> Vec<(i64, Tick)> {
+        let mut out = Vec::new();
+        self.drain(&mut out);
+        out
+    }
+
+    fn drain(&mut self, out: &mut Vec<(i64, Tick)>) {
+        let n = self.run.len() as i64;
+        for (k, t) in self.run.drain(..).enumerate() {
+            out.push((self.stamp + (2 * k as i64 + 1) * self.res_ms / (2 * n), t));
+        }
+    }
+}
+
+/// Epoch ms (a microsecond input is normalised to ms first) -> epoch microseconds;
+/// `None` for a non-positive value.
+pub fn ms_to_us(ts: i64) -> Option<u64> {
+    (ts > 0).then(|| normalize_timestamp_ms(ts) as u64 * 1000)
 }
 
 /// Fractional epoch seconds -> epoch microseconds; `None` for a non-finite or non-positive value.
@@ -1546,7 +1588,6 @@ mod tests {
             },
             row: |_| None,
             product: "",
-            ts_res_us: 0,
             contract: None,
         }
     }
@@ -1754,8 +1795,6 @@ mod tests {
         let run = |reply: fn(&str) -> Result<u64>| {
             faults(BOTH, reply, d(2024, 1, 3), d(2024, 1, 9), today)
         };
-        let miss =
-            |u: &str, days: &[&str]| days.iter().any(|d| u.ends_with(&format!("01-{d}.zip")));
         let hole = run(|u| {
             if u.ends_with("01-05.zip") {
                 Err(http_err(404))
@@ -1888,37 +1927,36 @@ mod tests {
         assert!(probe_archive(&flaky, &v, from, to, today).await.is_err());
     }
 
-    /// Trades sharing a coarse stamp are spread over it, in order, mid-slot.
+    /// A same-second run split over two calls is spread once, in order, and time
+    /// never goes back at the seam; a stamp off the resolution is left alone.
     #[test]
-    fn coarse_stamps_are_spread_over_their_interval() {
-        let v = Venue {
-            name: "binance",
-            row: |r| {
-                Some(Row {
-                    us: ms_to_us(field(r, 0)?),
-                    price: 100.0,
-                    size: 1.0,
-                    buyer: true,
-                })
-            },
-            ..venue(BOTH).with_ts_res(1_000_000)
+    fn spread_carries_a_run_across_calls() {
+        let t0 = 1_700_000_000_000i64;
+        let f = |ms: i64| {
+            TickFrame::new(
+                1,
+                mitch::timestamp::from_epoch_ms(ms),
+                honest_tick(7, 100.0, 1, true),
+            )
         };
-        let t = csv_ticks(
-            b"1700000000000\n1700000000000\n1700000000000\n1700000000000\n1700000001000\n",
-            7,
-            &v,
-            1.0,
-        )
-        .unwrap();
-        let ms: Vec<i64> = t.iter().map(|f| f.timestamp_ms()).collect();
-        let want: Vec<i64> = [125, 375, 625, 875, 1500]
-            .iter()
-            .map(|d| 1_700_000_000_000 + d)
-            .collect();
+        let frames = [f(t0), f(t0), f(t0), f(t0), f(t0 + 1000), f(t0 + 1500)];
+        let mut whole = Spread::new(1000);
+        let mut want = whole.push_all(&frames);
+        want.extend(whole.finish());
+        let mut split = Spread::new(1000);
+        let mut got = split.push_all(&frames[..2]);
+        got.extend(split.push_all(&frames[2..]));
+        got.extend(split.finish());
+        let ms = |v: &[(i64, Tick)]| v.iter().map(|x| x.0).collect::<Vec<_>>();
+        assert_eq!(ms(&got), ms(&want), "split == unsplit");
+        let near = |a: i64, b: i64| (a - b).abs() <= 1;
+        let exp = [t0 + 125, t0 + 375, t0 + 625, t0 + 875, t0 + 1500, t0 + 1500];
         assert!(
-            ms.iter().zip(&want).all(|(a, b)| (a - b).abs() <= 1),
-            "{ms:?}"
+            got.iter().zip(exp).all(|(g, e)| near(g.0, e)),
+            "{:?}",
+            ms(&got)
         );
+        assert!(got.windows(2).all(|w| w[0].0 <= w[1].0));
     }
 
     /// Placeholders expand identically in stems and file names.
@@ -1981,5 +2019,12 @@ mod tests {
             1,
             "a sub-unit trade keeps one unit of size"
         );
+        let t = csv_ticks(b"1700000000.5,100,0.016\n", 7, &v, 1.0).unwrap();
+        assert_eq!(
+            { t[0].body.vask },
+            2,
+            "volume rounds, as the live path does"
+        );
+        assert_eq!((ms_to_us(0), ms_to_us(-5)), (None, None));
     }
 }
