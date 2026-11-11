@@ -19,6 +19,7 @@ Rust library and CLI toolkit for building research-grade market data series from
 - [Pipeline](#pipeline)
 - [Binaries](#binaries)
 - [Data Sources](#data-sources)
+- [Perpetual series](#perpetual-series)
 - [Synthetic Models](#synthetic-models)
 - [File Formats](#file-formats)
 - [Usage](#usage)
@@ -109,14 +110,37 @@ Every new symbol, leg or source needs >= 7 d of history in the rollout (`docs/in
 
 ## Data Sources
 
-| Exchange | Format | History from | Notes |
-|----------|--------|--------------|-------|
-| Binance | ZIP/CSV | 2017 (monthly), 2021 (daily) | Monthly archives for completed months, daily for the current month |
-| Bybit | GZIP/CSV | 2019 | Monthly plus daily for the current month |
-| OKX | ZIP/CSV | 2021 | Daily files, dash-separated symbols (BTC-USDT) |
-| Bitget | ZIP/CSV | 2021 | Daily files, sequential chunks (001-N) |
+| Exchange | Spot | Perp | Archive granularity (perp) | Perp size unit |
+|----------|------|------|----------------------------|----------------|
+| Binance | yes | USDT/USDC-margined (USD-M) | monthly for completed months, daily otherwise | base |
+| Bybit | yes | USDT/USDC-margined (linear) | daily | base |
+| OKX | yes | USDT/USDC-margined swaps | monthly, daily | contracts, scaled by the swap's `ctVal` |
+| Bitget | yes | USDT/USDC-margined | daily, sequential chunks (001-N) | base |
+| Gate.io (`gateio`) | no | USDT-margined | monthly | contracts, scaled by `quanto_multiplier` |
 
-Archive URL templates are YAML-driven (`cexs.exchanges.<name>.archive_url_template` in the pipeline config); no URLs are hardcoded. Sources convert trades to ticks pessimistically: market sells set the bid, market buys set the ask, and the other side is forward-filled.
+Spot archive URL templates are YAML-driven (`cexs.exchanges.<name>.archive_url_template` in the pipeline config). Perp stems are constants in the source (`sources/*.rs`): the archive layout and the parser are one unit. Sources convert trades to ticks pessimistically: market sells set the bid, market buys set the ask, and the other side is forward-filled.
+
+**No public bulk trade history** (probed 2026-11-11, unauthenticated): Hyperliquid (requester-pays S3), Aster, MEXC, XT.com, WhiteBIT (login-gated downloads), CoinW (also hard-excluded from index construction), Toobit, Ourbit, Lighter (account-scoped export, REST only), Variational (per-user CSV only). Only REST recent-trades or vendor-paid history exists for these, so no fetcher is provided.
+
+## Perpetual series
+
+A perp series is the same pipeline with the quote spelled `USDT:PERP` (or `USDC:PERP`), the SDK's `BASE/QUOTE:PERP` convention. The MITCH ticker id then carries the PERP instrument type, so spot and perp of one pair never share an id, a raw-tick directory (`ticks/<exchange>/BTCUSDT:PERP/`), a per-provider `.idx` (`indexes/<exchange>/BTC-USDT:PERP.idx`) or a composite directory (`indexes/<MITCH_ID>/`). `merge-idx` blends several perp venues exactly as it does spot, with the same `cexs.exchanges.<name>.weight`.
+
+```bash
+fetch-crypto-history config.yml --pairs BTC --exchanges binance,bybit,okx,bitget,gateio --quote USDT:PERP --days 30
+for x in binance bybit okx bitget gateio; do ticks-to-idx $x BTC USDT:PERP; done
+merge-idx BTC USDT:PERP --exchange binance --exchange bybit --exchange okx --exchange bitget --exchange gateio
+s10-from-idx config.yml BTC-USDT:PERP
+```
+
+Notes:
+- The raw-tick directory and `.idx` file names contain a colon.
+- Contract-sized venues (OKX, Gate.io) convert contracts to base units with the multiplier read from the venue's public instrument endpoint at fetch time; a historical change of that multiplier is not reflected.
+- Per-tick volume is quote notional truncated to whole units (`u32`); a single perp trade cannot overflow it. Sub-unit trades truncate to zero, as for spot.
+- Perp provider ids in `.idx` headers are the spot venue's ids (the series is told apart by ticker id and path, not by provider id).
+- Contracts quoted per 1000 units (e.g. Binance `1000PEPEUSDT`) are not rescaled.
+- `--probe` skips perp series (coverage is discovered while fetching).
+- Funding, mark and index prices are not part of any trade archive and are not ingested.
 
 ## Synthetic Models
 
@@ -212,7 +236,7 @@ Two calibration regimes:
 
 ## Library Modules
 
-- `sources/`: exchange archive downloaders (Binance, Bybit, OKX, Bitget) + synthetic generators, all behind the `TickSource` trait.
+- `sources/`: exchange archive downloaders (Binance, Bybit, OKX, Bitget, Gate.io) + synthetic generators, all behind the `TickSource` trait.
 - `bar_construction/`: `.vol` builder (Rogers-Satchell sigma over s10 OHLC) and Renko multiplier calibration (`scale_to_target_k`).
 - `sharding.rs`: thin re-export of the canonical `nxr_sdk::shard` daily-shard primitives.
 - `seam.rs`: cross-shard continuity invariants shared by tests and checker binaries.
