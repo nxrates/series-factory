@@ -330,14 +330,6 @@ impl SynthS10State {
         }
         out
     }
-
-    /// Flush the open bucket unconditionally (called at end-of-stream).
-    fn finalize(&mut self) -> Option<Bar> {
-        let cb = self.cur_bucket?;
-        let out = self.flush_bucket(cb)?;
-        self.cur_bucket = None;
-        Some(out)
-    }
 }
 
 // NOTE (brick-storm RCA, 2026-06-10): the former `SynthRenkoState` — a local

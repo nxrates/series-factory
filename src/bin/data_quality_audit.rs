@@ -300,21 +300,6 @@ impl TargetResolver {
         let fm: Vec<&str> = self.fx_majors.iter().map(String::as_str).collect();
         bucket_for_pair(&pair, ticker_id, &cm, &sc, &fm) == AssetClassBucket::CryptoStable
     }
-
-    /// Resolve the asset-class bucket for `ticker_id` (same recipe as the target
-    /// + stable resolvers). Unknown pair (unresolvable id) → `Default`, so the
-    /// widest spread/jump envelope applies and a thin/synth pair is never
-    /// false-flagged. Drives the per-class [`ClassBand`] for the invariant chain.
-    fn class_for(&self, ticker_id: u64) -> nxr_sdk::asset_class::AssetClassBucket {
-        use nxr_sdk::asset_class::{bucket_for_pair, AssetClassBucket};
-        let Some(pair) = Self::pair_sym(ticker_id) else {
-            return AssetClassBucket::Default;
-        };
-        let cm: Vec<&str> = self.crypto_majors.iter().map(String::as_str).collect();
-        let sc: Vec<&str> = self.stablecoins.iter().map(String::as_str).collect();
-        let fm: Vec<&str> = self.fx_majors.iter().map(String::as_str).collect();
-        bucket_for_pair(&pair, ticker_id, &cm, &sc, &fm)
-    }
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -727,78 +712,13 @@ struct InvariantOutcome {
     /// FIX (reject) MED WARN: `rejected > accepted` — the composite rejected more
     /// provider quotes than it accepted this tick → a degraded composite. WARN.
     reject_dominant: bool,
-    /// SPREAD WARN/metric (NEVER a verdict input): positive `spread_bps` above the
-    /// per-class envelope. Legit on illiquid alts/synths, so advisory only.
-    spread_out_of_band: bool,
-}
-
-/// Per-asset-class microstructure envelope: the spread-realness ceiling (bps)
-/// and the per-tick jump guard (fractional mid move). FLAT bands are wrong:
-/// a 2000 bps spread is impossible on BTC/USDT yet plausible on an illiquid
-/// synth, and a 10% tick jump is a clear anomaly on a major but routine on a
-/// thin alt. Conservative defaults TIGHTEN majors (catch more) without
-/// false-flagging thin pairs. Resolved from the `AssetClassBucket` so the
-/// envelope is instrument-agnostic (keyed on class, not a hardcoded symbol).
-#[derive(Debug, Clone, Copy)]
-struct ClassBand {
-    /// Spread-realness ceiling in bps. A spread above this is implausible for
-    /// the class → hard invariant FAIL (replaces the flat [0,2000] ceiling).
-    spread_ceiling_bps: f64,
-    /// Per-tick jump ceiling (fractional |Δmid|/prev_mid). Above → anomaly WARN
-    /// (advisory, like the audit's MAD/CUSUM battery — never a hard FAIL).
-    /// Reserved for the per-class jump guard (the existing MAD/CUSUM battery
-    /// already covers cross-tick anomalies); kept on the band for completeness.
-    #[allow(dead_code)]
-    jump_frac: f64,
-}
-
-/// Resolve the per-class spread/jump envelope. Conservative, class-keyed.
-/// crypto_major: tightest (deep books, sub-100bps spreads, ~5% tick moves).
-/// crypto_alt / crypto_cross: looser. crypto_stable: very tight spread but the
-/// renko/vol gates already handle cadence; fx tight; synth/default: widest so a
-/// thin synthetic pair is never false-flagged.
-fn class_band(class: nxr_sdk::asset_class::AssetClassBucket) -> ClassBand {
-    use nxr_sdk::asset_class::AssetClassBucket::*;
-    match class {
-        // Deep, liquid majors: a real spread is a few bps; >150 bps is corrupt
-        // or a flash dislocation. 5% per-tick jump is already extreme here.
-        CryptoMajor => ClassBand {
-            spread_ceiling_bps: 150.0,
-            jump_frac: 0.05,
-        },
-        // Stable/stable: spread should be a handful of bps; cap tight.
-        CryptoStable => ClassBand {
-            spread_ceiling_bps: 100.0,
-            jump_frac: 0.02,
-        },
-        // FX majors: extremely tight institutional spreads.
-        FxMajor => ClassBand {
-            spread_ceiling_bps: 50.0,
-            jump_frac: 0.03,
-        },
-        // Alts / crypto-crosses: thinner books, wider real spreads + jumps.
-        CryptoAlt | CryptoCross => ClassBand {
-            spread_ceiling_bps: 800.0,
-            jump_frac: 0.15,
-        },
-        FxCross => ClassBand {
-            spread_ceiling_bps: 300.0,
-            jump_frac: 0.08,
-        },
-        // Synth / unknown: widest band — never false-flag a thin synthetic pair.
-        Default => ClassBand {
-            spread_ceiling_bps: 2000.0,
-            jump_frac: 0.25,
-        },
-    }
 }
 
 /// Evaluate the microstructure invariant chain for one INDEX record. Mirrors
 /// integrity-check's G1 (price floor), crossed-quote, and G4 (freshness floor)
 /// semantics so the cert and the per-file checker agree on the wire contract.
 ///
-/// `band` carries the per-asset-class spread ceiling (replaces the flat 2000bps
-/// cap). `vbid`/`vask`/`rejected` drive the depth + reject-dominant signals.
+/// `vbid`/`vask`/`rejected` drive the depth + reject-dominant signals.
 fn eval_invariant(
     bid: f64,
     ask: f64,
@@ -808,8 +728,6 @@ fn eval_invariant(
     rejected: u8,
     vbid: u32,
     vask: u32,
-    spread_bps: f64,
-    band: ClassBand,
 ) -> InvariantOutcome {
     // `confidence` is FLAG-SELECTED: FLAG_CONF_ACTIVE → packed ticking-leg count
     // + fresh-weight bit (live encoding since 2026-07-25); else
@@ -846,14 +764,9 @@ fn eval_invariant(
         // illiquid alts/synths (real 45d run flagged 819 bps on a real CryptoCross
         // pair). Only a STRUCTURAL impossibility fails here, and the crossed-quote
         // / sub-floor / non-finite branches above already cover every structural
-        // case. The per-class spread ceiling is now a WARN/metric (`spread_out_of_band`).
+        // case.
         None
     };
-    // Spread WARN/metric (NEVER a verdict input). A positive spread above the
-    // per-class envelope is surfaced as a count; majors keep a tighter band so
-    // the WARN still flags a dislocated major, but it never FAILs a ticker.
-    let spread_out_of_band =
-        spread_bps.is_finite() && spread_bps > band.spread_ceiling_bps && reason.is_none();
     // FIX #1 (G4 parity, advisory): structurally-OK records that fail their
     // encoding's liveness floor are a stale composite. WARN-only. Records with
     // NEITHER flag carry no liveness metadata and are skipped, as in G4.
@@ -870,7 +783,6 @@ fn eval_invariant(
         zero_depth,
         depth_one_sided,
         reject_dominant,
-        spread_out_of_band,
     }
 }
 
@@ -989,7 +901,6 @@ fn audit_ticker(
     target_resolved: bool,
     is_known_stable: bool,
     k_bounds: Option<(f64, f64)>,
-    band: ClassBand,
 ) -> Result<TickerReport> {
     let mut r = TickerReport {
         ticker_id: id,
@@ -1212,8 +1123,6 @@ fn audit_ticker(
             idx.rejected,
             idx.vbid,
             idx.vask,
-            sb_for_eval,
-            band,
         );
         if outcome.conf_stale {
             r.conf_stale_advisories += 1;
@@ -1447,7 +1356,7 @@ fn audit_ticker(
                     // Stored σ is a per-30-min fraction (e.g. 0.015 = 1.5%).
                     // Annualize the median to the SAME basis as sigma_park_ann:
                     // 30-min bins → 48/day × 365 days = 17_520 bins/yr.
-                    let mut sigmas: Vec<f64> = (0..n)
+                    let sigmas: Vec<f64> = (0..n)
                         .map(|i| vm.sigma_pct(i))
                         .filter(|s| s.is_finite() && *s > 0.0)
                         .collect();
@@ -2410,7 +2319,6 @@ fn main() -> Result<()> {
                 let per_ticker_target = resolved.unwrap_or(cli.target_bpd);
                 let target_resolved = resolved.is_some();
                 let is_known_stable = target_resolver.is_known_stable(id);
-                let band = class_band(target_resolver.class_for(id));
                 audit_ticker(
                     &cli.common.data_root,
                     id,
@@ -2422,7 +2330,6 @@ fn main() -> Result<()> {
                     target_resolved,
                     is_known_stable,
                     k_bounds,
-                    band,
                 )
                 // A per-ticker IO failure is a FAIL for that ticker, not a panic
                 // and not a dropped ticker (silent omission would be indistinguishable
@@ -2469,12 +2376,6 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Default band for invariant tests (Default bucket: widest envelope) — the
-    /// depth/reject/freshness tests don't exercise the spread ceiling.
-    fn test_band() -> ClassBand {
-        class_band(nxr_sdk::asset_class::AssetClassBucket::Default)
-    }
-
     /// `eval_invariant` with HEALTHY depth (vbid/vask both non-zero) and reject
     /// (rejected=0) defaults, so tests targeting the freshness/price chain don't
     /// have to spell out the new args. Depth/reject tests call `eval_invariant`
@@ -2485,7 +2386,6 @@ mod tests {
         flags: u8,
         confidence: u8,
         accepted: u8,
-        spread_bps: f64,
     ) -> InvariantOutcome {
         eval_invariant(
             bid,
@@ -2496,8 +2396,6 @@ mod tests {
             /*rejected*/ 0,
             /*vbid*/ 100,
             /*vask*/ 100,
-            spread_bps,
-            test_band(),
         )
     }
 
@@ -2661,7 +2559,7 @@ mod tests {
     fn fix1_fresh_record_no_false_fail() {
         const FRESH: u8 = FLAG_CONF_FRESHNESS;
         // confidence=78 (>accepted=6) but freshness-flagged → must NOT FAIL.
-        let o = eval_inv(100.0, 100.1, FRESH, 78, 6, 0.999_0 /*~spread bps*/);
+        let o = eval_inv(100.0, 100.1, FRESH, 78, 6);
         assert!(
             o.reason.is_none(),
             "fresh record must not FAIL invariant: {:?}",
@@ -2673,7 +2571,7 @@ mod tests {
         );
 
         // Same numbers WITHOUT the flag = legacy semantics → confidence>accepted FAIL.
-        let legacy = eval_inv(100.0, 100.1, 0, 200, 6, 0.999_0);
+        let legacy = eval_inv(100.0, 100.1, 0, 200, 6);
         assert_eq!(
             legacy.reason,
             Some("confidence > accepted"),
@@ -2682,7 +2580,7 @@ mod tests {
 
         // Freshness-flagged BUT stale (byte 4/100 = 0.04 < 0.05 floor) → advisory
         // WARN only, still NOT an invariant FAIL.
-        let stale = eval_inv(100.0, 100.1, FRESH, 4, 6, 0.999_0);
+        let stale = eval_inv(100.0, 100.1, FRESH, 4, 6);
         assert!(
             stale.reason.is_none(),
             "stale-fresh record must not FAIL: {:?}",
@@ -2697,21 +2595,21 @@ mod tests {
     /// passes `> 0.0` yet cannot be a real quote. The cert must FAIL it (G1 parity).
     #[test]
     fn fix2_subfloor_price_fails() {
-        let o = eval_inv(5e-10, 6e-10, 0, 1, 1, 0.0);
+        let o = eval_inv(5e-10, 6e-10, 0, 1, 1);
         assert_eq!(
             o.reason,
             Some("bid/ask below price floor (denormal)"),
             "sub-floor denormal must FAIL the price floor"
         );
         // Normal price → no floor FAIL.
-        let ok = eval_inv(100.0, 100.1, 0, 1, 1, 9.99);
+        let ok = eval_inv(100.0, 100.1, 0, 1, 1);
         assert!(
             ok.reason.is_none(),
             "normal price must not FAIL: {:?}",
             ok.reason
         );
         // Crossed quote → explicit FAIL.
-        let crossed = eval_inv(100.5, 100.0, 0, 1, 1, 0.0);
+        let crossed = eval_inv(100.5, 100.0, 0, 1, 1);
         assert_eq!(crossed.reason, Some("crossed quote (ask < bid)"));
     }
 
@@ -2734,8 +2632,6 @@ mod tests {
             0,
             /*vbid*/ 0,
             /*vask*/ 0,
-            9.99,
-            test_band(),
         );
         assert!(
             both.reason.is_none(),
@@ -2758,8 +2654,6 @@ mod tests {
             0,
             /*vbid*/ 0,
             /*vask*/ 50,
-            9.99,
-            test_band(),
         );
         assert!(bid_side.reason.is_none(), "one-sided depth must NOT FAIL");
         assert!(bid_side.depth_one_sided, "one-sided depth metric flag set");
@@ -2775,8 +2669,6 @@ mod tests {
             0,
             /*vbid*/ 10,
             /*vask*/ 10,
-            9.99,
-            test_band(),
         );
         assert!(
             !ok.zero_depth && !ok.depth_one_sided,
@@ -2802,8 +2694,6 @@ mod tests {
             /*rejected*/ 5,
             100,
             100,
-            9.99,
-            test_band(),
         );
         assert!(
             dom.reject_dominant,
@@ -2816,11 +2706,11 @@ mod tests {
         );
 
         // Equal → NOT dominant (strictly greater required).
-        let eq = eval_invariant(100.0, 100.1, 0, 1, 3, 3, 100, 100, 9.99, test_band());
+        let eq = eval_invariant(100.0, 100.1, 0, 1, 3, 3, 100, 100);
         assert!(!eq.reject_dominant, "rejected==accepted is not dominant");
 
         // Healthy (more accepted than rejected) → no signal.
-        let ok = eval_invariant(100.0, 100.1, 0, 1, 8, 1, 100, 100, 9.99, test_band());
+        let ok = eval_invariant(100.0, 100.1, 0, 1, 8, 1, 100, 100);
         assert!(!ok.reject_dominant, "accepted>rejected → no reject signal");
     }
 
