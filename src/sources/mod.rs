@@ -12,12 +12,19 @@ use crate::types::{Config, DataSource, TickFrame};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::NaiveDate;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::sync::mpsc;
 
 #[async_trait]
 pub trait TickSource: Send + Sync {
     async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()>;
+
+    /// Fetch the series' archive files for the window and report what the
+    /// archive had for each day. Only archive sources have one.
+    async fn fetch_days(&self, _config: &Config) -> Result<BTreeMap<NaiveDate, common::Day>> {
+        anyhow::bail!("not an archive source")
+    }
 
     /// Validate what the source needs for this series (its config), apart from
     /// the network: a failure here is a setup error, never "no coverage".

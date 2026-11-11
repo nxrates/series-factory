@@ -99,6 +99,26 @@ pub fn unlist_shards(dir: &Path, shards: &[PathBuf]) {
     }
 }
 
+/// Which venues contributed to each finished composite day, beside the manifest.
+/// A day finalised with fewer venues than were asked for is visible here, and can
+/// be rebuilt later with `--rebuild`. Written atomically (temp + rename).
+pub fn record_venues(
+    dir: &Path,
+    days: &std::collections::BTreeMap<NaiveDate, Vec<String>>,
+) -> Result<()> {
+    let mut all = read_venues(dir);
+    all.extend(days.iter().map(|(d, v)| (d.to_string(), v.clone())));
+    write_shard_atomic(&dir.join("venues.json"), &serde_json::to_vec_pretty(&all)?)
+}
+
+/// The recorded venues per day (`YYYY-MM-DD` -> venue names); empty when none.
+pub fn read_venues(dir: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    std::fs::read(dir.join("venues.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
 /// A derived shard is fresh when it is a whole, non-empty number of `rec_size`
 /// records and not older than the `input` it was built from.
 pub fn fresh(out: &Path, input: &Path, rec_size: u64) -> bool {
@@ -172,6 +192,23 @@ mod done_tests {
         unlist_shards(&dir, &[p.clone()]);
         assert!(!p.exists());
         assert_eq!(days_todo(&dir, "idx", day(1), day(1)), [day(1)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn venues_are_recorded_per_day_and_merged() {
+        let dir = std::env::temp_dir().join(format!("sf-venues-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = |d: u32, v: &[&str]| {
+            std::collections::BTreeMap::from([(day(d), v.iter().map(|s| s.to_string()).collect())])
+        };
+        record_venues(&dir, &one(1, &["binance", "okx"])).unwrap();
+        record_venues(&dir, &one(2, &["binance"])).unwrap();
+        record_venues(&dir, &one(1, &["binance", "okx", "bybit"])).unwrap();
+        let got = read_venues(&dir);
+        assert_eq!(got["2024-01-01"].len(), 3);
+        assert_eq!(got["2024-01-02"], ["binance"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

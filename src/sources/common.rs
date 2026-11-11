@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, NaiveDate};
 use memmap2::Mmap;
 use mitch::Tick;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -986,11 +986,13 @@ fn cached(p: &Path) -> bool {
 }
 
 /// Fetch `[from, to]` (inclusive days) into `dir` and return the `.ticks` files
-/// covering it, oldest first. Per calendar month: the monthly archive when the
-/// window covers the whole completed month, else daily archives; a monthly that
-/// is missing, failed or empty falls back to daily. A file already in `dir` is
-/// not fetched again; a zero-tick download is never kept. 404/403 is quiet
-/// (`debug`), any other failure that survives the retries is a `warn`.
+/// covering it plus what the archive had for every day. Per calendar month: the
+/// monthly archive when the window covers the whole completed month, else daily
+/// archives; a monthly that is missing, failed or empty falls back to daily. A
+/// file already in `dir` is not fetched again; a zero-tick download is never
+/// kept. 404/403 is quiet (`debug`), any other failure that survives the retries
+/// is a `warn` and marks its days [`Day::Failed`]. Whether a missing or failed day
+/// matters is the caller's policy, not the fetch's.
 pub async fn fetch_archive(
     net: &dyn Net,
     v: &Venue,
@@ -1007,14 +1009,13 @@ pub async fn fetch_archive(
         Ok::<_, anyhow::Error>(net.download(v, &url, &cache, k).await)
     };
     let mut out = Fetched::default();
-    // One outcome per unit fetched, in time order: a monthly file, or a day.
-    let mut units: Vec<(String, Unit)> = Vec::new();
     for (start, end) in month_ranges(from, to) {
         let (year, month) = (start.year(), start.month());
         let complete = last_day_of_month(year, month) < today;
         let before = out.files.len();
         let mut ticks = 0u64;
         let mut monthly_fault = None;
+        let month_days = || start.iter_days().take_while(move |d| *d <= end);
 
         let first = start.with_day(1).expect("day 1 exists");
         // A cached monthly is a superset of any window inside it.
@@ -1022,7 +1023,9 @@ pub async fn fetch_archive(
             let cache = cache_of(dir, &file);
             if cached(&cache) {
                 out.files.push(cache);
-                units.push((format!("{year}-{month:02}"), Unit::Got));
+                month_days().for_each(|d| {
+                    out.days.insert(d, Day::Got);
+                });
                 continue;
             }
         }
@@ -1038,7 +1041,9 @@ pub async fn fetch_archive(
                 }
                 Ok(_) => {
                     out.files.push(cache);
-                    units.push((format!("{year}-{month:02}"), Unit::Got));
+                    month_days().for_each(|d| {
+                        out.days.insert(d, Day::Got);
+                    });
                     continue;
                 }
                 Err(e) if is_missing(&e) => debug!("No monthly {file}, trying daily"),
@@ -1050,24 +1055,19 @@ pub async fn fetch_archive(
         }
 
         if v.files.daily.is_empty() {
-            // Monthly-only venue: a month it has not published yet (the current
-            // one, or a just-finished one) is held, never finalised without it.
-            let lag = last_day_of_month(year, month) + Duration::days(PUBLISH_LAG_DAYS) >= today;
-            if let Some(f) = monthly_fault {
-                out.faults.push(f);
-            } else if out.files.len() == before && (!complete || lag) {
-                out.faults.push(format!(
-                    "{} publishes monthly files only: {year}-{month:02} is not published yet",
-                    v.name
-                ));
-            }
+            // Monthly-only venue: the month's days all share the month's fate.
+            let state = match monthly_fault {
+                Some(f) => Day::Failed(f),
+                None => Day::Missing,
+            };
+            month_days().for_each(|d| {
+                out.days.insert(d, state.clone());
+            });
         } else {
-            let mut day = start;
-            while day <= end {
-                let (n, unit) = fetch_day(&get, v, dir, day, &mut out.files).await?;
+            for day in month_days() {
+                let (n, state) = fetch_day(&get, v, dir, day, &mut out.files).await?;
                 ticks += n;
-                units.push((day.to_string(), unit));
-                day += Duration::days(1);
+                out.days.insert(day, state);
             }
         }
 
@@ -1084,82 +1084,56 @@ pub async fn fetch_archive(
             );
         }
     }
-    // A venue cutting its days east of UTC ends its last file before the window
-    // does: the next day's file holds the rest, and the last day is not complete
-    // without it.
-    let tail = to + Duration::days(1);
-    if v.files.tz_h > 0 && tail <= today {
-        let (_, unit) = fetch_day(&get, v, dir, tail, &mut out.files).await?;
-        let last_got = matches!(units.last(), Some((_, Unit::Got)));
-        match unit {
-            Unit::Got => {}
-            Unit::Failed(e) => out.faults.push(format!("tail day {tail}: {e}")),
-            Unit::Missing if last_got => out.faults.push(format!(
-                "tail day {tail} is not published, so {to} is incomplete"
-            )),
-            Unit::Missing => {}
+    // A venue cutting its days east of UTC ends each file before the UTC day
+    // does: a day is complete only with the next day's file as well, and the
+    // window's last day needs the day after it.
+    if v.files.tz_h > 0 {
+        let tail = to + Duration::days(1);
+        if tail <= today {
+            let (_, state) = fetch_day(&get, v, dir, tail, &mut out.files).await?;
+            out.days.insert(tail, state);
+        } else {
+            out.days.insert(tail, Day::Missing);
         }
+        let own = out.days.clone();
+        for d in from.iter_days().take_while(|d| *d <= to) {
+            let cur = own.get(&d).cloned().unwrap_or(Day::Missing);
+            let next = own[&(d + Duration::days(1))].clone();
+            out.days.insert(d, cur.worst(next));
+        }
+        out.days.remove(&tail);
     }
-    out.faults.extend(unit_faults(&units));
     Ok(out)
 }
 
-/// What a fetch produced: the `.ticks` files covering the window, and why it may
-/// be incomplete. Any fault means the venue's data for the window must not be
-/// treated as final.
+/// What a fetch produced: the `.ticks` files covering the window, and the
+/// archive's state for every day of it.
 #[derive(Default)]
 pub struct Fetched {
     pub files: Vec<PathBuf>,
-    pub faults: Vec<String>,
+    pub days: BTreeMap<NaiveDate, Day>,
 }
 
-/// Archive units are final a few days after their period ends; a missing one
-/// inside this lag is "not published yet", not "absent".
-const PUBLISH_LAG_DAYS: i64 = 5;
-
-/// Outcome of one fetched unit.
-enum Unit {
+/// What the archive had for one day of one venue.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Day {
     Got,
-    /// 404/403, or an empty archive.
+    /// 404/403, or an empty archive: not published (yet), a hole, or a quiet day.
     Missing,
     /// A failure that survived the retries.
     Failed(String),
 }
 
-/// Faults over a run of units: every failure, and every run of two or more
-/// missing units between present ones. A single missing day is an archive hole;
-/// a run is what a block looks like (403 is also how Bitget says "missing", so
-/// status alone cannot tell them apart). Missing units before the first or after
-/// the last present one are the venue's listing and archive ends, not faults.
-fn unit_faults(units: &[(String, Unit)]) -> Vec<String> {
-    let mut faults: Vec<String> = units
-        .iter()
-        .filter_map(|(l, u)| match u {
-            Unit::Failed(e) => Some(format!("{l}: {e}")),
-            _ => None,
-        })
-        .collect();
-    let present = |u: &Unit| matches!(u, Unit::Got);
-    let (Some(first), Some(last)) = (
-        units.iter().position(|(_, u)| present(u)),
-        units.iter().rposition(|(_, u)| present(u)),
-    ) else {
-        return faults;
-    };
-    let mut run = 0;
-    for (l, u) in &units[first..=last] {
-        if matches!(u, Unit::Missing) {
-            run += 1;
-            if run == 2 {
-                faults.push(format!(
-                    "missing run inside coverage from {l} (block or archive hole)"
-                ));
-            }
-        } else {
-            run = 0;
+impl Day {
+    /// The weaker of two states (a day needing two files is only as good as the worse).
+    fn worst(self, other: Day) -> Day {
+        match (self, other) {
+            (Day::Failed(e), _) | (_, Day::Failed(e)) => Day::Failed(e),
+            (Day::Missing, _) | (_, Day::Missing) => Day::Missing,
+            _ => Day::Got,
         }
     }
-    faults
 }
 
 /// Fetch one archive day (one file, or numbered chunks until one is missing or
@@ -1170,7 +1144,7 @@ async fn fetch_day<G, Fut>(
     dir: &Path,
     day: NaiveDate,
     files: &mut Vec<PathBuf>,
-) -> Result<(u64, Unit)>
+) -> Result<(u64, Day)>
 where
     G: Fn(String, PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<Result<u64>>>,
@@ -1201,7 +1175,7 @@ where
                 }
                 Err(e) => {
                     warn!("{} {} {day} failed after retries: {e:#}", v.name, v.sym);
-                    return Ok((ticks, Unit::Failed(format!("{file}: {e:#}"))));
+                    return Ok((ticks, Day::Failed(format!("{file}: {e:#}"))));
                 }
             }
         }
@@ -1210,7 +1184,7 @@ where
         }
         seq += 1;
     }
-    Ok((ticks, if got { Unit::Got } else { Unit::Missing }))
+    Ok((ticks, if got { Day::Got } else { Day::Missing }))
 }
 
 /// Upper bound on probe requests per (venue, symbol): a longer window is sampled
@@ -1279,6 +1253,20 @@ impl ArchiveSource {
 #[async_trait::async_trait]
 impl TickSource for ArchiveSource {
     async fn fetch_ticks(&self, config: &Config, _tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
+        // The files are the output; no tick batches are sent.
+        let days = self.fetch_days(config).await?;
+        let failed: Vec<String> = days
+            .iter()
+            .filter_map(|(d, s)| match s {
+                Day::Failed(e) => Some(format!("{d}: {e}")),
+                _ => None,
+            })
+            .collect();
+        anyhow::ensure!(failed.is_empty(), "incomplete: {}", failed.join("; "));
+        Ok(())
+    }
+
+    async fn fetch_days(&self, config: &Config) -> Result<BTreeMap<NaiveDate, Day>> {
         let v = (self.venue)(config)?
             .with_context(|| format!("no archive for {} on this venue", config.quote))?;
         anyhow::ensure!(
@@ -1304,16 +1292,7 @@ impl TickSource for ArchiveSource {
         )
         .await?;
         info!("{} tick files for {}", fetched.files.len(), v.sym);
-        // The files are the output; no tick batches are sent. A fault fails the
-        // fetch so the caller never treats the window as final.
-        anyhow::ensure!(
-            fetched.faults.is_empty(),
-            "{} {} incomplete: {}",
-            v.name,
-            v.sym,
-            fetched.faults.join("; ")
-        );
-        Ok(())
+        Ok(fetched.days)
     }
 
     fn check(&self, config: &Config) -> Result<()> {
@@ -1746,109 +1725,69 @@ mod tests {
         assert_eq!(calls.len(), 2, "03-03 has not started");
     }
 
-    /// Faults of one fetch.
-    async fn faults(
+    /// What the archive had for each day of one fetch.
+    async fn states(
         files: Files,
         reply: fn(&str) -> Result<u64>,
         from: NaiveDate,
         to: NaiveDate,
         today: NaiveDate,
-    ) -> Vec<String> {
-        let (net, dir) = (Fake::new(reply), tmp("faults"));
+    ) -> Vec<Day> {
+        let (net, dir) = (Fake::new(reply), tmp("states"));
         let got = fetch_archive(&net, &venue(files), &dir, from, to, today)
             .await
             .unwrap();
         let _ = fs::remove_dir_all(&dir);
-        got.faults
+        got.days.into_values().collect()
     }
 
-    /// A failure that survives the retries makes the fetch incomplete, in the
-    /// middle of a chunked day as well as on a plain day.
+    fn kinds(v: &[Day]) -> String {
+        v.iter()
+            .map(|d| match d {
+                Day::Got => 'G',
+                Day::Missing => 'M',
+                Day::Failed(_) => 'F',
+            })
+            .collect()
+    }
+
+    /// A failure that survives the retries marks its day failed, also in the
+    /// middle of a chunked day; a 404/403 marks it missing. Neighbours are untouched.
     #[tokio::test]
-    async fn a_failed_download_is_a_fault() {
+    async fn failed_and_missing_days_are_told_apart() {
         let today = d(2024, 3, 1);
-        let f = faults(
-            BOTH,
-            |u| {
-                if u.ends_with("01-06.zip") {
-                    Err(http_err(500))
-                } else {
-                    Ok(5)
-                }
-            },
-            d(2024, 1, 5),
-            d(2024, 1, 7),
-            today,
-        )
-        .await;
-        assert_eq!(f.len(), 1, "{f:?}");
+        let reply: fn(&str) -> Result<u64> = |u| {
+            if u.ends_with("01-06.zip") {
+                Err(http_err(500))
+            } else if u.ends_with("01-07.zip") {
+                Err(http_err(403))
+            } else {
+                Ok(5)
+            }
+        };
+        let s = states(BOTH, reply, d(2024, 1, 5), d(2024, 1, 8), today).await;
+        assert_eq!(kinds(&s), "GFMG");
+        assert!(matches!(s[1], Day::Failed(_)));
         let chunked = Files {
             monthly: "",
             daily: "{ds}_{seq:03}.zip",
             tz_h: 0,
         };
-        let f = faults(
-            chunked,
-            |u| match u.rsplit('_').next().unwrap() {
-                "001.zip" => Ok(5),
-                _ => Err(http_err(502)),
-            },
-            d(2024, 1, 5),
-            d(2024, 1, 5),
-            today,
-        )
-        .await;
-        assert_eq!(f.len(), 1, "half a day is a fault: {f:?}");
-    }
-
-    /// One missing day between present ones is an archive hole; two in a row look
-    /// like a block. Missing days before the first or after the last present one
-    /// are the venue's listing and archive ends.
-    #[tokio::test]
-    async fn missing_runs_inside_coverage_are_faults() {
-        let today = d(2024, 3, 1);
-        let run = |reply: fn(&str) -> Result<u64>| {
-            faults(BOTH, reply, d(2024, 1, 3), d(2024, 1, 9), today)
+        let half: fn(&str) -> Result<u64> = |u| match u.rsplit('_').next().unwrap() {
+            "001.zip" => Ok(5),
+            _ => Err(http_err(502)),
         };
-        let hole = run(|u| {
-            if u.ends_with("01-05.zip") {
-                Err(http_err(404))
-            } else {
-                Ok(5)
-            }
-        })
-        .await;
-        assert!(hole.is_empty(), "{hole:?}");
-        let block = run(|u| {
-            if u.ends_with("01-05.zip") || u.ends_with("01-06.zip") {
-                Err(http_err(403))
-            } else {
-                Ok(5)
-            }
-        })
-        .await;
-        assert_eq!(block.len(), 1, "{block:?}");
-        let ends = run(|u| {
-            if u.ends_with("01-03.zip")
-                || u.ends_with("01-04.zip")
-                || u.ends_with("01-08.zip")
-                || u.ends_with("01-09.zip")
-            {
-                Err(http_err(403))
-            } else {
-                Ok(5)
-            }
-        })
-        .await;
-        assert!(ends.is_empty(), "{ends:?}");
+        let s = states(chunked, half, d(2024, 1, 5), d(2024, 1, 5), today).await;
+        assert_eq!(kinds(&s), "F", "half a day is failed");
     }
 
-    /// An east-of-UTC venue's last day is incomplete without the next day's file.
+    /// An east-of-UTC venue's day needs the next day's file too, and only that
+    /// one: a missing tail degrades the last day, not the days before it.
     #[tokio::test]
-    async fn missing_tail_file_is_a_fault() {
+    async fn east_of_utc_day_needs_the_next_days_file() {
         let east = Files { tz_h: 8, ..BOTH };
         let today = d(2024, 3, 1);
-        let f = faults(
+        let s = states(
             east,
             |u| {
                 if u.ends_with("01-07.zip") {
@@ -1862,40 +1801,52 @@ mod tests {
             today,
         )
         .await;
-        assert_eq!(f.len(), 1, "{f:?}");
-        assert!(faults(east, ok, d(2024, 1, 5), d(2024, 1, 6), today)
-            .await
-            .is_empty());
+        assert_eq!(kinds(&s), "GM");
+        let s = states(
+            east,
+            |u| {
+                if u.ends_with("01-06.zip") {
+                    Err(http_err(403))
+                } else {
+                    Ok(5)
+                }
+            },
+            d(2024, 1, 5),
+            d(2024, 1, 6),
+            today,
+        )
+        .await;
+        assert_eq!(kinds(&s), "MM", "day 5 needs day 6's file; day 6 has none");
+        let s = states(
+            east,
+            |_| Err(http_err(404)),
+            d(2024, 3, 1),
+            d(2024, 3, 2),
+            d(2024, 3, 2),
+        )
+        .await;
+        assert_eq!(kinds(&s), "MM", "tail day has not started");
+        let s = states(east, ok, d(2024, 1, 5), d(2024, 1, 6), today).await;
+        assert_eq!(kinds(&s), "GG");
     }
 
-    /// A monthly-only venue's month is held until it is published and old enough.
+    /// A monthly-only venue's days share its month file's fate.
     #[tokio::test]
-    async fn monthly_only_month_is_held_until_published() {
+    async fn monthly_only_days_share_the_months_fate() {
         let only = Files { daily: "", ..BOTH };
         let miss: fn(&str) -> Result<u64> = |_| Err(http_err(404));
-        // current month, and a month that ended 2 days ago: held
         assert_eq!(
-            faults(only, miss, d(2024, 3, 1), d(2024, 3, 2), d(2024, 3, 3))
-                .await
-                .len(),
-            1
+            kinds(&states(only, miss, d(2024, 2, 1), d(2024, 2, 29), d(2024, 3, 20)).await),
+            "M".repeat(29)
         );
         assert_eq!(
-            faults(only, miss, d(2024, 2, 1), d(2024, 2, 29), d(2024, 3, 2))
-                .await
-                .len(),
-            1
+            kinds(&states(only, ok, d(2024, 2, 1), d(2024, 2, 29), d(2024, 3, 20)).await),
+            "G".repeat(29)
         );
-        // an old month it never had: absent, not held
-        assert!(
-            faults(only, miss, d(2024, 1, 1), d(2024, 1, 31), d(2024, 3, 20))
-                .await
-                .is_empty()
-        );
-        assert!(
-            faults(only, ok, d(2024, 2, 1), d(2024, 2, 29), d(2024, 3, 2))
-                .await
-                .is_empty()
+        let boom: fn(&str) -> Result<u64> = |_| Err(http_err(500));
+        assert_eq!(
+            kinds(&states(only, boom, d(2024, 2, 1), d(2024, 2, 29), d(2024, 3, 20)).await),
+            "F".repeat(29)
         );
     }
 
@@ -1948,7 +1899,11 @@ mod tests {
     fn spread_batches_do_not_scale_with_file_size() {
         let t0 = 1_700_000_000_000i64;
         let frame = |ms: i64| {
-            TickFrame::new(1, mitch::timestamp::from_epoch_ms(ms), honest_tick(7, 100.0, 1, true))
+            TickFrame::new(
+                1,
+                mitch::timestamp::from_epoch_ms(ms),
+                honest_tick(7, 100.0, 1, true),
+            )
         };
         // 200k frames, 100 per second: runs of 100 per stamp
         let frames: Vec<TickFrame> = (0..200_000).map(|i| frame(t0 + (i / 100) * 1000)).collect();

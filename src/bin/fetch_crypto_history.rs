@@ -19,11 +19,11 @@ use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use clap::Parser;
 use serde::Serialize;
 use series_factory::{
-    sources::{create_source, TickSource},
-    types::{AggregationMode, Config, DataSource, TickFrame},
+    sources::{common::Day, create_source},
+    types::{AggregationMode, Config, DataSource},
 };
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
                 let _p = permit;
                 let result = fetch_one(&cfg, &exchange).await;
                 match &result {
-                    Ok(n) => info!("[{}/{}] ok ({} tick batches)", exchange, pair, n),
+                    Ok(days) => info!("[{}/{}] ok ({} days)", exchange, pair, days.len()),
                     Err(e) => error!("[{}/{}] failed: {:#}", exchange, pair, e),
                 }
                 (pair, exchange, result)
@@ -239,11 +239,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut ok = 0usize;
+    let mut reports: Vec<DayReport> = Vec::new();
     let mut failed = 0usize;
     for h in handles {
         match h.await {
-            Ok((_p, _e, Ok(_))) => ok += 1,
+            Ok((ticker, exchange, Ok(days))) => reports.push(DayReport {
+                ticker,
+                exchange,
+                days: days.into_iter().map(|(d, s)| (d.to_string(), s)).collect(),
+            }),
             Ok((_, _, Err(_))) => failed += 1,
             Err(e) => {
                 warn!("task join error: {:#}", e);
@@ -252,32 +256,30 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("done: {} ok, {} failed", ok, failed);
+    info!("done: {} ok, {} failed", reports.len(), failed);
+    // One JSON line for the caller: what each archive had for every day.
+    println!("{}", serde_json::to_string(&reports)?);
     if failed > 0 {
         std::process::exit(1);
     }
     Ok(())
 }
 
-async fn fetch_one(cfg: &Config, exchange: &str) -> Result<usize> {
-    let source = create_source(&DataSource::Exchange(exchange.to_string())).await?;
-    let (tx, mut rx) = mpsc::channel::<Vec<TickFrame>>(32);
-
-    let cfg_cloned = cfg.clone();
-    let fetch = tokio::spawn(async move { drive_source(source, &cfg_cloned, tx).await });
-
-    let mut batches = 0usize;
-    while rx.recv().await.is_some() {
-        batches += 1;
-    }
-    fetch.await??;
-    Ok(batches)
+/// What one venue's archive had for each day of the window: `got`, `missing`
+/// (not published, a hole or a quiet day) or `failed` (transport fault after retries).
+#[derive(Serialize)]
+struct DayReport {
+    ticker: String,
+    exchange: String,
+    days: std::collections::BTreeMap<String, Day>,
 }
 
-async fn drive_source(
-    source: Box<dyn TickSource>,
+async fn fetch_one(
     cfg: &Config,
-    tx: mpsc::Sender<Vec<TickFrame>>,
-) -> Result<()> {
-    source.fetch_ticks(cfg, tx).await
+    exchange: &str,
+) -> Result<std::collections::BTreeMap<NaiveDate, Day>> {
+    create_source(&DataSource::Exchange(exchange.to_string()))
+        .await?
+        .fetch_days(cfg)
+        .await
 }
