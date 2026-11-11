@@ -225,6 +225,13 @@ pub fn is_truncated(bytes_got: u64, content_length: Option<u64>) -> bool {
     matches!(content_length, Some(expected) if bytes_got < expected)
 }
 
+/// A 404/403 download error: the archive has no such object (a normal reply
+/// from these CDNs), as opposed to a transfer fault worth a warning.
+pub fn is_missing(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.ends_with("HTTP 404") || msg.ends_with("HTTP 403")
+}
+
 /// Stream-download to disk with retry + truncation detection.
 ///
 /// A download whose written byte count falls short of the advertised
@@ -277,8 +284,7 @@ pub async fn download_to_file_retry(
             }
             Err(e) => {
                 // 403/404 = missing object: final, not a transfer fault.
-                let msg = e.to_string();
-                if msg.ends_with("HTTP 404") || msg.ends_with("HTTP 403") {
+                if is_missing(&e) {
                     return Err(e);
                 }
                 if attempt + 1 < max_attempts {
@@ -354,6 +360,50 @@ pub fn honest_tick(ticker_id: u64, price: f64, volume: u32, is_buyer: bool) -> T
         vbid: if is_buyer { 0 } else { volume },
         vask: if is_buyer { volume } else { 0 },
     }
+}
+
+/// Parse one CSV chunk into ticks. `row` maps a record to
+/// `(epoch_us, price, quote_notional, is_buyer)`, or `None` to skip it: header
+/// rows, short rows and unparseable fields all land there, so a chunk that
+/// starts on the header or is cut mid-row never panics or poisons the parse.
+pub fn csv_ticks(
+    csv_data: &[u8],
+    ticker_id: u64,
+    provider: &str,
+    row: impl Fn(&csv::StringRecord) -> Option<(u64, f64, f64, bool)>,
+) -> Result<Vec<TickFrame>> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true) // column counts vary (Bybit `RPI`)
+        .from_reader(std::io::Cursor::new(csv_data));
+    let pid = super::provider_id_for(provider);
+    let mut ticks = Vec::new();
+    let mut r = csv::StringRecord::new();
+    while rdr.read_record(&mut r)? {
+        if let Some((us, price, notional, is_buyer)) = row(&r) {
+            ticks.push(TickFrame::new(
+                pid,
+                mitch::timestamp::from_epoch_us(us),
+                honest_tick(ticker_id, price, notional as u32, is_buyer),
+            ));
+        }
+    }
+    Ok(ticks)
+}
+
+/// Epoch ms (a microsecond input is normalised to ms first) -> epoch microseconds.
+pub fn ms_to_us(ts: i64) -> u64 {
+    normalize_timestamp_ms(ts).max(0) as u64 * 1000
+}
+
+/// Fractional epoch seconds -> epoch microseconds.
+pub fn secs_to_us(ts: f64) -> Option<u64> {
+    (ts > 0.0).then(|| (ts * 1e6).round() as u64)
+}
+
+/// Field `i` of a record parsed as `T`; `None` when missing or malformed.
+pub fn field<T: std::str::FromStr>(r: &csv::StringRecord, i: usize) -> Option<T> {
+    r.get(i)?.parse().ok()
 }
 
 // ─── Batch sending ─────────────────────────────────────────────────────────────
@@ -682,21 +732,29 @@ fn reverse_if_descending(path: &Path) -> Result<()> {
     if first <= bytemuck::pod_read_unaligned::<TickFrame>(&frame).timestamp() {
         return Ok(());
     }
-    let tmp = path.with_extension("ticks.reversed");
-    let mut out = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
-    let mut block: Vec<TickFrame> = vec![bytemuck::Zeroable::zeroed(); BLOCK_FRAMES];
-    let mut end = len as usize;
-    while end > 0 {
-        let n = end.min(BLOCK_FRAMES * F);
-        src.seek(SeekFrom::Start((end - n) as u64))?;
-        let frames = &mut block[..n / F];
-        src.read_exact(bytemuck::cast_slice_mut(frames))?;
-        frames.reverse();
-        out.write_all(bytemuck::cast_slice(frames))?;
-        end -= n;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".reversed");
+    let tmp = PathBuf::from(tmp);
+    let mut flipped = || -> Result<()> {
+        let mut out = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
+        let mut block: Vec<TickFrame> = vec![bytemuck::Zeroable::zeroed(); BLOCK_FRAMES];
+        let mut end = len as usize;
+        while end > 0 {
+            let n = end.min(BLOCK_FRAMES * F);
+            src.seek(SeekFrom::Start((end - n) as u64))?;
+            let frames = &mut block[..n / F];
+            src.read_exact(bytemuck::cast_slice_mut(frames))?;
+            frames.reverse();
+            out.write_all(bytemuck::cast_slice(frames))?;
+            end -= n;
+        }
+        out.flush()?;
+        Ok(())
+    };
+    if let Err(e) = flipped() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    out.flush()?;
-    drop(out);
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -739,7 +797,8 @@ fn stream_csv_in_chunks<R: std::io::BufRead>(
 ///
 /// `monthly(symbol, year, month)` returns `(url, filename)`.
 /// `daily(symbol, date)` returns `(url, filename)`.
-/// Monthly downloads get 3 attempts; daily gets 1. A closure that returns an
+/// Every download gets 3 attempts with backoff; a 404/403 is final and quiet,
+/// any other failure that survives the retries is logged at `warn`. A closure that returns an
 /// empty url means the venue publishes no such granularity: it is skipped.
 pub async fn fetch_monthly_daily<P>(
     agent: &Arc<btr_rpc::Http>,
@@ -815,7 +874,8 @@ where
                         files.push(cache_path);
                         used_cached_month = true;
                     }
-                    Err(e) => warn!("Monthly failed {}: {}, trying daily", filename, e),
+                    Err(e) if is_missing(&e) => debug!("No monthly {}, trying daily", filename),
+                    Err(e) => warn!("Monthly failed {}: {:#}, trying daily", filename, e),
                 }
             }
         }
@@ -839,7 +899,7 @@ where
                         &cache_path,
                         ticker_id,
                         compression,
-                        1,
+                        3,
                         parse_csv,
                     )
                     .await
@@ -853,7 +913,11 @@ where
                             month_ticks += n;
                             files.push(cache_path);
                         }
-                        Err(_) => debug!("No {} data for {}", exchange, day),
+                        Err(e) if is_missing(&e) => debug!("No {} data for {}", exchange, day),
+                        Err(e) => warn!(
+                            "{} {} {} failed after retries: {:#}",
+                            exchange, symbol, day, e
+                        ),
                     }
                 } else {
                     debug!("Cached: {}", cache_path.display());
@@ -891,6 +955,7 @@ mod tests {
     use nxr_sdk::pipeline_config::{
         DEFAULT_ARCHIVE_URL_BINANCE_MONTHLY, DEFAULT_ARCHIVE_URL_OKX_MONTHLY,
     };
+    use std::sync::atomic::Ordering;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -1056,42 +1121,136 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A newest-first `.ticks` file (Bybit perp) is flipped to oldest-first;
-    /// an ascending one is left byte-identical.
+    fn frames(ms: &[i64]) -> Vec<TickFrame> {
+        ms.iter()
+            .map(|&t| {
+                TickFrame::new(
+                    1,
+                    mitch::timestamp::from_epoch_ms(t),
+                    honest_tick(7, 100.0, 1, true),
+                )
+            })
+            .collect()
+    }
+
+    /// Write `ms` as a `.ticks` file, run the flip, return the timestamps and
+    /// whether the `.reversed` scratch file is gone.
+    fn flip(ms: &[i64]) -> (Vec<i64>, bool) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "sf-rev-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("d.ticks.partial");
+        std::fs::write(&p, bytemuck::cast_slice(&frames(ms))).unwrap();
+        reverse_if_descending(&p).unwrap();
+        let got = read_tick_file(&p)
+            .unwrap()
+            .iter()
+            .map(|f| f.timestamp_ms())
+            .collect();
+        let clean = !dir.join("d.ticks.partial.reversed").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        (got, clean)
+    }
+
+    const T0: i64 = 1_800_000_000_000;
+
+    /// A newest-first file (Bybit perp) is flipped across several blocks.
     #[test]
     fn descending_ticks_file_is_reversed() {
-        let frames = |ms: &[i64]| -> Vec<TickFrame> {
-            ms.iter()
-                .map(|&t| {
-                    TickFrame::new(
-                        1,
-                        mitch::timestamp::from_epoch_ms(t),
-                        honest_tick(7, 100.0, 1, true),
-                    )
-                })
-                .collect()
-        };
-        let dir = std::env::temp_dir().join(format!("sf-rev-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ts = |p: &Path| -> Vec<i64> {
-            read_tick_file(p)
-                .unwrap()
-                .iter()
-                .map(|f| f.timestamp_ms())
-                .collect()
-        };
-        let base = 1_800_000_000_000i64;
-        let p = dir.join("d.ticks");
-        let desc: Vec<i64> = (0..40_000).rev().map(|i| base + i * 1000).collect();
-        std::fs::write(&p, bytemuck::cast_slice(&frames(&desc))).unwrap();
-        reverse_if_descending(&p).unwrap();
+        let desc: Vec<i64> = (0..40_000).rev().map(|i| T0 + i * 1000).collect();
         let mut asc = desc.clone();
         asc.reverse();
-        assert_eq!(ts(&p), asc, "spans several blocks");
-        let before = std::fs::read(&p).unwrap();
-        reverse_if_descending(&p).unwrap();
-        assert_eq!(std::fs::read(&p).unwrap(), before, "ascending untouched");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(flip(&desc), (asc, true));
+    }
+
+    #[test]
+    fn ascending_single_and_equal_timestamp_files_are_untouched() {
+        let asc: Vec<i64> = (0..10).map(|i| T0 + i * 1000).collect();
+        assert_eq!(flip(&asc), (asc.clone(), true));
+        assert_eq!(flip(&[T0]), (vec![T0], true));
+        let same = vec![T0; 5];
+        assert_eq!(flip(&same), (same.clone(), true));
+    }
+
+    /// Newest-first with ties and one out-of-place row: first > last flips the
+    /// whole file; no row is lost or invented.
+    #[test]
+    fn partially_descending_file_is_flipped_whole() {
+        let v = vec![T0 + 5000, T0 + 4000, T0 + 4000, T0 + 4500, T0 + 2000, T0];
+        let mut want = v.clone();
+        want.reverse();
+        assert_eq!(flip(&v), (want, true));
+    }
+
+    fn cfg(from: (i32, u32, u32), to: (i32, u32, u32), root: &Path) -> Config {
+        let d = |(y, m, dd): (i32, u32, u32)| {
+            NaiveDate::from_ymd_opt(y, m, dd)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+        };
+        Config {
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            sources: vec![],
+            from: d(from),
+            to: d(to),
+            agg_mode: crate::types::AggregationMode::Time,
+            agg_step: 60_000.0,
+            cycle_ms: 200,
+            stale_secs: 30.0,
+            z_threshold: 6.0,
+            ticks_dir: root.to_path_buf(),
+            bars_dir: root.to_path_buf(),
+        }
+    }
+
+    /// Non-empty (spot-style) closures are never skipped: cached monthly and
+    /// daily files are picked up; an empty-URL granularity is skipped.
+    #[tokio::test]
+    async fn empty_url_skip_does_not_touch_non_empty_closures() {
+        let root = std::env::temp_dir().join(format!("sf-skip-{}", std::process::id()));
+        let dir = root.join("x").join("BTCUSDT");
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = http_agent();
+        let parse = |_: &[u8], _: u64| -> Result<Vec<TickFrame>> { Ok(vec![]) };
+        let run = |monthly_url: &'static str, daily_url: &'static str, to: u32| {
+            let (agent, root) = (agent.clone(), root.clone());
+            async move {
+                fetch_monthly_daily(
+                    &agent,
+                    &cfg((2024, 1, 1), (2024, 1, to), &root),
+                    "x",
+                    "BTCUSDT",
+                    "BTCUSDT",
+                    7,
+                    ".zip",
+                    Compression::Zip,
+                    |_, _, _| (monthly_url.into(), "M-2024-01.zip".into()),
+                    |_, d| (daily_url.into(), format!("D-{}.zip", d.format("%d"))),
+                    &parse,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        std::fs::write(dir.join("M-2024-01.ticks"), b"").unwrap();
+        for d in ["01", "02", "03"] {
+            std::fs::write(dir.join(format!("D-{d}.ticks")), b"").unwrap();
+        }
+        // non-empty monthly, cached: used, daily never reached
+        assert_eq!(run("http://invalid/", "http://invalid/", 3).await.len(), 1);
+        // empty monthly: falls to the (non-empty) daily closure, 3 cached days
+        assert_eq!(run("", "http://invalid/", 3).await.len(), 3);
+        // empty daily: nothing to fetch for the days, no cached monthly either
+        std::fs::remove_file(dir.join("M-2024-01.ticks")).unwrap();
+        assert_eq!(run("", "", 3).await.len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `month_ranges` tiles [from,to] contiguously with no per-symbol logic —

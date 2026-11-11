@@ -35,10 +35,8 @@ pub fn provider_id_for(exchange: &str) -> u16 {
 /// PERP instrument nibble, and the raw-tick dir (`BTCUSDT:PERP`) and per-provider
 /// `.idx` (`BTC-USDT:PERP.idx`) can never alias the spot series.
 pub fn split_quote(quote: &str) -> (&str, bool) {
-    (
-        nxr_sdk::resolve::split_perp(quote).0,
-        nxr_sdk::is_perp_symbol(quote),
-    )
+    let (bare, kind) = nxr_sdk::resolve::split_perp(quote);
+    (bare, kind == mitch::common::InstrumentType::PERP)
 }
 
 /// `(raw-tick dir name, MITCH ticker id)` of the series a `Config` names.
@@ -61,16 +59,11 @@ pub fn next_synthetic_id() -> u16 {
 
 /// Construct a historical tick source by enum tag.
 ///
-/// **Closed-set by design (2026-05-30):** each historical source has distinct API + parse logic
-/// (Binance aggTrades CSV vs Bybit per-trade CSV vs OKX zipped JSON vs
-/// Bitget per-symbol path conventions; each also has a perp variant picked by
-/// `split_quote`) that can't be YAML-driven without
-/// trait-object infrastructure that doesn't currently exist (a registry of
-/// `fn(&Config) -> Box<dyn TickSource>` constructors keyed by name). The
-/// match arm itself is a thin dispatcher; the per-source URL/template
-/// data has already been hoisted to YAML (`archive_url_template`).
-/// Deferred to a future refactor if a 5th
-/// historical source is added.
+/// Closed set by design: each venue has its own archive layout and CSV columns
+/// (spot and perp variants alike, picked by `split_quote`), so the parser and
+/// the URL stem are one unit per source and the match arm is a thin dispatcher.
+/// Spot URL stems come from YAML (`archive_url_template`); perp stems are
+/// constants in the source.
 pub async fn create_source(source: &DataSource) -> Result<Box<dyn TickSource>> {
     match source {
         DataSource::Exchange(name) => match name.as_str() {

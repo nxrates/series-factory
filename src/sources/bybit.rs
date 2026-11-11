@@ -2,8 +2,6 @@ use crate::sources::common::*;
 use crate::sources::{provider_id_for, series_key, split_quote, TickSource};
 use crate::types::{Config, TickFrame};
 use anyhow::Result;
-use csv::ReaderBuilder;
-use std::io::Cursor;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -21,76 +19,23 @@ impl BybitSource {
         }
     }
 
+    /// Spot: id, timestamp (ms), price, volume, side, [rpi]. Header-tolerant.
     fn parse_csv(csv_data: &[u8], ticker_id: u64) -> Result<Vec<TickFrame>> {
-        // Header-tolerant: `has_headers(false)` + parse-or-skip on the first
-        // numeric field, so streaming chunks work whether or not they start
-        // on the header row. (The monthly archive's first chunk has the
-        // header; every subsequent chunk is pure data.)
-        let mut rdr = ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(true) // Bybit added 'rpi' column mid-2025; rows mix 5 and 6 fields
-            .from_reader(Cursor::new(csv_data));
-        let mut ticks = Vec::new();
-        let pid = provider_id_for("bybit");
-        // Reuse one StringRecord across rows (no per-row alloc).
-        let mut r = csv::StringRecord::new();
-        while rdr.read_record(&mut r)? {
-            // Bybit: id, timestamp, price, volume, side, [rpi]
-            let ts_raw: i64 = match r[1].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let price: f64 = match r[2].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let qty: f64 = match r[3].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let ts = normalize_timestamp_ms(ts_raw);
-            let is_buyer = r[4].eq_ignore_ascii_case("buy");
-            ticks.push(TickFrame::new(
-                pid,
-                mitch::timestamp::from_epoch_ms(ts),
-                honest_tick(ticker_id, price, (qty * price) as u32, is_buyer),
-            ));
-        }
-        Ok(ticks)
+        csv_ticks(csv_data, ticker_id, "bybit", |r| {
+            let (price, qty): (f64, f64) = (field(r, 2)?, field(r, 3)?);
+            let buyer = r.get(4)?.eq_ignore_ascii_case("buy");
+            Some((ms_to_us(field(r, 1)?), price, qty * price, buyer))
+        })
     }
-}
 
-impl BybitSource {
     /// Linear perp `public.bybit.com/trading/`: timestamp (epoch seconds,
     /// fractional), symbol, side, size (base), price, ... Header-tolerant.
     fn parse_perp_csv(csv_data: &[u8], ticker_id: u64) -> Result<Vec<TickFrame>> {
-        let mut rdr = ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(true) // trailing `RPI` column appears mid-file-set
-            .from_reader(Cursor::new(csv_data));
-        let mut ticks = Vec::new();
-        let pid = provider_id_for("bybit");
-        let mut r = csv::StringRecord::new();
-        while rdr.read_record(&mut r)? {
-            let (Ok(ts), Ok(qty), Ok(price)) = (
-                r[0].parse::<f64>(),
-                r[3].parse::<f64>(),
-                r[4].parse::<f64>(),
-            ) else {
-                continue;
-            };
-            ticks.push(TickFrame::new(
-                pid,
-                mitch::timestamp::from_epoch_us((ts * 1e6).round() as u64),
-                honest_tick(
-                    ticker_id,
-                    price,
-                    (qty * price) as u32,
-                    r[2].eq_ignore_ascii_case("buy"),
-                ),
-            ));
-        }
-        Ok(ticks)
+        csv_ticks(csv_data, ticker_id, "bybit", |r| {
+            let (qty, price): (f64, f64) = (field(r, 3)?, field(r, 4)?);
+            let buyer = r.get(2)?.eq_ignore_ascii_case("buy");
+            Some((secs_to_us(field(r, 0)?)?, price, qty * price, buyer))
+        })
     }
 }
 
@@ -164,19 +109,31 @@ mod tests {
 
     /// Linear perp rows: fractional epoch seconds, side word, size in base.
     #[test]
-    fn perp_csv_seconds_and_header() {
+    fn perp_csv_seconds_header_and_short_rows() {
         let csv = "timestamp,symbol,side,size,price,tickDirection,trdMatchID,grossValue,homeNotional,foreignNotional,RPI\n\
                    1793836800.221,BTCUSDT,Sell,0.063,80474.10,MinusTick,x,5.0e11,0.063,5069.8683,0\n\
-                   1585180700.0647,BTCUSDT,Buy,0.042,6698.5,PlusTick,y,2.8e10,0.042,281.337\n";
+                   1585180700.0647,BTCUSDT,Buy,0.042,6698.5,PlusTick,y,2.8e10,0.042,281.337\n\
+                   1585180701.5,BTCUSDT,Buy\n";
         let t = BybitSource::parse_perp_csv(csv.as_bytes(), 7).unwrap();
         assert_eq!(
             t.len(),
             2,
-            "5- and 6-column rows both parse, header skipped"
+            "5- and 6-column rows parse; header and short row skipped"
         );
         assert_eq!({ t[0].body.vbid }, 5069);
         assert_eq!({ t[1].body.vask }, 281);
         // mts keeps 16 us resolution: floor, never a rounded-up ms.
         assert!((t[0].timestamp_ms() - 1_793_836_800_221).abs() <= 1);
+        assert!((t[1].timestamp_ms() - 1_585_180_700_065).abs() <= 1);
+    }
+
+    /// Spot rows: id, ms timestamp, price, volume, side; a cut row never panics.
+    #[test]
+    fn spot_csv_ms_and_short_rows() {
+        let csv = "id,timestamp,price,volume,side\n1,1704153600365,44176,0.5,buy\n2,17041536";
+        let t = BybitSource::parse_csv(csv.as_bytes(), 7).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!({ t[0].body.vask }, 22088);
+        assert!((t[0].timestamp_ms() - 1_704_153_600_365).abs() <= 1);
     }
 }

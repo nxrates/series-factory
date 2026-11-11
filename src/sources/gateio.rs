@@ -2,11 +2,10 @@ use crate::sources::common::*;
 use crate::sources::{provider_id_for, series_key, split_quote, TickSource};
 use crate::types::{Config, TickFrame};
 use anyhow::Result;
-use csv::ReaderBuilder;
-use std::io::Cursor;
+use chrono::Datelike;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Gate.io USDT-margined perps (`download.gatedata.org/futures_usdt/trades`).
 /// Perp-only: the spot archive is not wired here.
@@ -27,33 +26,15 @@ impl GateioSource {
     /// signed contract count (negative = taker sell); `quanto` is base units per
     /// contract. Header-tolerant.
     fn parse_csv(csv_data: &[u8], ticker_id: u64, quanto: f64) -> Result<Vec<TickFrame>> {
-        let mut rdr = ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(true)
-            .from_reader(Cursor::new(csv_data));
-        let mut ticks = Vec::new();
-        let pid = provider_id_for("gateio");
-        let mut r = csv::StringRecord::new();
-        while rdr.read_record(&mut r)? {
-            let (Ok(ts), Ok(price), Ok(size)) = (
-                r[0].parse::<f64>(),
-                r[2].parse::<f64>(),
-                r[3].parse::<f64>(),
-            ) else {
-                continue;
-            };
-            ticks.push(TickFrame::new(
-                pid,
-                mitch::timestamp::from_epoch_us((ts * 1e6).round() as u64),
-                honest_tick(
-                    ticker_id,
-                    price,
-                    (size.abs() * quanto * price) as u32,
-                    size > 0.0,
-                ),
-            ));
-        }
-        Ok(ticks)
+        csv_ticks(csv_data, ticker_id, "gateio", |r| {
+            let (price, size): (f64, f64) = (field(r, 2)?, field(r, 3)?);
+            Some((
+                secs_to_us(field(r, 0)?)?,
+                price,
+                size.abs() * quanto * price,
+                size > 0.0,
+            ))
+        })
     }
 
     /// Base units per contract from the public contracts endpoint (the archive
@@ -61,6 +42,11 @@ impl GateioSource {
     async fn quanto_multiplier(&self, contract: &str) -> Result<f64> {
         let url = format!("https://api.gateio.ws/api/v4/futures/usdt/contracts/{contract}");
         let reply = self.agent.get(&url, &[]).await?;
+        anyhow::ensure!(
+            reply.status == 200,
+            "Gate {contract}: contracts HTTP {}",
+            reply.status
+        );
         let j: serde_json::Value = serde_json::from_slice(&reply.body)?;
         j["quanto_multiplier"]
             .as_str()
@@ -81,7 +67,17 @@ impl TickSource for GateioSource {
         let sym = format!("{}_USDT", config.base.to_uppercase());
         let (dir, tid) = series_key(config);
         let quanto = self.quanto_multiplier(&sym).await?;
-        info!("Fetching Gate data for {}", sym);
+        info!(
+            "Fetching Gate data for {} (quanto_multiplier {})",
+            sym, quanto
+        );
+        let now = chrono::Utc::now().date_naive();
+        if config.to.date_naive() >= now.with_day(1).unwrap() {
+            warn!(
+                "gateio publishes monthly files only: the current month ({}) yields nothing",
+                now.format("%Y-%m")
+            );
+        }
         let parse = |c: &[u8], t: u64| Self::parse_csv(c, t, quanto);
         let files = fetch_monthly_daily(
             &self.agent,
@@ -112,13 +108,16 @@ mod tests {
 
     /// Signed contract counts: sign is the taker side, quanto scales to base.
     #[test]
-    fn signed_contracts_to_side_and_notional() {
+    fn signed_contracts_to_side_notional_and_time() {
         let csv = "1704067200.692228,249314541,42317.5,11\n\
-                   1704067204.158683,249314566,42323.3,-79\n";
+                   1704067204.158683,249314566,42323.3,-79\n\
+                   1704067205.1,249314567";
         let t = GateioSource::parse_csv(csv.as_bytes(), 7, 0.0001).unwrap();
-        assert_eq!(t.len(), 2);
+        assert_eq!(t.len(), 2, "short row skipped");
         assert_eq!(({ t[0].body.vask }, { t[0].body.vbid }), (46, 0));
         assert_eq!(({ t[1].body.vask }, { t[1].body.vbid }), (0, 334));
+        assert!((t[0].timestamp_ms() - 1_704_067_200_692).abs() <= 1);
+        assert!((t[1].timestamp_ms() - 1_704_067_204_159).abs() <= 1);
         let hdr = format!("timestamp,id,price,size\n{csv}");
         assert_eq!(
             GateioSource::parse_csv(hdr.as_bytes(), 7, 1.0)
