@@ -1,4 +1,4 @@
-//! Fan four per-provider `.idx` AppendLogs into a single cross-provider
+//! Fan per-provider `.idx` AppendLogs into a single cross-provider
 //! `<BASE>-<QUOTE>/<YYYY-MM-DD>.idx` set of daily shards via TDWAP.
 //!
 //! Mirrors the prod aggregator's inner cycle: at every composite cycle we
@@ -8,19 +8,14 @@
 //! `boundary_ts.utc_date()`. All
 //! artifacts are sharded by `open_ts.date_utc()` — daily granularity.
 //!
-//! Every exchange needs a weight (`cexs.exchanges.<name>.weight` or `--weight`);
-//! one without is an error, never a silent 1.0. Relay providers are exempt.
-//!
-//! Default weights (locked in for the BTC/USDT offline replay):
-//!   binance=40, okx=20, bybit=30, bitget=10
-//! Override at runtime with `--weight <exchange>=<w>` (repeatable) or by
-//! pointing `NXR_TICKER_PARAMS_PATH` at a ticker-params.json.
+//! Every exchange needs a weight: `cexs.exchanges.<name>.weight`, or `--weight
+//! <exchange>=<w>` (repeatable, wins); one without is an error, never a silent
+//! 1.0. Relay providers are exempt. Providers default to every exchange in the
+//! config plus the relay providers; one with no `.idx` for the ticker is skipped.
 //!
 //! Usage:
-//!   merge-idx <BASE> <QUOTE>
-//!     [--exchange binance --exchange okx --exchange bybit --exchange bitget]
-//!     [--cycle-ms 50] [--stale-secs 30]
-//!     [--weight binance=40 --weight okx=20 --weight bybit=30 --weight bitget=10]
+//!   merge-idx <BASE> <QUOTE> [--exchange <name>]... [--cycle-ms 200] [--stale-secs 30]
+//!     [--weight <exchange>=<w>]...
 //!
 //! Inputs:  `$NXR_DATA_INDEXES/<exchange>/<BASE>-<QUOTE>.idx` for each exchange
 //! Output:  `$NXR_DATA_INDEXES/<MITCH_ID>/<YYYY-MM-DD>.idx`
