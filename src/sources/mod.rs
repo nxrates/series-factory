@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod common;
+pub use common::excluded;
 pub mod synthetic;
 
 pub mod bitget;
@@ -264,5 +265,21 @@ mod tests {
         ] {
             assert!(venue(&cfg(quote)).unwrap().is_none(), "{quote}");
         }
+    }
+
+    /// A pair in the venue's `exclude_symbols` is never probed or fetched.
+    #[tokio::test]
+    async fn excluded_pairs_have_no_coverage() {
+        assert!(excluded("bybit", "U", "USDT").unwrap());
+        assert!(!excluded("bybit", "BTC", "USDT").unwrap());
+        assert!(!excluded("binance", "U", "USDT").unwrap());
+        let bybit = common::ArchiveSource::new(bybit::venue);
+        let mut c = cfg("USDT");
+        c.base = "U".into();
+        assert_eq!(bybit.probe(&c).await.unwrap(), None);
+        assert!(bybit
+            .fetch_ticks(&c, tokio::sync::mpsc::channel(1).0)
+            .await
+            .is_err());
     }
 }

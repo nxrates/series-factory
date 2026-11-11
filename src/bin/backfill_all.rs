@@ -752,6 +752,7 @@ impl Counters {
 /// availability vec + filtered exchanges that have coverage.
 fn probe_availability(
     ctx: &PlanCtx,
+    exchanges: &[String],
     base: &str,
     quote: &str,
 ) -> (Vec<AvailabilityEntry>, Vec<String>) {
@@ -760,7 +761,7 @@ fn probe_availability(
         "--pairs".to_string(),
         base.to_string(),
         "--exchanges".to_string(),
-        ctx.exchanges.join(","),
+        exchanges.join(","),
         "--quote".to_string(),
         quote.to_string(),
         "--from-date".to_string(),
@@ -790,7 +791,7 @@ fn probe_availability(
             }
             if let Ok(parsed) = serde_json::from_str::<Vec<ProbeOut>>(last) {
                 for p in parsed {
-                    if p.has_data && ctx.exchanges.iter().any(|e| e == &p.exchange) {
+                    if p.has_data && exchanges.iter().any(|e| e == &p.exchange) {
                         active.push(p.exchange.clone());
                     } else if !p.has_data {
                         warn!(
@@ -808,20 +809,40 @@ fn probe_availability(
                 }
             } else {
                 warn!(stdout_tail = %last, "probe stdout did not parse; falling back to full exchange list");
-                active = ctx.exchanges.clone();
+                active = exchanges.to_vec();
             }
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
             warn!(exit = ?o.status.code(), stderr = %stderr, "probe failed; falling back");
-            active = ctx.exchanges.clone();
+            active = exchanges.to_vec();
         }
         Err(e) => {
             warn!(err = %e, "probe spawn failed; falling back");
-            active = ctx.exchanges.clone();
+            active = exchanges.to_vec();
         }
     }
     (result, active)
+}
+
+/// A one-step failed report for a ticker that never started.
+fn failed_report(ctx: &PlanCtx, ticker: &str, step: &str, error: String) -> TickerReport {
+    ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+    write_marker(&ctx.args.out_dir, ticker, "failed");
+    TickerReport {
+        ticker: ticker.to_string(),
+        status: "failed".to_string(),
+        steps: vec![StepReport {
+            name: step.to_string(),
+            duration_ms: 0,
+            exit_code: -1,
+            bytes: 0,
+            skipped: false,
+            errors: vec![error],
+        }],
+        ticker_availability: Vec::new(),
+        skip_reason: None,
+    }
 }
 
 fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
@@ -917,13 +938,27 @@ fn run_ticker(ctx: &PlanCtx, ticker: &str) -> TickerReport {
 
     // 0) availability probe — drops dead exchanges before fetch
     let mut availability = Vec::new();
-    let mut active_exchanges = ctx.exchanges.clone();
+    // A venue that lists this pair as an unrelated asset (`exclude_symbols`) never contributes.
+    let venues: Vec<String> = match ctx
+        .exchanges
+        .iter()
+        .filter_map(|e| match series_factory::sources::excluded(e, &base, &quote) {
+            Ok(true) => None,
+            Ok(false) => Some(Ok(e.clone())),
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<_>>()
+    {
+        Ok(v) => v,
+        Err(err) => return failed_report(ctx, ticker, "config", format!("{err:#}")),
+    };
+    let mut active_exchanges = venues.clone();
     // An oracle-relayed symbol (FX, metals, equities, stablecoin pegs) has no
     // CEX book at all. Before the `pyth` step existed this was a hard skip, so
     // the "backfill everything" entry point silently covered crypto only.
     let mut pyth_only = false;
     if !ctx.args.skip_probe && want("fetch") {
-        let (av, active) = probe_availability(ctx, &base, &quote);
+        let (av, active) = probe_availability(ctx, &venues, &base, &quote);
         availability = av;
         // Pyth history is spot-only: a perp series with no coverage is skipped, never re-sourced.
         if active.is_empty() && want("pyth") && !perp {

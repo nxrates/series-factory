@@ -65,6 +65,8 @@ struct Template {
 struct Exchange {
     #[serde(default)]
     archive_url_template: Template,
+    #[serde(default)]
+    exclude_symbols: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -77,6 +79,24 @@ struct Cexs {
 struct Doc {
     #[serde(default)]
     cexs: Cexs,
+}
+
+/// Is `BASE/QUOTE` (quote spelled as in the series, `USDT:PERP` for perps) in the
+/// venue's `exclude_symbols`? Such a pair is an unrelated asset on that venue, so
+/// it never enters a composite: not probed, not fetched.
+pub fn excluded(exchange: &str, base: &str, quote: &str) -> Result<bool> {
+    use nxr_sdk::pipeline_config::{ConfigHint, PipelineYml};
+    let path = PipelineYml::resolve_path(ConfigHint::Bin);
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("read config {}", path.display()))?;
+    let doc: Doc =
+        serde_yml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
+    let pair = format!("{}/{}", base.to_uppercase(), quote.to_uppercase());
+    Ok(doc.cexs.exchanges.get(exchange).is_some_and(|e| {
+        e.exclude_symbols
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(&pair))
+    }))
 }
 
 /// URL stems of one venue × market from the pipeline config (`NXR_CONFIG`, else
@@ -1228,6 +1248,13 @@ impl TickSource for ArchiveSource {
     async fn fetch_ticks(&self, config: &Config, tx: mpsc::Sender<Vec<TickFrame>>) -> Result<()> {
         let v = (self.venue)(config)?
             .with_context(|| format!("no archive for {} on this venue", config.quote))?;
+        anyhow::ensure!(
+            !excluded(v.name, &config.base, &config.quote)?,
+            "{}/{} is in {}.exclude_symbols",
+            config.base,
+            config.quote,
+            v.name
+        );
         let (dir, ticker_id) = series_key(config);
         info!("Fetching {} data for {}", v.name, v.sym);
         let net = Live {
@@ -1252,6 +1279,9 @@ impl TickSource for ArchiveSource {
         let Some(v) = (self.venue)(config)? else {
             return Ok(None);
         };
+        if excluded(v.name, &config.base, &config.quote)? {
+            return Ok(None);
+        }
         let net = Live {
             agent: self.agent.clone(),
             ticker_id: series_key(config).1,

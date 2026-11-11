@@ -77,6 +77,8 @@ cexs:
           daily: https://data.binance.vision/data/futures/um/daily/aggTrades/{sym}/
     bybit:
       weight: 15
+      # Bybit's `U` is an unrelated token, not United Stables (see the live config).
+      exclude_symbols: [U/USDT]
       archive_url_template:
         monthly: https://public.bybit.com/spot/{sym}/
         daily: https://public.bybit.com/spot/{sym}/
