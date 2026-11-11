@@ -101,22 +101,32 @@ pub fn unlist_shards(dir: &Path, shards: &[PathBuf]) {
 
 /// Which venues contributed to each finished composite day, beside the manifest.
 /// A day finalised with fewer venues than were asked for is visible here, and can
-/// be rebuilt later with `--rebuild`. Written atomically (temp + rename).
+/// be rebuilt later with `--rebuild`. Written atomically (temp + rename). `forget`
+/// days (a rebuild that produced nothing) lose their entry. An unparseable file is
+/// an error, never an empty history to overwrite.
 pub fn record_venues(
     dir: &Path,
     days: &std::collections::BTreeMap<NaiveDate, Vec<String>>,
+    forget: &[NaiveDate],
 ) -> Result<()> {
-    let mut all = read_venues(dir);
+    let mut all = read_venues(dir)?;
+    for d in forget {
+        all.remove(&d.to_string());
+    }
     all.extend(days.iter().map(|(d, v)| (d.to_string(), v.clone())));
     write_shard_atomic(&dir.join("venues.json"), &serde_json::to_vec_pretty(&all)?)
 }
 
-/// The recorded venues per day (`YYYY-MM-DD` -> venue names); empty when none.
-pub fn read_venues(dir: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
-    std::fs::read(dir.join("venues.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+/// The recorded venues per day (`YYYY-MM-DD` -> venue names); empty when the file
+/// does not exist, an error when it exists but cannot be read.
+pub fn read_venues(dir: &Path) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+    let path = dir.join("venues.json");
+    match std::fs::read(&path) {
+        Ok(b) => serde_json::from_slice(&b)
+            .with_context(|| format!("{} is corrupt: fix or remove it", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 /// A derived shard is fresh when it is a whole, non-empty number of `rec_size`
@@ -203,12 +213,22 @@ mod done_tests {
         let one = |d: u32, v: &[&str]| {
             std::collections::BTreeMap::from([(day(d), v.iter().map(|s| s.to_string()).collect())])
         };
-        record_venues(&dir, &one(1, &["binance", "okx"])).unwrap();
-        record_venues(&dir, &one(2, &["binance"])).unwrap();
-        record_venues(&dir, &one(1, &["binance", "okx", "bybit"])).unwrap();
-        let got = read_venues(&dir);
+        record_venues(&dir, &one(1, &["binance", "okx"]), &[]).unwrap();
+        record_venues(&dir, &one(2, &["binance"]), &[]).unwrap();
+        record_venues(&dir, &one(1, &["binance", "okx", "bybit"]), &[]).unwrap();
+        let got = read_venues(&dir).unwrap();
         assert_eq!(got["2024-01-01"].len(), 3);
         assert_eq!(got["2024-01-02"], ["binance"]);
+        // a rebuild that produced nothing forgets the day
+        record_venues(&dir, &Default::default(), &[day(2)]).unwrap();
+        assert!(!read_venues(&dir).unwrap().contains_key("2024-01-02"));
+        // a corrupt sidecar is never replaced by an empty history
+        std::fs::write(dir.join("venues.json"), b"{ truncat").unwrap();
+        assert!(record_venues(&dir, &one(3, &["binance"]), &[]).is_err());
+        assert_eq!(
+            std::fs::read(dir.join("venues.json")).unwrap(),
+            b"{ truncat"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
