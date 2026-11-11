@@ -222,9 +222,11 @@ fn main() -> Result<()> {
         });
     }
 
-    // Final flush — close out whatever is in the last partial cycle.
-    if let Some(index) = acc.flush() {
-        let mts = mitch::timestamp::from_epoch_ms(last_tick_ms.max(next_cycle_ms.unwrap_or(0)));
+    // Final flush — close out whatever is in the last partial cycle, unless its
+    // stamp falls past the window.
+    let final_ms = last_tick_ms.max(next_cycle_ms.unwrap_or(0));
+    if let Some(index) = acc.flush().filter(|_| final_ms < window.1) {
+        let mts = mitch::timestamp::from_epoch_ms(final_ms);
         let header = MitchHeader::new(message_type::INDEX, provider_id, mts, 1);
         log.append(&IndexRecord { header, index })
             .with_context(|| "AppendLog final append failed")?;

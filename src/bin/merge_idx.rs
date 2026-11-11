@@ -301,8 +301,9 @@ fn main() -> Result<()> {
         }
     }
 
-    // final flush at last observed cycle boundary
-    if dirty {
+    // Final flush at the last observed cycle boundary: not past the window, or
+    // the writer would rotate into (and replace) the next day's shard.
+    if dirty && next_cycle_ms.is_some_and(|b| b < window.1) {
         let boundary = next_cycle_ms.unwrap();
         let boundary_now = sim_now(boundary);
         if let Some(composite) = compute_vwap_at(
