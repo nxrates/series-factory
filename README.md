@@ -120,7 +120,7 @@ Every new symbol, leg or source needs >= 7 d of history in the rollout (`docs/in
 
 Spot archive URL templates are YAML-driven (`cexs.exchanges.<name>.archive_url_template` in the pipeline config). Perp stems are constants in the source (`sources/*.rs`): the archive layout and the parser are one unit. Sources convert trades to ticks pessimistically: market sells set the bid, market buys set the ask, and the other side is forward-filled.
 
-**No public bulk trade history** (probed 2026-11-11, unauthenticated): Hyperliquid (requester-pays S3), Aster, MEXC, XT.com, WhiteBIT (login-gated downloads), CoinW (also hard-excluded from index construction), Toobit, Ourbit, Lighter (account-scoped export, REST only), Variational (per-user CSV only). Only REST recent-trades or vendor-paid history exists for these, so no fetcher is provided.
+**No public bulk trade history** (probed on 2026-11-11, unauthenticated; re-probe before relying on it): Hyperliquid (requester-pays S3), Aster, MEXC, XT.com, WhiteBIT (login-gated downloads), CoinW (also hard-excluded from index construction), Toobit, Ourbit, Lighter (account-scoped export, REST only), Variational (per-user CSV only). Only REST recent-trades or vendor-paid history exists for these, so no fetcher is provided.
 
 ## Perpetual series
 
@@ -139,6 +139,8 @@ Notes:
 - Per-tick volume is quote notional truncated to whole units (`u32`); a single perp trade cannot overflow it. Sub-unit trades truncate to zero, as for spot.
 - Perp provider ids in `.idx` headers are the spot venue's ids (the series is told apart by ticker id and path, not by provider id).
 - Contracts quoted per 1000 units (e.g. Binance `1000PEPEUSDT`) are not rescaled.
+- `backfill-all` for perps needs explicit `--tickers BTC-USDT:PERP,…` and `--exchanges …` (this path has not been exercised end to end against perps): the default pair set includes stablecoin bases that have no perps, and `gateio` is not in the default exchange list.
+- `merge-idx` requires a weight for every exchange (`cexs.exchanges.<name>.weight` in the config or `--weight name=n`) and fails naming the venue otherwise; relay providers are exempt. A config copied without `gateio` therefore errors instead of blending it at an arbitrary weight.
 - `--probe` skips perp series (coverage is discovered while fetching).
 - Funding, mark and index prices are not part of any trade archive and are not ingested.
 
