@@ -55,7 +55,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, Utc};
 use clap::Parser;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -200,7 +200,12 @@ struct TargetResolver {
     cal: Option<nxr_sdk::pipeline_config::CalibrationYml>,
     crypto_majors: Vec<String>,
     stablecoins: Vec<String>,
+    /// `cexs.usd_aliases`: the raw-USD leg of a peg (with `stablecoins`).
+    usd_aliases: Vec<String>,
     fx_majors: Vec<String>,
+    /// Configured native ticker ids (`NxrConfig::symbols` ∪ oracle provider
+    /// symbols); `None` when config.yml failed to load.
+    native_ids: Option<BTreeSet<u64>>,
 }
 
 impl TargetResolver {
@@ -223,6 +228,8 @@ impl TargetResolver {
                         DEFAULT_CRYPTO_MAJORS,
                     )),
                     stablecoins: to_owned(effective_list(&yml.cexs.pegged, DEFAULT_STABLECOINS)),
+                    usd_aliases: to_owned(effective_list(&yml.cexs.usd_aliases, &["USD"])),
+                    native_ids: Some(configured_native_ids(&yml)),
                     fx_majors: to_owned(effective_list(&yml.cexs.fx_majors, DEFAULT_FX_MAJORS)),
                 }
             }
@@ -230,7 +237,9 @@ impl TargetResolver {
                 cal: None,
                 crypto_majors: Vec::new(),
                 stablecoins: Vec::new(),
+                usd_aliases: Vec::new(),
                 fx_majors: Vec::new(),
+                native_ids: None,
             },
         }
     }
@@ -267,21 +276,62 @@ impl TargetResolver {
         Some(cal.target_for_pair_classed(&pair, class.as_key()))
     }
 
-    /// Whether `ticker_id` is a known stable/pegged pair by IDENTITY (asset-class
-    /// bucket = `crypto_stable`), independent of any volatility inference. Used
-    /// by the stuck-feed gate so a frozen non-stable feed cannot excuse itself
-    /// via the vol-derived `crypto_stable` flag. Unknown pair (unresolvable id)
-    /// → `false` (treat as non-stable; a flatline there is still suspicious).
+    /// Whether `ticker_id` is a stable pair by PEG identity: both legs redeem
+    /// against the same numeraire (`PegClass::SameNumeraire`, the arm of
+    /// `server::signed::peg_class_of_ticker` that `is_known_stable` and the
+    /// sigma floor share), never by volatility. Unregistered leg -> `false`.
     fn is_known_stable(&self, ticker_id: u64) -> bool {
-        use nxr_sdk::asset_class::{bucket_for_pair, AssetClassBucket};
-        let Some(pair) = Self::pair_sym(ticker_id) else {
-            return false;
-        };
-        let cm: Vec<&str> = self.crypto_majors.iter().map(String::as_str).collect();
-        let sc: Vec<&str> = self.stablecoins.iter().map(String::as_str).collect();
-        let fm: Vec<&str> = self.fx_majors.iter().map(String::as_str).collect();
-        bucket_for_pair(&pair, ticker_id, &cm, &sc, &fm) == AssetClassBucket::CryptoStable
+        same_numeraire(ticker_id, &self.stablecoins, &self.usd_aliases)
     }
+}
+
+/// Both legs of `ticker_id` answer to `cexs.pegged ∪ cexs.usd_aliases`,
+/// matched on the asset record (name, packed MITCH id, aliases) so an alias
+/// spelling classifies like the canonical one.
+fn same_numeraire(ticker_id: u64, pegged: &[String], usd_aliases: &[String]) -> bool {
+    let (base, quote) = nxr_sdk::resolve::ticker_assets(ticker_id);
+    let leg = |a: &nxr_sdk::mitch::ticker::Asset| {
+        let packed = nxr_sdk::mitch::ticker::pack_asset(a.class, a.class_id).to_string();
+        pegged.iter().chain(usd_aliases).any(|s| {
+            s.eq_ignore_ascii_case(&a.name)
+                || *s == packed
+                || a.aliases.split('|').any(|x| s.eq_ignore_ascii_case(x))
+        })
+    };
+    matches!((base, quote), (Some(b), Some(q)) if leg(b) && leg(q))
+}
+
+/// Native ticker ids from config, not from disk (NODE_ARCHITECTURE.md §2):
+/// `NxrConfig::symbols` ∪ `oracles.providers.*.symbols`. Same union as the
+/// materialization gate (`core/src/main.rs` `native_ids`); unresolvable
+/// symbols are skipped.
+fn configured_native_ids(yml: &nxr_sdk::pipeline_config::PipelineYml) -> BTreeSet<u64> {
+    use nxr_sdk::config::NxrConfig;
+    use nxr_sdk::pipeline_config::ConfigHint;
+    let cfg = NxrConfig::from_env_with_hint(ConfigHint::Bin);
+    cfg.symbols
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .chain(yml.relay_symbols())
+        .filter_map(|s| nxr_sdk::try_resolve_ticker_id(&s))
+        .collect()
+}
+
+/// Split ids into `(audit, orphan_dir, not_relayed)`: configured with a dir are
+/// audited; dirs not in config are `orphan_dir` (cleanup list, no verdict);
+/// configured ids with no dir are `not_relayed` (no verdict).
+fn plan_enumeration(
+    configured: &BTreeSet<u64>,
+    on_disk: &[u64],
+) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+    let disk: BTreeSet<u64> = on_disk.iter().copied().collect();
+    (
+        configured.intersection(&disk).copied().collect(),
+        disk.difference(configured).copied().collect(),
+        configured.difference(&disk).copied().collect(),
+    )
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -468,6 +518,10 @@ struct AuditReport {
     n_pass: u64,
     n_fail: u64,
     n_no_data: u64,
+    /// Dirs on disk that are not in the configured native set (cleanup list).
+    orphan_dirs: Vec<u64>,
+    /// Configured native ids with no dir (declared, never relayed).
+    not_relayed: Vec<u64>,
 }
 
 // ── Stats: median/mean/stddev/mad all sourced from `nxr_sdk::stats` ─────────
@@ -872,6 +926,133 @@ fn failed_ticker_report(id: u64, e: &anyhow::Error) -> TickerReport {
 
 // ── Per-ticker audit ─────────────────────────────────────────────────────────
 
+// ── Sessions (shared by OUTAGE + K4) ──────────────────────────────────────
+
+/// Observed trading sessions of one ticker, derived from its own idx tape with
+/// no calendar and no per-class table (owner rule: market hours = weekends
+/// only, per asset class, so the tape decides).
+///  * `days`: first and last record per UTC day. A market that is closed prints
+///    nothing, so a weekend/holiday has no entry and a 24/7 tape yields a full
+///    day. 439 of 439 cert failures on 2026-08-14 were an overnight close
+///    scored as a dead feed.
+///  * `breaks`: intra-day gaps whose same time-of-day span recurs as a gap on
+///    >= `BREAK_MIN_OTHER_DAYS` other weekdays in the window (FX 21-22Z
+///    rollover, index halts). Learned per ticker, never per symbol.
+struct Sessions {
+    days: std::collections::BTreeMap<NaiveDate, (i64, i64)>,
+    /// Absolute `(start_ms, end_ms)` of recurring breaks, sorted by start.
+    breaks: Vec<(i64, i64)>,
+}
+
+const BREAK_MIN_OTHER_DAYS: usize = 3;
+const MS_DAY: i64 = 86_400_000;
+
+impl Sessions {
+    /// `ts` ascending record timestamps (ms).
+    fn build(ts: &[i64], max_gap_ms: i64) -> Self {
+        use std::collections::BTreeMap;
+        let mut days: BTreeMap<NaiveDate, (i64, i64)> = BTreeMap::new();
+        for &t in ts {
+            let e = days.entry(ts_ms_to_utc_date(t)).or_insert((t, t));
+            e.0 = e.0.min(t);
+            e.1 = e.1.max(t);
+        }
+        // Intra-day gaps per date, as time-of-day spans.
+        let mut by_day: BTreeMap<NaiveDate, Vec<(i64, i64)>> = BTreeMap::new();
+        for w in ts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let d = ts_ms_to_utc_date(a);
+            if b - a > max_gap_ms && d == ts_ms_to_utc_date(b) {
+                let base = a.div_euclid(MS_DAY) * MS_DAY;
+                by_day.entry(d).or_default().push((a - base, b - base));
+            }
+        }
+        let weekday = |d: &NaiveDate| d.weekday().number_from_monday() <= 5;
+        let mut breaks = Vec::new();
+        for (d, gaps) in &by_day {
+            let base = d.and_hms_opt(0, 0, 0).map(|x| x.and_utc().timestamp_millis());
+            let Some(base) = base else { continue };
+            for &(s, e) in gaps {
+                let len = e - s;
+                let recurs = by_day
+                    .iter()
+                    .filter(|(od, og)| {
+                        *od != d
+                            && weekday(od)
+                            && og.iter().any(|&(s2, e2)| {
+                                let ov = e.min(e2) - s.max(s2);
+                                ov > 0 && 2 * ov >= len.max(e2 - s2)
+                            })
+                    })
+                    .count();
+                if recurs >= BREAK_MIN_OTHER_DAYS {
+                    breaks.push((base + s, base + e));
+                }
+            }
+        }
+        breaks.sort_unstable();
+        Sessions { days, breaks }
+    }
+
+    /// The gap `[from, to]` is itself a learned recurring break.
+    fn is_recurring_break(&self, from: i64, to: i64) -> bool {
+        self.breaks.binary_search(&(from, to)).is_ok()
+    }
+
+    /// Milliseconds of `[from, to]` inside days that traded.
+    fn active_ms(&self, from: i64, to: i64) -> i64 {
+        self.days
+            .values()
+            .map(|(o, c)| (to.min(*c) - from.max(*o)).max(0))
+            .sum()
+    }
+
+    /// `ts` falls inside a traded day and outside a recurring break. An empty
+    /// map (no idx tape) is "unknown", read as open so nothing is excused.
+    fn is_open(&self, ts: i64) -> bool {
+        if self.days.is_empty() {
+            return true;
+        }
+        let in_day = self
+            .days
+            .get(&ts_ms_to_utc_date(ts))
+            .is_some_and(|(o, c)| ts >= *o && ts <= *c);
+        if !in_day {
+            return false;
+        }
+        let i = self.breaks.partition_point(|(s, _)| *s <= ts);
+        !(i > 0 && ts < self.breaks[i - 1].1)
+    }
+}
+
+/// K4 run tracker: consecutive in-session zero-tick bars. An out-of-session bar
+/// resets the run (a closed market is not a stall). Remembers the end of the
+/// CURRENT run so a sample prints where that run ended, not the longest's.
+#[derive(Default)]
+struct ZeroRun {
+    run: u64,
+    end_ms: i64,
+    longest: u64,
+}
+
+impl ZeroRun {
+    /// Feed one bar; returns `(run_len, run_end_ms)` of the run that just ended.
+    fn push(&mut self, open_ms: i64, zero_tick: bool, open: bool) -> Option<(u64, i64)> {
+        if zero_tick && open {
+            self.run += 1;
+            self.end_ms = open_ms;
+            self.longest = self.longest.max(self.run);
+            return None;
+        }
+        self.finish()
+    }
+    fn finish(&mut self) -> Option<(u64, i64)> {
+        let out = (self.run > 0).then_some((self.run, self.end_ms));
+        self.run = 0;
+        out
+    }
+}
+
 fn audit_ticker(
     data_root: &Path,
     id: u64,
@@ -988,33 +1169,9 @@ fn audit_ticker(
         .iter()
         .any(|rec| (rec.index.flags & FLAG_HEARTBEAT_SENTINEL) != 0);
 
-    // Observed session envelope per UTC day: first and last record that day.
-    // A market that is closed prints nothing, so the envelope IS the session,
-    // derived per ticker with no calendar and no per-class table. A 24/7 tape
-    // yields a full-day envelope and so excuses nothing; an equity yields its
-    // real session and its overnight gap stops reading as an outage. 439 of
-    // 439 cert failures on 2026-08-14 were this: a 3.6 h overnight close
-    // scored identically to a dead feed.
-    let sessions: std::collections::BTreeMap<NaiveDate, (i64, i64)> = {
-        let mut m: std::collections::BTreeMap<NaiveDate, (i64, i64)> =
-            std::collections::BTreeMap::new();
-        for rec in records.iter() {
-            let ts = rec.shard_ts_ms();
-            let e = m.entry(ts_ms_to_utc_date(ts)).or_insert((ts, ts));
-            e.0 = e.0.min(ts);
-            e.1 = e.1.max(ts);
-        }
-        m
-    };
-    // Active milliseconds a span covers: overlap with the days that traded.
-    // A day with no records contributes nothing, so weekends and holidays fall
-    // out for free rather than needing to be enumerated.
-    let active_ms = |from: i64, to: i64| -> i64 {
-        sessions
-            .values()
-            .map(|(o, c)| (to.min(*c) - from.max(*o)).max(0))
-            .sum()
-    };
+    // Session map shared by the OUTAGE classifier and K4 (see `Sessions`).
+    let rec_ts: Vec<i64> = records.iter().map(|rec| rec.shard_ts_ms()).collect();
+    let sessions = Sessions::build(&rec_ts, max_gap_ms);
 
     for pair in records.windows(2) {
         let a = &pair[0];
@@ -1036,7 +1193,11 @@ fn audit_ticker(
         // Judge the gap on the time the market was OPEN inside it, not on wall
         // clock. An overnight or weekend span covers no active time; a genuine
         // stall inside a session covers all of it, so a 24/7 tape is unchanged.
-        let dt_active = active_ms(ts1, ts2);
+        let dt_active = if sessions.is_recurring_break(ts1, ts2) {
+            0
+        } else {
+            sessions.active_ms(ts1, ts2)
+        };
         let classification = if dt_active <= max_gap_ms {
             r.closed_gaps += 1;
             "closed"
@@ -1299,18 +1460,16 @@ fn audit_ticker(
         r.longest_flat_run = longest;
     }
 
-    // Stable/stable inference: annualized Parkinson sigma < 0.5% OR >95% zero returns.
-    let sigma_finite = r.sigma_park_ann.is_finite();
-    if (sigma_finite && r.sigma_park_ann < 0.005) || zero_return_frac > 0.95 {
-        r.crypto_stable = true;
-    }
+    // Stable = the peg resolver says both legs redeem against the SAME numeraire
+    // (identity, not volatility: USD1 has peg noise a sigma threshold misses).
+    r.crypto_stable = is_known_stable;
 
     // Stuck-feed gate (idx HIGH): near-constant feed (>99% zero returns) that is
     // NOT a known stable/pegged pair (resolved from the asset-class bucket, NOT
     // from the volatility-inferred `crypto_stable` flag — which would let a
     // flatline excuse itself). A genuine non-stable pair frozen at one quote is
     // a dead/stale forwarder, not legitimately quiet.
-    if !returns.is_empty() && zero_return_frac > 0.99 && !is_known_stable && !r.crypto_stable {
+    if !returns.is_empty() && zero_return_frac > 0.99 && !r.crypto_stable {
         r.stuck_feed = true;
         if r.s10_samples.len() < 10 {
             r.s10_samples.push(format!(
@@ -1531,7 +1690,7 @@ fn audit_ticker(
                 // search clamped at the wall (the SOL 3.995-vs-4.0 signature) and
                 // never converged on a target-bpd-correct k. Non-stable pairs only:
                 // a genuinely stable pair legitimately wants a near-ceiling k.
-                if !r.crypto_stable && !is_known_stable {
+                if !r.crypto_stable {
                     r.renko_k_clamped_warn = true;
                     if r.renko_samples.len() < 10 {
                         r.renko_samples.push(format!(
@@ -1591,8 +1750,7 @@ fn audit_ticker(
                                                     // Per day: bar count, plus the first and last bucket seen that day.
                                                     // The span between them IS the session, so coverage needs no calendar.
         let mut buckets_per_day: BTreeMap<NaiveDate, (u64, i64, i64)> = BTreeMap::new();
-        let mut zero_run: u64 = 0;
-        let mut zero_run_end_ms: i64 = 0;
+        let mut k4 = ZeroRun::default();
         for (date, bars) in &s10_bars_by_shard {
             // Cross-shard seam x-check via the SHARED production primitive
             // (`seam::check_s10_cross_shard`, close→close residual, ±1ms jitter
@@ -1619,24 +1777,23 @@ fn audit_ticker(
                 // K4 flat-fill run (see `s10_zero_tick_bars`). Counted per
                 // ticker across shards: an outage that straddles UTC midnight is
                 // one event, not two.
-                if bar.tick_count == 0 {
+                // Judged only inside trading sessions (shared `Sessions`).
+                let bar_open = bar.open_time_ms() as i64;
+                let in_session = sessions.is_open(bar_open + S10_BUCKET_MS / 2);
+                let zero = bar.tick_count == 0;
+                if zero && in_session {
                     r.s10_zero_tick_bars += 1;
-                    zero_run += 1;
-                    if zero_run > r.s10_longest_zero_run {
-                        r.s10_longest_zero_run = zero_run;
-                        zero_run_end_ms = bar.open_time_ms();
-                    }
-                } else {
-                    if zero_run >= K4_ZERO_RUN_WARN && r.s10_zero_run_samples.len() < 10 {
+                }
+                if let Some((n, end_ms)) = k4.push(bar_open, zero, in_session) {
+                    if n >= K4_ZERO_RUN_WARN && r.s10_zero_run_samples.len() < 10 {
                         r.s10_zero_run_samples.push(format!(
                             "[{}] K4 {} consecutive zero-tick bars ({} s frozen price) ending ts={}",
                             date,
-                            zero_run,
-                            zero_run * (S10_BUCKET_MS as u64) / 1000,
-                            zero_run_end_ms
+                            n,
+                            n * (S10_BUCKET_MS as u64) / 1000,
+                            end_ms
                         ));
                     }
-                    zero_run = 0;
                 }
                 let o = bar.open;
                 let h = bar.high;
@@ -1728,14 +1885,17 @@ fn audit_ticker(
 
         // A run still open at the end of the window is the WORST case — it means
         // the price is frozen right now — so flush it rather than dropping it.
-        if zero_run >= K4_ZERO_RUN_WARN && r.s10_zero_run_samples.len() < 10 {
-            r.s10_zero_run_samples.push(format!(
-                "K4 {} consecutive zero-tick bars ({} s frozen price) ending ts={} (RUN OPEN AT WINDOW END)",
-                zero_run,
-                zero_run * (S10_BUCKET_MS as u64) / 1000,
-                zero_run_end_ms
-            ));
+        if let Some((n, end_ms)) = k4.finish() {
+            if n >= K4_ZERO_RUN_WARN && r.s10_zero_run_samples.len() < 10 {
+                r.s10_zero_run_samples.push(format!(
+                    "K4 {} consecutive zero-tick bars ({} s frozen price) ending ts={} (RUN OPEN AT WINDOW END)",
+                    n,
+                    n * (S10_BUCKET_MS as u64) / 1000,
+                    end_ms
+                ));
+            }
         }
+        r.s10_longest_zero_run = k4.longest;
 
         // K3 coverage, measured against the ticker's OWN session norm rather
         // than a 24/7 day. A fixed `MS_PER_DAY / bucket` denominator asserts
@@ -2221,6 +2381,11 @@ fn print_human(report: &AuditReport) {
         " PASS={}  FAIL={}  NO_DATA={}",
         report.n_pass, report.n_fail, report.n_no_data
     );
+    println!(
+        " orphan_dir={}  not_relayed={}  (no verdict)",
+        report.orphan_dirs.len(),
+        report.not_relayed.len()
+    );
     println!("══════════════════════════════════════════════════════════════════════");
 }
 
@@ -2254,7 +2419,16 @@ fn main() -> Result<()> {
     let win_end = today;
     let win_start = today - Duration::days(cli.window_days.max(0));
 
-    // Resolve ticker set.
+    // Per-ticker calibration target + stable-pair identity, resolved exactly the
+    // way the calibrator + live producer do (config.yml per-pair/per-class). The
+    // flat `--target-bpd` is only a fallback when config.yml can't be loaded.
+    let target_resolver = TargetResolver::load();
+
+    // Resolve ticker set. Default = the CONFIGURED native set; disk-only dirs
+    // are `orphan_dir`, configured ids without a dir are `not_relayed`; neither
+    // gets a verdict. Config unloadable -> disk discovery (old behaviour).
+    let mut orphan_dirs: Vec<u64> = Vec::new();
+    let mut not_relayed: Vec<u64> = Vec::new();
     let tickers: Vec<u64> = match &cli.tickers {
         Some(s) => s
             .split(',')
@@ -2262,13 +2436,19 @@ fn main() -> Result<()> {
             .filter(|x| !x.is_empty())
             .filter_map(|x| x.parse::<u64>().ok())
             .collect(),
-        None => discover_tickers(&cli.common.data_root),
+        None => {
+            let on_disk = discover_tickers(&cli.common.data_root);
+            match &target_resolver.native_ids {
+                Some(cfg) => {
+                    let (audit, orphan, missing) = plan_enumeration(cfg, &on_disk);
+                    orphan_dirs = orphan;
+                    not_relayed = missing;
+                    audit
+                }
+                None => on_disk,
+            }
+        }
     };
-
-    // Per-ticker calibration target + stable-pair identity, resolved exactly the
-    // way the calibrator + live producer do (config.yml per-pair/per-class). The
-    // flat `--target-bpd` is only a fallback when config.yml can't be loaded.
-    let target_resolver = TargetResolver::load();
 
     // FIX #6: the calibrator's renko-k envelope (`mult_bounds = [K_FLOOR, ceiling]`)
     // when config.yml is loadable, so the absolute-k plausibility gate compares
@@ -2337,6 +2517,8 @@ fn main() -> Result<()> {
         n_pass,
         n_fail,
         n_no_data,
+        orphan_dirs,
+        not_relayed,
     };
 
     if cli.json {
@@ -2357,6 +2539,105 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Sessions / K4 / stable / enumeration (synthetic, no disk) ────────────
+
+    fn monday() -> NaiveDate {
+        let d = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        d - Duration::days(d.weekday().num_days_from_monday() as i64)
+    }
+    fn day_ms(d: NaiveDate, hh: i64, mm: i64) -> i64 {
+        d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis() + (hh * 60 + mm) * 60_000
+    }
+    /// Records every minute Mon..Fri in `[from_h, to_h)` except `skip` spans per day.
+    fn week_tape(skip: &dyn Fn(usize, i64) -> bool) -> Vec<i64> {
+        let mut v = Vec::new();
+        for i in 0..5usize {
+            let d = monday() + Duration::days(i as i64);
+            for m in 0..(24 * 60) {
+                if !skip(i, m) {
+                    v.push(day_ms(d, 0, 0) + m * 60_000);
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn k4_weekend_is_out_of_session() {
+        // Fri tape ends 21:00; Sat/Sun empty; Mon first.
+        let ts = week_tape(&|i, m| i == 4 && m >= 21 * 60);
+        let s = Sessions::build(&ts, 120_000);
+        let fri = monday() + Duration::days(4);
+        let sat = monday() + Duration::days(5);
+        assert!(s.is_open(day_ms(fri, 20, 0)));
+        assert!(!s.is_open(day_ms(fri, 22, 0)), "after Fri last record");
+        assert!(!s.is_open(day_ms(sat, 12, 0)), "Saturday has no session");
+    }
+
+    #[test]
+    fn recurring_daily_break_is_closed_but_one_off_gap_is_not() {
+        // 21:00-22:00 gap every weekday; plus a one-off 10:00-10:30 hole on Wed.
+        let ts = week_tape(&|i, m| {
+            (21 * 60..22 * 60).contains(&m) || (i == 2 && (10 * 60..10 * 60 + 30).contains(&m))
+        });
+        let s = Sessions::build(&ts, 120_000);
+        let tue = monday() + Duration::days(1);
+        let wed = monday() + Duration::days(2);
+        // Gap endpoints are the last record before and the first after.
+        assert!(s.is_recurring_break(day_ms(tue, 20, 59), day_ms(tue, 22, 0)));
+        assert!(!s.is_recurring_break(day_ms(wed, 9, 59), day_ms(wed, 10, 30)));
+        assert!(!s.is_open(day_ms(tue, 21, 30)), "inside the break");
+        assert!(s.is_open(day_ms(wed, 10, 15)), "one-off hole stays active");
+    }
+
+    #[test]
+    fn break_needs_three_other_weekdays() {
+        // Only Mon + Tue + Wed share the gap: each has 2 others -> not recurring.
+        let ts = week_tape(&|i, m| i < 3 && (21 * 60..22 * 60).contains(&m));
+        let s = Sessions::build(&ts, 120_000);
+        assert!(s.breaks.is_empty());
+    }
+
+    #[test]
+    fn k4_run_resets_out_of_session_and_samples_current_run_end() {
+        let mut k = ZeroRun::default();
+        let b = S10_BUCKET_MS;
+        for i in 0..5 {
+            assert!(k.push(i * b, true, true).is_none());
+        }
+        // Out-of-session zero bar ends the run (closed market is not a stall).
+        assert_eq!(k.push(5 * b, true, false), Some((5, 4 * b)));
+        // A later, shorter run reports ITS OWN end, not the longest's.
+        k.push(100 * b, true, true);
+        k.push(101 * b, true, true);
+        assert_eq!(k.push(102 * b, false, true), Some((2, 101 * b)));
+        assert_eq!(k.longest, 5);
+        k.push(200 * b, true, true);
+        assert_eq!(k.finish(), Some((1, 200 * b)));
+    }
+
+    #[test]
+    fn stable_comes_from_peg_identity_not_volatility() {
+        let pegged: Vec<String> = ["USDT", "USDC", "USD1"].iter().map(|s| s.to_string()).collect();
+        let usd = vec!["USD".to_string()];
+        let id = |s: &str| nxr_sdk::try_resolve_ticker_id(s).expect(s);
+        assert!(same_numeraire(id("USD1/USDT"), &pegged, &usd));
+        assert!(same_numeraire(id("USDT/USD"), &pegged, &usd));
+        assert!(!same_numeraire(id("BTC/USDT"), &pegged, &usd));
+        assert!(!same_numeraire(id("EUR/USD"), &pegged, &usd));
+        // Empty config lists -> nothing is stable.
+        assert!(!same_numeraire(id("USDT/USD"), &[], &[]));
+    }
+
+    #[test]
+    fn enumeration_splits_audit_orphan_and_not_relayed() {
+        let cfg: BTreeSet<u64> = [1, 2, 3].into_iter().collect();
+        let (audit, orphan, missing) = plan_enumeration(&cfg, &[2, 3, 9]);
+        assert_eq!(audit, vec![2, 3]);
+        assert_eq!(orphan, vec![9]);
+        assert_eq!(missing, vec![1]);
+    }
 
     /// `eval_invariant` with HEALTHY depth (vbid/vask both non-zero) and reject
     /// (rejected=0) defaults, so tests targeting the freshness/price chain don't
