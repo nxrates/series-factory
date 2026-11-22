@@ -121,7 +121,7 @@ serde_yml = "0.0.12"
 # CSV parsing
 csv = "1.3"
 # ZIP compression for Binance data
-zip = "2.2"
+zip = "9"
 # GZIP compression for Bybit data
 flate2 = "1.0"
 # Logging
