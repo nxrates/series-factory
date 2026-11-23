@@ -25,7 +25,7 @@ cexs:
     - GHO
     - CRVUSD
     - USYC
-    - BUIDL
+    # BUIDL unregistered: tokenized fund, no MITCH id, no CEX book, no pool source; re-add with an id + source.
     - USDF
     - RLUSD
     - USDY
